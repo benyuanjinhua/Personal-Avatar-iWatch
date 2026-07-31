@@ -4,7 +4,10 @@ ESS-30 入库说明：本模块由 ESS-23（鉴权/幂等骨架）→ ESS-25（�
 → ESS-26（完整 Bridge）逐步合并而来，`projection/` 为 ESS-27 QwenTaskProjection。
 ESS-30 追加：F2 turn 超时 watchdog（supervisor 强制重建 WS）、D1 写动作总开关
 `write_actions_enabled`（默认 false：上游权限请求一律自动 reject，含针对上游
-authorization 挂错 task 缺陷的全局清扫器 `deny_sweep_interval_ms`）。
+authorization 挂错 task 缺陷的清扫器 `deny_sweep_interval_ms`）。ESS-34 收窄：
+清扫器只 reject 能归属到本 Bridge 在途 turn 的 authorization（task_id 或
+delegation session 命中），无关任务/会话的 pending 权限保持不动；归属不了的
+自身写请求由 turn 硬超时 fail closed。
 
 Mac mini 上的 tailnet 窄入口：鉴权、幂等、生命周期、北向 API 的完整实现。
 依据《技术架构设计 v2.1》§4.1 / §6 / §7 / §10 P1，在 ESS-23（鉴权/幂等骨架）与

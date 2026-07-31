@@ -50,31 +50,61 @@ export class TaskWatcher {
     this.active = new Map() // request_id → { controller, deadlineTimer }
   }
 
-  // D1 全局权限清扫（ESS-30）：上游会把 authorization 挂到错误的 task 上
-  // （ESS-24/27 已实测的缺陷），仅盯自身 task 会漏掉写权限请求，写任务只能
-  // 烧满 300s 硬超时。写开关关闭时周期清扫全部 pending authorization 并一律
-  // reject——写请求被快速、确定地拒绝，Codex 收到拒绝后以文本收尾。
+  // D1 权限清扫（ESS-30，收窄于 ESS-34）：上游会把 authorization 挂到错误的
+  // task 上（ESS-24/27 已实测的缺陷），仅盯自身 task 会漏掉写权限请求，写任务
+  // 只能烧满 300s 硬超时。写开关关闭时周期清扫 pending authorization，但只
+  // reject 能可靠归属到本 Bridge 在途 turn 的那些：task.id 命中在途 turn 的
+  // task_id，或 task 的 delegation session 命中在途 turn 的 codex_session_id。
+  // 无法归属的 authorization 一律不动——Mac UI、其他 Agent/会话/人工任务的
+  // 权限请求不归本 Bridge 管（ESS-34：网关级全局拒写破坏任务隔离）。归属不了
+  // 的自身写请求由 turn 的 300s 硬超时 fail closed，不牵连无关任务。
   startDenySweeper() {
     if (this.cfg.write_actions_enabled !== false || this.denySweeper) return
     const interval = this.cfg.deny_sweep_interval_ms || 5000
     this.deniedAuths ??= new Set()
     this.denySweeper = setInterval(async () => {
       if (this.active.size === 0) return   // 只在有在途后台 turn 时清扫
+      const owned = this.activeOwnership()
+      if (owned.taskIds.size === 0 && owned.sessionIds.size === 0) return
       let tasks
       try { tasks = await this.gateway.listTasks() } catch { return }
       for (const task of tasks) {
         const auth = task.authorization
         if (!auth?.id || auth.status !== 'pending') continue
+        const ownedVia = this.ownershipOf(task, owned)
+        if (!ownedVia) continue
         const authId = String(auth.id)
         if (this.deniedAuths.has(authId)) continue
         this.deniedAuths.add(authId)
-        this.log({ evt: 'write_permission_auto_denied', task_id: task.id, authorization_id: authId, via: 'sweeper' })
+        this.log({ evt: 'write_permission_auto_denied', task_id: task.id, authorization_id: authId, via: 'sweeper', owned_via: ownedVia })
         this.gateway.respondPermission(authId, 'reject').catch(error => {
           this.log({ evt: 'auto_deny_failed', authorization_id: authId, err: String(error.message) })
         })
       }
     }, interval)
     this.denySweeper.unref?.()
+  }
+
+  // 本 Bridge 在途 turn 的归属标识：task_id（正常挂载）与 codex_session_id
+  // （上游错挂 task 时唯一可信的会话级 owner 标记，来自 task.delegation）。
+  activeOwnership() {
+    const taskIds = new Set()
+    const sessionIds = new Set()
+    for (const requestId of this.active.keys()) {
+      const turn = this.ledger.get(requestId)
+      if (!turn) continue
+      if (turn.task_id) taskIds.add(String(turn.task_id))
+      if (turn.codex_session_id) sessionIds.add(String(turn.codex_session_id))
+    }
+    return { taskIds, sessionIds }
+  }
+
+  // 返回归属证据（'task_id' | 'codex_session'），归属不了返回 null。
+  ownershipOf(task, { taskIds, sessionIds }) {
+    if (taskIds.has(String(task.id))) return 'task_id'
+    const session = task.delegation?.sessionId || task.delegation?.session_id || null
+    if (session && sessionIds.has(String(session))) return 'codex_session'
+    return null
   }
 
   stopDenySweeper() {

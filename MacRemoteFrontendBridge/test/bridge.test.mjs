@@ -385,22 +385,53 @@ describe('D1 read-only switch (write_actions_enabled=false, the default)', () =>
     }
   })
 
-  it('sweeper rejects a pending authorization misattached to another task (upstream taskId bug)', async () => {
+  it('sweeper rejects a misattached authorization provably owned by this bridge (codex session match)', async () => {
     const ctx = await launch({ scenario: 'background', overrides: { deny_sweep_interval_ms: 200 } })
     try {
       const id = rid()
       await ctx.client.createTurn(id, pcm(400))
       await waitFor(async () => (await ctx.client.getTurn(id)).json.task_id === 'task_bg')
 
+      // turn 先从自身 task 事件学到 codex session（正常委派路径）
+      ctx.mock.emitTask('task.running', {
+        ...ctx.mock.tasks.get('task_bg'), delegation: { sessionId: 'sess_watch' },
+      })
+      await waitFor(() => ctx.bridge.ledger.get(id).codex_session_id === 'sess_watch')
+
       // 上游缺陷复现（ESS-24/27 + ESS-30 真机实测）：权限挂在另一个 task 上，
-      // 被监视的 task 永远看不到它。
+      // 被监视的 task 永远看不到它——但 delegation session 证明它属于本 turn。
       ctx.mock.setTask({
-        id: 'task_other', status: 'completed',
+        id: 'task_other', status: 'completed', delegation: { sessionId: 'sess_watch' },
         authorization: { id: 'perm_misattached', status: 'pending', title: '允许写文件？' },
       })
 
       await waitFor(() => ctx.mock.permissionDecisions.length > 0, { timeoutMs: 5000 })
       assert.deepEqual(ctx.mock.permissionDecisions, [{ id: 'perm_misattached', decision: 'reject' }])
+    } finally {
+      await ctx.bridge.stop()
+      await ctx.mock.stop()
+    }
+  })
+
+  it('sweeper leaves unrelated pending authorizations untouched (ESS-34 task isolation)', async () => {
+    const ctx = await launch({ scenario: 'background', overrides: { deny_sweep_interval_ms: 200 } })
+    try {
+      const id = rid()
+      await ctx.client.createTurn(id, pcm(400))
+      await waitFor(async () => (await ctx.client.getTurn(id)).json.task_id === 'task_bg')
+
+      // 无关任务（其他会话/Agent/人工发起）带着 pending authorization 出现在
+      // 全局列表里；本 Bridge 的 turn 同时在途。
+      ctx.mock.setTask({
+        id: 'task_stranger', status: 'running', delegation: { sessionId: 'sess_someone_else' },
+        authorization: { id: 'perm_unrelated', status: 'pending', title: '允许部署到生产？' },
+      })
+
+      // 等待超过两个 sweep interval：无关 authorization 必须保持 pending，
+      // respondPermission 一次都不能被调用。
+      await new Promise(resolve => setTimeout(resolve, 700))
+      assert.deepEqual(ctx.mock.permissionDecisions, [])
+      assert.equal(ctx.mock.tasks.get('task_stranger').authorization.status, 'pending')
     } finally {
       await ctx.bridge.stop()
       await ctx.mock.stop()
