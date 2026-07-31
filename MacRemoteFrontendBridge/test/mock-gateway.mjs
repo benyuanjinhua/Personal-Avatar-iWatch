@@ -58,6 +58,12 @@ export class MockGateway extends EventEmitter {
         send({ type: 'voice.ready' })
         return
       }
+      if (msg.type === 'unmute') {
+        // 真实网关对 unmute 总是回播 voice.ownership（activateVoiceClient →
+        // broadcastVoiceOwnership）——Bridge 的注入前活性预检依赖这一点。
+        send({ type: 'voice.ownership', state: 'active', holder: { label: 'watch-bridge' } })
+        return
+      }
       if (msg.type === 'audio.append' && !turnScheduled) {
         turnScheduled = true
         this.realtimeTurns += 1

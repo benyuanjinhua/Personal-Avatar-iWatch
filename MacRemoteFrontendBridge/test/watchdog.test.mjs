@@ -22,6 +22,11 @@ describe('F2 watchdog: turn timeout recycles the realtime WS', () => {
           ws.send(JSON.stringify({ type: 'voice.ready' }))
           return
         }
+        if (msg.type === 'unmute') {
+          // 活性预检回播：连接 1 事件环路存活（停摆发生在 turn 层），预检必须通过
+          ws.send(JSON.stringify({ type: 'voice.ownership', state: 'active', holder: { label: 'watch-bridge' } }))
+          return
+        }
         // 连接 1 对注入保持沉默（停摆）；连接 2 正常直答
         if (conn >= 2 && msg.type === 'audio.append' && !replied) {
           replied = true

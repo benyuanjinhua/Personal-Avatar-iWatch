@@ -63,7 +63,28 @@ export function createBridge(overrides = {}) {
     deviceId: CONFIG.device_id,
     idleDisconnectMs: CONFIG.idle_disconnect_ms,
     turnTimeoutMs: CONFIG.turn_timeout_ms,
+    probeTimeoutMs: CONFIG.probe_timeout_ms,
+    firstEventTimeoutMs: CONFIG.first_event_timeout_ms,
+    maxTurnAttempts: CONFIG.max_turn_attempts,
     log: (...args) => log({ evt: 'supervisor', detail: args.map(String).join(' ').slice(0, 500) }),
+  })
+
+  // ESS-37 取证：supervisor journal（ws.connecting/close code/error frame、
+  // probe、stall、rebuild、全部网关事件摘要）落 bridge 日志——此前这些只存在
+  // 于进程内 journal，真机停摆后无据可查。audio.delta 只计数不落行（高频）。
+  const RT_GATEWAY_EVENTS = new Set([
+    'gateway.connected', 'voice.ready', 'voice.state', 'voice.deactivated',
+    'turn.started', 'audio.delta', 'audio.done', 'response.started', 'response.interrupted',
+    'transcript.delta', 'transcript.final', 'transcript.discard', 'timeline.inline',
+    'playback.clear', 'error',
+    'task.running', 'task.delegated', 'task.finalizing', 'task.cancelling', 'task.progress',
+    'task.completed', 'task.failed', 'task.cancelled',
+    'task.permission.requested', 'task.permission.resolved',
+  ])
+  supervisor.listeners.add(entry => {
+    const label = supervisor.currentTurn?.label
+    if (label && RT_GATEWAY_EVENTS.has(entry.event)) ledger.bumpEvents(label)
+    if (entry.event !== 'audio.delta') log({ evt: 'rt', ...entry })
   })
   const sourceAllowed = makeSourceGate(CONFIG.allowed_peer_ips)
 
@@ -144,6 +165,10 @@ export function createBridge(overrides = {}) {
         ledger.fail(requestId, 'ERR_WORK_TIMEOUT')
       } else if (/turn timeout/.test(String(error.message))) {
         ledger.fail(requestId, 'ERR_REALTIME_TIMEOUT')
+      } else if (error.stalled || error.sessionDead || error.connectionLost) {
+        // 停摆已重放仍失败 / 重建后会话仍无响应：快速终态，禁止头部阻塞
+        log({ evt: 'turn_stalled', request_id: requestId, err: String(error.message).slice(0, 300) })
+        ledger.fail(requestId, 'ERR_REALTIME_STALLED')
       } else {
         log({ evt: 'turn_failed', request_id: requestId, err: String(error.message).slice(0, 300) })
         ledger.fail(requestId, 'ERR_PROCESSING_FAILED')
