@@ -85,4 +85,43 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
     ) {
         Task { @MainActor in self.apply(messageData) }
     }
+
+    // MARK: - iPhone Relay 回执（ESS-28）
+
+    nonisolated func session(
+        _ session: WCSession,
+        didReceiveMessage message: [String: Any]
+    ) {
+        forwardRelayPayloads(in: message)
+    }
+
+    nonisolated func session(
+        _ session: WCSession,
+        didReceiveUserInfo userInfo: [String: Any] = [:]
+    ) {
+        forwardRelayPayloads(in: userInfo)
+    }
+
+    nonisolated func session(_ session: WCSession, didReceive file: WCSessionFile) {
+        // 系统会在本方法返回后删除临时文件，必须同步读出/搬移。
+        let payloadData = file.metadata?[VoiceMessage.resultKey] as? Data
+        guard payloadData != nil else { return }
+        let stagedURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("relay-result-\(UUID().uuidString).m4a")
+        try? FileManager.default.moveItem(at: file.fileURL, to: stagedURL)
+        Task { @MainActor in
+            self.voiceTransport?.handleResultAudioFile(tempURL: stagedURL, payloadData: payloadData)
+            try? FileManager.default.removeItem(at: stagedURL)
+        }
+    }
+
+    private nonisolated func forwardRelayPayloads(in userInfo: [String: Any]) {
+        let statusData = userInfo[VoiceMessage.relayStatusKey] as? Data
+        let resultData = userInfo[VoiceMessage.resultKey] as? Data
+        guard statusData != nil || resultData != nil else { return }
+        Task { @MainActor in
+            if let statusData { self.voiceTransport?.handleRelayStatus(data: statusData) }
+            if let resultData { self.voiceTransport?.handleResultPayload(data: resultData) }
+        }
+    }
 }
