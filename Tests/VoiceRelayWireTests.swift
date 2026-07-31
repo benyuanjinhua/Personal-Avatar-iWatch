@@ -93,7 +93,7 @@ final class VoiceRelayEventsTests: XCTestCase {
         let json = """
         {"request_id":"req-1","event":"status","status":"background_processing","occurred_at":"2026-07-30T09:00:00Z"}
         """
-        let event = VoiceTurnEvent.decode(from: Data(json.utf8))
+        let event = VoiceRelayEvent.decode(from: Data(json.utf8))
         XCTAssertEqual(event?.requestId, "req-1")
         XCTAssertEqual(event?.phase, .backgroundProcessing)
     }
@@ -102,7 +102,7 @@ final class VoiceRelayEventsTests: XCTestCase {
         let json = """
         {"request_id":"req-1","event":"result","status":"completed","text":"完成","audio_base64":"QUJD"}
         """
-        let event = VoiceTurnEvent.decode(from: Data(json.utf8))
+        let event = VoiceRelayEvent.decode(from: Data(json.utf8))
         XCTAssertEqual(event?.text, "完成")
         XCTAssertEqual(event?.audioBase64, "QUJD")
         XCTAssertEqual(event?.phase, .completed)
@@ -112,10 +112,10 @@ final class VoiceRelayEventsTests: XCTestCase {
         let json = """
         {"request_id":"req-1","event":"status","status":"quantum_flux","future_field":42}
         """
-        let event = VoiceTurnEvent.decode(from: Data(json.utf8))
+        let event = VoiceRelayEvent.decode(from: Data(json.utf8))
         XCTAssertNotNil(event, "未知字段/未知状态不应导致解码失败")
         XCTAssertNil(event?.phase, "未知状态映射为 nil 由上层忽略")
-        XCTAssertNil(VoiceTurnEvent.decode(from: Data("not-json".utf8)), "坏 JSON 返回 nil 不崩溃")
+        XCTAssertNil(VoiceRelayEvent.decode(from: Data("not-json".utf8)), "坏 JSON 返回 nil 不崩溃")
     }
 
     func testRelayStatusUpdateRoundTripUsesContractKeys() throws {
@@ -132,19 +132,19 @@ final class VoiceRelayEventsTests: XCTestCase {
         XCTAssertEqual(RelayStatusUpdate.decode(from: data), update)
     }
 
-    func testVoiceResultPayloadRoundTrip() throws {
-        let payload = VoiceResultPayload(
+    func testVoiceRelayResultPayloadRoundTrip() throws {
+        let payload = VoiceRelayResultPayload(
             requestId: "req-1", text: "答案", audioSha256: String(repeating: "a", count: 64),
             completedAt: Date(timeIntervalSince1970: 1_753_920_000)
         )
-        XCTAssertEqual(VoiceResultPayload.decode(from: try payload.jsonData()), payload)
+        XCTAssertEqual(VoiceRelayResultPayload.decode(from: try payload.jsonData()), payload)
     }
 
     func testTerminalPhases() {
-        XCTAssertTrue(VoiceTurnPhase.completed.isTerminal)
-        XCTAssertTrue(VoiceTurnPhase.failed.isTerminal)
-        XCTAssertTrue(VoiceTurnPhase.cancelled.isTerminal)
-        XCTAssertFalse(VoiceTurnPhase.waitingForMac.isTerminal)
-        XCTAssertFalse(VoiceTurnPhase.permissionRequired.isTerminal)
+        XCTAssertTrue(VoiceRelayPhase.completed.isTerminal)
+        XCTAssertTrue(VoiceRelayPhase.failed.isTerminal)
+        XCTAssertTrue(VoiceRelayPhase.cancelled.isTerminal)
+        XCTAssertFalse(VoiceRelayPhase.waitingForMac.isTerminal)
+        XCTAssertFalse(VoiceRelayPhase.permissionRequired.isTerminal)
     }
 }

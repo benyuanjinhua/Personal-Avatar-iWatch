@@ -1,7 +1,7 @@
 import Foundation
 
 /// §6 跨设备共享的最小公共状态机。rawValue 即 wire 上的状态字符串。
-enum VoiceTurnPhase: String, Codable, CaseIterable {
+enum VoiceRelayPhase: String, Codable, CaseIterable {
     case recorded
     case waitingForPhone = "waiting_for_phone"
     case waitingForMac = "waiting_for_mac"
@@ -40,7 +40,7 @@ enum VoiceTurnPhase: String, Codable, CaseIterable {
 
 /// WSS /v1/voice/events 下行事件（§7）。防御性解码：
 /// 未知 kind / 未知 status 保留原始字符串，未知字段忽略，坏 JSON 返回 nil。
-struct VoiceTurnEvent: Codable, Equatable {
+struct VoiceRelayEvent: Codable, Equatable {
     let requestId: String
     /// "status" | "permission_required" | "result"；未知类型原样保留由上层忽略。
     let event: String
@@ -60,14 +60,14 @@ struct VoiceTurnEvent: Codable, Equatable {
         case occurredAt = "occurred_at"
     }
 
-    var phase: VoiceTurnPhase? {
-        status.flatMap(VoiceTurnPhase.init(rawValue:))
+    var phase: VoiceRelayPhase? {
+        status.flatMap(VoiceRelayPhase.init(rawValue:))
     }
 
-    static func decode(from data: Data) -> VoiceTurnEvent? {
+    static func decode(from data: Data) -> VoiceRelayEvent? {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try? decoder.decode(VoiceTurnEvent.self, from: data)
+        return try? decoder.decode(VoiceRelayEvent.self, from: data)
     }
 }
 
@@ -75,7 +75,7 @@ struct VoiceTurnEvent: Codable, Equatable {
 struct RelayStatusUpdate: Codable, Equatable {
     let protocolVersion: String
     let requestId: String
-    let phase: VoiceTurnPhase
+    let phase: VoiceRelayPhase
     /// 面向用户的补充说明（如失败原因、权限摘要）；不含凭据与内部路径。
     let detail: String?
     let updatedAt: Date
@@ -88,7 +88,7 @@ struct RelayStatusUpdate: Codable, Equatable {
         case updatedAt = "updated_at"
     }
 
-    init(requestId: String, phase: VoiceTurnPhase, detail: String? = nil, updatedAt: Date = Date()) {
+    init(requestId: String, phase: VoiceRelayPhase, detail: String? = nil, updatedAt: Date = Date()) {
         self.protocolVersion = VoiceRequestEnvelope.currentProtocolVersion
         self.requestId = requestId
         self.phase = phase
@@ -107,7 +107,7 @@ struct RelayStatusUpdate: Codable, Equatable {
 
 /// iPhone → Watch 的最终结果。短文本随本载荷走 sendMessage / transferUserInfo；
 /// 结果音频单独 transferFile，metadata 里带同一载荷用于关联与校验。
-struct VoiceResultPayload: Codable, Equatable {
+struct VoiceRelayResultPayload: Codable, Equatable {
     let protocolVersion: String
     let requestId: String
     let text: String?
@@ -135,8 +135,8 @@ struct VoiceResultPayload: Codable, Equatable {
         try RelayEventCoding.encoder.encode(self)
     }
 
-    static func decode(from data: Data) -> VoiceResultPayload? {
-        try? RelayEventCoding.decoder.decode(VoiceResultPayload.self, from: data)
+    static func decode(from data: Data) -> VoiceRelayResultPayload? {
+        try? RelayEventCoding.decoder.decode(VoiceRelayResultPayload.self, from: data)
     }
 }
 

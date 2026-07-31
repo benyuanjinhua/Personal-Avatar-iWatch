@@ -30,7 +30,7 @@ final class WatchVoiceTransport: ObservableObject {
     /// iPhone Relay 回执的最新链路状态（ESS-28；完整时间线 UI 归 ESS-29）。
     @Published private(set) var remoteStatus: RelayStatusUpdate?
     /// Mac 返回的最新结果；音频落在 resultsDirectory/<request_id>.m4a。
-    @Published private(set) var lastResult: VoiceResultPayload?
+    @Published private(set) var lastResult: VoiceRelayResultPayload?
 
     /// 语音回合日志：发送各阶段状态写入其中，UI 时间线由它驱动（ESS-29）。
     private weak var journal: VoiceTurnJournal?
@@ -56,7 +56,7 @@ final class WatchVoiceTransport: ObservableObject {
     }
 
     func handleResultPayload(data: Data) {
-        guard let payload = VoiceResultPayload.decode(from: data) else { return }
+        guard let payload = VoiceRelayResultPayload.decode(from: data) else { return }
         lastResult = payload
     }
 
@@ -64,7 +64,7 @@ final class WatchVoiceTransport: ObservableObject {
     func handleResultAudioFile(tempURL: URL, payloadData: Data?) {
         guard
             let payloadData,
-            let payload = VoiceResultPayload.decode(from: payloadData),
+            let payload = VoiceRelayResultPayload.decode(from: payloadData),
             let audioData = try? Data(contentsOf: tempURL),
             payload.audioSha256?.lowercased() == VoiceDigest.sha256Hex(of: audioData)
         else { return }

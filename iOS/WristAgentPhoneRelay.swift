@@ -8,8 +8,8 @@ import UserNotifications
 @MainActor
 protocol WatchFeedbackChannel: AnyObject {
     func notifyWatch(status: RelayStatusUpdate)
-    func notifyWatch(result: VoiceResultPayload)
-    func transferResultAudio(fileURL: URL, payload: VoiceResultPayload)
+    func notifyWatch(result: VoiceRelayResultPayload)
+    func transferResultAudio(fileURL: URL, payload: VoiceRelayResultPayload)
 }
 
 /// WristAgentPhoneRelay（ESS-28）：iPhone Companion Relay 编排器。
@@ -114,7 +114,7 @@ final class WristAgentPhoneRelay: ObservableObject {
                 ))
             case .duplicate(let existing):
                 // 幂等：不产生第二个请求，只把当前状态重发给 Watch。
-                let phase: VoiceTurnPhase = existing.state == .delivered ? .accepted : .waitingForMac
+                let phase: VoiceRelayPhase = existing.state == .delivered ? .accepted : .waitingForMac
                 notify(status: RelayStatusUpdate(requestId: existing.requestId, phase: phase))
             }
         } catch {
@@ -288,7 +288,7 @@ final class WristAgentPhoneRelay: ObservableObject {
     }
 
     private func handleEvent(data: Data) {
-        guard let event = VoiceTurnEvent.decode(from: data) else { return }
+        guard let event = VoiceRelayEvent.decode(from: data) else { return }
         switch event.event {
         case "status":
             guard let phase = event.phase else { return }
@@ -306,7 +306,7 @@ final class WristAgentPhoneRelay: ObservableObject {
         }
     }
 
-    private func deliverResult(_ event: VoiceTurnEvent) {
+    private func deliverResult(_ event: VoiceRelayEvent) {
         var audioSha: String?
         var audioURL: URL?
         if let base64 = event.audioBase64, let audioData = Data(base64Encoded: base64) {
@@ -317,7 +317,7 @@ final class WristAgentPhoneRelay: ObservableObject {
                 audioURL = url
             }
         }
-        let payload = VoiceResultPayload(
+        let payload = VoiceRelayResultPayload(
             requestId: event.requestId, text: event.text, audioSha256: audioSha
         )
         notifyResult(payload)
@@ -338,7 +338,7 @@ final class WristAgentPhoneRelay: ObservableObject {
         watchChannel?.notifyWatch(status: status)
     }
 
-    private func notifyResult(_ payload: VoiceResultPayload) {
+    private func notifyResult(_ payload: VoiceRelayResultPayload) {
         watchChannel?.notifyWatch(result: payload)
     }
 

@@ -162,13 +162,13 @@ extension PhoneConnectivity: WatchFeedbackChannel {
         sendToWatch(key: VoiceMessage.relayStatusKey, data: data)
     }
 
-    func notifyWatch(result: VoiceResultPayload) {
+    func notifyWatch(result: VoiceRelayResultPayload) {
         guard let data = try? result.jsonData() else { return }
         sendToWatch(key: VoiceMessage.resultKey, data: data)
     }
 
     /// 结果音频走系统托管 transferFile；metadata 带结果载荷用于 Watch 端关联与 sha256 校验。
-    func transferResultAudio(fileURL: URL, payload: VoiceResultPayload) {
+    func transferResultAudio(fileURL: URL, payload: VoiceRelayResultPayload) {
         guard WCSession.default.activationState == .activated,
               let data = try? payload.jsonData() else { return }
         WCSession.default.transferFile(fileURL, metadata: [VoiceMessage.resultKey: data])
