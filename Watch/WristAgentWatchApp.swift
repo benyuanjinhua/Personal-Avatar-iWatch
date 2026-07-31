@@ -14,6 +14,8 @@ struct WristAgentWatchApp: App {
                 .environmentObject(pushToTalk)
                 .task {
                     settings.voiceTransport = pushToTalk.transport
+                    settings.voiceJournal = pushToTalk.journal
+                    settings.speechVault = pushToTalk.speechVault
                     settings.activate()
                     conversation.configure(with: settings.configuration)
                     if settings.configuration.autoListen {
