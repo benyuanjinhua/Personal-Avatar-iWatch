@@ -46,6 +46,14 @@
         <button id="reset" title="重置">↻</button>
       </div>
       <div id="cases" class="cases"></div>
+      <div class="trace-tools">
+        <input id="custom-query" placeholder="自定义输入，如：杭州天气咋样">
+        <input id="trace-id" placeholder="traceid（可选，如 223lkjl；留空自动生成）">
+        <div class="trace-actions">
+          <button id="send-custom">发送自定义查询</button>
+          <button id="lookup-trace">查询链路</button>
+        </div>
+      </div>
       <pre id="events" aria-live="polite">等待开始…</pre>
     </aside>
   </main>

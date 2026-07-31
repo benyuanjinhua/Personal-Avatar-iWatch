@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { after, before, test } from "node:test";
 import { server } from "./mock-gateway.mjs";
 
+const traceLogDir = process.env.WRIST_AGENT_TRACE_DIR
+  || path.join(import.meta.dirname, "..", "logs", "trace");
 let baseURL;
 
 before(async () => {
@@ -38,6 +42,46 @@ test("turn endpoint validates audio", async () => {
     body: JSON.stringify({})
   });
   assert.equal(response.status, 400);
+});
+
+test("caller trace id propagates across every module", async () => {
+  const traceId = `223lkjl${Date.now()}`;
+  const response = await fetch(`${baseURL}/v1/turns`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "杭州天气咋样", trace_id: traceId })
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("x-trace-id"), traceId);
+  const body = await response.json();
+  assert.equal(body.trace_id, traceId);
+  assert.equal(body.transcript, "杭州天气咋样");
+  assert.match(body.reply, /天气|多云/);
+
+  const lookup = await fetch(`${baseURL}/v1/trace/${traceId}`).then(result => result.json());
+  assert.equal(lookup.found, true);
+  for (const module of ["h5-mock", "main-agent", "codex-cli"]) {
+    assert.equal(lookup.modules[module].ok, true, `${module} should log the trace`);
+    assert.ok(lookup.modules[module].events > 0);
+    const logFile = await readFile(path.join(traceLogDir, `${module}.log`), "utf8");
+    assert.ok(logFile.includes(traceId), `${module}.log should contain the trace id`);
+  }
+});
+
+test("missing trace id is generated, malformed trace id is rejected", async () => {
+  const generated = await fetch(`${baseURL}/v1/turns`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "现在几点" })
+  }).then(result => result.json());
+  assert.match(generated.trace_id, /^trc-[0-9a-f-]{8}$/);
+
+  const rejected = await fetch(`${baseURL}/v1/turns`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text: "现在几点", trace_id: "bad id!" })
+  });
+  assert.equal(rejected.status, 400);
 });
 
 test("turn, long task and confirmation flows are executable", async () => {

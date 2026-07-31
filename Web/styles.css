@@ -39,6 +39,10 @@ button { font: inherit; cursor: pointer; }
 .case.active { color: white; border-color: #4de2d08a; background: #14373255; }
 .case.passed { color: #94d9bf; }
 .case .state { font-size: 10px; letter-spacing: .08em; }
+.trace-tools { display: grid; gap: 8px; margin-top: 18px; }
+.trace-tools input { font: inherit; font-size: 12px; padding: 9px 12px; border-radius: 10px; border: 1px solid #ffffff22; background: #0c1214; color: #e8f4f2; }
+.trace-actions { display: flex; gap: 8px; }
+.trace-actions button { flex: 1; font-size: 12px; font-weight: 700; padding: 9px; border-radius: 999px; border: 1px solid #46daca66; background: #12312f; color: #6ff3e5; }
 pre { min-height: 120px; max-height: 170px; overflow: auto; margin-top: 18px; padding: 15px; border-radius: 12px; background: #030404; color: #71807e; font: 10px/1.7 ui-monospace, monospace; white-space: pre-wrap; }
 @media (max-width: 960px) { main { grid-template-columns: 1fr 1fr; } .intro { grid-column: 1 / -1; max-width: none; } }
 @media (max-width: 680px) { main { display: flex; flex-direction: column; padding: 38px 20px; } .test-panel { width: 100%; border-left: 0; border-top: 1px solid #ffffff18; padding: 28px 0 0; } }

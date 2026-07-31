@@ -132,6 +132,13 @@ Mock 中依次验证四条核心链路：
 HTTP 请求事件。此入口与 Watch 联调共用同一个 Mock Gateway 协议，不需要复制
 一套测试数据。
 
+每轮请求带全链路 `trace_id`（可在右侧输入框自定义，如 `223lkjl`，配合
+自定义输入“杭州天气咋样”）。网关按模块写 JSONL 日志到
+`logs/trace/{h5-mock,main-agent,codex-cli}.log`，每行都含 `trace_id`；
+`grep 223lkjl logs/trace/*.log` 或页面上点“查询链路”（`GET
+/v1/trace/223lkjl`）即可确认该输入在主 Agent、Codex CLI 阶段是否成功。
+约定见 [Docs/API.md](Docs/API.md) 第 6 节。
+
 查出 Mac 的局域网 IP，在 iPhone App 中填写：
 
 ```text
