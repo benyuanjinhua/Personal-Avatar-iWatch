@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test test/bridge.test.mjs test/watchdog.test.mjs"
+    "test": "node --test test/bridge.test.mjs test/watchdog.test.mjs test/ess36-realtime.test.mjs"
   },
   "dependencies": {
     "ws": "^8.21.1"
