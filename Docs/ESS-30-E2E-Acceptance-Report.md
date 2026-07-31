@@ -139,3 +139,36 @@ ASR 质量佐证：本轮 22.05kHz AAC TTS 样本经管线转 16k PCM 后，问�
 
 - 集成分支：`agent/duolong/ess-30-e2e-acceptance`（含本报告、合并修复、集成后的 pbxproj）
 - 运行数据：latency 报告 JSON、权限实测日志、live-recover 输出（随验收评论附件归档）
+
+---
+
+# 第二轮：demo 修复验收（2026-07-31，加速口径）
+
+按白梦林拍板的 demo 口径（D1 只读方案；F1 权限四象限闭环转 demo 后）执行本轮修复并复测。
+
+## 修复内容
+
+| 项 | 实现 | 验证 |
+|---|---|---|
+| **D1 强制只读** | 双层：① 网关 `INITIAL_AGENT_MODE=read-only`（codex-acp AgentMode.ReadOnly：approval on-request + sandbox read-only；写入 `config.env`，备份 `config.env.bak-ess30`，恢复即删该行重启）；② Bridge 写动作总开关 `write_actions_enabled`（默认 false）：上游权限请求一律自动 reject、北向永不投影 `permission_required` | mock 2 项新测试 + 真网关负例（下） |
+| **D1 全局权限清扫器** | 复测发现上游把 authorization **挂到错误的 task** 上（ESS-24/27 已记录的缺陷、本轮真机复现）：被监视 task 永远看不到权限请求，写任务只能烧满 300s。新增 sweeper：写开关关闭时周期 `GET /api/tasks` 清扫一切 pending authorization 并 reject | mock 挂错场景测试 + 真网关实测 |
+| **F2 watchdog** | supervisor turn 超时即强制 terminate WS 走既有退避重连（此前仅 ping 僵尸检测，停摆不自愈）；旧连接可能持有所有权，按既有僵尸规则条件 takeover | 新增 `test/watchdog.test.mjs`：停摆连接 → 强制重建 → 新连接上下一 turn 成功 |
+| **PR #5 冲突** | `origin/main`（已含 ESS-22/28）合入 ESS-29 分支，采用与集成分支相同的解法（delegate 分流 + relay 类型更名 + pbxproj 重生成） | 66 XCTest 全过；GitHub 状态 MERGEABLE |
+| **模块入库** | `MacRemoteFrontendBridge/`（ESS-23+25+26 合并演进的 Bridge + ESS-27 `projection/`）、`AudioPipe/`（ESS-25 Swift 转码器）入仓库；README 注明沿革与构建方式 | 仓库内 `npm test` 16/16、projection 12/12、audiopipe swift build 通过 |
+
+## 真网关复测证据（只读模式生效后）
+
+| 场景 | 结果 |
+|---|---|
+| 直答（q4） | ✅ completed 3.8s，含 77KB 结果语音——读路径不受只读模式影响 |
+| 后台只读任务（统计仓库文件） | ✅ completed 45.9s，结果正确——Codex read-only sandbox 下只读任务照常执行 |
+| **写请求负例（sweeper 前）** | 写任务在 read-only sandbox 下升级为 ACP 权限请求，但上游把 authorization 挂到另一 task（缺陷复现）→ 无人可答 → 300s 硬超时 `ERR_WORK_TIMEOUT`，**文件未创建**（拒写成立但烧满超时） |
+| **写请求负例（sweeper 后）** | ✅ sweeper 5s 内 reject（日志 `write_permission_auto_denied`）→ Codex 收到拒绝，26.8s 返回用户可读答复：「无法在仓库根目录创建文件，因为写入权限申请被拒绝了。当前环境是只读模式…」；**文件未创建**，`git status` 干净 |
+| 回归 | Bridge mock 16/16（新增 D1×2、watchdog 另文件 1）、projection 12/12、Swift 66+5、双端模拟器构建成功 |
+
+## 更新后的状态
+
+- F1（权限闭环）：demo 口径下由 D1 只读替代，**写路径整体关闭且有双层强制**；F1 四象限闭环（含上游 authorization 挂错 task 缺陷的上游修复或绕过）转 demo 后专项。
+- F2：已修复（watchdog），mock 场景验证；真机长会话连续 turn 观察随 demo 进行。
+- F3：按拍板口径「按现状」，本轮未动（本轮直答样本 3.8s）。
+- 网关当前运行态：`INITIAL_AGENT_MODE=read-only` 已生效（LaunchAgent 已重启，health 200）。
