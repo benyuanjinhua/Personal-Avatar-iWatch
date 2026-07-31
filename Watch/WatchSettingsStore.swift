@@ -7,6 +7,10 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
     @Published private(set) var configuration: AgentConfiguration = .demo
     /// 语音传输回调转发目标（WCSession 只允许一个 delegate）。
     weak var voiceTransport: WatchVoiceTransport?
+    /// 状态/权限/结果事件入账目标（ESS-29）。
+    weak var voiceJournal: VoiceTurnJournal?
+    /// 结果语音的加密落盘仓（ESS-29）。
+    weak var speechVault: EncryptedAudioVault?
     private let defaults = UserDefaults.standard
     private let storageKey = "wristagent.watch.configuration"
 
@@ -84,5 +88,55 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         didReceiveMessageData messageData: Data
     ) {
         Task { @MainActor in self.apply(messageData) }
+    }
+
+    // MARK: - 状态/权限/结果事件（ESS-29）
+
+    nonisolated func session(
+        _ session: WCSession,
+        didReceiveMessage message: [String: Any]
+    ) {
+        guard let data = message[VoiceStatusMessage.envelopeKey] as? Data else { return }
+        Task { @MainActor in self.applyVoiceStatus(data) }
+    }
+
+    nonisolated func session(
+        _ session: WCSession,
+        didReceiveUserInfo userInfo: [String: Any] = [:]
+    ) {
+        guard let data = userInfo[VoiceStatusMessage.envelopeKey] as? Data else { return }
+        Task { @MainActor in self.applyVoiceStatus(data) }
+    }
+
+    nonisolated func session(_ session: WCSession, didReceive file: WCSessionFile) {
+        // 系统在本回调返回后就会删除临时文件，必须同步读出内容。
+        guard
+            let envelopeData = file.metadata?[VoiceSpeechMessage.envelopeKey] as? Data,
+            let audioData = try? Data(contentsOf: file.fileURL)
+        else { return }
+        Task { @MainActor in self.storeSpeech(envelopeData: envelopeData, audioData: audioData) }
+    }
+
+    @MainActor
+    private func applyVoiceStatus(_ data: Data) {
+        guard let envelope = try? VoiceStatusEnvelope.decode(from: data) else { return }
+        voiceJournal?.apply(envelope)
+    }
+
+    /// 结果语音入库：sha256 校验通过才加密落盘；校验失败整体丢弃（数据不可信）。
+    @MainActor
+    private func storeSpeech(envelopeData: Data, audioData: Data) {
+        guard
+            let envelope = try? VoiceStatusEnvelope.decode(from: envelopeData),
+            envelope.validate() == nil
+        else { return }
+        if let expected = envelope.result?.speechSha256,
+           VoiceDigest.sha256Hex(of: audioData) != expected.lowercased() {
+            return
+        }
+        voiceJournal?.apply(envelope)
+        let fileName = "\(envelope.requestId).m4a"
+        guard let vault = speechVault, (try? vault.store(audioData, name: fileName)) != nil else { return }
+        voiceJournal?.attachSpeech(requestId: envelope.requestId, fileName: fileName)
     }
 }
