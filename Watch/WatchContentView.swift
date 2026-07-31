@@ -3,6 +3,7 @@ import SwiftUI
 struct WatchContentView: View {
     @EnvironmentObject private var conversation: ConversationViewModel
     @EnvironmentObject private var settings: WatchSettingsStore
+    @EnvironmentObject private var pushToTalk: PushToTalkController
 
     var body: some View {
         NavigationStack {
@@ -58,6 +59,15 @@ struct WatchContentView: View {
                         .font(.footnote)
                         .tint(.orange)
                     }
+
+                    NavigationLink {
+                        PushToTalkView(transport: pushToTalk.transport)
+                    } label: {
+                        Label("按住说话（PoC）", systemImage: "mic.circle.fill")
+                    }
+                    .font(.footnote)
+                    .buttonStyle(.bordered)
+                    .tint(.cyan)
 
                     NavigationLink {
                         WatchHistoryListView(

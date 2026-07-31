@@ -18,6 +18,16 @@ enum RecorderError: LocalizedError {
 
 @MainActor
 final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
+    struct Recording {
+        let fileURL: URL
+        let data: Data
+        let durationMs: Int
+    }
+
+    static let maxDuration: TimeInterval = 60
+    static let sampleRate = 16_000
+    static let channels = 1
+
     @Published private(set) var isRecording = false
     @Published private(set) var level: Float = 0
 
@@ -41,8 +51,8 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
             .appendingPathComponent("wristagent-\(UUID().uuidString).m4a")
         let settings: [String: Any] = [
             AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
-            AVSampleRateKey: 16_000,
-            AVNumberOfChannelsKey: 1,
+            AVSampleRateKey: Self.sampleRate,
+            AVNumberOfChannelsKey: Self.channels,
             AVEncoderBitRateKey: 32_000,
             AVEncoderAudioQualityKey: AVAudioQuality.medium.rawValue
         ]
@@ -50,7 +60,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         let audioRecorder = try AVAudioRecorder(url: url, settings: settings)
         audioRecorder.delegate = self
         audioRecorder.isMeteringEnabled = true
-        guard audioRecorder.prepareToRecord(), audioRecorder.record(forDuration: 30) else {
+        guard audioRecorder.prepareToRecord(), audioRecorder.record(forDuration: Self.maxDuration) else {
             throw RecorderError.cannotCreateRecorder
         }
 
@@ -61,6 +71,14 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
     }
 
     func stop() throws -> Data {
+        let recording = try finish()
+        try? FileManager.default.removeItem(at: recording.fileURL)
+        return recording.data
+    }
+
+    /// 结束录音并保留文件（transferFile 需要文件在传输完成前存在）。
+    func finish() throws -> Recording {
+        let durationMs = Int(((recorder?.currentTime ?? 0) * 1000).rounded())
         recorder?.stop()
         stopMetering()
         isRecording = false
@@ -68,10 +86,9 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         guard let url = currentURL, let data = try? Data(contentsOf: url), !data.isEmpty else {
             throw RecorderError.noRecording
         }
-        try? FileManager.default.removeItem(at: url)
         currentURL = nil
         recorder = nil
-        return data
+        return Recording(fileURL: url, data: data, durationMs: max(1, durationMs))
     }
 
     func cancel() {
