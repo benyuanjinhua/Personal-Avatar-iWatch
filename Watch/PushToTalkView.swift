@@ -44,6 +44,13 @@ struct PushToTalkView: View {
                     .font(.caption2)
                     .foregroundStyle(.orange)
             }
+
+            if let remote = transport.remoteStatus {
+                Text(remote.detail ?? remote.phase.displayText)
+                    .font(.caption2)
+                    .foregroundStyle(remote.phase == .failed ? .red : .secondary)
+                    .lineLimit(2)
+            }
         }
         .navigationTitle("按住说话")
     }
