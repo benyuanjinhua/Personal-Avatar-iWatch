@@ -27,18 +27,51 @@ final class WatchVoiceTransport: ObservableObject {
 
     @Published private(set) var phase: DeliveryPhase = .idle
     @Published private(set) var pendingCount = 0
+    /// iPhone Relay 回执的最新链路状态（ESS-28；完整时间线 UI 归 ESS-29）。
+    @Published private(set) var remoteStatus: RelayStatusUpdate?
+    /// Mac 返回的最新结果；音频落在 resultsDirectory/<request_id>.m4a。
+    @Published private(set) var lastResult: VoiceRelayResultPayload?
 
     /// 语音回合日志：发送各阶段状态写入其中，UI 时间线由它驱动（ESS-29）。
     private weak var journal: VoiceTurnJournal?
     private let outboxDirectory: URL
+    let resultsDirectory: URL
     private let fileManager = FileManager.default
 
     init(journal: VoiceTurnJournal? = nil) {
         self.journal = journal
         let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         outboxDirectory = base.appendingPathComponent("VoiceOutbox", isDirectory: true)
+        resultsDirectory = base.appendingPathComponent("VoiceResults", isDirectory: true)
         try? fileManager.createDirectory(at: outboxDirectory, withIntermediateDirectories: true)
+        try? fileManager.createDirectory(at: resultsDirectory, withIntermediateDirectories: true)
         refreshPendingCount()
+    }
+
+    // MARK: - iPhone Relay 回执（ESS-28）
+
+    func handleRelayStatus(data: Data) {
+        guard let update = RelayStatusUpdate.decode(from: data) else { return }
+        remoteStatus = update
+    }
+
+    func handleResultPayload(data: Data) {
+        guard let payload = VoiceRelayResultPayload.decode(from: data) else { return }
+        lastResult = payload
+    }
+
+    /// 结果音频 transferFile 落地：sha256 校验通过才保留。
+    func handleResultAudioFile(tempURL: URL, payloadData: Data?) {
+        guard
+            let payloadData,
+            let payload = VoiceRelayResultPayload.decode(from: payloadData),
+            let audioData = try? Data(contentsOf: tempURL),
+            payload.audioSha256?.lowercased() == VoiceDigest.sha256Hex(of: audioData)
+        else { return }
+        let destination = resultsDirectory.appendingPathComponent("\(payload.requestId).m4a")
+        try? fileManager.removeItem(at: destination)
+        guard (try? audioData.write(to: destination, options: .atomic)) != nil else { return }
+        lastResult = payload
     }
 
     func send(envelope: VoiceRequestEnvelope, recording: AudioRecorder.Recording) {

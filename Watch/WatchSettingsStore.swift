@@ -90,12 +90,14 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         Task { @MainActor in self.apply(messageData) }
     }
 
-    // MARK: - 状态/权限/结果事件（ESS-29）
+    // MARK: - iPhone Relay 回执（ESS-28）＋ 状态/权限/结果事件（ESS-29）
+    // 同一 WCSession delegate 同时服务两条链路：payload 按各自的 key 分流。
 
     nonisolated func session(
         _ session: WCSession,
         didReceiveMessage message: [String: Any]
     ) {
+        forwardRelayPayloads(in: message)
         guard let data = message[VoiceStatusMessage.envelopeKey] as? Data else { return }
         Task { @MainActor in self.applyVoiceStatus(data) }
     }
@@ -104,17 +106,38 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         _ session: WCSession,
         didReceiveUserInfo userInfo: [String: Any] = [:]
     ) {
+        forwardRelayPayloads(in: userInfo)
         guard let data = userInfo[VoiceStatusMessage.envelopeKey] as? Data else { return }
         Task { @MainActor in self.applyVoiceStatus(data) }
     }
 
     nonisolated func session(_ session: WCSession, didReceive file: WCSessionFile) {
-        // 系统在本回调返回后就会删除临时文件，必须同步读出内容。
+        // 系统会在本方法返回后删除临时文件，必须同步读出/搬移。
+        if let payloadData = file.metadata?[VoiceMessage.resultKey] as? Data {
+            let stagedURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("relay-result-\(UUID().uuidString).m4a")
+            try? FileManager.default.moveItem(at: file.fileURL, to: stagedURL)
+            Task { @MainActor in
+                self.voiceTransport?.handleResultAudioFile(tempURL: stagedURL, payloadData: payloadData)
+                try? FileManager.default.removeItem(at: stagedURL)
+            }
+            return
+        }
         guard
             let envelopeData = file.metadata?[VoiceSpeechMessage.envelopeKey] as? Data,
             let audioData = try? Data(contentsOf: file.fileURL)
         else { return }
         Task { @MainActor in self.storeSpeech(envelopeData: envelopeData, audioData: audioData) }
+    }
+
+    private nonisolated func forwardRelayPayloads(in userInfo: [String: Any]) {
+        let statusData = userInfo[VoiceMessage.relayStatusKey] as? Data
+        let resultData = userInfo[VoiceMessage.resultKey] as? Data
+        guard statusData != nil || resultData != nil else { return }
+        Task { @MainActor in
+            if let statusData { self.voiceTransport?.handleRelayStatus(data: statusData) }
+            if let resultData { self.voiceTransport?.handleResultPayload(data: resultData) }
+        }
     }
 
     @MainActor

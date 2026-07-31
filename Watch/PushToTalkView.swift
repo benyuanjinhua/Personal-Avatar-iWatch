@@ -53,6 +53,13 @@ struct PushToTalkView: View {
                 .font(.footnote)
                 .buttonStyle(.bordered)
                 .tint(.secondary)
+
+                if let remote = transport.remoteStatus {
+                    Text(remote.detail ?? remote.phase.displayText)
+                        .font(.caption2)
+                        .foregroundStyle(remote.phase == .failed ? .red : .secondary)
+                        .lineLimit(2)
+                }
             }
             .padding(.horizontal, 6)
         }
