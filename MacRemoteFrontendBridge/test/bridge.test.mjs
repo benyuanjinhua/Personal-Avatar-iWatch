@@ -413,6 +413,38 @@ describe('D1 read-only switch (write_actions_enabled=false, the default)', () =>
     }
   })
 
+  it('uses backendRef session ownership when the real gateway omits delegation', async () => {
+    const ctx = await launch({ scenario: 'background', overrides: { deny_sweep_interval_ms: 200 } })
+    try {
+      const id = rid()
+      await ctx.client.createTurn(id, pcm(400))
+      await waitFor(async () => (await ctx.client.getTurn(id)).json.task_id === 'task_bg')
+
+      // 真网关 v0.9.x 主路径：delegation=null，session owner 只存在于
+      // resultMetadata.backendRef。被监视 task 先让 Bridge 学到该 owner。
+      ctx.mock.emitTask('task.running', {
+        ...ctx.mock.tasks.get('task_bg'),
+        delegation: null,
+        resultMetadata: { backendRef: { sessionId: 'sess_watch_backend' } },
+      })
+      await waitFor(() => ctx.bridge.ledger.get(id).codex_session_id === 'sess_watch_backend')
+
+      // authorization 错挂在终态 task，但同一个 backendRef session 可证明
+      // 它属于当前 Watch turn，因此可以快速、定向 reject。
+      ctx.mock.setTask({
+        id: 'task_orphan', status: 'completed', delegation: null,
+        resultMetadata: { backendRef: { sessionId: 'sess_watch_backend' } },
+        authorization: { id: 'perm_backend_ref', status: 'pending', title: '允许写文件？' },
+      })
+
+      await waitFor(() => ctx.mock.permissionDecisions.length > 0, { timeoutMs: 5000 })
+      assert.deepEqual(ctx.mock.permissionDecisions, [{ id: 'perm_backend_ref', decision: 'reject' }])
+    } finally {
+      await ctx.bridge.stop()
+      await ctx.mock.stop()
+    }
+  })
+
   it('sweeper leaves unrelated pending authorizations untouched (ESS-34 task isolation)', async () => {
     const ctx = await launch({ scenario: 'background', overrides: { deny_sweep_interval_ms: 200 } })
     try {

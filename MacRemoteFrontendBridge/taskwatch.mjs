@@ -15,6 +15,17 @@ const TERMINAL_TASK = new Set(['completed', 'failed', 'cancelled'])
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
+// Gateway v0.9.x does not consistently populate `delegation`, but the Codex
+// session owner is also exposed on real tasks as resultMetadata.backendRef.
+// Treat both spellings as the same request-scoped ownership signal.
+export function taskSessionId(task) {
+  return task?.delegation?.sessionId
+    || task?.delegation?.session_id
+    || task?.resultMetadata?.backendRef?.sessionId
+    || task?.resultMetadata?.backendRef?.session_id
+    || null
+}
+
 // Bounded, client-safe summary of a permission request. Never forwards the
 // raw payload (§8: logs/clients don't get full permission internals).
 export function permissionSummary(authorization) {
@@ -54,7 +65,8 @@ export class TaskWatcher {
   // task 上（ESS-24/27 已实测的缺陷），仅盯自身 task 会漏掉写权限请求，写任务
   // 只能烧满 300s 硬超时。写开关关闭时周期清扫 pending authorization，但只
   // reject 能可靠归属到本 Bridge 在途 turn 的那些：task.id 命中在途 turn 的
-  // task_id，或 task 的 delegation session 命中在途 turn 的 codex_session_id。
+  // task_id，或 task 的 delegation/backendRef session 命中在途 turn 的
+  // codex_session_id。
   // 无法归属的 authorization 一律不动——Mac UI、其他 Agent/会话/人工任务的
   // 权限请求不归本 Bridge 管（ESS-34：网关级全局拒写破坏任务隔离）。归属不了
   // 的自身写请求由 turn 的 300s 硬超时 fail closed，不牵连无关任务。
@@ -86,7 +98,7 @@ export class TaskWatcher {
   }
 
   // 本 Bridge 在途 turn 的归属标识：task_id（正常挂载）与 codex_session_id
-  // （上游错挂 task 时唯一可信的会话级 owner 标记，来自 task.delegation）。
+  // （上游错挂 task 时可信的会话级 owner 标记，来自 delegation 或 backendRef）。
   activeOwnership() {
     const taskIds = new Set()
     const sessionIds = new Set()
@@ -102,7 +114,7 @@ export class TaskWatcher {
   // 返回归属证据（'task_id' | 'codex_session'），归属不了返回 null。
   ownershipOf(task, { taskIds, sessionIds }) {
     if (taskIds.has(String(task.id))) return 'task_id'
-    const session = task.delegation?.sessionId || task.delegation?.session_id || null
+    const session = taskSessionId(task)
     if (session && sessionIds.has(String(session))) return 'codex_session'
     return null
   }
@@ -200,7 +212,7 @@ export class TaskWatcher {
 
   // Map gateway task state → northbound projection. Returns true if terminal.
   projectTask(requestId, task, eventType = null) {
-    const codexSessionId = task.delegation?.sessionId || task.delegation?.session_id || null
+    const codexSessionId = taskSessionId(task)
     const patch = codexSessionId ? { codex_session_id: codexSessionId } : {}
 
     if (task.authorization?.id && task.authorization.status === 'pending') {
