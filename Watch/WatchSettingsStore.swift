@@ -5,6 +5,8 @@ import WatchConnectivity
 @MainActor
 final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
     @Published private(set) var configuration: AgentConfiguration = .demo
+    /// 语音传输回调转发目标（WCSession 只允许一个 delegate）。
+    weak var voiceTransport: WatchVoiceTransport?
     private let defaults = UserDefaults.standard
     private let storageKey = "wristagent.watch.configuration"
 
@@ -50,7 +52,24 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         _ session: WCSession,
         activationDidCompleteWith activationState: WCSessionActivationState,
         error: Error?
-    ) {}
+    ) {
+        guard activationState == .activated else { return }
+        Task { @MainActor in self.voiceTransport?.retryPending() }
+    }
+
+    nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
+        let isReachable = session.isReachable
+        Task { @MainActor in self.voiceTransport?.handleReachabilityChange(isReachable: isReachable) }
+    }
+
+    nonisolated func session(
+        _ session: WCSession,
+        didFinish fileTransfer: WCSessionFileTransfer,
+        error: Error?
+    ) {
+        let fileName = fileTransfer.file.fileURL.lastPathComponent
+        Task { @MainActor in self.voiceTransport?.handleTransferFinished(fileName: fileName, error: error) }
+    }
 
     nonisolated func session(
         _ session: WCSession,

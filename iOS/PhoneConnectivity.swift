@@ -6,16 +6,39 @@ import WatchConnectivity
 final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     @Published private(set) var status = "尚未连接 Apple Watch"
     @Published private(set) var history: [ConversationHistoryEntry] = []
+    @Published private(set) var voiceEntries: [VoiceInboxEntry] = []
+    @Published private(set) var voiceStatus = "尚未收到语音请求"
     private var pendingConfiguration: AgentConfiguration?
     private let historyStorageKey = "wristagent.phone.conversation.history"
+    private let voiceInbox: VoiceRequestInbox?
 
     override init() {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        voiceInbox = try? VoiceRequestInbox(directory: base.appendingPathComponent("VoiceInbox", isDirectory: true))
         super.init()
+        voiceEntries = voiceInbox?.entries ?? []
         if
             let data = UserDefaults.standard.data(forKey: historyStorageKey),
             let saved = try? JSONDecoder().decode([ConversationHistoryEntry].self, from: data)
         {
             history = saved
+        }
+    }
+
+    /// Watch 端 transferFile 落地：sha256 校验 + request_id 幂等去重，失败不送往 Mac。
+    private func ingestVoiceFile(envelopeData: Data, audioData: Data) {
+        guard let inbox = voiceInbox else {
+            voiceStatus = "收件箱不可用"
+            return
+        }
+        switch inbox.ingest(envelopeData: envelopeData, audioData: audioData) {
+        case .accepted(let envelope, _):
+            voiceEntries = inbox.entries
+            voiceStatus = "已接收 \(envelope.requestId.prefix(8))…（\(envelope.audio.durationMs) ms）"
+        case .duplicate(let requestId):
+            voiceStatus = "重复请求 \(requestId.prefix(8))…，已幂等丢弃"
+        case .rejected(let error):
+            voiceStatus = "已拒收：\(error.description)"
         }
     }
 
@@ -66,6 +89,28 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
 
     nonisolated func sessionDidDeactivate(_ session: WCSession) {
         session.activate()
+    }
+
+    nonisolated func session(
+        _ session: WCSession,
+        didReceiveMessage message: [String: Any]
+    ) {
+        guard
+            let envelopeData = message[VoiceMessage.envelopeKey] as? Data,
+            let envelope = try? VoiceRequestEnvelope.decode(from: envelopeData)
+        else { return }
+        Task { @MainActor in
+            self.voiceStatus = "收到元数据预告 \(envelope.requestId.prefix(8))…，等待音频文件"
+        }
+    }
+
+    nonisolated func session(_ session: WCSession, didReceive file: WCSessionFile) {
+        // 系统会在本方法返回后删除临时文件，必须同步读出。
+        guard let audioData = try? Data(contentsOf: file.fileURL) else { return }
+        guard let envelopeData = file.metadata?[VoiceMessage.envelopeKey] as? Data else { return }
+        Task { @MainActor in
+            self.ingestVoiceFile(envelopeData: envelopeData, audioData: audioData)
+        }
     }
 
     nonisolated func session(

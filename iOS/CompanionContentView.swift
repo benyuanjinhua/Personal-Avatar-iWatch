@@ -54,6 +54,24 @@ struct CompanionContentView: View {
                     }
                 }
 
+                Section("语音收件箱（PoC）") {
+                    Label(connectivity.voiceStatus, systemImage: "waveform.circle")
+                        .font(.footnote)
+                    ForEach(connectivity.voiceEntries.suffix(5).reversed()) { entry in
+                        LabeledContent {
+                            Text("\(entry.durationMs) ms · \(entry.sizeBytes / 1024) KB")
+                                .foregroundStyle(.secondary)
+                                .font(.caption)
+                        } label: {
+                            Text(entry.requestId.prefix(8) + "…")
+                                .font(.caption.monospaced())
+                        }
+                    }
+                    if !connectivity.voiceEntries.isEmpty {
+                        LabeledContent("累计接收", value: "\(connectivity.voiceEntries.count) 条")
+                    }
+                }
+
                 Section("历史对话") {
                     NavigationLink {
                         PhoneHistoryListView(entries: connectivity.history)
