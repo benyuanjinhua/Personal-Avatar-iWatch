@@ -20,6 +20,17 @@ test("health endpoint responds", async () => {
   assert.equal((await response.json()).ok, true);
 });
 
+test("web iWatch mock and its assets are served", async () => {
+  const page = await fetch(`${baseURL}/`);
+  assert.equal(page.status, 200);
+  assert.match(page.headers.get("content-type"), /^text\/html/);
+  assert.match(await page.text(), /运行全链路 testcase/);
+
+  const app = await fetch(`${baseURL}/web/app.js`);
+  assert.equal(app.status, 200);
+  assert.match(await app.text(), /\/v1\/confirmations\//);
+});
+
 test("turn endpoint validates audio", async () => {
   const response = await fetch(`${baseURL}/v1/turns`, {
     method: "POST",

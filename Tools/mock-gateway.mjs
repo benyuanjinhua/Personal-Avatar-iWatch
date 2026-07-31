@@ -1,9 +1,17 @@
 #!/usr/bin/env node
 import http from "node:http";
+import { readFile } from "node:fs/promises";
 
 const port = Number(process.env.WRIST_AGENT_PORT || 8787);
 const tasks = new Map();
 let turn = 0;
+const webRoot = new URL("../Web/", import.meta.url);
+const webAssets = new Map([
+  ["/", ["index.html", "text/html; charset=utf-8"]],
+  ["/web/index.html", ["index.html", "text/html; charset=utf-8"]],
+  ["/web/styles.css", ["styles.css", "text/css; charset=utf-8"]],
+  ["/web/app.js", ["app.js", "text/javascript; charset=utf-8"]]
+]);
 
 function json(response, status, body) {
   response.writeHead(status, {
@@ -49,6 +57,17 @@ function responseBase(overrides) {
 
 export const server = http.createServer(async (request, response) => {
   const url = new URL(request.url, `http://${request.headers.host}`);
+
+  if (request.method === "GET" && webAssets.has(url.pathname)) {
+    const [file, contentType] = webAssets.get(url.pathname);
+    const body = await readFile(new URL(file, webRoot));
+    response.writeHead(200, {
+      "content-type": contentType,
+      "content-length": body.byteLength,
+      "cache-control": "no-store"
+    });
+    return response.end(body);
+  }
 
   if (request.method === "GET" && url.pathname === "/health") {
     return json(response, 200, { ok: true, service: "wristagent-mock" });
@@ -159,6 +178,6 @@ export const server = http.createServer(async (request, response) => {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   server.listen(port, "0.0.0.0", () => {
-    console.log(`WristAgent mock gateway: http://0.0.0.0:${port}`);
+    console.log(`WristAgent Web iWatch mock: http://localhost:${port}`);
   });
 }
