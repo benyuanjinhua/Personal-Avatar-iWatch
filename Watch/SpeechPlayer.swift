@@ -1,35 +1,16 @@
 import AVFoundation
 import Foundation
 
+/// 语音播放器：只播真实链路语音（Qwen Audio Realtime 生成、AudioPipe 转码的
+/// AAC/M4A），不做系统 TTS（ESS-40 起系统 TTS 随静态 demo 一并移除）。
 @MainActor
-final class SpeechPlayer: NSObject, ObservableObject, AVSpeechSynthesizerDelegate, AVAudioPlayerDelegate {
+final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published private(set) var isPlaying = false
 
-    private let synthesizer = AVSpeechSynthesizer()
     private var audioPlayer: AVAudioPlayer?
     private var onFinish: (() -> Void)?
 
-    override init() {
-        super.init()
-        synthesizer.delegate = self
-    }
-
-    func speak(_ text: String, cloudAudioBase64: String? = nil) {
-        stop()
-        if
-            let cloudAudioBase64,
-            let data = Data(base64Encoded: cloudAudioBase64)
-        {
-            if play(data: data) { return }
-        }
-
-        let utterance = AVSpeechUtterance(string: text)
-        utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN")
-        utterance.rate = 0.49
-        synthesizer.speak(utterance)
-    }
-
-    /// 播放 Mac 返回的语音片段（ESS-29）。数据只在内存中解密，不落明文文件。
+    /// 播放语音片段（ESS-29）。数据只在内存中解密，不落明文文件。
     @discardableResult
     func play(data: Data, onFinish: (() -> Void)? = nil) -> Bool {
         stop()
@@ -50,7 +31,6 @@ final class SpeechPlayer: NSObject, ObservableObject, AVSpeechSynthesizerDelegat
     }
 
     func stop() {
-        synthesizer.stopSpeaking(at: .immediate)
         audioPlayer?.stop()
         audioPlayer = nil
         isPlaying = false

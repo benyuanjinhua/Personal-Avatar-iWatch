@@ -70,12 +70,6 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         startMetering()
     }
 
-    func stop() throws -> Data {
-        let recording = try finish()
-        try? FileManager.default.removeItem(at: recording.fileURL)
-        return recording.data
-    }
-
     /// 结束录音并保留文件（transferFile 需要文件在传输完成前存在）。
     func finish() throws -> Recording {
         let durationMs = Int(((recorder?.currentTime ?? 0) * 1000).rounded())
