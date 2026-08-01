@@ -79,6 +79,9 @@ export function createBridge(overrides = {}) {
     maxTurnAttempts: CONFIG.max_turn_attempts,
     log: (...args) => log({ evt: 'supervisor', detail: args.map(String).join(' ').slice(0, 500) }),
   })
+  // D1 主路径（ESS-34）：本会话 Realtime WS 上的权限请求即会话级归属证明
+  // （网关只下发 sessionId 匹配的任务权限事件），写开关关闭时定向 reject。
+  supervisor.onPermissionRequested = task => watcher.denyRealtimePermission(task)
   // ESS-36 可观测性 + ESS-37 取证：supervisor journal（ws.connecting/close
   // code/error frame、probe、stall、rebuild、全部网关事件摘要）全量落 Bridge
   // 结构化日志，request_id 由 journal 的 label 字段携带 —— accepted →

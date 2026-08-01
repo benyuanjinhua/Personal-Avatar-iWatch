@@ -364,14 +364,17 @@ describe('D1 read-only switch (write_actions_enabled=false, the default)', () =>
         authorization: { id: 'perm_w', status: 'pending', title: '允许修改 README.md？' },
       })
 
-      // 上游收到 reject（mock 语义：reject → task cancelled → 正常终态投影）
+      // 上游收到 reject（mock 语义：reject → task cancelled）；拒写 turn 以
+      // completed + 用户可读文案收尾，Watch 不露裸 cancelled/错误码。
       await waitFor(() => ctx.mock.permissionDecisions.length > 0)
       assert.deepEqual(ctx.mock.permissionDecisions, [{ id: 'perm_w', decision: 'reject' }])
       const done = await waitFor(async () => {
         const r = await ctx.client.getTurn(id)
         return ['completed', 'failed', 'cancelled'].includes(r.json.status) ? r.json : null
       })
-      assert.equal(done.status, 'cancelled')
+      assert.equal(done.status, 'completed')
+      assert.match(done.result.text, /只读模式/)
+      assert.match(done.result.text, /写操作已被拒绝/)
 
       // 北向事件流中从未出现 permission_required
       const states = events.received
@@ -385,60 +388,88 @@ describe('D1 read-only switch (write_actions_enabled=false, the default)', () =>
     }
   })
 
-  it('sweeper rejects a misattached authorization provably owned by this bridge (codex session match)', async () => {
-    const ctx = await launch({ scenario: 'background', overrides: { deny_sweep_interval_ms: 200 } })
+  it('rejects a session-scoped permission event arriving on the bridge realtime WS (in-band path)', async () => {
+    const ctx = await launch({ scenario: 'background' }) // 清扫周期保持默认 5s：本用例只可能走 in-band 路径
     try {
       const id = rid()
       await ctx.client.createTurn(id, pcm(400))
       await waitFor(async () => (await ctx.client.getTurn(id)).json.task_id === 'task_bg')
 
-      // turn 先从自身 task 事件学到 codex session（正常委派路径）
-      ctx.mock.emitTask('task.running', {
-        ...ctx.mock.tasks.get('task_bg'), delegation: { sessionId: 'sess_watch' },
-      })
-      await waitFor(() => ctx.bridge.ledger.get(id).codex_session_id === 'sess_watch')
-
-      // 上游缺陷复现（ESS-24/27 + ESS-30 真机实测）：权限挂在另一个 task 上，
-      // 被监视的 task 永远看不到它——但 delegation session 证明它属于本 turn。
-      ctx.mock.setTask({
-        id: 'task_other', status: 'completed', delegation: { sessionId: 'sess_watch' },
-        authorization: { id: 'perm_misattached', status: 'pending', title: '允许写文件？' },
+      // 真机第三轮实测形态：权限事件经本会话 Realtime WS 到达（网关按
+      // sessionId 过滤后下发，到达即归属证明），宿主 task 错挂且 running
+      // ——list 清扫器对 running 非己宿主不动手，in-band 路径必须定向 reject。
+      ctx.mock.pushTaskEvent('task.permission.requested', {
+        id: 'work_ghost_host', status: 'running',
+        authorization: { id: 'perm_inband', status: 'pending', title: '允许写文件？' },
       })
 
-      await waitFor(() => ctx.mock.permissionDecisions.length > 0, { timeoutMs: 5000 })
-      assert.deepEqual(ctx.mock.permissionDecisions, [{ id: 'perm_misattached', decision: 'reject' }])
+      await waitFor(() => ctx.mock.permissionDecisions.length > 0, { timeoutMs: 3000 })
+      assert.deepEqual(ctx.mock.permissionDecisions, [{ id: 'perm_inband', decision: 'reject' }])
+
+      // Codex 收到 reject 后以 cancelled 收尾本 turn 的任务 → completed + 可读文案
+      ctx.mock.emitTask('task.cancelled', {
+        ...ctx.mock.tasks.get('task_bg'), status: 'cancelled', authorization: null,
+      })
+      const done = await waitFor(async () => {
+        const r = await ctx.client.getTurn(id)
+        return ['completed', 'failed', 'cancelled'].includes(r.json.status) ? r.json : null
+      })
+      assert.equal(done.status, 'completed')
+      assert.match(done.result.text, /只读模式/)
     } finally {
       await ctx.bridge.stop()
       await ctx.mock.stop()
     }
   })
 
-  it('uses backendRef session ownership when the real gateway omits delegation', async () => {
+  it('sweeper rejects a terminal-orphan authorization and the denied turn ends with readable copy', async () => {
     const ctx = await launch({ scenario: 'background', overrides: { deny_sweep_interval_ms: 200 } })
     try {
       const id = rid()
       await ctx.client.createTurn(id, pcm(400))
       await waitFor(async () => (await ctx.client.getTurn(id)).json.task_id === 'task_bg')
 
-      // 真网关 v0.9.x 主路径：delegation=null，session owner 只存在于
-      // resultMetadata.backendRef。被监视 task 先让 Bridge 学到该 owner。
-      ctx.mock.emitTask('task.running', {
-        ...ctx.mock.tasks.get('task_bg'),
-        delegation: null,
-        resultMetadata: { backendRef: { sessionId: 'sess_watch_backend' } },
-      })
-      await waitFor(() => ctx.bridge.ledger.get(id).codex_session_id === 'sess_watch_backend')
-
-      // authorization 错挂在终态 task，但同一个 backendRef session 可证明
-      // 它属于当前 Watch turn，因此可以快速、定向 reject。
+      // 真网关错挂缺陷的实测形态（ESS-34 三轮）：写授权 pending 挂在一个
+      // completed 终态任务上，delegation/backendRef 均不可用于归属。终态宿主
+      // 不可能有活跃执行在等这份授权 → 终态孤儿规则定向 reject。
       ctx.mock.setTask({
-        id: 'task_orphan', status: 'completed', delegation: null,
-        resultMetadata: { backendRef: { sessionId: 'sess_watch_backend' } },
-        authorization: { id: 'perm_backend_ref', status: 'pending', title: '允许写文件？' },
+        id: 'task_orphan_host', status: 'completed',
+        authorization: { id: 'perm_orphan', status: 'pending', title: '允许写文件？' },
       })
 
       await waitFor(() => ctx.mock.permissionDecisions.length > 0, { timeoutMs: 5000 })
-      assert.deepEqual(ctx.mock.permissionDecisions, [{ id: 'perm_backend_ref', decision: 'reject' }])
+      assert.deepEqual(ctx.mock.permissionDecisions, [{ id: 'perm_orphan', decision: 'reject' }])
+
+      // Codex 收到 reject 后以 cancelled 收尾本 turn 的任务 → 投影层凭拒写
+      // 标记升级为 completed + 用户可读文案，Watch 不露裸 cancelled。
+      ctx.mock.emitTask('task.cancelled', {
+        ...ctx.mock.tasks.get('task_bg'), status: 'cancelled', authorization: null,
+      })
+      const done = await waitFor(async () => {
+        const r = await ctx.client.getTurn(id)
+        return ['completed', 'failed', 'cancelled'].includes(r.json.status) ? r.json : null
+      })
+      assert.equal(done.status, 'completed')
+      assert.match(done.result.text, /只读模式/)
+    } finally {
+      await ctx.bridge.stop()
+      await ctx.mock.stop()
+    }
+  })
+
+  it('terminal-orphan rule is inert without an in-flight bridge turn', async () => {
+    const ctx = await launch({ scenario: 'background', overrides: { deny_sweep_interval_ms: 200 } })
+    try {
+      // 没有任何在途 turn：即使全局列表里出现终态孤儿 authorization，
+      // 本 Bridge 也没有写嫌疑，一概不动。
+      ctx.mock.setTask({
+        id: 'task_orphan_idle', status: 'failed',
+        authorization: { id: 'perm_idle_orphan', status: 'pending', title: '允许写文件？' },
+      })
+
+      await new Promise(resolve => setTimeout(resolve, 700))
+      assert.deepEqual(ctx.mock.permissionDecisions, [])
+      assert.equal(ctx.mock.tasks.get('task_orphan_idle').authorization.status, 'pending')
     } finally {
       await ctx.bridge.stop()
       await ctx.mock.stop()
@@ -453,9 +484,10 @@ describe('D1 read-only switch (write_actions_enabled=false, the default)', () =>
       await waitFor(async () => (await ctx.client.getTurn(id)).json.task_id === 'task_bg')
 
       // 无关任务（其他会话/Agent/人工发起）带着 pending authorization 出现在
-      // 全局列表里；本 Bridge 的 turn 同时在途。
+      // 全局列表里；宿主 running（真实活任务的 authorization 挂在自己 running
+      // 的宿主上）、无 delegation/backendRef（真网关运行期形态）。
       ctx.mock.setTask({
-        id: 'task_stranger', status: 'running', delegation: { sessionId: 'sess_someone_else' },
+        id: 'task_stranger', status: 'running',
         authorization: { id: 'perm_unrelated', status: 'pending', title: '允许部署到生产？' },
       })
 
