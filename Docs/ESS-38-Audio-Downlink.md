@@ -80,3 +80,28 @@ supervisor journal（`request_id=label`）→ `announcement_bound`（携 `task_i
 - D1 只读边界不变（写权限清扫器未触碰）。
 - 未引入第二套 TTS：Watch 播放的就是 Qwen Audio Realtime 生成的 announcement
   原声（Bridge 仅转码封装）。
+
+---
+
+## 复测加固（2026-08-01，ESS-38 重开）
+
+真机复测（白梦林）：文字到 Watch，语音未播。按段加固与取证：
+
+| 段 | 状态 | 出处 |
+|---|---|---|
+| 1 Bridge 产物 | 已有 `turn_accepted → announcement_bound → result_audio_attached` 日志；新增 `Scripts/ess38-trace.sh` 一键核验（节点计数 + m4a 存在/sha256/afinfo） | 本轮 |
+| 2 Bridge → iPhone | 新增：重连 snapshot 回放保留窗口内的**终态**回合（此前只回放非终态——iPhone 挂起期间完成的 turn 连文本带语音永久丢失）；内联/下载两路各有回归 | 本轮 |
+| 3 iPhone 落盘/下载 | WCSession 静默丢弃 + 过早去重 → 持久化下行队列与 didFinish 回执 | PR #14（ESS-21 B1） |
+| 4 WatchConnectivity | transfer 回执、重投、留痕 | PR #14 |
+| 5 Watch 存储/播放 | **修复播放失败也删密文的缺陷**（此前 onFinish 不分成败一律删文件+清 speechFileName——失败即"文件被提前删除"且无痕）；成功也不再即删（退出重进可重播），改保留期清理；`AVAudioSession(.playback)` 激活 + SpeechIngest/SpeechPlayer 全分支 os.Logger；播放失败上 UI | 本轮（会话激活与 ESS-41 B3 同因） |
+| 6 并发/顺序 | 迟到补挂/快照重放回归在案；语音入库强校验（缺 sha 一律拒收） | 本轮 + 既有 |
+
+真机四段取证入口：
+
+- Bridge：`Scripts/ess38-trace.sh <bridge-log.jsonl> <request_id>`
+- iPhone：Console 过滤 subsystem `com.benyuan.wristagent`（下行队列七类事件）
+- Watch：Console 过滤 subsystem `com.benyuan.wristagent.watch`，category `SpeechIngest`（received/rejected/sha/stored）与 `SpeechPlayer`（session/init/start/finish + 错误码）
+
+回归（本轮）：Bridge 35/35（+3：终态 snapshot 回放、窗口外不回放、内联超限走下载）；
+Swift 79 XCTest + 5 swift-testing（+6：SpeechIngest 5、vault 保留期清理 1）；
+projection mock 通过；iOS / watchOS 模拟器构建 BUILD SUCCEEDED。

@@ -24,11 +24,16 @@ final class PushToTalkController: ObservableObject {
 
     private let recorder = AudioRecorder()
 
+    /// 结果语音密文的保留期：不再"播放即删除"（退出重进可重播是验收项），
+    /// 到期由启动时的清理兜底。
+    private static let speechRetention: TimeInterval = 24 * 60 * 60
+
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         journal = VoiceTurnJournal(directory: base.appendingPathComponent("VoiceTurns", isDirectory: true))
         speechVault = try? EncryptedAudioVault(directory: base.appendingPathComponent("SpeechVault", isDirectory: true))
         transport = WatchVoiceTransport(journal: journal)
+        _ = speechVault?.purge(olderThan: Self.speechRetention)
 
         recorder.$level
             .receive(on: RunLoop.main)
@@ -102,15 +107,24 @@ final class PushToTalkController: ObservableObject {
 
     /// 播放结果语音：从加密仓解密到内存播放，播完即删（交付后删除）。
     func playResult(for turn: VoiceTurnRecord) {
-        guard
-            let fileName = turn.speechFileName,
-            let vault = speechVault,
-            let data = try? vault.load(name: fileName)
-        else { return }
-        let requestId = turn.requestId
-        player.play(data: data) { [weak self] in
-            self?.speechVault?.remove(name: fileName)
-            self?.journal.clearSpeech(requestId: requestId)
+        guard let fileName = turn.speechFileName, let vault = speechVault else { return }
+        let data: Data
+        do {
+            data = try vault.load(name: fileName)
+        } catch {
+            // 文件已被保留期清理或损坏：说明原因并摘掉播放入口，文本仍在。
+            errorMessage = "结果语音已不可用（\(String(describing: error))）"
+            journal.clearSpeech(requestId: turn.requestId)
+            return
+        }
+        // ESS-38 复测修正：此前无论播放成败都删密文并清 speechFileName——真机
+        // 播放失败（会话/解码问题）时文件被"提前删除"，既不可重试也无痕迹。
+        // 现在只在失败时报错并保留文件；成功也不删（退出重进可重播），
+        // 密文由保留期清理兜底。
+        player.play(data: data) { [weak self] success in
+            if !success {
+                self?.errorMessage = self?.player.lastError ?? "语音播放失败"
+            }
         }
     }
 }

@@ -61,3 +61,25 @@ final class EncryptedAudioVaultTests: XCTestCase {
         XCTAssertThrowsError(try vault.load(name: "turn-5.m4a"))
     }
 }
+
+// ESS-38 复测：保留期清理（结果语音不再"播放即删除"，退出重进可重播）。
+extension EncryptedAudioVaultTests {
+    func testPurgeRemovesOnlyExpiredSealedFiles() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("vault-purge-\(UUID().uuidString)")
+        let vault = try EncryptedAudioVault(directory: directory, key: .init(size: .bits256))
+        try vault.store(Data("old".utf8), name: "old.m4a")
+        try vault.store(Data("new".utf8), name: "new.m4a")
+
+        // old.m4a 的 mtime 拨回 2 小时前
+        let oldURL = directory.appendingPathComponent("old.m4a.sealed")
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-7200)], ofItemAtPath: oldURL.path
+        )
+
+        let removed = vault.purge(olderThan: 3600)
+        XCTAssertEqual(removed, 1)
+        XCTAssertFalse(vault.contains(name: "old.m4a"), "过期密文应被清理")
+        XCTAssertTrue(vault.contains(name: "new.m4a"), "保留期内的密文必须保留（重进可重播）")
+    }
+}

@@ -58,6 +58,24 @@ final class EncryptedAudioVault {
         try? fileManager.removeItem(at: fileURL(for: name))
     }
 
+    /// 保留期清理（ESS-38 复测）：结果语音不再"播放即删除"（退出重进重播是
+    /// 验收项），密文文件改由保留期兜底清理。返回删除的文件数。
+    @discardableResult
+    func purge(olderThan interval: TimeInterval, now: Date = Date()) -> Int {
+        guard let names = try? fileManager.contentsOfDirectory(atPath: directory.path) else { return 0 }
+        var removed = 0
+        for name in names where name.hasSuffix(".sealed") {
+            let url = directory.appendingPathComponent(name)
+            guard
+                let mtime = (try? fileManager.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date,
+                now.timeIntervalSince(mtime) > interval
+            else { continue }
+            try? fileManager.removeItem(at: url)
+            removed += 1
+        }
+        return removed
+    }
+
     private func fileURL(for name: String) -> URL {
         directory.appendingPathComponent(name).appendingPathExtension("sealed")
     }

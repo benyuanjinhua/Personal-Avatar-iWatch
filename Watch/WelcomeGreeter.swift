@@ -47,7 +47,7 @@ final class WelcomeGreeter: ObservableObject {
             return
         }
         stage = .playing
-        let started = player.play(data: data) { [weak self] in
+        let started = player.play(data: data) { [weak self] _ in
             guard let self, self.stage == .playing else { return }
             self.stage = .finished
         }

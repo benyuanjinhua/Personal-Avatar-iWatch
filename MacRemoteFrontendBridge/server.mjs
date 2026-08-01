@@ -562,10 +562,15 @@ export function createBridge(overrides = {}) {
         const client = { ws, deviceId }
         eventClients.add(client)
         log({ evt: 'events_client_connected', device_id: deviceId })
-        // Reconnect recovery: replay the live (non-terminal) turns for this device.
+        // Reconnect recovery: replay live turns AND recently-terminal turns.
+        // 只回放非终态的话，iPhone 挂起期间完成的 turn（文本 + 语音补挂）会
+        // 永久丢失（ESS-38 复测）；终态窗口内的回合一并回放，客户端幂等去重。
+        const terminalWindowMs = CONFIG.snapshot_terminal_window_ms ?? 15 * 60 * 1000
         ws.send(JSON.stringify({
           type: 'snapshot',
-          turns: ledger.nonTerminal().filter(t => t.device_id === deviceId).map(t => ledger.projection(t)),
+          turns: [...ledger.nonTerminal(), ...ledger.recentlyTerminal(terminalWindowMs)]
+            .filter(t => t.device_id === deviceId)
+            .map(t => ledger.projection(t)),
         }))
         ws.on('close', () => eventClients.delete(client))
         ws.on('error', () => eventClients.delete(client))

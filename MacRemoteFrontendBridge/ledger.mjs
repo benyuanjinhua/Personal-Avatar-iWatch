@@ -178,4 +178,12 @@ export class TurnLedger extends EventEmitter {
   nonTerminal() {
     return [...this.turns.values()].filter(t => !TERMINAL.has(t.state))
   }
+
+  // 近期终态回合（ESS-38 复测）：iPhone 后台挂起是常态，WSS 断开期间到达的
+  // completed（文本）与语音补挂投影会整体丢失——重连 snapshot 必须把保留窗口
+  // 内的终态回合一并回放，靠客户端幂等去重（journal 状态机 + 音频 sha）消重。
+  recentlyTerminal(windowMs, now = Date.now()) {
+    return [...this.turns.values()].filter(t =>
+      TERMINAL.has(t.state) && now - Date.parse(t.updated_at) <= windowMs)
+  }
 }

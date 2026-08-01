@@ -262,3 +262,69 @@ describe('ESS-38 direct path stores file + metadata too', () => {
     }
   })
 })
+
+describe('ESS-38 reopen: reconnect must not lose completed turns', () => {
+  it('snapshot replays recently-terminal turns (text + audio) to a reconnecting client', async () => {
+    const ctx = await launch({ scenario: 'direct' })
+    try {
+      const id = rid()
+      await ctx.client.createTurn(id, pcm16())
+      await waitFor(async () => (await ctx.client.getTurn(id)).json.status === 'completed')
+
+      // 事件流此刻才连接（模拟 iPhone 在 turn 完成期间处于挂起）：
+      // snapshot 必须包含刚完成的 turn（文本 + 语音元数据），否则该结果永久丢失
+      const events = ctx.client.events()
+      const snapshot = await waitFor(() =>
+        events.received.find(e => e.type === 'snapshot'))
+      const replayed = snapshot.turns.find(t => t.request_id === id)
+      assert.ok(replayed, 'completed turn must be replayed in the reconnect snapshot')
+      assert.equal(replayed.status, 'completed')
+      assert.ok(replayed.result.audio, 'replayed projection must carry the audio metadata')
+      events.ws.close()
+    } finally {
+      await ctx.bridge.stop(); await ctx.mock.stop()
+    }
+  })
+
+  it('terminal turns older than the window are not replayed', async () => {
+    const ctx = await launch({ scenario: 'direct', overrides: { snapshot_terminal_window_ms: 0 } })
+    try {
+      const id = rid()
+      await ctx.client.createTurn(id, pcm16())
+      await waitFor(async () => (await ctx.client.getTurn(id)).json.status === 'completed')
+      await new Promise(r => setTimeout(r, 50))
+      const events = ctx.client.events()
+      const snapshot = await waitFor(() => events.received.find(e => e.type === 'snapshot'))
+      assert.ok(!snapshot.turns.some(t => t.request_id === id), 'window=0 must suppress terminal replay')
+      events.ws.close()
+    } finally {
+      await ctx.bridge.stop(); await ctx.mock.stop()
+    }
+  })
+})
+
+describe('ESS-38 reopen: download-only path when inline base64 exceeds the cap', () => {
+  it('drops the inline audio but keeps metadata and serves the bytes via /audio', async () => {
+    // 上限压到 16 字节：任何结果语音都必然走"元数据 + Range 下载"路径
+    const ctx = await launch({ scenario: 'direct', overrides: { max_result_audio_bytes: 16 } })
+    try {
+      const id = rid()
+      await ctx.client.createTurn(id, pcm16())
+      const done = await waitFor(async () => {
+        const r = await ctx.client.getTurn(id)
+        return r.json.status === 'completed' ? r.json : null
+      })
+      assert.equal(done.result.audio_base64, null, 'inline audio over the cap must be dropped')
+      assert.ok(done.result.audio, 'metadata must survive the inline drop')
+
+      // 两段 Range 取回拼接 == 全量，sha 与元数据一致（断点续传语义）
+      const head = await ctx.client.downloadAudio(id, { range: 'bytes=0-99' })
+      assert.equal(head.status, 206)
+      const rest = await ctx.client.downloadAudio(id, { range: 'bytes=100-' })
+      assert.equal(rest.status, 206)
+      assert.equal(sha256hex(Buffer.concat([head.body, rest.body])), done.result.audio.sha256)
+    } finally {
+      await ctx.bridge.stop(); await ctx.mock.stop()
+    }
+  })
+})

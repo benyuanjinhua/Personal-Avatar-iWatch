@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import WatchConnectivity
+import os
 
 @MainActor
 final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
@@ -13,6 +14,8 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
     weak var speechVault: EncryptedAudioVault?
     private let defaults = UserDefaults.standard
     private let storageKey = "wristagent.watch.configuration"
+    /// ESS-38 复测取证：语音落地/校验/入库全分支留痕（真机按 subsystem 过滤）。
+    private static let speechLogger = Logger(subsystem: "com.benyuan.wristagent.watch", category: "SpeechIngest")
 
     override init() {
         super.init()
@@ -117,10 +120,15 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             }
             return
         }
-        guard
-            let envelopeData = file.metadata?[VoiceSpeechMessage.envelopeKey] as? Data,
-            let audioData = try? Data(contentsOf: file.fileURL)
-        else { return }
+        guard let envelopeData = file.metadata?[VoiceSpeechMessage.envelopeKey] as? Data else {
+            Self.speechLogger.error("file received without known metadata keys (name=\(file.fileURL.lastPathComponent, privacy: .public))")
+            return
+        }
+        guard let audioData = try? Data(contentsOf: file.fileURL) else {
+            Self.speechLogger.error("speech file unreadable (name=\(file.fileURL.lastPathComponent, privacy: .public))")
+            return
+        }
+        Self.speechLogger.info("speech file received (name=\(file.fileURL.lastPathComponent, privacy: .public), bytes=\(audioData.count))")
         Task { @MainActor in self.storeSpeech(envelopeData: envelopeData, audioData: audioData) }
     }
 
@@ -140,20 +148,30 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         voiceJournal?.apply(envelope)
     }
 
-    /// 结果语音入库：sha256 校验通过才加密落盘；校验失败整体丢弃（数据不可信）。
+    /// 结果语音入库（ESS-38 复测取证）：SpeechIngest 强校验（信封 + sha256）
+    /// 通过才加密落盘；每个拒收/失败分支都留 os.Logger 痕迹，绝不静默。
     @MainActor
     private func storeSpeech(envelopeData: Data, audioData: Data) {
-        guard
-            let envelope = try? VoiceStatusEnvelope.decode(from: envelopeData),
-            envelope.validate() == nil
-        else { return }
-        if let expected = envelope.result?.speechSha256,
-           VoiceDigest.sha256Hex(of: audioData) != expected.lowercased() {
-            return
+        switch SpeechIngest.validate(envelopeData: envelopeData, audioData: audioData) {
+        case .envelopeInvalid(let reason):
+            Self.speechLogger.error("speech rejected: \(reason, privacy: .public) (bytes=\(audioData.count))")
+        case .shaMismatch(let expected, let actual):
+            Self.speechLogger.error("speech sha mismatch expected=\(expected.prefix(12), privacy: .public) actual=\(actual.prefix(12), privacy: .public)")
+        case .accepted(let envelope, let sha256):
+            voiceJournal?.apply(envelope)
+            let fileName = "\(envelope.requestId).m4a"
+            guard let vault = speechVault else {
+                Self.speechLogger.error("speech vault unavailable request_id=\(envelope.requestId, privacy: .public)")
+                return
+            }
+            do {
+                try vault.store(audioData, name: fileName)
+            } catch {
+                Self.speechLogger.error("vault store failed request_id=\(envelope.requestId, privacy: .public): \(String(describing: error), privacy: .public)")
+                return
+            }
+            voiceJournal?.attachSpeech(requestId: envelope.requestId, fileName: fileName)
+            Self.speechLogger.info("speech stored request_id=\(envelope.requestId, privacy: .public) bytes=\(audioData.count) sha=\(sha256.prefix(12), privacy: .public)")
         }
-        voiceJournal?.apply(envelope)
-        let fileName = "\(envelope.requestId).m4a"
-        guard let vault = speechVault, (try? vault.store(audioData, name: fileName)) != nil else { return }
-        voiceJournal?.attachSpeech(requestId: envelope.requestId, fileName: fileName)
     }
 }

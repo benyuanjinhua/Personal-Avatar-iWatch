@@ -31,6 +31,7 @@
   "max_result_audio_bytes": 2097152,
   "max_announcement_pcm_bytes": 5760000,
   "result_audio_retention_ms": 86400000,
+  "snapshot_terminal_window_ms": 900000,
   "sse_backoff_base_ms": 1000,
   "sse_backoff_max_ms": 15000,
   "poll_interval_ms": 3000,

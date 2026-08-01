@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		069EBDFDA102D87E99860A5C /* SpeechIngest.swift in Sources */ = {isa = PBXBuildFile; fileRef = 275762B629C570BA96A7D9F0 /* SpeechIngest.swift */; };
 		0B14BB8E0DE371AE0274D4F9 /* PhoneConnectivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08AB0CED9CE83E1BB446A82C /* PhoneConnectivity.swift */; };
 		16999EF5199C5B5E800A83B8 /* VoiceRequestEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16A065FFB735532D201B2183 /* VoiceRequestEnvelope.swift */; };
 		20A0B47A1FB2A2099BE53146 /* VoiceStatusEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0EAD7935F2F128D8408C210F /* VoiceStatusEnvelope.swift */; };
@@ -38,6 +39,7 @@
 		7F172712436C104970B3035C /* VoiceRelayWire.swift in Sources */ = {isa = PBXBuildFile; fileRef = 035DF4EEFBF9F540A0B791F7 /* VoiceRelayWire.swift */; };
 		8D74BBCA5601E569150562B6 /* PhoneHistoryViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0A1CA98E116775B1257DB33 /* PhoneHistoryViews.swift */; };
 		9FE3E5082197E2851CD75F30 /* WatchVoiceTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = F16E394DC77EF14BAE142B32 /* WatchVoiceTransport.swift */; };
+		A90DE76AB5F938D679C68903 /* SpeechIngest.swift in Sources */ = {isa = PBXBuildFile; fileRef = 275762B629C570BA96A7D9F0 /* SpeechIngest.swift */; };
 		A9E722341F5CCE1CCF5D65CD /* WelcomeSpeech.m4a in Resources */ = {isa = PBXBuildFile; fileRef = 4872AA5D7D68F48548C7ABF5 /* WelcomeSpeech.m4a */; };
 		AB38F702523DAB57ECDB758F /* AudioRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98840DEEAC5DA7B6F8FCC628 /* AudioRecorder.swift */; };
 		AC284F28E28E5427A577455B /* AgentModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB1D464D47EC34B55A8C8411 /* AgentModels.swift */; };
@@ -92,6 +94,7 @@
 		13F51C6DCBABB59C404B307D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		16A065FFB735532D201B2183 /* VoiceRequestEnvelope.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRequestEnvelope.swift; sourceTree = "<group>"; };
 		1AB8CD6D695437D845CE87AF /* VoiceRequestInbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRequestInbox.swift; sourceTree = "<group>"; };
+		275762B629C570BA96A7D9F0 /* SpeechIngest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechIngest.swift; sourceTree = "<group>"; };
 		2E4C7D8E5213EE0C04CA8BEC /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		2E88D71F4696224E69D652E8 /* WristAgent Watch App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "WristAgent Watch App.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		36A3DD675D9E3E4CDC7C7C5A /* WristAgentApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WristAgentApp.swift; sourceTree = "<group>"; };
@@ -136,6 +139,7 @@
 				E92A4F28175D63C6FBD62D7E /* ConversationHistory.swift */,
 				F7C56A17FC91DC667B51B7D6 /* EncryptedAudioVault.swift */,
 				CC28E8D4A89C399924568EEB /* SecureTokenStore.swift */,
+				275762B629C570BA96A7D9F0 /* SpeechIngest.swift */,
 				E36424AC38F0A8BB28751248 /* UUIDv7.swift */,
 				CB7ABFE8DE51D05121E27317 /* VoiceOutbox.swift */,
 				C58AEB9B4C54F952DFC96AB2 /* VoiceRelayEvents.swift */,
@@ -329,6 +333,7 @@
 				0B14BB8E0DE371AE0274D4F9 /* PhoneConnectivity.swift in Sources */,
 				8D74BBCA5601E569150562B6 /* PhoneHistoryViews.swift in Sources */,
 				F085E299171F674D4D155E09 /* SecureTokenStore.swift in Sources */,
+				069EBDFDA102D87E99860A5C /* SpeechIngest.swift in Sources */,
 				59EF7588E503BBA5DF84681B /* UUIDv7.swift in Sources */,
 				3720FA2BBC2A5376CB24FD23 /* VoiceOutbox.swift in Sources */,
 				FD2534104A35901AC28B604D /* VoiceRelayEvents.swift in Sources */,
@@ -357,6 +362,7 @@
 				34523D43C35817094DA2E618 /* PermissionRequestView.swift in Sources */,
 				5E9988BFEA3673DAA88C1F70 /* PushToTalkController.swift in Sources */,
 				41214906A025D5C1E7C4ECA9 /* SecureTokenStore.swift in Sources */,
+				A90DE76AB5F938D679C68903 /* SpeechIngest.swift in Sources */,
 				2BE4825B9DE1357E0469CED7 /* SpeechPlayer.swift in Sources */,
 				D9B1A7DECC44E46204E0FFF3 /* UUIDv7.swift in Sources */,
 				2AFB7EE475338CDAB23D6E85 /* VoiceOrbView.swift in Sources */,

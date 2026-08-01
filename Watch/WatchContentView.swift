@@ -78,7 +78,8 @@ struct WatchContentView: View {
             }
         }
         .onChange(of: journal.activeTurn?.speechFileName) { _, fileName in
-            // 结果语音到达时自动播放一次（播放即交付，随后删除密文文件）。
+            // 结果语音到达时自动播放一次；密文保留（退出重进可重播），
+            // 由保留期清理兜底（ESS-38 复测：失败不清文件、不静默）。
             guard fileName != nil, let turn = journal.activeTurn else { return }
             welcome.interrupt()
             pushToTalk.playResult(for: turn)
@@ -162,6 +163,13 @@ struct WatchContentView: View {
                 .tint(.green)
                 .font(.footnote)
                 .disabled(player.isPlaying)
+            }
+
+            // 语音失败必须可观测：保留文本降级的同时给出失败原因（可重试）。
+            if let playbackError = player.lastError {
+                Text(playbackError)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.red)
             }
         }
         .padding(9)
