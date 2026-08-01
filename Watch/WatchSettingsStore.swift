@@ -216,7 +216,11 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             "turn", "speech_stored", requestId: envelope.requestId, detail: "bytes=\(audioData.count)"
         )
         voiceJournal?.attachSpeech(requestId: envelope.requestId, fileName: fileName)
-        voiceTransport?.sendResultAck(requestId: envelope.requestId)
+        // interim 语音（ESS-46，非终态信封）落盘不算交付：ACK 只对终态结果发，
+        // 否则 Bridge 会在回合转终态后接受这个早发的 ACK，final 丢失时不再重投（ESS-47）。
+        if envelope.state.isTerminal {
+            voiceTransport?.sendResultAck(requestId: envelope.requestId)
+        }
         WatchLogShipper.shared.ship(reason: "speech_stored")
     }
 }
