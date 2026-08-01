@@ -77,6 +77,7 @@ export class TurnLedger extends EventEmitter {
       detail: null,               // sub-state for observability (realtime_processing, background_processing…)
       permission: null,           // { id, ...bounded summary } while permission_required
       result: null,               // { text, audio_base64?, truncated? } once terminal
+      delivered_ack: null,        // { at, source } once Watch has durably stored the result
       error: null,                // stable ERR_* code once failed
       event_count: 0,             // 全量观测计数（Realtime + SSE，ESS-37 取证口径）
       task_event_count: 0,        // 仅 SSE/task 生命周期事件（taskwatch 熔断预算，ESS-41）
@@ -185,6 +186,25 @@ export class TurnLedger extends EventEmitter {
       created_at: turn.created_at,
       updated_at: turn.updated_at,
     }
+  }
+
+  acknowledgeResult(requestId, { source = 'watch' } = {}) {
+    const turn = this.turns.get(requestId)
+    if (!turn || !TERMINAL.has(turn.state)) return null
+    if (turn.delivered_ack) return turn
+    turn.delivered_ack = { at: new Date().toISOString(), source }
+    turn.updated_at = new Date().toISOString()
+    this.save()
+    return turn
+  }
+
+  replayable({ now = Date.now(), terminalTtlMs = 30 * 60 * 1000 } = {}) {
+    return [...this.turns.values()].filter(turn => {
+      if (!TERMINAL.has(turn.state)) return true
+      if (turn.delivered_ack) return false
+      const terminalAt = Date.parse(turn.updated_at)
+      return Number.isFinite(terminalAt) && now - terminalAt <= terminalTtlMs
+    })
   }
 
   nonTerminal() {

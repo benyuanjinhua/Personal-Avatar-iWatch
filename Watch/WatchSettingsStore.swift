@@ -180,6 +180,9 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         if envelope.state.isTerminal {
             WatchLogShipper.shared.ship(reason: "turn_terminal")
         }
+        if envelope.state == .completed, envelope.result?.speechSha256 == nil {
+            voiceTransport?.sendResultAck(requestId: envelope.requestId)
+        }
     }
 
     /// 结果语音入库：sha256 校验通过才加密落盘；校验失败整体丢弃（数据不可信）。
@@ -213,6 +216,7 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             "turn", "speech_stored", requestId: envelope.requestId, detail: "bytes=\(audioData.count)"
         )
         voiceJournal?.attachSpeech(requestId: envelope.requestId, fileName: fileName)
+        voiceTransport?.sendResultAck(requestId: envelope.requestId)
         WatchLogShipper.shared.ship(reason: "speech_stored")
     }
 }
