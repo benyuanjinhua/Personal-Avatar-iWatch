@@ -148,6 +148,11 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         _ session: WCSession,
         didReceiveMessage message: [String: Any]
     ) {
+        if let ackData = message[ResultDeliveryAckMessage.envelopeKey] as? Data,
+           let ack = ResultDeliveryAck.decode(from: ackData) {
+            Task { @MainActor in self.relay.acknowledgeResult(requestId: ack.requestId) }
+            return
+        }
         guard
             let envelopeData = message[VoiceMessage.envelopeKey] as? Data,
             let envelope = try? VoiceRequestEnvelope.decode(from: envelopeData)
@@ -155,6 +160,15 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         Task { @MainActor in
             self.voiceStatus = "收到元数据预告 \(envelope.requestId.prefix(8))…，等待音频文件"
         }
+    }
+
+    nonisolated func session(
+        _ session: WCSession,
+        didReceiveUserInfo userInfo: [String: Any] = [:]
+    ) {
+        guard let data = userInfo[ResultDeliveryAckMessage.envelopeKey] as? Data,
+              let ack = ResultDeliveryAck.decode(from: data) else { return }
+        Task { @MainActor in self.relay.acknowledgeResult(requestId: ack.requestId) }
     }
 
     nonisolated func session(_ session: WCSession, didReceive file: WCSessionFile) {
