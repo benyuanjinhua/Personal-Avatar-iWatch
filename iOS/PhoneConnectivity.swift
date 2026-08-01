@@ -1,9 +1,11 @@
 import Combine
 import Foundation
+import os
 import WatchConnectivity
 
 @MainActor
 final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
+    private static let logger = Logger(subsystem: "com.benyuan.wristagent.phone", category: "VoiceDownlink")
     @Published private(set) var status = "尚未连接 Apple Watch"
     @Published private(set) var history: [ConversationHistoryEntry] = []
     @Published private(set) var voiceEntries: [VoiceInboxEntry] = []
@@ -132,6 +134,10 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         error: Error?
     ) {
         let fileName = fileTransfer.file.fileURL.lastPathComponent
+        let envelope = (fileTransfer.file.metadata?[VoiceSpeechMessage.envelopeKey] as? Data)
+            .flatMap { try? VoiceStatusEnvelope.decode(from: $0) }
+        let requestId = envelope?.requestId ?? "unknown"
+        Self.logger.log("l2_transfer_finished request_id=\(requestId, privacy: .public) success=\(error == nil) error=\(error?.localizedDescription ?? "none", privacy: .public)")
         Task { @MainActor in
             self.relay.handleResultAudioTransferFinished(fileName: fileName, error: error)
         }
@@ -176,9 +182,21 @@ extension PhoneConnectivity: WatchFeedbackChannel {
     /// 结果语音走系统托管 transferFile；metadata 带含 speechSha256 的信封，
     /// Watch 端（WatchSettingsStore.storeSpeech）校验通过才加密入库并挂到回合。
     func transferSpeech(fileURL: URL, envelope: VoiceStatusEnvelope) {
-        guard WCSession.default.activationState == .activated,
-              let data = try? envelope.jsonData() else { return }
-        WCSession.default.transferFile(fileURL, metadata: [VoiceSpeechMessage.envelopeKey: data])
+        let session = WCSession.default
+        guard session.activationState == .activated else {
+            Self.logger.error("l2_transfer_failed request_id=\(envelope.requestId, privacy: .public) reason=session_not_activated")
+            return
+        }
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            Self.logger.error("l2_transfer_failed request_id=\(envelope.requestId, privacy: .public) reason=file_missing")
+            return
+        }
+        guard let data = try? envelope.jsonData() else {
+            Self.logger.error("l2_transfer_failed request_id=\(envelope.requestId, privacy: .public) reason=envelope_encode")
+            return
+        }
+        let transfer = session.transferFile(fileURL, metadata: [VoiceSpeechMessage.envelopeKey: data])
+        Self.logger.log("l2_transfer_queued request_id=\(envelope.requestId, privacy: .public) reachable=\(session.isReachable) outstanding=\(session.outstandingFileTransfers.count) file=\(transfer.file.fileURL.lastPathComponent, privacy: .public)")
     }
 
     private func sendToWatch(key: String, data: Data) {
