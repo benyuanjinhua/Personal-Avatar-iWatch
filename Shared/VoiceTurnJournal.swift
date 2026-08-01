@@ -115,11 +115,23 @@ final class VoiceTurnJournal: ObservableObject {
         save()
     }
 
+    /// 结果语音落盘事件（ESS-41 B3）：attachSpeech 成功后按 request_id 回调。
+    /// 播放触发由此驱动而非 UI onChange——语音是后到的（文字先行、transferFile
+    /// 随后），到达时该回合可能已被新回合顶掉或已判终态，只盯 activeTurn 的
+    /// UI 触发会静默漏播。
+    var onSpeechAttached: ((String) -> Void)?
+
+    /// 按 request_id 查找回合（结果语音定向交付用）。
+    func turn(withId requestId: String) -> VoiceTurnRecord? {
+        turns.first(where: { $0.requestId == requestId })
+    }
+
     /// 结果语音已加密落盘。
     func attachSpeech(requestId: String, fileName: String) {
         guard let index = turns.firstIndex(where: { $0.requestId == requestId }) else { return }
         turns[index].speechFileName = fileName
         save()
+        onSpeechAttached?(requestId)
     }
 
     /// 结果语音已播放交付（文件删除由调用方负责）。
