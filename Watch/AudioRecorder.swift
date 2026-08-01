@@ -37,15 +37,23 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
 
     func start() async throws {
         let granted = await requestPermission()
-        guard granted else { throw RecorderError.permissionDenied }
+        guard granted else {
+            WatchLog.error("recorder", "permission_denied", code: "ERR_MIC_PERMISSION")
+            throw RecorderError.permissionDenied
+        }
 
         let session = AVAudioSession.sharedInstance()
-        if #available(watchOS 11.0, *) {
-            try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.allowBluetooth])
-        } else {
-            try session.setCategory(.playAndRecord, mode: .spokenAudio)
+        do {
+            if #available(watchOS 11.0, *) {
+                try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.allowBluetooth])
+            } else {
+                try session.setCategory(.playAndRecord, mode: .spokenAudio)
+            }
+            try session.setActive(true)
+        } catch {
+            WatchLog.error("recorder", "session_activation_failed", error: error)
+            throw error
         }
-        try session.setActive(true)
 
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("wristagent-\(UUID().uuidString).m4a")
@@ -57,10 +65,17 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
             AVEncoderAudioQualityKey: AVAudioQuality.medium.rawValue
         ]
 
-        let audioRecorder = try AVAudioRecorder(url: url, settings: settings)
+        let audioRecorder: AVAudioRecorder
+        do {
+            audioRecorder = try AVAudioRecorder(url: url, settings: settings)
+        } catch {
+            WatchLog.error("recorder", "recorder_init_failed", error: error)
+            throw error
+        }
         audioRecorder.delegate = self
         audioRecorder.isMeteringEnabled = true
         guard audioRecorder.prepareToRecord(), audioRecorder.record(forDuration: Self.maxDuration) else {
+            WatchLog.error("recorder", "record_start_failed", code: "ERR_RECORD_START")
             throw RecorderError.cannotCreateRecorder
         }
 
@@ -68,6 +83,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         recorder = audioRecorder
         isRecording = true
         startMetering()
+        WatchLog.info("recorder", "record_started", detail: "aac \(Self.sampleRate)Hz max=\(Int(Self.maxDuration))s")
     }
 
     /// 结束录音并保留文件（transferFile 需要文件在传输完成前存在）。
@@ -78,14 +94,20 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         isRecording = false
 
         guard let url = currentURL, let data = try? Data(contentsOf: url), !data.isEmpty else {
+            WatchLog.error(
+                "recorder", "record_empty",
+                detail: "duration_ms=\(durationMs)", code: "ERR_NO_RECORDING"
+            )
             throw RecorderError.noRecording
         }
         currentURL = nil
         recorder = nil
+        WatchLog.info("recorder", "record_finished", detail: "duration_ms=\(durationMs) bytes=\(data.count)")
         return Recording(fileURL: url, data: data, durationMs: max(1, durationMs))
     }
 
     func cancel() {
+        WatchLog.info("recorder", "record_cancelled")
         recorder?.stop()
         if let currentURL { try? FileManager.default.removeItem(at: currentURL) }
         currentURL = nil

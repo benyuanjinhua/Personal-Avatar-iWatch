@@ -38,6 +38,8 @@ final class WristAgentPhoneRelay: ObservableObject {
     private var credentials: RelayDeviceCredentials?
     private let session: URLSession
     private let resultAudioDirectory: URL
+    /// Watch 交互日志 chunk → Bridge /v1/client-logs（ESS-42）。
+    private(set) var clientLogUplink: ClientLogUplink!
 
     private var drainTask: Task<Void, Never>?
     private var scheduledDrainTask: Task<Void, Never>?
@@ -71,6 +73,10 @@ final class WristAgentPhoneRelay: ObservableObject {
         credentials = RelayCredentialsStore.read()
         isPaired = credentials != nil
         relayStatus = isPaired ? "已配对，等待请求" : "Relay 未配对"
+        clientLogUplink = ClientLogUplink(
+            directory: base.appendingPathComponent("ClientLogQueue", isDirectory: true),
+            makeClient: { [weak self] in self?.makeClient() }
+        )
         refreshEntries()
     }
 
@@ -79,6 +85,7 @@ final class WristAgentPhoneRelay: ObservableObject {
         purgeExpired()
         scheduleDrain(after: 0)
         connectEventsIfNeeded()
+        clientLogUplink.start()
     }
 
     // MARK: - 配对
@@ -98,6 +105,7 @@ final class WristAgentPhoneRelay: ObservableObject {
             relayStatus = "配对成功"
             scheduleDrain(after: 0)
             connectEventsIfNeeded()
+            clientLogUplink.start()
         } catch {
             relayStatus = "配对失败：\((error as? RelayUploadError)?.stableCode ?? error.localizedDescription)"
         }

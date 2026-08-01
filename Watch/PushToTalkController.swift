@@ -96,19 +96,26 @@ final class PushToTalkController: ObservableObject {
     /// 取消当前进行中的回合：上行取消请求，本地立即投影为已取消。
     func cancelActiveTurn() {
         guard let turn = journal.activeTurn, turn.isActive else { return }
+        WatchLog.info("turn", "cancel_requested", requestId: turn.requestId)
         transport.send(cancel: VoiceCancelEnvelope.cancel(requestId: turn.requestId))
         journal.recordLocal(.cancelled, requestId: turn.requestId, detail: "你取消了本次请求")
     }
 
     /// 播放结果语音：从加密仓解密到内存播放，播完即删（交付后删除）。
     func playResult(for turn: VoiceTurnRecord) {
-        guard
-            let fileName = turn.speechFileName,
-            let vault = speechVault,
-            let data = try? vault.load(name: fileName)
-        else { return }
         let requestId = turn.requestId
-        player.play(data: data) { [weak self] in
+        guard let fileName = turn.speechFileName else {
+            WatchLog.error("player", "result_speech_missing", requestId: requestId, code: "ERR_NO_SPEECH_FILE")
+            return
+        }
+        guard let vault = speechVault, let data = try? vault.load(name: fileName) else {
+            WatchLog.error(
+                "player", "result_speech_load_failed", requestId: requestId,
+                detail: "vault=\(speechVault != nil)", code: "ERR_VAULT_LOAD"
+            )
+            return
+        }
+        player.play(data: data, context: requestId) { [weak self] in
             self?.speechVault?.remove(name: fileName)
             self?.journal.clearSpeech(requestId: requestId)
         }

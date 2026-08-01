@@ -119,10 +119,17 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
 
     nonisolated func session(_ session: WCSession, didReceive file: WCSessionFile) {
         // 系统会在本方法返回后删除临时文件，必须同步读出。
-        guard let audioData = try? Data(contentsOf: file.fileURL) else { return }
+        guard let fileData = try? Data(contentsOf: file.fileURL) else { return }
+        // Watch 交互日志 chunk（ESS-42）：入上送队列，异步转发 Bridge。
+        if let chunkId = file.metadata?[WatchClientLogMessage.fileKey] as? String {
+            Task { @MainActor in
+                self.relay.clientLogUplink.enqueue(chunkId: chunkId, data: fileData)
+            }
+            return
+        }
         guard let envelopeData = file.metadata?[VoiceMessage.envelopeKey] as? Data else { return }
         Task { @MainActor in
-            self.ingestVoiceFile(envelopeData: envelopeData, audioData: audioData)
+            self.ingestVoiceFile(envelopeData: envelopeData, audioData: fileData)
         }
     }
 

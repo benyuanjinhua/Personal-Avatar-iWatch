@@ -51,12 +51,26 @@ final class WatchVoiceTransport: ObservableObject {
     // MARK: - iPhone Relay 回执（ESS-28）
 
     func handleRelayStatus(data: Data) {
-        guard let update = RelayStatusUpdate.decode(from: data) else { return }
+        guard let update = RelayStatusUpdate.decode(from: data) else {
+            WatchLog.error("transport", "relay_status_undecodable", detail: "bytes=\(data.count)", code: "ERR_DECODE")
+            return
+        }
+        WatchLog.info(
+            "turn", "relay_status", requestId: update.requestId,
+            detail: "phase=\(update.phase.rawValue)\(update.detail.map { " detail=\($0)" } ?? "")"
+        )
         remoteStatus = update
     }
 
     func handleResultPayload(data: Data) {
-        guard let payload = VoiceRelayResultPayload.decode(from: data) else { return }
+        guard let payload = VoiceRelayResultPayload.decode(from: data) else {
+            WatchLog.error("transport", "result_payload_undecodable", detail: "bytes=\(data.count)", code: "ERR_DECODE")
+            return
+        }
+        WatchLog.info(
+            "turn", "result_received", requestId: payload.requestId,
+            detail: "text_chars=\(payload.text?.count ?? 0) audio=\(payload.audioSha256 != nil)"
+        )
         lastResult = payload
     }
 
@@ -64,18 +78,46 @@ final class WatchVoiceTransport: ObservableObject {
     func handleResultAudioFile(tempURL: URL, payloadData: Data?) {
         guard
             let payloadData,
-            let payload = VoiceRelayResultPayload.decode(from: payloadData),
-            let audioData = try? Data(contentsOf: tempURL),
-            payload.audioSha256?.lowercased() == VoiceDigest.sha256Hex(of: audioData)
-        else { return }
+            let payload = VoiceRelayResultPayload.decode(from: payloadData)
+        else {
+            WatchLog.error("transport", "result_audio_payload_undecodable", code: "ERR_DECODE")
+            return
+        }
+        guard let audioData = try? Data(contentsOf: tempURL) else {
+            WatchLog.error(
+                "transport", "result_audio_unreadable", requestId: payload.requestId, code: "ERR_FILE_READ"
+            )
+            return
+        }
+        guard payload.audioSha256?.lowercased() == VoiceDigest.sha256Hex(of: audioData) else {
+            WatchLog.error(
+                "transport", "result_audio_sha_mismatch", requestId: payload.requestId,
+                detail: "bytes=\(audioData.count)", code: "ERR_SHA_MISMATCH"
+            )
+            return
+        }
         let destination = resultsDirectory.appendingPathComponent("\(payload.requestId).m4a")
         try? fileManager.removeItem(at: destination)
-        guard (try? audioData.write(to: destination, options: .atomic)) != nil else { return }
+        guard (try? audioData.write(to: destination, options: .atomic)) != nil else {
+            WatchLog.error(
+                "transport", "result_audio_write_failed", requestId: payload.requestId,
+                detail: destination.lastPathComponent, code: "ERR_FILE_WRITE"
+            )
+            return
+        }
+        WatchLog.info(
+            "transport", "result_audio_stored", requestId: payload.requestId,
+            detail: "bytes=\(audioData.count)"
+        )
         lastResult = payload
     }
 
     func send(envelope: VoiceRequestEnvelope, recording: AudioRecorder.Recording) {
         journal?.begin(requestId: envelope.requestId)
+        WatchLog.info(
+            "transport", "send_begin", requestId: envelope.requestId,
+            detail: "duration_ms=\(recording.durationMs) bytes=\(recording.data.count)"
+        )
         do {
             let audioURL = outboxDirectory.appendingPathComponent("\(envelope.requestId).m4a")
             try fileManager.moveItem(at: recording.fileURL, to: audioURL)
@@ -85,6 +127,7 @@ final class WatchVoiceTransport: ObservableObject {
         } catch {
             phase = .failed("保存录音失败：\(error.localizedDescription)")
             journal?.recordLocal(.failed, requestId: envelope.requestId, detail: "保存录音失败")
+            WatchLog.error("transport", "outbox_save_failed", requestId: envelope.requestId, error: error)
         }
     }
 
@@ -98,21 +141,24 @@ final class WatchVoiceTransport: ObservableObject {
                 let envelopeData = try? Data(contentsOf: sidecarURL(for: requestId)),
                 let envelope = try? VoiceRequestEnvelope.decode(from: envelopeData)
             else { continue }
+            WatchLog.info("transport", "retry_pending", requestId: requestId)
             submit(envelope: envelope, audioURL: outboxDirectory.appendingPathComponent("\(requestId).m4a"))
         }
     }
 
     func handleTransferFinished(fileName: String, error: Error?) {
+        let requestId = (fileName as NSString).deletingPathExtension
         if let error {
             phase = .failed("发送失败，将自动重试：\(error.localizedDescription)")
+            WatchLog.error("transport", "transfer_failed", requestId: requestId, detail: fileName, error: error)
             return
         }
-        let requestId = (fileName as NSString).deletingPathExtension
         // 音频已交付 iPhone：删除 Watch 侧临时副本（交付后删除），状态推进到“等待 Mac”。
         try? fileManager.removeItem(at: outboxDirectory.appendingPathComponent(fileName))
         try? fileManager.removeItem(at: sidecarURL(for: requestId))
         refreshPendingCount()
         phase = pendingCount == 0 ? .delivered : .sending
+        WatchLog.info("transport", "transfer_delivered", requestId: requestId, detail: "pending=\(pendingCount)")
         journal?.recordLocal(.waitingForMac, requestId: requestId, detail: "语音已到手机")
     }
 
@@ -131,9 +177,13 @@ final class WatchVoiceTransport: ObservableObject {
 
     private func deliver(payload: [String: Any]) {
         let session = WCSession.default
-        guard session.activationState == .activated else { return }
+        guard session.activationState == .activated else {
+            WatchLog.error("transport", "deliver_session_not_activated", code: "ERR_WC_NOT_ACTIVATED")
+            return
+        }
         if session.isReachable {
-            session.sendMessage(payload, replyHandler: nil) { _ in
+            session.sendMessage(payload, replyHandler: nil) { error in
+                WatchLog.error("transport", "send_message_failed_fallback_queue", error: error)
                 session.transferUserInfo(payload)
             }
         } else {
@@ -142,6 +192,7 @@ final class WatchVoiceTransport: ObservableObject {
     }
 
     func handleReachabilityChange(isReachable: Bool) {
+        WatchLog.info("wcsession", "reachability_changed", detail: "reachable=\(isReachable) pending=\(pendingCount)")
         if isReachable {
             if phase == .waitingForPhone { phase = .sending }
             retryPending()
@@ -155,11 +206,16 @@ final class WatchVoiceTransport: ObservableObject {
         guard session.activationState == .activated else {
             phase = .waitingForPhone
             journal?.recordLocal(.waitingForPhone, requestId: envelope.requestId)
+            WatchLog.info(
+                "transport", "submit_deferred", requestId: envelope.requestId,
+                detail: "session_not_activated"
+            )
             return
         }
         guard let envelopeData = try? envelope.jsonData() else {
             phase = .failed("信封编码失败")
             journal?.recordLocal(.failed, requestId: envelope.requestId, detail: "信封编码失败")
+            WatchLog.error("transport", "envelope_encode_failed", requestId: envelope.requestId, code: "ERR_ENCODE")
             return
         }
         if session.isReachable {
@@ -170,6 +226,10 @@ final class WatchVoiceTransport: ObservableObject {
             journal?.recordLocal(.waitingForPhone, requestId: envelope.requestId)
         }
         session.transferFile(audioURL, metadata: [VoiceMessage.envelopeKey: envelopeData])
+        WatchLog.info(
+            "transport", "transfer_enqueued", requestId: envelope.requestId,
+            detail: "reachable=\(session.isReachable) file=\(audioURL.lastPathComponent)"
+        )
     }
 
     private func outboxRequestIds() -> [String] {
