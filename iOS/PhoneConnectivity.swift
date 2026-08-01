@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import OSLog
 import os
 import WatchConnectivity
 
@@ -10,18 +11,31 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     @Published private(set) var history: [ConversationHistoryEntry] = []
     @Published private(set) var voiceEntries: [VoiceInboxEntry] = []
     @Published private(set) var voiceStatus = "尚未收到语音请求"
+    /// 下行未送达条目数：iPhone UI 可见「还有 N 条没到手表」，不再无声无息。
+    @Published private(set) var pendingDownlinkCount = 0
     /// ESS-28：加密 outbox + Tailscale 上送 + 结果回传编排器。
     let relay: WristAgentPhoneRelay
     private var pendingConfiguration: AgentConfiguration?
     private let historyStorageKey = "wristagent.phone.conversation.history"
     private let voiceInbox: VoiceRequestInbox?
+    /// ESS-21 B1：iPhone → Watch 下行持久化队列。会话未激活时排队重投，不静默丢弃。
+    private let downlink: WatchDownlinkOutbox?
+    private var downlinkFlushTask: Task<Void, Never>?
+    private static let downlinkLogger = Logger(
+        subsystem: "beer.workspace.wristagent", category: "watch-downlink"
+    )
 
     override init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         voiceInbox = try? VoiceRequestInbox(directory: base.appendingPathComponent("VoiceInbox", isDirectory: true))
+        downlink = try? WatchDownlinkOutbox(
+            directory: base.appendingPathComponent("WatchDownlink", isDirectory: true),
+            log: { event in PhoneConnectivity.logDownlink(event) }
+        )
         relay = WristAgentPhoneRelay()
         super.init()
         relay.watchChannel = self
+        pendingDownlinkCount = downlink?.pendingCount() ?? 0
         voiceEntries = voiceInbox?.entries ?? []
         if
             let data = UserDefaults.standard.data(forKey: historyStorageKey),
@@ -64,6 +78,8 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         WCSession.default.delegate = self
         WCSession.default.activate()
         relay.start()
+        // 冷启动补投：上次进程排队/在途未确认的下行，App 一打开就重投。
+        flushDownlink(trigger: "activate")
     }
 
     func send(_ configuration: AgentConfiguration) {
@@ -97,6 +113,8 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
                     self.send(configuration)
                 }
             }
+            // 会话刚激活正是此前静默丢弃的时刻，这里必须补投。
+            self.flushDownlink(trigger: "activation")
         }
     }
 
@@ -104,6 +122,26 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
 
     nonisolated func sessionDidDeactivate(_ session: WCSession) {
         session.activate()
+    }
+
+    nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
+        Task { @MainActor in self.flushDownlink(trigger: "reachability") }
+    }
+
+    nonisolated func sessionWatchStateDidChange(_ session: WCSession) {
+        Task { @MainActor in self.flushDownlink(trigger: "watch-state") }
+    }
+
+    /// 系统回执：userInfo 队列条目已交付 Watch（或最终失败）。
+    nonisolated func session(
+        _ session: WCSession,
+        didFinish userInfoTransfer: WCSessionUserInfoTransfer,
+        error: Error?
+    ) {
+        let itemId = userInfoTransfer.userInfo[Self.downlinkItemIdKey] as? String
+        Task { @MainActor in
+            self.completeDownlink(itemId: itemId, error: error)
+        }
     }
 
     nonisolated func session(
@@ -133,13 +171,17 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         didFinish fileTransfer: WCSessionFileTransfer,
         error: Error?
     ) {
-        let fileName = fileTransfer.file.fileURL.lastPathComponent
+        let stagedName = fileTransfer.file.fileURL.lastPathComponent
+        let itemId = fileTransfer.file.metadata?[Self.downlinkItemIdKey] as? String
         let envelope = (fileTransfer.file.metadata?[VoiceSpeechMessage.envelopeKey] as? Data)
             .flatMap { try? VoiceStatusEnvelope.decode(from: $0) }
         let requestId = envelope?.requestId ?? "unknown"
         Self.logger.log("l2_transfer_finished request_id=\(requestId, privacy: .public) success=\(error == nil) error=\(error?.localizedDescription ?? "none", privacy: .public)")
         Task { @MainActor in
-            self.relay.handleResultAudioTransferFinished(fileName: fileName, error: error)
+            self.completeDownlink(itemId: itemId, error: error)
+            // Relay 侧仍按原始文件名清理它自己的临时副本（暂存名形如 "<id>__<原名>"）。
+            let originalName = stagedName.components(separatedBy: "__").last ?? stagedName
+            self.relay.handleResultAudioTransferFinished(fileName: originalName, error: error)
         }
     }
 
@@ -161,54 +203,215 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
 // MARK: - Relay → Watch 回执通道（ESS-28）
 
 extension PhoneConnectivity: WatchFeedbackChannel {
-    /// 状态/结果短文本：可达时 sendMessage 即时送达；不可达时 transferUserInfo 排队，
-    /// 由系统在下次连接时交付（Watch 离线也不丢）。
+    /// 下行条目 ID 随载荷同行，用于把 WCSession 的 didFinish 回执映射回队列条目。
+    static let downlinkItemIdKey = "wristagent_downlink_item_id"
+
     func notifyWatch(status: RelayStatusUpdate) {
         guard let data = try? status.jsonData() else { return }
-        sendToWatch(key: VoiceMessage.relayStatusKey, data: data)
+        enqueueDownlink(
+            requestId: status.requestId, kind: .relayStatus,
+            key: VoiceMessage.relayStatusKey, data: data
+        )
     }
 
     func notifyWatch(result: VoiceRelayResultPayload) {
         guard let data = try? result.jsonData() else { return }
-        sendToWatch(key: VoiceMessage.resultKey, data: data)
+        enqueueDownlink(
+            requestId: result.requestId, kind: .result,
+            key: VoiceMessage.resultKey, data: data
+        )
     }
 
     /// 状态/权限/结果信封 → Watch VoiceTurnJournal（ESS-29 时间线；ESS-38 接通）。
     func notifyWatch(voiceStatus envelope: VoiceStatusEnvelope) {
         guard let data = try? envelope.jsonData() else { return }
-        sendToWatch(key: VoiceStatusMessage.envelopeKey, data: data)
+        enqueueDownlink(
+            requestId: envelope.requestId, kind: .voiceStatus,
+            key: VoiceStatusMessage.envelopeKey, data: data
+        )
     }
 
     /// 结果语音走系统托管 transferFile；metadata 带含 speechSha256 的信封，
     /// Watch 端（WatchSettingsStore.storeSpeech）校验通过才加密入库并挂到回合。
-    func transferSpeech(fileURL: URL, envelope: VoiceStatusEnvelope) {
-        let session = WCSession.default
-        guard session.activationState == .activated else {
-            Self.logger.error("l2_transfer_failed request_id=\(envelope.requestId, privacy: .public) reason=session_not_activated")
-            return
+    ///
+    /// ESS-21 B1：音频先复制进下行队列自持有的目录再投递——调用方的临时文件
+    /// 随时可能被清理，且会话未激活时本条必须留在队列里等重投，不能像原先那样直接 return。
+    @discardableResult
+    func transferSpeech(fileURL: URL, envelope: VoiceStatusEnvelope) -> Bool {
+        guard let data = try? envelope.jsonData() else { return false }
+        guard let downlink else {
+            Self.downlinkLogger.error(
+                "下行队列不可用，语音无法保证送达 request_id=\(envelope.requestId, privacy: .public)"
+            )
+            return false
         }
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            Self.logger.error("l2_transfer_failed request_id=\(envelope.requestId, privacy: .public) reason=file_missing")
-            return
+        guard let audio = try? Data(contentsOf: fileURL) else {
+            Self.downlinkLogger.error(
+                "结果语音读取失败 request_id=\(envelope.requestId, privacy: .public)"
+            )
+            return false
         }
-        guard let data = try? envelope.jsonData() else {
-            Self.logger.error("l2_transfer_failed request_id=\(envelope.requestId, privacy: .public) reason=envelope_encode")
-            return
+        do {
+            _ = try downlink.enqueueSpeech(
+                requestId: envelope.requestId,
+                messageKey: VoiceSpeechMessage.envelopeKey,
+                envelope: data,
+                audio: audio,
+                fileName: fileURL.lastPathComponent
+            )
+        } catch {
+            Self.downlinkLogger.error(
+                "语音入队失败 request_id=\(envelope.requestId, privacy: .public) error=\(String(describing: error), privacy: .public)"
+            )
+            return false
         }
-        let transfer = session.transferFile(fileURL, metadata: [VoiceSpeechMessage.envelopeKey: data])
-        Self.logger.log("l2_transfer_queued request_id=\(envelope.requestId, privacy: .public) reachable=\(session.isReachable) outstanding=\(session.outstandingFileTransfers.count) file=\(transfer.file.fileURL.lastPathComponent, privacy: .public)")
+        refreshDownlinkCount()
+        flushDownlink(trigger: "speech-enqueue")
+        return true
     }
 
-    private func sendToWatch(key: String, data: Data) {
+    private func enqueueDownlink(
+        requestId: String, kind: WatchDownlinkKind, key: String, data: Data
+    ) {
+        guard let downlink else {
+            // 队列不可用时退回旧的尽力而为通道，但明确留痕，不假装成功。
+            Self.downlinkLogger.error(
+                "下行队列不可用，退回尽力而为通道 request_id=\(requestId, privacy: .public)"
+            )
+            bestEffortSend(key: key, data: data)
+            return
+        }
+        do {
+            _ = try downlink.enqueue(
+                requestId: requestId, kind: kind, messageKey: key, payload: data
+            )
+        } catch {
+            Self.downlinkLogger.error(
+                "下行入队失败 request_id=\(requestId, privacy: .public) error=\(String(describing: error), privacy: .public)"
+            )
+            bestEffortSend(key: key, data: data)
+            return
+        }
+        refreshDownlinkCount()
+        flushDownlink(trigger: "enqueue")
+    }
+
+    /// 排空下行队列。会话未激活/未安装 Watch App 时**不投递也不丢弃**，
+    /// 条目留在队列里，等 activation / reachability / watch-state 变化再来。
+    func flushDownlink(trigger: String) {
+        guard let downlink else { return }
+        let session = WCSession.default
+        let due = downlink.dueItems()
+        guard !due.isEmpty else {
+            refreshDownlinkCount()
+            return
+        }
+        guard WCSession.isSupported(), session.activationState == .activated else {
+            due.forEach { downlink.markDeferred(id: $0.id, reason: "session-not-activated:\(trigger)") }
+            refreshDownlinkCount()
+            return
+        }
+        guard session.isWatchAppInstalled else {
+            due.forEach { downlink.markDeferred(id: $0.id, reason: "watch-app-not-installed:\(trigger)") }
+            refreshDownlinkCount()
+            return
+        }
+
+        for item in due {
+            guard let payload = try? downlink.payload(for: item.id) else {
+                downlink.markFailed(id: item.id, reason: "payload-missing")
+                continue
+            }
+            switch item.kind {
+            case .speech:
+                guard let audioURL = downlink.stagedAudioURL(for: item.id) else {
+                    downlink.markFailed(id: item.id, reason: "staged-audio-missing")
+                    continue
+                }
+                downlink.markInFlight(id: item.id)
+                session.transferFile(audioURL, metadata: [
+                    item.messageKey: payload,
+                    Self.downlinkItemIdKey: item.id
+                ])
+            case .relayStatus, .result, .voiceStatus:
+                downlink.markInFlight(id: item.id)
+                // transferUserInfo 是系统托管的可靠队列，且有 didFinish 回执——
+                // 它、而不是 sendMessage，才是「送达」的判据。
+                session.transferUserInfo([
+                    item.messageKey: payload,
+                    Self.downlinkItemIdKey: item.id
+                ])
+                // 可达时额外走一次即时通道降低延迟；失败无所谓，可靠性由上面那条兜底。
+                if session.isReachable {
+                    session.sendMessage([item.messageKey: payload], replyHandler: nil, errorHandler: { _ in })
+                }
+            }
+        }
+        refreshDownlinkCount()
+        scheduleDownlinkRetry()
+    }
+
+    /// 系统回执落地：成功转 delivered 并删载荷，失败退避重投。
+    private func completeDownlink(itemId: String?, error: Error?) {
+        guard let downlink else { return }
+        if let itemId {
+            if let error {
+                downlink.markFailed(id: itemId, reason: error.localizedDescription)
+            } else {
+                downlink.markDelivered(id: itemId)
+            }
+        }
+        refreshDownlinkCount()
+        scheduleDownlinkRetry()
+    }
+
+    private func scheduleDownlinkRetry() {
+        guard let downlink, let next = downlink.earliestNextAttempt() else { return }
+        let delay = max(0.5, next.timeIntervalSinceNow)
+        downlinkFlushTask?.cancel()
+        downlinkFlushTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await MainActor.run { self?.flushDownlink(trigger: "retry") }
+        }
+    }
+
+    private func refreshDownlinkCount() {
+        downlink?.purgeExpired()
+        pendingDownlinkCount = downlink?.pendingCount() ?? 0
+    }
+
+    /// 队列不可用时的降级路径（尽力而为，无回执）。
+    private func bestEffortSend(key: String, data: Data) {
         let session = WCSession.default
         guard session.activationState == .activated else { return }
         if session.isReachable {
             session.sendMessage([key: data], replyHandler: nil) { _ in
-                // 即时通道失败退回系统排队通道。
                 session.transferUserInfo([key: data])
             }
         } else {
             session.transferUserInfo([key: data])
+        }
+    }
+
+    fileprivate static func logDownlink(_ event: WatchDownlinkLogEvent) {
+        switch event {
+        case .enqueued(let requestId, let kind, let itemId):
+            downlinkLogger.info("downlink enqueued request_id=\(requestId, privacy: .public) kind=\(kind.rawValue, privacy: .public) item=\(itemId, privacy: .public)")
+        case .duplicate(let requestId, let kind, let itemId):
+            downlinkLogger.debug("downlink duplicate request_id=\(requestId, privacy: .public) kind=\(kind.rawValue, privacy: .public) item=\(itemId, privacy: .public)")
+        case .deferred(let requestId, let kind, let itemId, let reason):
+            downlinkLogger.notice("downlink deferred request_id=\(requestId, privacy: .public) kind=\(kind.rawValue, privacy: .public) item=\(itemId, privacy: .public) reason=\(reason, privacy: .public)")
+        case .attempted(let requestId, let kind, let itemId, let attempt):
+            downlinkLogger.info("downlink attempt request_id=\(requestId, privacy: .public) kind=\(kind.rawValue, privacy: .public) item=\(itemId, privacy: .public) attempt=\(attempt)")
+        case .delivered(let requestId, let kind, let itemId, let attempt):
+            downlinkLogger.info("downlink delivered request_id=\(requestId, privacy: .public) kind=\(kind.rawValue, privacy: .public) item=\(itemId, privacy: .public) attempt=\(attempt)")
+        case .failed(let requestId, let kind, let itemId, let attempt, let reason):
+            downlinkLogger.error("downlink failed request_id=\(requestId, privacy: .public) kind=\(kind.rawValue, privacy: .public) item=\(itemId, privacy: .public) attempt=\(attempt) reason=\(reason, privacy: .public)")
+        case .expired(let requestId, let kind, let itemId):
+            downlinkLogger.error("downlink expired request_id=\(requestId, privacy: .public) kind=\(kind.rawValue, privacy: .public) item=\(itemId, privacy: .public)")
+        case .persistFailed(let operation, let reason):
+            downlinkLogger.fault("downlink index persist failed operation=\(operation, privacy: .public) reason=\(reason, privacy: .public)")
         }
     }
 }
