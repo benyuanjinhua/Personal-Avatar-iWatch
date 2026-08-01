@@ -35,6 +35,18 @@ import { QwenRealtimeSessionSupervisor } from './supervisor.mjs'
 
 const BASE = dirname(fileURLToPath(import.meta.url))
 
+// 16-bit PCM 的 RMS 能量（ESS-41 B2）：区分「几乎全静音的误触」与真实语音。
+function pcmRms16(pcm) {
+  const samples = pcm.length >> 1
+  if (samples === 0) return 0
+  let sum = 0
+  for (let i = 0; i < samples; i++) {
+    const v = pcm.readInt16LE(i * 2)
+    sum += v * v
+  }
+  return Math.sqrt(sum / samples)
+}
+
 export function createBridge(overrides = {}) {
   const CONFIG = { ...JSON.parse(readFileSync(join(BASE, 'config.json'), 'utf8')), ...overrides }
   const log = obj => process.stdout.write(JSON.stringify({ ts: new Date().toISOString(), ...obj }) + '\n')
@@ -85,6 +97,8 @@ export function createBridge(overrides = {}) {
   // realtime events → completed 可按同一 request_id 串起来。原始音频永不落
   // 日志（journal 只记字节数）。RT_GATEWAY_EVENTS 同步累计账本事件数
   // （ESS-37：修复 event_count 只统计后台 SSE、从不统计 Realtime 的取证缺口）。
+  // ESS-41 B1：此处只走 bumpEvents（纯观测计数）——taskwatch 的熔断预算在
+  // bumpTaskEvents 单独分账，Realtime 高频 delta 流永不触发 taskwatch 熔断。
   const RT_GATEWAY_EVENTS = new Set([
     'gateway.connected', 'voice.ready', 'voice.state', 'voice.deactivated',
     'turn.started', 'audio.delta', 'audio.done', 'response.started', 'response.interrupted',
@@ -215,6 +229,17 @@ export function createBridge(overrides = {}) {
 
       ledger.update(requestId, { state: 'processing', detail: 'decoding' })
       const { pcm16k } = await audio.decodeTo16k(audioBuf, audioMeta.codec)
+
+      // ESS-41 B2：空/误触音频快速失败——最小时长 + 能量下限在注入前拦截，
+      // 不进 Realtime 注入 / 停摆重放 / 会话重建机器（真机取证：1920 bytes
+      // ≈60ms 的尾部静音走完整停摆链后误报 ERR_REALTIME_STALLED）。
+      const durationMs = pcm16k.length / 32 // 16kHz mono PCM16 = 32 bytes/ms
+      const rms = pcmRms16(pcm16k)
+      if (durationMs < (CONFIG.min_audio_ms ?? 0) || rms < (CONFIG.min_audio_rms ?? 0)) {
+        log({ evt: 'audio_too_short', request_id: requestId, pcm_bytes: pcm16k.length, duration_ms: Math.round(durationMs), rms: Math.round(rms) })
+        ledger.fail(requestId, 'ERR_AUDIO_TOO_SHORT')
+        return
+      }
 
       if (ledger.get(requestId)?.state === 'cancelled') return
       ledger.update(requestId, { state: 'processing', detail: 'realtime_processing' })
