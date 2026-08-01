@@ -169,8 +169,12 @@ final class PushToTalkController: ObservableObject {
         player.play(data: data, context: requestId) { [weak self] in
             self?.speechVault?.remove(name: fileName)
             self?.journal.clearSpeech(requestId: requestId)
-            // ESS-45：播放交付完成，runtime session 的持有理由随之消失。
-            self?.sessionKeeper.markDelivered(requestId: requestId)
+            // ESS-45×ESS-46：只有终态回合的结果语音播完才算交付——interim
+            // （回合仍在处理中）播完不算，否则 completed 后等待最终语音的
+            // 120s grace 持有会被跳过，App 挂起、最终结果播不出来。
+            if self?.journal.turn(withId: requestId)?.currentState.isTerminal == true {
+                self?.sessionKeeper.markDelivered(requestId: requestId)
+            }
         }
     }
 }
