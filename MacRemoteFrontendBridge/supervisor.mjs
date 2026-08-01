@@ -29,6 +29,13 @@
 // - announcement 隔离（ESS-36）：origin=announcement 的响应是后台任务播报，
 //   不属于当前 turn——其音频/转写不得混入 turn 结果，其 idle 状态不得提前
 //   结束 turn。
+// - announcement 归属与聚合（ESS-38）：announcement 不只是要隔离，还是后台
+//   任务结果语音的唯一来源（Qwen Audio Realtime 生成的人物状态/口气播报）。
+//   response.started 携带 taskId —— 按 responseId 聚合 24kHz PCM delta 与
+//   assistant transcript，audio.done / 播报窗口 idle 时整体交给 onAnnouncement
+//   回调（server 侧按 taskId → request_id 绑定回原请求）。聚合有上限
+//   （maxAnnouncementPcmBytes），超限截断；孤儿聚合由 announcementIdleMs
+//   兜底回收，绝不无界持有 PCM。
 
 import WebSocket from 'ws'
 import { randomUUID } from 'node:crypto'
@@ -54,12 +61,15 @@ export class QwenRealtimeSessionSupervisor {
     turnTimeoutMs = 120_000,
     injectAckTimeoutMs = 15_000, // 注入完成后等待首个 turn 事件的上限
     takeoverFromFrontends = false,
+    maxAnnouncementPcmBytes = 5_760_000, // ≈120s @ 24kHz mono PCM16（ESS-38）
+    announcementIdleMs = 30_000,         // 孤儿 announcement 聚合的回收兜底
     log = (...args) => console.error(new Date().toISOString(), ...args),
   } = {}) {
     this.cfg = {
       gatewayUrl, deviceId, idleDisconnectMs, pingIntervalMs, pingTimeoutMs,
       backoffBaseMs, backoffMaxMs, frameMs, paceMs, trailingSilenceMs, turnGapMs,
       turnTimeoutMs, injectAckTimeoutMs, takeoverFromFrontends,
+      maxAnnouncementPcmBytes, announcementIdleMs,
     }
     this.lastTurnEndedAt = 0
     this.sessionId = `watch-bridge-v1-${deviceId}`
@@ -79,8 +89,9 @@ export class QwenRealtimeSessionSupervisor {
     this.pingTimer = null
     this.pongTimer = null
     this.suspectZombie = false    // 上一连接因 ping 超时被判僵尸
-    this.announcementResponses = new Set() // origin=announcement 的 responseId
+    this.announcements = new Map() // responseId → 聚合中的 announcement 捕获（ESS-38）
     this.playbackStarted = new Set()       // 已回执 playback.started 的 responseId
+    this.onAnnouncement = null    // (capture) => void — 后台播报聚合完成的交付回调
   }
 
   record(entry) {
@@ -268,22 +279,31 @@ export class QwenRealtimeSessionSupervisor {
       this.ws.close()
     }
     this.voiceReady = false
+    // 关闭前交付聚合中的 announcement（能交多少交多少），同时释放兜底定时器
+    for (const responseId of [...this.announcements.keys()]) {
+      this.finishAnnouncement(responseId, `close:${reason}`)
+    }
     this.record({ event: 'ws.closed-by-bridge', reason })
   }
 
   // ---- 服务端事件 ---------------------------------------------------------
 
   handleServerEvent(event) {
-    // origin=announcement 的响应登记在册：其音频只回执、不进 turn 结果。
+    // origin=announcement 的响应登记在册并开始聚合（ESS-38）：其音频回执、
+    // 不进 turn 结果，但要按 responseId 聚合后绑定回后台任务的 request_id。
     // 注意 origin 有三种：model（Realtime 直答）、agent（后端 Agent 对本 turn
     // 的应答呈现）、announcement（无关后台任务播报）——只有最后一种要隔离，
     // agent 应答是 turn 结果本体（ESS-36 真机实测）。
     if (event.type === 'response.started' && event.responseId
       && event.origin === 'announcement') {
-      this.announcementResponses.add(event.responseId)
+      this.beginAnnouncement(event)
+    }
+    if (event.type === 'transcript.final' && event.role === 'assistant'
+      && event.responseId && this.announcements.has(event.responseId)) {
+      this.appendAnnouncementTranscript(event)
     }
     if (event.type === 'audio.delta') {
-      const announcement = this.announcementResponses.has(event.responseId)
+      const capture = this.announcements.get(event.responseId)
       // 播放回执：Bridge 即转码转发，收到即视为开始"播放"。turn 间隙的
       // announcement 音频同样回执，否则网关播报窗口卡死。
       if (event.responseId && !this.playbackStarted.has(event.responseId)) {
@@ -291,8 +311,9 @@ export class QwenRealtimeSessionSupervisor {
         this.wsSend({ type: 'playback.started', responseId: event.responseId })
       }
       // 24kHz PCM base64 → 聚合缓冲；日志不落原始音频
-      this.record({ event: 'audio.delta', responseId: event.responseId, bytes: Buffer.from(event.audio || '', 'base64').length, sampleRate: event.sampleRate, announcement })
-      if (!announcement) this.currentTurn?.onAudioDelta(event)
+      this.record({ event: 'audio.delta', responseId: event.responseId, bytes: Buffer.from(event.audio || '', 'base64').length, sampleRate: event.sampleRate, announcement: Boolean(capture) })
+      if (capture) this.appendAnnouncementAudio(capture, event)
+      else this.currentTurn?.onAudioDelta(event)
       return
     }
     if (event.type === 'audio.done') {
@@ -300,7 +321,16 @@ export class QwenRealtimeSessionSupervisor {
         this.playbackStarted.delete(event.responseId)
         this.wsSend({ type: 'playback.ended', responseId: event.responseId })
       }
-      this.announcementResponses.delete(event.responseId)
+      if (this.announcements.has(event.responseId)) {
+        this.finishAnnouncement(event.responseId, 'audio.done')
+      }
+    }
+    // 播报窗口收尾：还没等到 audio.done 的聚合（纯文本播报等）就此交付
+    if (event.type === 'voice.state' && event.state === 'idle'
+      && event.origin === 'announcement') {
+      for (const responseId of [...this.announcements.keys()]) {
+        this.finishAnnouncement(responseId, 'announcement-idle')
+      }
     }
     if (event.type === 'voice.ownership') {
       this.ownership = event.state
@@ -317,6 +347,90 @@ export class QwenRealtimeSessionSupervisor {
       this.voiceReady = false
       this.record({ event: 'ownership.lost', holder: event.holder })
       this.currentTurn?.fail(Object.assign(new Error('voice ownership lost'), { code: 'ERR_VOICE_BUSY' }))
+    }
+  }
+
+  // ---- announcement 聚合（ESS-38） -----------------------------------------
+
+  beginAnnouncement(event) {
+    if (this.announcements.has(event.responseId)) return
+    const capture = {
+      responseId: event.responseId,
+      taskId: event.taskId ?? event.task?.id ?? null,
+      turnId: event.turnId ?? null,
+      chunks: [],
+      pcmBytes: 0,
+      truncated: false,
+      transcript: null,
+      startedAt: Date.now(),
+      idleTimer: null,
+    }
+    this.announcements.set(event.responseId, capture)
+    this.touchAnnouncement(capture)
+    this.record({ event: 'announcement.started', responseId: capture.responseId, taskId: capture.taskId })
+  }
+
+  appendAnnouncementAudio(capture, event) {
+    this.touchAnnouncement(capture)
+    if (!event.audio) return
+    const chunk = Buffer.from(event.audio, 'base64')
+    // 有界聚合：超限只截断，不丢整段——短摘要语音仍可交付
+    const room = this.cfg.maxAnnouncementPcmBytes - capture.pcmBytes
+    if (room <= 0) {
+      if (!capture.truncated) {
+        capture.truncated = true
+        this.record({ event: 'announcement.truncated', responseId: capture.responseId, pcmBytes: capture.pcmBytes })
+      }
+      return
+    }
+    const kept = chunk.length > room ? chunk.subarray(0, room) : chunk
+    if (kept.length < chunk.length) capture.truncated = true
+    capture.chunks.push(kept)
+    capture.pcmBytes += kept.length
+  }
+
+  appendAnnouncementTranscript(event) {
+    const capture = this.announcements.get(event.responseId)
+    if (!capture || typeof event.content !== 'string') return
+    this.touchAnnouncement(capture)
+    capture.transcript = (capture.transcript || '') + event.content
+  }
+
+  touchAnnouncement(capture) {
+    clearTimeout(capture.idleTimer)
+    capture.idleTimer = setTimeout(() => {
+      // 兜底：audio.done / 播报 idle 丢失时也不无界持有 PCM
+      this.finishAnnouncement(capture.responseId, 'idle-timeout')
+    }, this.cfg.announcementIdleMs)
+    capture.idleTimer.unref?.()
+  }
+
+  finishAnnouncement(responseId, reason) {
+    const capture = this.announcements.get(responseId)
+    if (!capture) return
+    this.announcements.delete(responseId)
+    clearTimeout(capture.idleTimer)
+    const payload = {
+      responseId: capture.responseId,
+      taskId: capture.taskId,
+      turnId: capture.turnId,
+      transcript: capture.transcript,
+      pcm24k: Buffer.concat(capture.chunks),
+      truncated: capture.truncated,
+      reason,
+    }
+    this.record({
+      event: 'announcement.finished', responseId, taskId: capture.taskId,
+      pcmBytes: payload.pcm24k.length, truncated: capture.truncated, reason,
+      transcriptChars: capture.transcript?.length ?? 0,
+    })
+    try {
+      // 回调可能是 async（转码 + 落盘）：同步异常和 rejection 都不炸事件循环
+      Promise.resolve(this.onAnnouncement?.(payload)).catch(error => {
+        this.record({ event: 'announcement.deliver-failed', responseId, message: error.message })
+      })
+    } catch (error) {
+      this.record({ event: 'announcement.deliver-failed', responseId, message: error.message })
     }
   }
 

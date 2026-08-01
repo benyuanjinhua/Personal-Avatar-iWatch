@@ -167,11 +167,18 @@ extension PhoneConnectivity: WatchFeedbackChannel {
         sendToWatch(key: VoiceMessage.resultKey, data: data)
     }
 
-    /// 结果音频走系统托管 transferFile；metadata 带结果载荷用于 Watch 端关联与 sha256 校验。
-    func transferResultAudio(fileURL: URL, payload: VoiceRelayResultPayload) {
+    /// 状态/权限/结果信封 → Watch VoiceTurnJournal（ESS-29 时间线；ESS-38 接通）。
+    func notifyWatch(voiceStatus envelope: VoiceStatusEnvelope) {
+        guard let data = try? envelope.jsonData() else { return }
+        sendToWatch(key: VoiceStatusMessage.envelopeKey, data: data)
+    }
+
+    /// 结果语音走系统托管 transferFile；metadata 带含 speechSha256 的信封，
+    /// Watch 端（WatchSettingsStore.storeSpeech）校验通过才加密入库并挂到回合。
+    func transferSpeech(fileURL: URL, envelope: VoiceStatusEnvelope) {
         guard WCSession.default.activationState == .activated,
-              let data = try? payload.jsonData() else { return }
-        WCSession.default.transferFile(fileURL, metadata: [VoiceMessage.resultKey: data])
+              let data = try? envelope.jsonData() else { return }
+        WCSession.default.transferFile(fileURL, metadata: [VoiceSpeechMessage.envelopeKey: data])
     }
 
     private func sendToWatch(key: String, data: Data) {

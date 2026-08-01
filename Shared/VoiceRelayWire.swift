@@ -187,6 +187,28 @@ final class RelayClient {
         return try JSONDecoder().decode(RelayDeviceCredentials.self, from: data)
     }
 
+    /// 结果语音有界取回（ESS-38）：GET /v1/voice/turns/{id}/audio。
+    /// rangeStart 非 nil 时带 Range 头断点续传（Bridge 返回 206 + 剩余字节）。
+    /// 返回 (字节, HTTP 状态码)；sha256 校验由调用方按结果元数据执行。
+    func fetchResultAudio(requestId: String, rangeStart: Int? = nil) async throws -> (Data, Int) {
+        var request = RelaySignedRequestBuilder(baseURL: baseURL, credentials: credentials)
+            .request(
+                method: "GET", path: "/v1/voice/turns/\(requestId)/audio",
+                requestId: requestId, body: nil
+            )
+        if let rangeStart, rangeStart > 0 {
+            request.setValue("bytes=\(rangeStart)-", forHTTPHeaderField: "Range")
+        }
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw RelayUploadError.transport(error)
+        }
+        guard let http = response as? HTTPURLResponse else { throw RelayUploadError.badResponse }
+        return (data, http.statusCode)
+    }
+
     /// 上送一个 turn；重试时以同一 request_id 重新调用（新 nonce/签名），Bridge 幂等去重。
     func upload(envelope: VoiceRequestEnvelope, audioData: Data) async throws -> VoiceTurnResponse {
         let body = try JSONEncoder().encode(VoiceTurnUpload(envelope: envelope, audioData: audioData))

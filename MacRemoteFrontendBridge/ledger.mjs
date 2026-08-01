@@ -44,6 +44,18 @@ export class TurnLedger extends EventEmitter {
 
   get(requestId) { return this.turns.get(requestId) }
 
+  // task_id → turn（ESS-38：announcement 的 taskId 归属回原 request_id）。
+  // 多个 turn 命中同一 task_id 时取最新的一个（Map 保持插入序）：真实网关
+  // task id 唯一，命中多条只会来自历史残留，播报只属于最近的请求。
+  byTaskId(taskId) {
+    if (!taskId) return null
+    let match = null
+    for (const turn of this.turns.values()) {
+      if (turn.task_id && String(turn.task_id) === String(taskId)) match = turn
+    }
+    return match
+  }
+
   // Idempotent create. Returns { turn, replay } — replay=true means the
   // request_id already exists and the caller must NOT start a second execution.
   create({ requestId, deviceId, bodySha256, sessionId }) {
@@ -90,20 +102,41 @@ export class TurnLedger extends EventEmitter {
   }
 
   // Trim results to the configured caps before storing (§4.1 result-size limit).
-  setResult(requestId, { text = null, audioBase64 = null, extra = {} }, state = 'completed') {
+  // `audio`（ESS-38）：结果语音文件的元数据 {sha256, codec, duration_ms,
+  // size_bytes}——即使 inline base64 超限被丢弃，元数据仍保留，客户端可经
+  // GET /v1/voice/turns/:id/audio 有界下载取回。
+  setResult(requestId, { text = null, audioBase64 = null, audio = null, extra = {} }, state = 'completed') {
     let truncated = false
     if (typeof text === 'string' && text.length > this.maxResultChars) {
       text = text.slice(0, this.maxResultChars) + '…'
       truncated = true
     }
     if (typeof audioBase64 === 'string' && Buffer.byteLength(audioBase64, 'utf8') > this.maxResultAudioBytes) {
-      audioBase64 = null // audio over cap is dropped, text summary still delivered
+      audioBase64 = null // inline audio over cap is dropped; metadata + download endpoint remain
       truncated = true
     }
     return this.update(requestId, {
       state,
       permission: null,
-      result: { text, audio_base64: audioBase64, truncated, ...extra },
+      result: { text, audio_base64: audioBase64, audio, truncated, ...extra },
+    })
+  }
+
+  // 迟到的结果语音补挂到已完成 turn（ESS-38：announcement 在 task 终态之后
+  // 到达）。只补 completed；state 不变，重新投影一次让北向客户端拿到音频。
+  attachResultAudio(requestId, { audioBase64 = null, audio = null, speechText = null }) {
+    const turn = this.turns.get(requestId)
+    if (!turn || turn.state !== 'completed' || !turn.result) return null
+    if (typeof audioBase64 === 'string' && Buffer.byteLength(audioBase64, 'utf8') > this.maxResultAudioBytes) {
+      audioBase64 = null
+    }
+    return this.update(requestId, {
+      result: {
+        ...turn.result,
+        audio_base64: audioBase64,
+        audio,
+        ...(speechText ? { speech_text: speechText } : {}),
+      },
     })
   }
 

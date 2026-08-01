@@ -48,11 +48,13 @@
 		B61FF83E4DCF49ED91557083 /* EncryptedAudioVault.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7C56A17FC91DC667B51B7D6 /* EncryptedAudioVault.swift */; };
 		BF1A28E74E549CDAB4F6DB58 /* VoiceRelayEvents.swift in Sources */ = {isa = PBXBuildFile; fileRef = C58AEB9B4C54F952DFC96AB2 /* VoiceRelayEvents.swift */; };
 		C3D8984AB14E3ECEB93542E0 /* OpenWristAgentIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F9C01710FDC8C90D754460F /* OpenWristAgentIntent.swift */; };
+		CD555D87536F29C54A475DFB /* BridgeTurnProjection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A61F7EAFB8A0CCF3D03F1D2 /* BridgeTurnProjection.swift */; };
 		D482537406EC7EC94069E3AF /* WristAgentPhoneRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79F87E24A5046DA1229304B2 /* WristAgentPhoneRelay.swift */; };
 		D9B1A7DECC44E46204E0FFF3 /* UUIDv7.swift in Sources */ = {isa = PBXBuildFile; fileRef = E36424AC38F0A8BB28751248 /* UUIDv7.swift */; };
 		DADA85367CAACD55C3514A81 /* CompanionSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0DFA30C0EEFD46DDC835A5B6 /* CompanionSettings.swift */; };
 		E0C092AAB8EB860FC6D5A0B7 /* AgentModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB1D464D47EC34B55A8C8411 /* AgentModels.swift */; };
 		E67E11F4044782400305330E /* WatchContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 937C17EC6A16413E34C276A2 /* WatchContentView.swift */; };
+		E817250A3DAFD3D2F889876B /* BridgeTurnProjection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A61F7EAFB8A0CCF3D03F1D2 /* BridgeTurnProjection.swift */; };
 		EFF14C832245DFFF4D10E97F /* VoiceRelayWire.swift in Sources */ = {isa = PBXBuildFile; fileRef = 035DF4EEFBF9F540A0B791F7 /* VoiceRelayWire.swift */; };
 		F085E299171F674D4D155E09 /* SecureTokenStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC28E8D4A89C399924568EEB /* SecureTokenStore.swift */; };
 		FD2534104A35901AC28B604D /* VoiceRelayEvents.swift in Sources */ = {isa = PBXBuildFile; fileRef = C58AEB9B4C54F952DFC96AB2 /* VoiceRelayEvents.swift */; };
@@ -99,6 +101,7 @@
 		368090AE8C6F95663E822547 /* AgentService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentService.swift; sourceTree = "<group>"; };
 		36A3DD675D9E3E4CDC7C7C5A /* WristAgentApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WristAgentApp.swift; sourceTree = "<group>"; };
 		52EB1A31FDA5F9AE96F8B8B0 /* ConversationViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationViewModel.swift; sourceTree = "<group>"; };
+		5A61F7EAFB8A0CCF3D03F1D2 /* BridgeTurnProjection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeTurnProjection.swift; sourceTree = "<group>"; };
 		67C6A03628F073DFB7BD92CF /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		6AE6645A23368CC50DBD7CCE /* WristAgent.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = WristAgent.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		7669A09014913EDDEC887BBE /* SpeechPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechPlayer.swift; sourceTree = "<group>"; };
@@ -135,6 +138,7 @@
 			isa = PBXGroup;
 			children = (
 				CB1D464D47EC34B55A8C8411 /* AgentModels.swift */,
+				5A61F7EAFB8A0CCF3D03F1D2 /* BridgeTurnProjection.swift */,
 				E92A4F28175D63C6FBD62D7E /* ConversationHistory.swift */,
 				F7C56A17FC91DC667B51B7D6 /* EncryptedAudioVault.swift */,
 				CC28E8D4A89C399924568EEB /* SecureTokenStore.swift */,
@@ -317,6 +321,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				E0C092AAB8EB860FC6D5A0B7 /* AgentModels.swift in Sources */,
+				CD555D87536F29C54A475DFB /* BridgeTurnProjection.swift in Sources */,
 				3213E1FAF48D79262E5EA9FC /* CompanionContentView.swift in Sources */,
 				DADA85367CAACD55C3514A81 /* CompanionSettings.swift in Sources */,
 				FF0CBF3B2F165CCB9D3F426C /* ConversationHistory.swift in Sources */,
@@ -345,6 +350,7 @@
 				AC284F28E28E5427A577455B /* AgentModels.swift in Sources */,
 				AFF0F7C0B1CC4F55BE66C14D /* AgentService.swift in Sources */,
 				AB38F702523DAB57ECDB758F /* AudioRecorder.swift in Sources */,
+				E817250A3DAFD3D2F889876B /* BridgeTurnProjection.swift in Sources */,
 				54817C157F20C92848363962 /* ConversationHistory.swift in Sources */,
 				2600C4D0F1086887A7E1B04A /* ConversationTimelineView.swift in Sources */,
 				B5A3CF092890ABBFA156A433 /* ConversationViewModel.swift in Sources */,

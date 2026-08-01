@@ -88,6 +88,20 @@ export class BridgeClient {
   }
 
   getTurn(requestId) { return this.signed('GET', `/v1/voice/turns/${requestId}`) }
+
+  // 结果语音下载（ESS-38）：签名 GET，可带 Range 断点续传；返回原始字节。
+  async downloadAudio(requestId, { range = null } = {}) {
+    const path = `/v1/voice/turns/${requestId}/audio`
+    const headers = this.signHeaders('GET', path, Buffer.alloc(0), requestId)
+    if (range) headers.range = range
+    const response = await fetch(this.baseUrl + path, { method: 'GET', headers })
+    const body = Buffer.from(await response.arrayBuffer())
+    return {
+      status: response.status,
+      body,
+      headers: Object.fromEntries(response.headers.entries()),
+    }
+  }
   cancelTurn(requestId) { return this.signed('POST', `/v1/voice/turns/${requestId}/cancel`, { json: {} }) }
   permission(requestId, permissionId, decision) {
     return this.signed('POST', `/v1/voice/turns/${requestId}/permission`, {

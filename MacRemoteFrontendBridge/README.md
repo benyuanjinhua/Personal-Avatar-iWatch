@@ -52,11 +52,28 @@ iPhone Relay ──HTTPS/WSS(HMAC 签名)──▶ server.mjs（北向 API）
 | GET | `/v1/voice/turns/{id}` | 稳定状态投影 + 短结果 |
 | POST | `/v1/voice/turns/{id}/cancel` | 取消（后台任务映射到 `DELETE /api/tasks/:id`） |
 | POST | `/v1/voice/turns/{id}/permission` | `{permission_id, decision: allow\|deny}` |
+| GET | `/v1/voice/turns/{id}/audio` | 结果语音（AAC/M4A）有界取回；支持 `Range` 断点续传，`x-audio-sha256` 响应头供校验（ESS-38） |
 | WSS | `/v1/voice/events` | `turn.state` 事件推送；连接即回放非终态 snapshot |
 | GET | `/v1/health` | 健康检查（无鉴权，仅源 IP 门禁） |
 
 状态投影：`accepted → processing → (permission_required) → completed | failed | cancelled`，
 `detail` 携带子状态（`realtime_processing` / `background_accepted` / `background_running`…）。
+
+结果结构（completed）：`result.text`（任务/直答文本）、`result.speech_text`（Qwen Audio
+Realtime 播报转写，后台路径）、`result.audio_base64`（≤ `max_result_audio_bytes` 时内联）、
+`result.audio = {sha256, codec, duration_ms, size_bytes}`（语音文件元数据，内联被裁时仍在，
+客户端凭它走 `/audio` 端点下载）。
+
+## Realtime 语音下行（ESS-38）
+
+后台任务的结果语音以 `origin=announcement` 经 Realtime WS 到达（Qwen 生成的人物
+状态/口气播报，Bridge 不做二次 TTS）。supervisor 按 `responseId` 聚合 24kHz PCM
+delta 与 assistant transcript（`response.started` 携带 `taskId`），聚合上限
+`max_announcement_pcm_bytes`（超限截断）；聚合完成后按 `taskId → task_id →
+request_id` 绑定回原请求，转码 AAC/M4A 落 `state/result-audio/`（保留期
+`result_audio_retention_ms`），并把元数据补挂到账本结果。到达次序与 task 终态
+无关：文本先投影（终态不等语音），语音随后以第二条 `turn.state` 补上。归属不了
+的播报（Mac 本机任务等）只留日志、绝不乱挂。
 
 ## 关键机制
 
