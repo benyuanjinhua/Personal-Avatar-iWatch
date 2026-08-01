@@ -13,6 +13,7 @@ Apple Watch 上的语音 Agent 遥控器。Watch 负责录音、状态反馈、T
 - App Intent / Siri 快捷入口。
 - 无服务器也能体验的三轮 Demo Agent。
 - 可运行的本地 Mock Gateway 和接口测试。
+- 可在浏览器中运行全链路 testcase 的 Web iWatch Mock。
 
 ## 目录
 
@@ -23,6 +24,7 @@ WristAgent/
 ├── Watch/                   # 录音、Agent、TTS、风险确认、Watch UI
 ├── Docs/PRD.md              # 产品需求与 iPhone Relay 网络架构
 ├── Docs/API.md              # 云端 Agent Gateway 协议
+├── Docs/ARCHITECTURE_CONSTRAINTS.md # 架构约束清单（评审对照）
 ├── Docs/ARCHITECTURE.md     # 模块划分、依赖规则与渐进迁移方案
 ├── Docs/WATCH_INSTALL_TROUBLESHOOTING.md # Watch 真机安装排障
 ├── Tools/mock-gateway.mjs   # 本地联调服务
@@ -119,6 +121,25 @@ Debug 构建允许连接私有局域网内的 HTTP 地址：
 ```bash
 node Tools/mock-gateway.mjs
 ```
+
+启动后访问 [http://localhost:8787](http://localhost:8787)，可以直接在 Web iWatch
+Mock 中依次验证四条核心链路：
+
+1. 只读日程查询。
+2. 长任务启动、轮询和完成。
+3. 可撤回提醒及撤回请求。
+4. 高风险发送操作及确认请求。
+
+点击“运行全链路 testcase”可自动跑完整场景，右侧会显示每条用例状态和真实
+HTTP 请求事件。此入口与 Watch 联调共用同一个 Mock Gateway 协议，不需要复制
+一套测试数据。
+
+每轮请求带全链路 `trace_id`（可在右侧输入框自定义，如 `223lkjl`，配合
+自定义输入“杭州天气咋样”）。网关按模块写 JSONL 日志到
+`logs/trace/{h5-mock,main-agent,codex-cli}.log`，每行都含 `trace_id`；
+`grep 223lkjl logs/trace/*.log` 或页面上点“查询链路”（`GET
+/v1/trace/223lkjl`）即可确认该输入在主 Agent、Codex CLI 阶段是否成功。
+约定见 [Docs/API.md](Docs/API.md) 第 6 节。
 
 查出 Mac 的局域网 IP，在 iPhone App 中填写：
 
