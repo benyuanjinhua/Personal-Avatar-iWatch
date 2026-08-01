@@ -1,4 +1,5 @@
 import SwiftUI
+import WatchKit
 
 @main
 struct WristAgentWatchApp: App {
@@ -15,6 +16,10 @@ struct WristAgentWatchApp: App {
                         "lifecycle", "cold_start",
                         detail: "version=\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] ?? "?")"
                     )
+                    // ESS-45：降腕后 frontmost 保持从默认 ~8s 延长到 70s，
+                    // 与 ExtendedRuntimeSession（VoiceSessionKeeper）叠加覆盖长任务等待。
+                    WKExtension.shared().isFrontmostTimeoutExtended = true
+                    WatchLog.info("lifecycle", "frontmost_timeout_extended")
                     settings.voiceTransport = pushToTalk.transport
                     settings.voiceJournal = pushToTalk.journal
                     settings.speechVault = pushToTalk.speechVault

@@ -58,6 +58,11 @@ targets:
         WKCompanionAppBundleIdentifier: $(WRISTAGENT_BUNDLE_ID)
         WKApplication: true
         WKRunsIndependentlyOfCompanionApp: true
+        # ESS-45：audio = 熄屏/后台继续播结果语音；self-care = ExtendedRuntimeSession
+        # 类型（系统上限 10 分钟），覆盖录音→等待→播放的整个语音回合。
+        WKBackgroundModes:
+          - audio
+          - self-care
     entitlements:
       path: Watch/WristAgentWatch.entitlements
     settings:
