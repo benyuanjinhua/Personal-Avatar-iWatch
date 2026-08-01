@@ -1,10 +1,12 @@
 import Combine
 import Foundation
 import OSLog
+import os
 import WatchConnectivity
 
 @MainActor
 final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
+    private static let logger = Logger(subsystem: "com.benyuan.wristagent.phone", category: "VoiceDownlink")
     @Published private(set) var status = "尚未连接 Apple Watch"
     @Published private(set) var history: [ConversationHistoryEntry] = []
     @Published private(set) var voiceEntries: [VoiceInboxEntry] = []
@@ -171,6 +173,10 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     ) {
         let stagedName = fileTransfer.file.fileURL.lastPathComponent
         let itemId = fileTransfer.file.metadata?[Self.downlinkItemIdKey] as? String
+        let envelope = (fileTransfer.file.metadata?[VoiceSpeechMessage.envelopeKey] as? Data)
+            .flatMap { try? VoiceStatusEnvelope.decode(from: $0) }
+        let requestId = envelope?.requestId ?? "unknown"
+        Self.logger.log("l2_transfer_finished request_id=\(requestId, privacy: .public) success=\(error == nil) error=\(error?.localizedDescription ?? "none", privacy: .public)")
         Task { @MainActor in
             self.completeDownlink(itemId: itemId, error: error)
             // Relay 侧仍按原始文件名清理它自己的临时副本（暂存名形如 "<id>__<原名>"）。

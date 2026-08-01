@@ -35,6 +35,18 @@ import { QwenRealtimeSessionSupervisor } from './supervisor.mjs'
 
 const BASE = dirname(fileURLToPath(import.meta.url))
 
+// 16-bit PCM 的 RMS 能量（ESS-41 B2）：区分「几乎全静音的误触」与真实语音。
+function pcmRms16(pcm) {
+  const samples = pcm.length >> 1
+  if (samples === 0) return 0
+  let sum = 0
+  for (let i = 0; i < samples; i++) {
+    const v = pcm.readInt16LE(i * 2)
+    sum += v * v
+  }
+  return Math.sqrt(sum / samples)
+}
+
 export function createBridge(overrides = {}) {
   const CONFIG = { ...JSON.parse(readFileSync(join(BASE, 'config.json'), 'utf8')), ...overrides }
   const log = obj => process.stdout.write(JSON.stringify({ ts: new Date().toISOString(), ...obj }) + '\n')
@@ -85,6 +97,8 @@ export function createBridge(overrides = {}) {
   // realtime events → completed 可按同一 request_id 串起来。原始音频永不落
   // 日志（journal 只记字节数）。RT_GATEWAY_EVENTS 同步累计账本事件数
   // （ESS-37：修复 event_count 只统计后台 SSE、从不统计 Realtime 的取证缺口）。
+  // ESS-41 B1：此处只走 bumpEvents（纯观测计数）——taskwatch 的熔断预算在
+  // bumpTaskEvents 单独分账，Realtime 高频 delta 流永不触发 taskwatch 熔断。
   const RT_GATEWAY_EVENTS = new Set([
     'gateway.connected', 'voice.ready', 'voice.state', 'voice.deactivated',
     'turn.started', 'audio.delta', 'audio.done', 'response.started', 'response.interrupted',
@@ -109,7 +123,11 @@ export function createBridge(overrides = {}) {
   // 重新投影（turn.state 事件），北向先拿到文本、随后补到语音元数据。
 
   const pendingResultAudio = new Map() // request_id → { meta, base64, speechText, at }
+  const pendingAnnouncements = new Map() // task_id → raw announcement, waiting for ledger binding
   const PENDING_AUDIO_TTL_MS = 10 * 60 * 1000
+  const MAX_PENDING_ANNOUNCEMENTS = 64
+  const MAX_PENDING_ANNOUNCEMENT_BYTES = (CONFIG.max_announcement_pcm_bytes ?? 5_760_000) * 4
+  let pendingAnnouncementBytes = 0
 
   function attachPendingResultAudio(requestId) {
     const entry = pendingResultAudio.get(requestId)
@@ -124,14 +142,8 @@ export function createBridge(overrides = {}) {
     log({ evt: 'result_audio_attached', request_id: requestId, size_bytes: entry.meta.size_bytes, duration_ms: entry.meta.duration_ms })
   }
 
-  supervisor.onAnnouncement = async announcement => {
+  async function bindAnnouncement(announcement, turn) {
     const { taskId, responseId, transcript, pcm24k, truncated } = announcement
-    const turn = taskId ? ledger.byTaskId(taskId) : null
-    if (!turn) {
-      // 归属不了的播报（Mac 本机任务等）不属于本 Bridge 的请求，只留取证日志
-      log({ evt: 'announcement_unmatched', task_id: taskId ?? null, response_id: responseId, pcm_bytes: pcm24k.length })
-      return
-    }
     const requestId = turn.request_id
     if (pcm24k.length === 0) {
       // 纯文本播报：没有语音可交付，保留 transcript 作为语气摘要
@@ -158,10 +170,12 @@ export function createBridge(overrides = {}) {
         at: Date.now(),
       })
       log({ evt: 'announcement_bound', request_id: requestId, task_id: taskId, response_id: responseId, pcm_bytes: pcm24k.length, m4a_bytes: m4a.length })
+      log({ evt: 'l1_audio_ready', request_id: requestId, task_id: taskId, source: 'background', response_id: responseId, codec: 'm4a', duration_ms: meta.duration_ms, size_bytes: meta.size_bytes, sha256: meta.sha256 })
       attachPendingResultAudio(requestId)
     } catch (error) {
       // 转码失败：文本结果照常交付（降级），原因入日志
       log({ evt: 'announcement_encode_failed', request_id: requestId, err: String(error.message) })
+      log({ evt: 'l1_audio_failed', request_id: requestId, task_id: taskId, response_id: responseId, source: 'background', stage: 'encode', reason: String(error.message) })
       if (transcript) {
         pendingResultAudio.set(requestId, { meta: null, base64: null, speechText: transcript, at: Date.now() })
         attachPendingResultAudio(requestId)
@@ -169,8 +183,57 @@ export function createBridge(overrides = {}) {
     }
   }
 
+  function queueAnnouncement(announcement) {
+    const { taskId, responseId, pcm24k } = announcement
+    if (!taskId) {
+      log({ evt: 'announcement_unmatched', task_id: null, response_id: responseId, pcm_bytes: pcm24k.length, reason: 'missing_task_id' })
+      log({ evt: 'l1_audio_failed', request_id: null, task_id: null, response_id: responseId, source: 'background', stage: 'ownership', reason: 'missing_task_id' })
+      return
+    }
+    const key = String(taskId)
+    const previous = pendingAnnouncements.get(key)
+    if (previous?.responseId === responseId) return
+    if (previous) pendingAnnouncementBytes -= previous.pcm24k.length
+    while (pendingAnnouncements.size >= MAX_PENDING_ANNOUNCEMENTS
+      || pendingAnnouncementBytes + pcm24k.length > MAX_PENDING_ANNOUNCEMENT_BYTES) {
+      const oldestKey = pendingAnnouncements.keys().next().value
+      if (oldestKey === undefined) break
+      const dropped = pendingAnnouncements.get(oldestKey)
+      pendingAnnouncements.delete(oldestKey)
+      pendingAnnouncementBytes -= dropped.pcm24k.length
+      log({ evt: 'announcement_unmatched_expired', task_id: oldestKey, response_id: dropped.responseId, reason: 'capacity' })
+    }
+    if (pcm24k.length > MAX_PENDING_ANNOUNCEMENT_BYTES) {
+      log({ evt: 'announcement_unmatched', task_id: key, response_id: responseId, pcm_bytes: pcm24k.length, reason: 'capacity' })
+      return
+    }
+    pendingAnnouncements.set(key, { ...announcement, at: Date.now() })
+    pendingAnnouncementBytes += pcm24k.length
+    log({ evt: 'announcement_unmatched_pending', task_id: key, response_id: responseId, pcm_bytes: pcm24k.length, ttl_ms: PENDING_AUDIO_TTL_MS })
+  }
+
+  function attachPendingAnnouncement(projection) {
+    if (!projection.task_id) return
+    const key = String(projection.task_id)
+    const announcement = pendingAnnouncements.get(key)
+    if (!announcement) return
+    const turn = ledger.byTaskId(key)
+    if (!turn) return
+    pendingAnnouncements.delete(key)
+    pendingAnnouncementBytes -= announcement.pcm24k.length
+    log({ evt: 'announcement_rebound', request_id: turn.request_id, task_id: key, response_id: announcement.responseId })
+    void bindAnnouncement(announcement, turn)
+  }
+
+  supervisor.onAnnouncement = async announcement => {
+    const turn = announcement.taskId ? ledger.byTaskId(announcement.taskId) : null
+    if (!turn) return queueAnnouncement(announcement)
+    await bindAnnouncement(announcement, turn)
+  }
+
   // task 终态先于 announcement 落账时，completed 投影触发补挂
   ledger.on('turn', projection => {
+    attachPendingAnnouncement(projection)
     if (projection.status === 'completed' && pendingResultAudio.has(projection.request_id)) {
       attachPendingResultAudio(projection.request_id)
     }
@@ -180,6 +243,13 @@ export function createBridge(overrides = {}) {
     const cutoff = Date.now() - PENDING_AUDIO_TTL_MS
     for (const [requestId, entry] of pendingResultAudio) {
       if (entry.at < cutoff) pendingResultAudio.delete(requestId)
+    }
+    for (const [taskId, entry] of pendingAnnouncements) {
+      if (entry.at < cutoff) {
+        pendingAnnouncements.delete(taskId)
+        pendingAnnouncementBytes -= entry.pcm24k.length
+        log({ evt: 'announcement_unmatched_expired', task_id: taskId, response_id: entry.responseId, reason: 'ttl' })
+      }
     }
   }, 60_000)
   pendingAudioSweeper.unref?.()
@@ -215,6 +285,17 @@ export function createBridge(overrides = {}) {
 
       ledger.update(requestId, { state: 'processing', detail: 'decoding' })
       const { pcm16k } = await audio.decodeTo16k(audioBuf, audioMeta.codec)
+
+      // ESS-41 B2：空/误触音频快速失败——最小时长 + 能量下限在注入前拦截，
+      // 不进 Realtime 注入 / 停摆重放 / 会话重建机器（真机取证：1920 bytes
+      // ≈60ms 的尾部静音走完整停摆链后误报 ERR_REALTIME_STALLED）。
+      const durationMs = pcm16k.length / 32 // 16kHz mono PCM16 = 32 bytes/ms
+      const rms = pcmRms16(pcm16k)
+      if (durationMs < (CONFIG.min_audio_ms ?? 0) || rms < (CONFIG.min_audio_rms ?? 0)) {
+        log({ evt: 'audio_too_short', request_id: requestId, pcm_bytes: pcm16k.length, duration_ms: Math.round(durationMs), rms: Math.round(rms) })
+        ledger.fail(requestId, 'ERR_AUDIO_TOO_SHORT')
+        return
+      }
 
       if (ledger.get(requestId)?.state === 'cancelled') return
       ledger.update(requestId, { state: 'processing', detail: 'realtime_processing' })
@@ -261,8 +342,10 @@ export function createBridge(overrides = {}) {
           }
           resultAudio.put(requestId, m4a)
           audioBase64 = m4a.toString('base64')
+          log({ evt: 'l1_audio_ready', request_id: requestId, task_id: null, source: 'direct', response_id: result.responseIds?.[0] ?? null, codec: 'm4a', duration_ms: resultAudioMeta.duration_ms, size_bytes: resultAudioMeta.size_bytes, sha256: resultAudioMeta.sha256 })
         } catch (error) {
           log({ evt: 'encode_failed', request_id: requestId, err: String(error.message) })
+          log({ evt: 'l1_audio_failed', request_id: requestId, task_id: null, source: 'direct', response_id: result.responseIds?.[0] ?? null, stage: 'encode', reason: String(error.message) })
         }
       }
       ledger.update(requestId, { path: 'direct' })

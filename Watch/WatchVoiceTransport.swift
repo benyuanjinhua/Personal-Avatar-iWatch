@@ -1,5 +1,6 @@
 import Foundation
 import WatchConnectivity
+import os
 
 /// Watch → iPhone 语音请求传输（ESS-22 策略）：
 /// - 双端活跃且 isReachable：先 sendMessage 送信封元数据，再 transferFile 送音频；
@@ -60,17 +61,35 @@ final class WatchVoiceTransport: ObservableObject {
         lastResult = payload
     }
 
+    /// ESS-41 L3 取证：relay-result 音频「到没到手表、为何被丢」。
+    private static let speechLogger = Logger(subsystem: "com.benyuan.wristagent.watch", category: "SpeechStore")
+
     /// 结果音频 transferFile 落地：sha256 校验通过才保留。
+    /// ESS-41 L3 取证：每个丢弃分支必须留 request_id + 原因，禁止静默 return。
     func handleResultAudioFile(tempURL: URL, payloadData: Data?) {
-        guard
-            let payloadData,
-            let payload = VoiceRelayResultPayload.decode(from: payloadData),
-            let audioData = try? Data(contentsOf: tempURL),
-            payload.audioSha256?.lowercased() == VoiceDigest.sha256Hex(of: audioData)
-        else { return }
-        let destination = resultsDirectory.appendingPathComponent("\(payload.requestId).m4a")
+        guard let payloadData, let payload = VoiceRelayResultPayload.decode(from: payloadData) else {
+            Self.speechLogger.error("relay-result dropped: payload undecodable")
+            return
+        }
+        let rid = payload.requestId
+        guard let audioData = try? Data(contentsOf: tempURL) else {
+            Self.speechLogger.error("relay-result dropped: audio unreadable (request_id=\(rid, privacy: .public))")
+            return
+        }
+        let actual = VoiceDigest.sha256Hex(of: audioData)
+        guard payload.audioSha256?.lowercased() == actual else {
+            Self.speechLogger.error("relay-result dropped: sha mismatch (request_id=\(rid, privacy: .public), expected=\(payload.audioSha256 ?? "nil", privacy: .public), actual=\(actual, privacy: .public))")
+            return
+        }
+        let destination = resultsDirectory.appendingPathComponent("\(rid).m4a")
         try? fileManager.removeItem(at: destination)
-        guard (try? audioData.write(to: destination, options: .atomic)) != nil else { return }
+        do {
+            try audioData.write(to: destination, options: .atomic)
+        } catch {
+            Self.speechLogger.error("relay-result dropped: write failed (request_id=\(rid, privacy: .public)): \(error.localizedDescription, privacy: .public)")
+            return
+        }
+        Self.speechLogger.info("relay-result stored (request_id=\(rid, privacy: .public), bytes=\(audioData.count))")
         lastResult = payload
     }
 

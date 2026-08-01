@@ -1,6 +1,7 @@
 import Combine
 import CryptoKit
 import Foundation
+import os
 import Security
 import UserNotifications
 
@@ -27,6 +28,7 @@ protocol WatchFeedbackChannel: AnyObject {
 /// - 只持有 Bridge 设备凭据（Keychain），不保存 DashScope/Codex/Vault 凭据。
 @MainActor
 final class WristAgentPhoneRelay: ObservableObject {
+    private static let downlinkLogger = Logger(subsystem: "com.benyuan.wristagent.phone", category: "VoiceDownlink")
     @Published private(set) var outboxEntries: [VoiceOutboxEntry] = []
     @Published private(set) var relayStatus = "Relay 未配对"
     @Published private(set) var eventsConnected = false
@@ -370,6 +372,7 @@ final class WristAgentPhoneRelay: ObservableObject {
         guard (try? data.write(to: url, options: .atomic)) != nil else { return }
         // transferFile 的信封以实际字节的 sha 为准（Watch 端以此校验入库）。
         guard let envelope = speechEnvelope(projection: projection, sha: sha) else { return }
+        Self.downlinkLogger.log("l2_relay_audio_ready request_id=\(projection.requestId, privacy: .public) bytes=\(data.count) sha256=\(sha, privacy: .public) source=\(projection.path ?? "unknown", privacy: .public)")
         guard watchChannel?.transferSpeech(fileURL: url, envelope: envelope) == true else {
             // 编码/读文件/落盘任一环失败：不写内存去重，下一次快照重放还能重试这条语音。
             relayLog("结果语音入队失败，等待快照重试 \(projection.requestId.prefix(8))…")

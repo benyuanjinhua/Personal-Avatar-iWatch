@@ -244,7 +244,7 @@ describe('hard timeout (300s rule, shortened for test)', () => {
     const ctx = await launch({ scenario: 'silent', overrides: { max_work_ms: 2500 } })
     try {
       const id = rid()
-      await ctx.client.createTurn(id, pcm(200))
+      await ctx.client.createTurn(id, pcm(400))
       const failed = await waitFor(async () => {
         const r = await ctx.client.getTurn(id)
         return r.json.status === 'failed' ? r.json : null
@@ -259,7 +259,7 @@ describe('hard timeout (300s rule, shortened for test)', () => {
     const ctx = await launch({ scenario: 'background', overrides: { max_work_ms: 3000 } })
     try {
       const id = rid()
-      await ctx.client.createTurn(id, pcm(200))
+      await ctx.client.createTurn(id, pcm(400))
       const failed = await waitFor(async () => {
         const r = await ctx.client.getTurn(id)
         return r.json.status === 'failed' ? r.json : null
