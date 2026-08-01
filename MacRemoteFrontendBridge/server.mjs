@@ -611,10 +611,11 @@ export function createBridge(overrides = {}) {
 
     const str = (value, max) => (typeof value === 'string' ? value.slice(0, max) : null)
     const lines = body.jsonl.split('\n').filter(line => line.trim().length > 0)
-    for (const line of lines.slice(0, MAX_LOG_LINES_PER_CHUNK)) {
+    for (const [index, line] of lines.slice(0, MAX_LOG_LINES_PER_CHUNK).entries()) {
       let entry = null
-      try { entry = JSON.parse(line) } catch { /* bad_line below */ }
-      if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+      let parsed = false
+      try { entry = JSON.parse(line); parsed = true } catch { /* bad_line below */ }
+      if (parsed && entry && typeof entry === 'object' && !Array.isArray(entry)) {
         log({
           evt: 'watch_client_log',
           device_id: authInfo.deviceId,
@@ -628,7 +629,18 @@ export function createBridge(overrides = {}) {
           error_description: str(entry.error?.description, 300),
         })
       } else {
-        log({ evt: 'watch_client_log_bad_line', chunk_id: chunkId, raw: line.slice(0, 200) })
+        // 坏行没通过任何字段白名单，原文是未校验的客户端输入——可能带 Token、
+        // 用户语音文本或注入载荷。bridge.log 只记定位所需的元信息：行号、字节数、
+        // 内容指纹（可与手表本地 JSONL 对账）、错因；原文一个字节都不落盘。
+        log({
+          evt: 'watch_client_log_bad_line',
+          device_id: authInfo.deviceId,
+          chunk_id: chunkId,
+          line_index: index,
+          bytes: Buffer.byteLength(line, 'utf8'),
+          line_sha256: sha256hex(line),
+          error_code: parsed ? 'ERR_LOG_LINE_NOT_OBJECT' : 'ERR_LOG_LINE_BAD_JSON',
+        })
       }
     }
     if (lines.length > MAX_LOG_LINES_PER_CHUNK) {

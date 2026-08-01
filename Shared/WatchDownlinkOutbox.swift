@@ -81,7 +81,9 @@ enum WatchDownlinkError: Error, Equatable, CustomStringConvertible {
 /// - 入队即落盘，`request_id` 全程携带；进程重启后继续投递；
 ///   索引落盘失败时回滚内存与载荷并抛错，**不谎报已入队**；
 /// - 会话不可用时条目保持 `queued` 并记 `deferred`，绝不丢弃；
-/// - 只有拿到 WCSession 的 `didFinish` 回执才转 `delivered` 并删除载荷；
+/// - 只有拿到 WCSession 的 `didFinish` 回执才转 `delivered`，且**删除载荷永远排在
+///   「delivered 已落盘」之后**——磁盘上还写着 `inFlight`/`queued` 时载荷就是重启后
+///   唯一的重投材料，先删就等于把这条下行变成永久 `payload-missing`（ESS-43）；
 /// - `inFlight` 在重启后回落 `queued`（没有回执就不算送达）；
 /// - 失败按指数退避重试，超过保留期才放弃，且以 `expired` 留痕。
 ///
@@ -106,6 +108,10 @@ final class WatchDownlinkOutbox {
     private let makeId: () -> String
     private let log: (WatchDownlinkLogEvent) -> Void
     private let fileManager = FileManager.default
+
+    /// 已拿到系统回执、但 `delivered` 索引尚未成功落盘的条目：载荷与暂存音频必须继续保留。
+    /// 只有索引写盘成功后这些文件才允许删除（见 `flushPendingPayloadDiscards`）。
+    private var pendingPayloadDiscards: Set<String> = []
 
     /// 下行退避比上送更激进：Watch 通常只是「App 没打开」，恢复窗口以秒计。
     static let downlinkBackoff = RetryBackoff(baseDelay: 1, maxDelay: 60, jitterRatio: 0.2)
@@ -295,8 +301,17 @@ final class WatchDownlinkOutbox {
         }
     }
 
-    /// 系统回执成功：删除载荷与暂存音频，条目保留用于幂等与观测。
+    /// 系统回执成功：条目转 `delivered` 并保留用于幂等与观测；载荷与暂存音频
+    /// **只有在 `delivered` 成功落盘之后**才删除。
+    ///
+    /// 原实现无条件先删载荷：索引写盘失败时只记一条 fault 就继续删，磁盘上仍是
+    /// `inFlight`，进程此刻退出 → 重启 `recoverInFlight()` 把它拉回 `queued` →
+    /// 载荷已不存在 → 永久 `payload-missing`，这条结果再也送不到手表（ESS-43）。
+    /// 现在落盘失败时文件原样保留，等下一次成功落盘再删；进程中途退出也只是按磁盘
+    /// 状态重投一次（至少一次交付），不会丢。
     func markDelivered(id: String) {
+        guard items.contains(where: { $0.id == id }) else { return }
+        pendingPayloadDiscards.insert(id)
         mutate(id: id, operation: "mark-delivered") { item in
             item.state = .delivered
             item.deliveredAt = now()
@@ -305,7 +320,6 @@ final class WatchDownlinkOutbox {
                 requestId: item.requestId, kind: item.kind, itemId: item.id, attempt: item.attemptCount
             ))
         }
-        discardPayloads(id: id)
     }
 
     /// 投递失败：退避后重试，返回下一次尝试时间。
@@ -341,6 +355,11 @@ final class WatchDownlinkOutbox {
 
     /// 清理：已送达条目超保留期移除；排队条目超保留期放弃并以 `expired` 留痕。
     /// 返回被放弃的排队条目，调用方可据此提示用户「这条结果没能送到手表」。
+    ///
+    /// 与 `markDelivered` 同一条纪律：**先让「条目已移除」这件事落盘，再删文件**。
+    /// 反过来（旧实现）在写盘失败时会留下「磁盘仍列着条目、载荷已被删」的组合，
+    /// 重启后同样变成永久 `payload-missing`（ESS-43 同类顺序窗口）。落盘失败时
+    /// 整轮清理回滚，条目与文件都原样保留，下一轮再清。
     @discardableResult
     func purgeExpired() -> [WatchDownlinkItem] {
         let cutoff = now().addingTimeInterval(-retention)
@@ -351,13 +370,24 @@ final class WatchDownlinkOutbox {
                 : item.enqueuedAt < cutoff
         }
         guard !removable.isEmpty else { return [] }
+
+        // 文件名必须在移除条目之前取到——移除后 `item(id:)` 就查不到 stagedFileName 了。
+        let doomed = removable.map { (id: $0.id, stagedFileName: $0.stagedFileName) }
+        let snapshot = items
+        let removedIds = Set(removable.map(\.id))
+        items.removeAll { removedIds.contains($0.id) }
+        guard persistIndexReportingFailure(operation: "purge-expired") else {
+            items = snapshot
+            return []
+        }
+
+        for entry in doomed {
+            discardFiles(id: entry.id, stagedFileName: entry.stagedFileName)
+            pendingPayloadDiscards.remove(entry.id)
+        }
         for item in expired {
             log(.expired(requestId: item.requestId, kind: item.kind, itemId: item.id))
         }
-        for item in removable { discardPayloads(id: item.id) }
-        let removedIds = Set(removable.map(\.id))
-        items.removeAll { removedIds.contains($0.id) }
-        persistIndexReportingFailure(operation: "purge-expired")
         return expired
     }
 
@@ -367,6 +397,14 @@ final class WatchDownlinkOutbox {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
         body(&items[index])
         persistIndexReportingFailure(operation: operation)
+    }
+
+    /// 索引已经 durable，此前推迟的载荷删除到这里才安全。
+    private func flushPendingPayloadDiscards() {
+        guard !pendingPayloadDiscards.isEmpty else { return }
+        let ids = pendingPayloadDiscards
+        pendingPayloadDiscards.removeAll()
+        for id in ids { discardPayloads(id: id) }
     }
 
     private func discardPayloads(id: String) {
@@ -391,15 +429,20 @@ final class WatchDownlinkOutbox {
         } catch {
             throw WatchDownlinkError.storageFailure(error.localizedDescription)
         }
+        flushPendingPayloadDiscards()
     }
 
     /// 状态迁移路径不能抛错（多来自 WCSession 回调），但失败必须留痕：
     /// 内存是最新真相，磁盘落后一步，下一次成功落盘即收敛。
-    private func persistIndexReportingFailure(operation: String) {
+    /// 返回值供调用方决定「能不能做不可逆的后续动作」（删载荷、删条目）。
+    @discardableResult
+    private func persistIndexReportingFailure(operation: String) -> Bool {
         do {
             try persistIndex()
+            return true
         } catch {
             log(.persistFailed(operation: operation, reason: String(describing: error)))
+            return false
         }
     }
 }
