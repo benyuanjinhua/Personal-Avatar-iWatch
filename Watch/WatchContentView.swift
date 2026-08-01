@@ -77,12 +77,10 @@ struct WatchContentView: View {
                 .padding(.horizontal, 6)
             }
         }
-        .onChange(of: journal.activeTurn?.speechFileName) { _, fileName in
-            // 结果语音到达时自动播放一次（播放即交付，随后删除密文文件）。
-            guard fileName != nil, let turn = journal.activeTurn else { return }
-            welcome.interrupt()
-            pushToTalk.playResult(for: turn)
-        }
+        // 结果语音的自动播放已下沉到 PushToTalkController（journal.onSpeechAttached
+        // 按 request_id 定向触发，ESS-41 B3）：不再依赖本视图挂载或该回合仍是
+        // activeTurn——旧的 onChange 触发在「语音后到 + 回合已切换/已判失败」时
+        // 会静默漏播。
     }
 
     // MARK: - 欢迎语（ESS-40）

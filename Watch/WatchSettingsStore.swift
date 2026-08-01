@@ -1,9 +1,12 @@
 import Combine
 import Foundation
 import WatchConnectivity
+import os
 
 @MainActor
 final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
+    /// ESS-41 L3 取证：结果语音「到没到手表、为何被丢」全部走这条日志。
+    private static let speechLogger = Logger(subsystem: "com.benyuan.wristagent.watch", category: "SpeechStore")
     @Published private(set) var configuration: AgentConfiguration = .demo
     /// 语音传输回调转发目标（WCSession 只允许一个 delegate）。
     weak var voiceTransport: WatchVoiceTransport?
@@ -107,7 +110,9 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
 
     nonisolated func session(_ session: WCSession, didReceive file: WCSessionFile) {
         // 系统会在本方法返回后删除临时文件，必须同步读出/搬移。
+        let bytes = (try? file.fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? -1
         if let payloadData = file.metadata?[VoiceMessage.resultKey] as? Data {
+            Self.speechLogger.info("didReceive file (kind=relay-result, bytes=\(bytes))")
             let stagedURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("relay-result-\(UUID().uuidString).m4a")
             try? FileManager.default.moveItem(at: file.fileURL, to: stagedURL)
@@ -117,10 +122,15 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             }
             return
         }
-        guard
-            let envelopeData = file.metadata?[VoiceSpeechMessage.envelopeKey] as? Data,
-            let audioData = try? Data(contentsOf: file.fileURL)
-        else { return }
+        guard let envelopeData = file.metadata?[VoiceSpeechMessage.envelopeKey] as? Data else {
+            Self.speechLogger.error("didReceive file dropped: no known metadata key (bytes=\(bytes))")
+            return
+        }
+        guard let audioData = try? Data(contentsOf: file.fileURL) else {
+            Self.speechLogger.error("didReceive file dropped: audio unreadable (kind=speech, bytes=\(bytes))")
+            return
+        }
+        Self.speechLogger.info("didReceive file (kind=speech, bytes=\(audioData.count))")
         Task { @MainActor in self.storeSpeech(envelopeData: envelopeData, audioData: audioData) }
     }
 
@@ -141,19 +151,38 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
     }
 
     /// 结果语音入库：sha256 校验通过才加密落盘；校验失败整体丢弃（数据不可信）。
+    /// ESS-41 L3 取证：每个丢弃分支必须留 request_id + 原因，禁止静默 return。
     @MainActor
     private func storeSpeech(envelopeData: Data, audioData: Data) {
-        guard
-            let envelope = try? VoiceStatusEnvelope.decode(from: envelopeData),
-            envelope.validate() == nil
-        else { return }
-        if let expected = envelope.result?.speechSha256,
-           VoiceDigest.sha256Hex(of: audioData) != expected.lowercased() {
+        guard let envelope = try? VoiceStatusEnvelope.decode(from: envelopeData) else {
+            Self.speechLogger.error("speech dropped: envelope undecodable (bytes=\(audioData.count))")
             return
         }
+        let rid = envelope.requestId
+        if let reason = envelope.validate() {
+            Self.speechLogger.error("speech dropped: envelope invalid (request_id=\(rid, privacy: .public), reason=\(reason, privacy: .public))")
+            return
+        }
+        if let expected = envelope.result?.speechSha256 {
+            let actual = VoiceDigest.sha256Hex(of: audioData)
+            if actual != expected.lowercased() {
+                Self.speechLogger.error("speech dropped: sha mismatch (request_id=\(rid, privacy: .public), expected=\(expected, privacy: .public), actual=\(actual, privacy: .public))")
+                return
+            }
+        }
         voiceJournal?.apply(envelope)
-        let fileName = "\(envelope.requestId).m4a"
-        guard let vault = speechVault, (try? vault.store(audioData, name: fileName)) != nil else { return }
-        voiceJournal?.attachSpeech(requestId: envelope.requestId, fileName: fileName)
+        let fileName = "\(rid).m4a"
+        guard let vault = speechVault else {
+            Self.speechLogger.error("speech dropped: vault unavailable (request_id=\(rid, privacy: .public))")
+            return
+        }
+        do {
+            _ = try vault.store(audioData, name: fileName)
+        } catch {
+            Self.speechLogger.error("speech dropped: vault store failed (request_id=\(rid, privacy: .public)): \(error.localizedDescription, privacy: .public)")
+            return
+        }
+        Self.speechLogger.info("speech stored (request_id=\(rid, privacy: .public), bytes=\(audioData.count))")
+        voiceJournal?.attachSpeech(requestId: rid, fileName: fileName)
     }
 }

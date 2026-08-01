@@ -13,6 +13,7 @@ struct WristAgentWatchApp: App {
                     settings.voiceTransport = pushToTalk.transport
                     settings.voiceJournal = pushToTalk.journal
                     settings.speechVault = pushToTalk.speechVault
+                    pushToTalk.onAutoPlayStarted = { welcome.interrupt() }
                     settings.activate()
                     welcome.greetIfNeeded()
                 }
