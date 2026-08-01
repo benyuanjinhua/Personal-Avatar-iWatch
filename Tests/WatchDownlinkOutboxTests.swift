@@ -15,7 +15,17 @@ final class WatchDownlinkOutboxTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
+        setIndexWritable(true)
         try? FileManager.default.removeItem(at: directory)
+    }
+
+    /// 故障注入：给 index.json 打上 immutable 标记，之后的原子写（临时文件 + rename）
+    /// 一律失败，但**文件内容仍可读**——这正是 ESS-43 需要的形状：磁盘停在旧状态，
+    /// 后续落盘失败，进程重启还能读到旧索引。
+    private func setIndexWritable(_ writable: Bool) {
+        let path = directory.appendingPathComponent("index.json").path
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        try? FileManager.default.setAttributes([.immutable: !writable], ofItemAtPath: path)
     }
 
     private func makeOutbox(
@@ -264,6 +274,95 @@ final class WatchDownlinkOutboxTests: XCTestCase {
             return false
         }, "状态迁移写盘失败必须留痕，不能静默宣称成功")
         XCTAssertEqual(outbox.items.first?.state, .inFlight, "内存状态仍推进，等待下次成功落盘收敛")
+    }
+
+    // MARK: - ESS-43：不可逆动作必须排在落盘成功之后
+
+    /// 事故形状：`markDelivered` 索引写盘失败 → 只记 fault 就把载荷删了 → 进程退出 →
+    /// 磁盘仍是 `inFlight` → 重启回落 `queued` → 载荷没了 → 永久 `payload-missing`。
+    func testDeliveredPersistFailureKeepsPayloadForRestart() throws {
+        var events: [WatchDownlinkLogEvent] = []
+        let outbox = try makeOutbox(log: { events.append($0) })
+        let item = try XCTUnwrap(enqueueStatus(outbox))
+        outbox.markInFlight(id: item.id)
+
+        setIndexWritable(false)   // 此刻磁盘上是 inFlight
+        outbox.markDelivered(id: item.id)
+
+        XCTAssertTrue(events.contains {
+            if case .persistFailed(let operation, _) = $0 { return operation == "mark-delivered" }
+            return false
+        }, "delivered 落盘失败必须留痕")
+        XCTAssertNoThrow(
+            try outbox.payload(for: item.id),
+            "delivered 还没落盘就不能删载荷——磁盘上仍是 inFlight，重启要靠它重投"
+        )
+
+        // 进程被杀后重启：读到的仍是旧索引 inFlight。
+        let reopened = try makeOutbox()
+        XCTAssertEqual(reopened.items.first?.state, .queued, "没落盘的 delivered 不算数，重启按磁盘状态重投")
+        XCTAssertNoThrow(
+            try reopened.payload(for: item.id),
+            "重投材料必须还在，不得出现永久 payload-missing"
+        )
+    }
+
+    /// 落盘恢复后，此前推迟的删除必须收敛，不能把载荷永久留在盘上。
+    func testDeferredPayloadDiscardConvergesOnNextSuccessfulPersist() throws {
+        let outbox = try makeOutbox()
+        let audio = Data(repeating: 0xEF, count: 1024)
+        let result = try outbox.enqueueSpeech(
+            requestId: requestId, messageKey: "voice_speech_envelope",
+            envelope: Data("env".utf8), audio: audio, fileName: "\(requestId).m4a"
+        )
+        guard case .enqueued(let item) = result else { return XCTFail("语音应入队") }
+        outbox.markInFlight(id: item.id)
+
+        setIndexWritable(false)
+        outbox.markDelivered(id: item.id)
+        XCTAssertNotNil(outbox.stagedAudioURL(for: item.id), "落盘失败期间暂存音频保留")
+
+        // 存储恢复：下一次成功落盘时，delivered 状态与载荷删除一起生效。
+        setIndexWritable(true)
+        _ = try outbox.enqueue(
+            requestId: requestId, kind: .voiceStatus,
+            messageKey: "voice_status_envelope", payload: Data("s-next".utf8)
+        )
+        XCTAssertNil(outbox.stagedAudioURL(for: item.id), "索引落盘成功后必须补上删除，不留残余音频")
+        XCTAssertThrowsError(try outbox.payload(for: item.id))
+
+        let reopened = try makeOutbox()
+        XCTAssertEqual(reopened.item(id: item.id)?.state, .delivered, "delivered 已 durable，重启不再重投")
+    }
+
+    /// `purgeExpired` 的同类顺序窗口：先删文件再落盘，写盘失败就会留下
+    /// 「磁盘仍列着条目、载荷已被删」——重启同样是永久 payload-missing。
+    func testPurgePersistFailureRollsBackAndKeepsPayloads() throws {
+        var events: [WatchDownlinkLogEvent] = []
+        let outbox = try makeOutbox(retention: 60, log: { events.append($0) })
+        let item = try XCTUnwrap(enqueueStatus(outbox))
+
+        clock = clock.addingTimeInterval(120)
+        setIndexWritable(false)
+        let expired = outbox.purgeExpired()
+
+        XCTAssertTrue(expired.isEmpty, "清理没落盘就不能对外宣称已放弃投递")
+        XCTAssertEqual(outbox.items.map(\.id), [item.id], "落盘失败必须整轮回滚，条目留在内存里")
+        XCTAssertNoThrow(try outbox.payload(for: item.id), "条目还在索引里，载荷就不能删")
+        XCTAssertFalse(events.contains(.expired(
+            requestId: requestId, kind: .relayStatus, itemId: item.id
+        )), "回滚的清理不得留下 expired 假证据")
+
+        // 存储恢复后，下一轮清理正常收敛。
+        setIndexWritable(true)
+        let retried = outbox.purgeExpired()
+        XCTAssertEqual(retried.map(\.id), [item.id])
+        XCTAssertTrue(outbox.items.isEmpty)
+        XCTAssertTrue(
+            try FileManager.default.contentsOfDirectory(atPath: directory.path)
+                .filter { $0 != "index.json" }.isEmpty,
+            "成功清理后不得残留载荷文件"
+        )
     }
 
     // MARK: - 过期
