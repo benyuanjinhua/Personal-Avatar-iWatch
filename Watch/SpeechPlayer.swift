@@ -1,6 +1,17 @@
 import AVFoundation
 import Foundation
 
+/// 播放上下文（ESS-41 L4 取证）：request_id + 音频来源贯穿 session 激活、
+/// player init/start/finish/error 全链日志，与 Bridge/iPhone 侧同一
+/// request_id 串成 L1→L4 证据链。
+struct SpeechPlaybackContext {
+    let requestId: String
+    /// welcome | result_direct | result_background
+    let source: String
+
+    static let welcome = SpeechPlaybackContext(requestId: "welcome", source: "welcome")
+}
+
 /// 语音播放器：只播真实链路语音（Qwen Audio Realtime 生成、AudioPipe 转码的
 /// AAC/M4A），不做系统 TTS（ESS-40 起系统 TTS 随静态 demo 一并移除）。
 /// ESS-42 取证：会话激活、音频路由、播放器创建、play() 返回、完成/解码

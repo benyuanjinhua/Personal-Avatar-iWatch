@@ -1,9 +1,12 @@
 import Combine
 import Foundation
 import WatchConnectivity
+import os
 
 @MainActor
 final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
+    /// ESS-41 L3 取证：结果语音「到没到手表、为何被丢」全部走这条日志。
+    private static let speechLogger = Logger(subsystem: "com.benyuan.wristagent.watch", category: "SpeechStore")
     @Published private(set) var configuration: AgentConfiguration = .demo
     /// 语音传输回调转发目标（WCSession 只允许一个 delegate）。
     weak var voiceTransport: WatchVoiceTransport?
@@ -180,6 +183,7 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
     }
 
     /// 结果语音入库：sha256 校验通过才加密落盘；校验失败整体丢弃（数据不可信）。
+    /// ESS-41 L3 取证：每个丢弃分支必须留 request_id + 原因，禁止静默 return。
     @MainActor
     private func storeSpeech(envelopeData: Data, audioData: Data) {
         guard

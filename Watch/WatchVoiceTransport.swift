@@ -1,5 +1,6 @@
 import Foundation
 import WatchConnectivity
+import os
 
 /// Watch → iPhone 语音请求传输（ESS-22 策略）：
 /// - 双端活跃且 isReachable：先 sendMessage 送信封元数据，再 transferFile 送音频；
@@ -74,7 +75,11 @@ final class WatchVoiceTransport: ObservableObject {
         lastResult = payload
     }
 
+    /// ESS-41 L3 取证：relay-result 音频「到没到手表、为何被丢」。
+    private static let speechLogger = Logger(subsystem: "com.benyuan.wristagent.watch", category: "SpeechStore")
+
     /// 结果音频 transferFile 落地：sha256 校验通过才保留。
+    /// ESS-41 L3 取证：每个丢弃分支必须留 request_id + 原因，禁止静默 return。
     func handleResultAudioFile(tempURL: URL, payloadData: Data?) {
         guard
             let payloadData,

@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import os
 
 /// 按住说话（ESS-22/ESS-29）：按下开始录音（最长 60 秒），松开生成
 /// UUIDv7 request_id + 版本化信封，交给 WatchVoiceTransport 发送。
@@ -22,6 +23,10 @@ final class PushToTalkController: ObservableObject {
     let player = SpeechPlayer()
     let transport: WatchVoiceTransport
 
+    /// 结果语音自动播放即将开始（App 层用来打断欢迎语）。
+    var onAutoPlayStarted: (() -> Void)?
+
+    private static let logger = Logger(subsystem: "com.benyuan.wristagent.watch", category: "PlaybackTrigger")
     private let recorder = AudioRecorder()
 
     init() {
@@ -33,6 +38,39 @@ final class PushToTalkController: ObservableObject {
         recorder.$level
             .receive(on: RunLoop.main)
             .assign(to: &$recordingLevel)
+
+        // ESS-41 B3 深修：播放触发下沉到 speech attach 事件本身，按 request_id
+        // 定向交付——不依赖该回合仍是 activeTurn、不依赖 UI 挂载、不依赖回合
+        // 未被判失败（语音后到时这三个条件都可能已不成立，旧 onChange 触发
+        // 会静默漏播）。
+        journal.onSpeechAttached = { [weak self] requestId in
+            self?.autoPlayResult(requestId: requestId)
+        }
+    }
+
+    /// 录音期间到达的结果语音先挂起，录音结束后补播（不静默丢弃）。
+    private var pendingAutoPlayRequestId: String?
+
+    /// 结果语音落盘后的定向自动播放（ESS-41 B3）。
+    private func autoPlayResult(requestId: String) {
+        guard state == .idle else {
+            Self.logger.info("auto-play deferred: recording in progress (request_id=\(requestId, privacy: .public))")
+            pendingAutoPlayRequestId = requestId
+            return
+        }
+        guard let turn = journal.turn(withId: requestId) else {
+            Self.logger.error("auto-play failed: turn not found (request_id=\(requestId, privacy: .public))")
+            return
+        }
+        onAutoPlayStarted?()
+        playResult(for: turn)
+    }
+
+    /// 录音结束/取消后补播挂起的结果语音。
+    private func flushPendingAutoPlay() {
+        guard let requestId = pendingAutoPlayRequestId else { return }
+        pendingAutoPlayRequestId = nil
+        autoPlayResult(requestId: requestId)
     }
 
     func pressBegan() {
@@ -53,7 +91,10 @@ final class PushToTalkController: ObservableObject {
     func pressEnded() {
         guard state == .recording else { return }
         state = .finishing
-        defer { state = .idle }
+        defer {
+            state = .idle
+            flushPendingAutoPlay()
+        }
         do {
             let recording = try recorder.finish()
             let envelope = VoiceRequestEnvelope.voiceRequest(
@@ -75,6 +116,7 @@ final class PushToTalkController: ObservableObject {
         guard state == .recording else { return }
         recorder.cancel()
         state = .idle
+        flushPendingAutoPlay()
     }
 
     /// 权限确认（§5.3）：只对当前回合生效；先本地记账（UI 立即反馈），再上行给 iPhone 签名转发。

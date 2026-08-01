@@ -161,3 +161,55 @@ describe('ESS-41 B2: empty/mis-touch audio fails fast before injection', () => {
     assert.equal(done.result.text, '现在是上午九点。')
   })
 })
+
+describe('ESS-41 B4: queued task ownership and delayed announcement rebinding', () => {
+  it('task.accepted(queued) binds task_id before the turn window closes', async () => {
+    const ctx = await launch({ scenario: 'queued' })
+    try {
+      const id = rid()
+      await ctx.client.createTurn(id, noisePcm())
+      const queued = await waitFor(async () => {
+        const r = await ctx.client.getTurn(id)
+        return r.json.task_id === 'task_queued' ? r.json : null
+      })
+      assert.equal(queued.path, 'background')
+      assert.equal(queued.detail, 'background_queued')
+
+      ctx.mock.emitTask('task.completed', {
+        ...ctx.mock.tasks.get('task_queued'), status: 'completed',
+        resultMetadata: { presentation: { speech: '排队任务最终完成。' } },
+      })
+      const done = await waitFor(async () => {
+        const r = await ctx.client.getTurn(id)
+        return r.json.status === 'completed' ? r.json : null
+      })
+      assert.equal(done.result.text, '排队任务最终完成。')
+    } finally {
+      await ctx.bridge.stop(); await ctx.mock.stop()
+    }
+  })
+
+  it('announcement arriving before ledger binding is retained and rebound by task_id', async () => {
+    const ctx = await launch({
+      scenario: 'queued-announcement-first',
+      overrides: { audiopipe_path: './test/fake-audiopipe' },
+    })
+    try {
+      const id = rid()
+      await ctx.client.createTurn(id, noisePcm())
+      await waitFor(async () => (await ctx.client.getTurn(id)).json.task_id === 'task_queued')
+      ctx.mock.emitTask('task.completed', {
+        ...ctx.mock.tasks.get('task_queued'), status: 'completed',
+        resultMetadata: { presentation: { speech: '排队任务最终完成。' } },
+      })
+      const done = await waitFor(async () => {
+        const r = await ctx.client.getTurn(id)
+        return r.json.status === 'completed' && r.json.result?.audio ? r.json : null
+      })
+      assert.equal(done.result.speech_text, '排队任务完成。')
+      assert.equal(done.result.audio.duration_ms, 500)
+    } finally {
+      await ctx.bridge.stop(); await ctx.mock.stop()
+    }
+  })
+})
