@@ -171,6 +171,28 @@ describe('direct-answer path', () => {
     assert.equal(conflict.status, 409)
     assert.equal(conflict.json.error, 'ERR_IDEMPOTENCY_CONFLICT')
   })
+
+  it('replays an unacknowledged completed result after reconnect and stops after Watch ACK', async () => {
+    const id = rid()
+    await ctx.client.createTurn(id, pcm(300))
+    await waitFor(async () => (await ctx.client.getTurn(id)).json.status === 'completed')
+
+    const replay = ctx.client.events()
+    await waitFor(() => replay.received.some(e =>
+      e.type === 'snapshot' && e.turns.some(turn => turn.request_id === id && turn.status === 'completed')))
+    replay.ws.close()
+
+    const ack = await ctx.client.ackTurn(id)
+    assert.equal(ack.status, 200)
+    assert.equal(ack.json.acknowledged, true)
+    const duplicate = await ctx.client.ackTurn(id)
+    assert.equal(duplicate.status, 200, 'ACK must be idempotent')
+
+    const afterAck = ctx.client.events()
+    const snapshot = await waitFor(() => afterAck.received.find(e => e.type === 'snapshot'))
+    assert.equal(snapshot.turns.some(turn => turn.request_id === id), false)
+    afterAck.ws.close()
+  })
 })
 
 describe('background path: task projection, permission, cancel', () => {

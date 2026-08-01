@@ -53,11 +53,16 @@ iPhone Relay ──HTTPS/WSS(HMAC 签名)──▶ server.mjs（北向 API）
 | POST | `/v1/voice/turns/{id}/cancel` | 取消（后台任务映射到 `DELETE /api/tasks/:id`） |
 | POST | `/v1/voice/turns/{id}/permission` | `{permission_id, decision: allow\|deny}` |
 | GET | `/v1/voice/turns/{id}/audio` | 结果语音（AAC/M4A）有界取回；支持 `Range` 断点续传，`x-audio-sha256` 响应头供校验（ESS-38） |
-| WSS | `/v1/voice/events` | `turn.state` 事件推送；连接即回放非终态 snapshot |
+| POST | `/v1/voice/turns/:id/ack` | Watch 结果校验落盘后的幂等交付确认 |
+| WSS | `/v1/voice/events` | `turn.state` 推送；连接回放非终态及 30 分钟内未 ACK 终态 snapshot |
 | GET | `/v1/health` | 健康检查（无鉴权，仅源 IP 门禁） |
 
 状态投影：`accepted → processing → (permission_required) → completed | failed | cancelled`，
 `detail` 携带子状态（`realtime_processing` / `background_accepted` / `background_running`…）。
+Bridge 每 20 秒发送 WebSocket ping，失活连接会被终止并由 iPhone 指数退避重连。
+终态结果只有在 Watch 完成文本入账或音频 sha256 校验并落盘后才 ACK；ACK 前重连会
+重复投递，ACK 后按 `request_id` 幂等停止回放。日志事件为 `result_redelivered` 与
+`result_acked`。
 
 结果结构（completed）：`result.text`（任务/直答文本）、`result.speech_text`（Qwen Audio
 Realtime 播报转写，后台路径）、`result.audio_base64`（≤ `max_result_audio_bytes` 时内联）、

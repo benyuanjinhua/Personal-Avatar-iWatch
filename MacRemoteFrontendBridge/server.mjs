@@ -115,6 +115,38 @@ export function createBridge(overrides = {}) {
   })
   const sourceAllowed = makeSourceGate(CONFIG.allowed_peer_ips)
 
+  // 长任务即时回执（ESS-46）：事件本身不进入终态账本，避免改变回合状态机。
+  // delivery_sequence 与 final（2）分离，北向/Watch 可据此跨重连幂等去重。
+  const deliveredInterims = new Set()
+  const interimPayloads = new Map()
+  let fallbackInterimAudio = null
+  try {
+    fallbackInterimAudio = readFileSync(resolve(BASE, CONFIG.interim_fallback_audio_path))
+  } catch (error) {
+    log({ evt: 'interim_fallback_unavailable', reason: String(error.message) })
+  }
+  function emitInterim(requestId, payload) {
+    if (deliveredInterims.has(requestId)) return
+    deliveredInterims.add(requestId)
+    const interim = { kind: 'interim', request_id: requestId, delivery_sequence: 1, ...payload }
+    interimPayloads.set(requestId, interim)
+    const message = JSON.stringify({
+      type: 'turn.interim',
+      interim,
+    })
+    for (const client of eventClients) {
+      const turn = ledger.get(requestId)
+      if (turn && client.deviceId === turn.device_id && client.ws.readyState === client.ws.OPEN) {
+        client.ws.send(message)
+      }
+    }
+  }
+
+  function clearInterim(requestId) {
+    deliveredInterims.delete(requestId)
+    interimPayloads.delete(requestId)
+  }
+
   // ---- announcement 语音下行归属（ESS-38） ---------------------------------
   //
   // 后台任务的结果语音以 origin=announcement 经 Realtime WS 到达，taskId 是
@@ -234,6 +266,9 @@ export function createBridge(overrides = {}) {
   // task 终态先于 announcement 落账时，completed 投影触发补挂
   ledger.on('turn', projection => {
     attachPendingAnnouncement(projection)
+    if (['completed', 'failed', 'cancelled'].includes(projection.status)) {
+      clearInterim(projection.request_id)
+    }
     if (projection.status === 'completed' && pendingResultAudio.has(projection.request_id)) {
       attachPendingResultAudio(projection.request_id)
     }
@@ -314,6 +349,36 @@ export function createBridge(overrides = {}) {
       }
 
       if (result.taskId) {
+        // Realtime 在委派前生成的口头确认已经随当前 turn 聚合在 result 中。
+        // 先下发 interim，再推进 background_accepted，保证 Watch 先看到/听到回执。
+        const interimText = result.assistantTranscript?.trim() || '收到，正在处理，请稍后'
+        let interimAudio = null
+        if (result.audio24k?.length) {
+          try {
+            const m4a = await audio.encode24kToM4a(result.audio24k)
+            interimAudio = {
+              base64: m4a.toString('base64'),
+              sha256: sha256hex(m4a),
+              codec: 'm4a',
+              duration_ms: Math.round(result.audio24k.length / 48),
+              size_bytes: m4a.length,
+            }
+            log({ evt: 'l1_audio_ready', request_id: requestId, task_id: result.taskId, source: 'interim', response_id: result.responseIds?.[0] ?? null, codec: 'm4a', duration_ms: interimAudio.duration_ms, size_bytes: interimAudio.size_bytes, sha256: interimAudio.sha256 })
+          } catch (error) {
+            log({ evt: 'l1_audio_failed', request_id: requestId, task_id: result.taskId, source: 'interim', stage: 'encode', reason: String(error.message) })
+          }
+        }
+        if (!interimAudio && fallbackInterimAudio) {
+          interimAudio = {
+            base64: fallbackInterimAudio.toString('base64'),
+            sha256: sha256hex(fallbackInterimAudio),
+            codec: 'm4a',
+            duration_ms: null,
+            size_bytes: fallbackInterimAudio.length,
+          }
+          log({ evt: 'l1_audio_ready', request_id: requestId, task_id: result.taskId, source: 'interim', response_id: null, codec: 'm4a', duration_ms: null, size_bytes: interimAudio.size_bytes, sha256: interimAudio.sha256, fallback: true })
+        }
+        emitInterim(requestId, { text: interimText, audio: interimAudio })
         // Background path: only now (task event captured) is it background_accepted (§6).
         ledger.update(requestId, {
           task_id: result.taskId,
@@ -679,6 +744,24 @@ export function createBridge(overrides = {}) {
         return reply(r.status, r.body)
       }
 
+      m = pathName.match(/^\/v1\/voice\/turns\/([A-Za-z0-9_-]+)\/ack$/)
+      if (m) {
+        if (req.method !== 'POST') throw new ApiError(ERR.METHOD_NOT_ALLOWED)
+        const authInfo = verify()
+        if (authInfo.requestId !== m[1]) throw new ApiError(ERR.MISSING_FIELD, 'x-request-id must match turn id')
+        let body
+        try { body = JSON.parse(rawBody.toString('utf8')) } catch { throw new ApiError(ERR.BAD_JSON) }
+        if (body.protocol_version !== CONFIG.protocol_version) throw new ApiError(ERR.PROTOCOL_VERSION)
+        const turn = ledger.get(m[1])
+        if (!turn) throw new ApiError(ERR.NOT_FOUND)
+        if (turn.device_id !== authInfo.deviceId) throw new ApiError(ERR.NOT_FOUND)
+        const duplicate = Boolean(turn.delivered_ack)
+        const acked = ledger.acknowledgeResult(m[1], { source: 'watch' })
+        if (!acked) throw new ApiError(ERR.MISSING_FIELD, 'terminal result required')
+        log({ evt: 'result_acked', request_id: m[1], device_id: authInfo.deviceId, duplicate })
+        return reply(200, { request_id: m[1], acknowledged: true, acknowledged_at: acked.delivered_ack.at })
+      }
+
       throw new ApiError(ERR.NOT_FOUND)
     } catch (e) {
       if (e instanceof ApiError) {
@@ -695,6 +778,7 @@ export function createBridge(overrides = {}) {
 
   const wss = new WebSocketServer({ noServer: true })
   const eventClients = new Set() // { ws, deviceId }
+  const eventsHeartbeatMs = CONFIG.events_heartbeat_ms ?? 20_000
 
   ledger.on('turn', projection => {
     const message = JSON.stringify({ type: 'turn.state', turn: projection })
@@ -717,14 +801,32 @@ export function createBridge(overrides = {}) {
       if (pathName !== '/v1/voice/events') return refuse(404, 'ERR_NOT_FOUND')
       const { deviceId } = auth.verify({ headers: req.headers, method: 'GET', pathName, rawBody: Buffer.alloc(0) })
       wss.handleUpgrade(req, socket, head, ws => {
-        const client = { ws, deviceId }
+        const client = { ws, deviceId, alive: true }
         eventClients.add(client)
         log({ evt: 'events_client_connected', device_id: deviceId })
-        // Reconnect recovery: replay the live (non-terminal) turns for this device.
+        ws.on('pong', () => { client.alive = true })
+        // Reconnect recovery: replay live turns plus recent terminal results until
+        // the Watch explicitly confirms durable storage.
+        const replayTurns = ledger.replayable({
+          terminalTtlMs: CONFIG.result_delivery_ttl_ms ?? 30 * 60 * 1000,
+        }).filter(t => t.device_id === deviceId)
+        for (const turn of replayTurns) {
+          if (['completed', 'failed', 'cancelled'].includes(turn.state)) {
+            log({ evt: 'result_redelivered', request_id: turn.request_id, device_id: deviceId, status: turn.state })
+          }
+        }
         ws.send(JSON.stringify({
           type: 'snapshot',
-          turns: ledger.nonTerminal().filter(t => t.device_id === deviceId).map(t => ledger.projection(t)),
+          turns: replayTurns.map(t => ledger.projection(t)),
         }))
+        // interim 不改变账本状态，但非终态回合重连时仍须重放；客户端用
+        // request_id + delivery_sequence 去重，已持久入 Watch 队列的不会重复播。
+        for (const [requestId, interim] of interimPayloads) {
+          const turn = ledger.get(requestId)
+          if (turn?.device_id === deviceId && !['completed', 'failed', 'cancelled'].includes(turn.state)) {
+            ws.send(JSON.stringify({ type: 'turn.interim', interim }))
+          }
+        }
         ws.on('close', () => eventClients.delete(client))
         ws.on('error', () => eventClients.delete(client))
       })
@@ -734,6 +836,21 @@ export function createBridge(overrides = {}) {
       refuse(e instanceof ApiError ? e.status : 500, code)
     }
   }
+
+
+  const eventsHeartbeat = setInterval(() => {
+    for (const client of eventClients) {
+      if (!client.alive) {
+        log({ evt: 'events_client_heartbeat_timeout', device_id: client.deviceId })
+        client.ws.terminate()
+        eventClients.delete(client)
+        continue
+      }
+      client.alive = false
+      client.ws.ping()
+    }
+  }, eventsHeartbeatMs)
+  eventsHeartbeat.unref?.()
 
   // ---- restart recovery (§4.1) -------------------------------------------
 
@@ -792,6 +909,7 @@ export function createBridge(overrides = {}) {
     supervisor.close('shutdown')
     resultAudio.stopSweeper()
     clearInterval(pendingAudioSweeper)
+    clearInterval(eventsHeartbeat)
     for (const client of eventClients) client.ws.close()
     for (const timer of workTimers.values()) clearTimeout(timer)
     return Promise.all(servers.map(s => new Promise(r => s.close(r))))

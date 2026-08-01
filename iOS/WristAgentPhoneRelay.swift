@@ -57,6 +57,11 @@ final class WristAgentPhoneRelay: ObservableObject {
     private var deliveredResultAudio: Set<String> = []
     /// 下载中的结果语音（requestId|sha）：避免并发重复下载。
     private var activeAudioDownloads: Set<String> = []
+    /// Watch 已落盘 ACK 的网络重试。进程存活期间持续重试；若进程被杀，Bridge
+    /// 仍保留未 ACK 终态，下一次 snapshot 会触发 Watch 再发同一幂等 ACK。
+    private var resultAckTasks: [String: Task<Void, Never>] = [:]
+    /// requestId|delivery_sequence：WSS 重连或服务端重放不重复显示/播放 interim。
+    private var deliveredInterims: Set<String> = []
 
     private static let bridgeURLKey = "wristagent.relay.bridge_url"
     /// 连续失败到该次数时提醒用户打开 App（后台网络受限时人工兜底）。
@@ -232,6 +237,29 @@ final class WristAgentPhoneRelay: ObservableObject {
         return RelayClient(baseURL: baseURL, credentials: credentials, session: session)
     }
 
+    func acknowledgeResult(requestId: String) {
+        guard resultAckTasks[requestId] == nil else { return }
+        resultAckTasks[requestId] = Task { [weak self] in
+            var attempt = 0
+            while !Task.isCancelled {
+                guard let self else { return }
+                if let client = self.makeClient() {
+                    do {
+                        try await client.acknowledgeResult(requestId: requestId)
+                        self.relayStatus = "手表已确认结果 \(requestId.prefix(8))…"
+                        self.resultAckTasks[requestId] = nil
+                        return
+                    } catch {
+                        self.relayLog("结果确认暂未送达，正在重试")
+                    }
+                }
+                attempt += 1
+                let delay = RetryBackoff.outboxDefault.delay(forAttempt: attempt)
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+        }
+    }
+
     private func purgeExpired() {
         guard let outbox else { return }
         for expired in outbox.purgeExpired() {
@@ -311,7 +339,7 @@ final class WristAgentPhoneRelay: ObservableObject {
     }
 
     /// Bridge 事件入口（ESS-38）：真实契约是 `turn.state` 增量 + 连接回放
-    /// `snapshot`（非终态回合）。快照重放靠 request_id + 音频 sha 幂等去重。
+    /// `snapshot`（非终态 + TTL 内未 ACK 终态）。快照重放靠 request_id + 音频 sha 幂等去重。
     private func handleEvent(data: Data) {
         guard let message = BridgeEventMessage.decode(from: data) else { return }
         switch message.type {
@@ -319,9 +347,38 @@ final class WristAgentPhoneRelay: ObservableObject {
             if let turn = message.turn { process(projection: turn) }
         case "snapshot":
             message.turns?.forEach { process(projection: $0) }
+        case "turn.interim":
+            if let interim = message.interim { process(interim: interim) }
         default:
             break // 未知事件类型：忽略，不中断事件流。
         }
+    }
+
+    private func process(interim: BridgeInterimProjection) {
+        let key = "\(interim.requestId)|\(interim.deliverySequence)"
+        guard !deliveredInterims.contains(key) else { return }
+        let result = VoiceResultPayload(
+            summary: interim.text, isTruncated: false,
+            speechSha256: interim.audio?.sha256.lowercased(),
+            speechDurationMs: interim.audio?.durationMs
+        )
+        let envelope = VoiceStatusEnvelope.status(
+            requestId: interim.requestId, state: .backgroundAccepted,
+            detail: interim.text, result: result
+        )
+        watchChannel?.notifyWatch(voiceStatus: envelope)
+        guard let audio = interim.audio,
+              let data = Data(base64Encoded: audio.base64),
+              RelayWire.sha256Hex(data) == audio.sha256.lowercased()
+        else {
+            deliveredInterims.insert(key) // 文字已经可靠入队；音频缺失时不伪造
+            return
+        }
+        let url = resultAudioDirectory.appendingPathComponent("\(interim.requestId)-interim-\(interim.deliverySequence).m4a")
+        guard (try? data.write(to: url, options: .atomic)) != nil,
+              watchChannel?.transferSpeech(fileURL: url, envelope: envelope) == true
+        else { return }
+        deliveredInterims.insert(key)
     }
 
     private func process(projection: BridgeTurnProjection) {

@@ -62,6 +62,21 @@ final class BridgeTurnProjectionTests: XCTestCase {
         XCTAssertNil(BridgeEventMessage.decode(from: Data("not-json".utf8)), "坏 JSON 返回 nil 不崩溃")
     }
 
+    func testDecodesInterimWithDeliverySequenceAndAudio() throws {
+        let json = """
+        {"type":"turn.interim","interim":{
+          "request_id":"\(requestId)","delivery_sequence":1,
+          "text":"收到，正在处理，请稍后",
+          "audio":{"base64":"ZmFrZQ==","sha256":"abcd","codec":"m4a","duration_ms":900,"size_bytes":4}
+        }}
+        """
+        let interim = try XCTUnwrap(BridgeEventMessage.decode(from: Data(json.utf8))?.interim)
+        XCTAssertEqual(interim.requestId, requestId)
+        XCTAssertEqual(interim.deliverySequence, 1)
+        XCTAssertEqual(interim.text, "收到，正在处理，请稍后")
+        XCTAssertEqual(interim.audio?.durationMs, 900)
+    }
+
     func testStateMappingMatrix() {
         XCTAssertEqual(projection(status: "accepted")?.turnState, .accepted)
         XCTAssertEqual(projection(status: "processing", detail: "decoding")?.turnState, .realtimeProcessing)

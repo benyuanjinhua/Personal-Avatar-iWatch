@@ -25,6 +25,9 @@ final class PushToTalkController: ObservableObject {
     let speechVault: EncryptedAudioVault?
     let player = SpeechPlayer()
     let transport: WatchVoiceTransport
+    /// ESS-45：录音 → 等待 → 播放整个回合期间持有 ExtendedRuntimeSession，
+    /// 降腕/熄屏不挂起；空闲即释放。
+    let sessionKeeper = VoiceSessionKeeper()
 
     /// 结果语音自动播放即将开始（App 层用来打断欢迎语）。
     var onAutoPlayStarted: (() -> Void)?
@@ -54,6 +57,12 @@ final class PushToTalkController: ObservableObject {
         journal.onResultWithoutSpeech = { [weak self] requestId in
             self?.presentTranscriptOnly(requestId: requestId)
         }
+
+        sessionKeeper.bind(
+            turns: journal.$turns.eraseToAnyPublisher(),
+            playing: player.$isPlaying.eraseToAnyPublisher(),
+            recording: $state.map { $0 != .idle }.eraseToAnyPublisher()
+        )
     }
 
     /// 展示纯文本结果全文。录音期间不弹（打断按住说话手势），文字仍在结果卡片里可点开。
@@ -187,6 +196,12 @@ final class PushToTalkController: ObservableObject {
         let started = player.play(data: data, context: requestId) { [weak self] in
             self?.speechVault?.remove(name: fileName)
             self?.journal.clearSpeech(requestId: requestId)
+            // ESS-45×ESS-46：只有终态回合的结果语音播完才算交付——interim
+            // （回合仍在处理中）播完不算，否则 completed 后等待最终语音的
+            // 120s grace 持有会被跳过，App 挂起、最终结果播不出来。
+            if self?.journal.turn(withId: requestId)?.currentState.isTerminal == true {
+                self?.sessionKeeper.markDelivered(requestId: requestId)
+            }
         }
         // 字幕式播放（ESS-48）：播放开始即进入全文视图，按进度逐句高亮；
         // 播放起不来但有文字时降级为纯文本展示，不留空白。

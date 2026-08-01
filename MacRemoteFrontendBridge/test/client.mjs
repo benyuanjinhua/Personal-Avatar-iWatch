@@ -88,6 +88,7 @@ export class BridgeClient {
   }
 
   getTurn(requestId) { return this.signed('GET', `/v1/voice/turns/${requestId}`) }
+  ackTurn(requestId) { return this.signed('POST', `/v1/voice/turns/${requestId}/ack`, { requestId, json: { protocol_version: 1 } }) }
 
   // 结果语音下载（ESS-38）：签名 GET，可带 Range 断点续传；返回原始字节。
   async downloadAudio(requestId, { range = null } = {}) {
