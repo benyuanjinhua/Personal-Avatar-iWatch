@@ -128,7 +128,7 @@ export function createBridge(overrides = {}) {
   function emitInterim(requestId, payload) {
     if (deliveredInterims.has(requestId)) return
     deliveredInterims.add(requestId)
-    const interim = { request_id: requestId, delivery_sequence: 1, ...payload }
+    const interim = { kind: 'interim', request_id: requestId, delivery_sequence: 1, ...payload }
     interimPayloads.set(requestId, interim)
     const message = JSON.stringify({
       type: 'turn.interim',
@@ -140,6 +140,11 @@ export function createBridge(overrides = {}) {
         client.ws.send(message)
       }
     }
+  }
+
+  function clearInterim(requestId) {
+    deliveredInterims.delete(requestId)
+    interimPayloads.delete(requestId)
   }
 
   // ---- announcement 语音下行归属（ESS-38） ---------------------------------
@@ -261,6 +266,9 @@ export function createBridge(overrides = {}) {
   // task 终态先于 announcement 落账时，completed 投影触发补挂
   ledger.on('turn', projection => {
     attachPendingAnnouncement(projection)
+    if (['completed', 'failed', 'cancelled'].includes(projection.status)) {
+      clearInterim(projection.request_id)
+    }
     if (projection.status === 'completed' && pendingResultAudio.has(projection.request_id)) {
       attachPendingResultAudio(projection.request_id)
     }

@@ -105,6 +105,11 @@ final class VoiceTurnJournal: ObservableObject {
             turns[index].result = result
         }
         save()
+        // 纯文本降级（ESS-48）：结果没有配套语音（speech_sha256 为空），不会有
+        // transferFile / attachSpeech 后续，在这里按 request_id 通知展示全文。
+        if envelope.state == .completed, let result = envelope.result, result.speechSha256 == nil {
+            onResultWithoutSpeech?(envelope.requestId)
+        }
         return true
     }
 
@@ -120,6 +125,10 @@ final class VoiceTurnJournal: ObservableObject {
     /// 随后），到达时该回合可能已被新回合顶掉或已判终态，只盯 activeTurn 的
     /// UI 触发会静默漏播。
     var onSpeechAttached: ((String) -> Void)?
+
+    /// 纯文本结果入账（completed 且 speech_sha256 为空，ESS-48 降级路径）：
+    /// 语音永远不会到，直接展示全文，不进播放态。
+    var onResultWithoutSpeech: ((String) -> Void)?
 
     /// 按 request_id 查找回合（结果语音定向交付用）。
     func turn(withId requestId: String) -> VoiceTurnRecord? {
