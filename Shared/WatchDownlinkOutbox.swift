@@ -54,6 +54,9 @@ enum WatchDownlinkLogEvent: Equatable {
     case failed(requestId: String, kind: WatchDownlinkKind, itemId: String, attempt: Int, reason: String)
     /// 超过保留期仍未送达，放弃并留痕（不静默消失）。
     case expired(requestId: String, kind: WatchDownlinkKind, itemId: String)
+    /// 状态迁移后索引写盘失败：内存与磁盘暂时不一致，靠下一次成功写盘收敛。
+    /// 入队路径不会走到这里——入队落盘失败直接回滚并抛错，不会宣称成功。
+    case persistFailed(operation: String, reason: String)
 }
 
 enum WatchDownlinkError: Error, Equatable, CustomStringConvertible {
@@ -76,6 +79,7 @@ enum WatchDownlinkError: Error, Equatable, CustomStringConvertible {
 ///
 /// 本队列的契约：
 /// - 入队即落盘，`request_id` 全程携带；进程重启后继续投递；
+///   索引落盘失败时回滚内存与载荷并抛错，**不谎报已入队**；
 /// - 会话不可用时条目保持 `queued` 并记 `deferred`，绝不丢弃；
 /// - 只有拿到 WCSession 的 `didFinish` 回执才转 `delivered` 并删除载荷；
 /// - `inFlight` 在重启后回落 `queued`（没有回执就不算送达）；
@@ -85,7 +89,9 @@ enum WatchDownlinkError: Error, Equatable, CustomStringConvertible {
 final class WatchDownlinkOutbox {
     enum EnqueueResult: Equatable {
         case enqueued(WatchDownlinkItem)
-        /// 同 request_id + 同类别 + 同载荷摘要且尚未送达：复用既有条目，不重复排队。
+        /// 同 request_id + 同类别 + 同载荷摘要：复用既有条目，不重复排队。
+        /// **保留期内已送达的条目也参与判定**——iPhone 重启后内存去重清零，
+        /// Bridge 重放同一 completed 快照时必须靠这里挡住重复播放。
         case duplicate(WatchDownlinkItem)
     }
 
@@ -184,8 +190,7 @@ final class WatchDownlinkOutbox {
 
         if
             let existing = items.first(where: {
-                $0.requestId == requestId && $0.kind == kind
-                    && $0.payloadSha256 == sha && $0.state != .delivered
+                $0.requestId == requestId && $0.kind == kind && $0.payloadSha256 == sha
             })
         {
             log(.duplicate(requestId: requestId, kind: kind, itemId: existing.id))
@@ -200,7 +205,7 @@ final class WatchDownlinkOutbox {
                 try audio.write(to: directory.appendingPathComponent(stagedName), options: .atomic)
             }
         } catch {
-            try? fileManager.removeItem(at: payloadURL(for: id))
+            discardFiles(id: id, stagedFileName: stagedName)
             throw WatchDownlinkError.storageFailure(error.localizedDescription)
         }
 
@@ -219,7 +224,15 @@ final class WatchDownlinkOutbox {
             lastError: nil
         )
         items.append(item)
-        persistIndex()
+        do {
+            // 「已入队」的承诺以索引落盘为准：写盘失败必须回滚内存和刚写的载荷，
+            // 向调用方抛错——绝不能在磁盘满/IO 故障时假装可靠入队（进程一退就丢）。
+            try persistIndex()
+        } catch {
+            items.removeLast()
+            discardFiles(id: id, stagedFileName: stagedName)
+            throw error
+        }
         log(.enqueued(requestId: requestId, kind: kind, itemId: id))
         return .enqueued(item)
     }
@@ -273,7 +286,7 @@ final class WatchDownlinkOutbox {
 
     /// 已交给 WCSession，等待系统回执。
     func markInFlight(id: String) {
-        mutate(id: id) { item in
+        mutate(id: id, operation: "mark-in-flight") { item in
             item.state = .inFlight
             item.attemptCount += 1
             log(.attempted(
@@ -284,7 +297,7 @@ final class WatchDownlinkOutbox {
 
     /// 系统回执成功：删除载荷与暂存音频，条目保留用于幂等与观测。
     func markDelivered(id: String) {
-        mutate(id: id) { item in
+        mutate(id: id, operation: "mark-delivered") { item in
             item.state = .delivered
             item.deliveredAt = now()
             item.lastError = nil
@@ -299,7 +312,7 @@ final class WatchDownlinkOutbox {
     @discardableResult
     func markFailed(id: String, reason: String) -> Date? {
         var next: Date?
-        mutate(id: id) { item in
+        mutate(id: id, operation: "mark-failed") { item in
             if item.state != .inFlight { item.attemptCount += 1 }
             item.state = .queued
             item.lastError = reason
@@ -323,7 +336,7 @@ final class WatchDownlinkOutbox {
             items[index].nextAttemptAt = now()
             changed = true
         }
-        if changed { persistIndex() }
+        if changed { persistIndexReportingFailure(operation: "recover-in-flight") }
     }
 
     /// 清理：已送达条目超保留期移除；排队条目超保留期放弃并以 `expired` 留痕。
@@ -344,22 +357,26 @@ final class WatchDownlinkOutbox {
         for item in removable { discardPayloads(id: item.id) }
         let removedIds = Set(removable.map(\.id))
         items.removeAll { removedIds.contains($0.id) }
-        persistIndex()
+        persistIndexReportingFailure(operation: "purge-expired")
         return expired
     }
 
     // MARK: - 私有
 
-    private func mutate(id: String, _ body: (inout WatchDownlinkItem) -> Void) {
+    private func mutate(id: String, operation: String, _ body: (inout WatchDownlinkItem) -> Void) {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }
         body(&items[index])
-        persistIndex()
+        persistIndexReportingFailure(operation: operation)
     }
 
     private func discardPayloads(id: String) {
+        discardFiles(id: id, stagedFileName: item(id: id)?.stagedFileName)
+    }
+
+    private func discardFiles(id: String, stagedFileName: String?) {
         try? fileManager.removeItem(at: payloadURL(for: id))
-        if let name = item(id: id)?.stagedFileName {
-            try? fileManager.removeItem(at: directory.appendingPathComponent(name))
+        if let stagedFileName {
+            try? fileManager.removeItem(at: directory.appendingPathComponent(stagedFileName))
         }
     }
 
@@ -367,8 +384,22 @@ final class WatchDownlinkOutbox {
         directory.appendingPathComponent("\(id).payload")
     }
 
-    private func persistIndex() {
-        guard let data = try? JSONEncoder().encode(items) else { return }
-        try? data.write(to: indexURL, options: .atomic)
+    private func persistIndex() throws {
+        do {
+            let data = try JSONEncoder().encode(items)
+            try data.write(to: indexURL, options: .atomic)
+        } catch {
+            throw WatchDownlinkError.storageFailure(error.localizedDescription)
+        }
+    }
+
+    /// 状态迁移路径不能抛错（多来自 WCSession 回调），但失败必须留痕：
+    /// 内存是最新真相，磁盘落后一步，下一次成功落盘即收敛。
+    private func persistIndexReportingFailure(operation: String) {
+        do {
+            try persistIndex()
+        } catch {
+            log(.persistFailed(operation: operation, reason: String(describing: error)))
+        }
     }
 }

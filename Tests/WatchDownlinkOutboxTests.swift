@@ -142,6 +142,68 @@ final class WatchDownlinkOutboxTests: XCTestCase {
         XCTAssertNil(outbox.stagedAudioURL(for: item.id), "送达后暂存音频应删除（§8 不留存）")
     }
 
+    // MARK: - 复审阻断项 2：已送达条目跨重启仍参与幂等
+
+    func testDeliveredSpeechStaysDedupedAcrossRelaunch() throws {
+        let audio = Data(repeating: 0xCD, count: 2048)
+        let first = try makeOutbox()
+        let result = try first.enqueueSpeech(
+            requestId: requestId, messageKey: "voice_speech_envelope",
+            envelope: Data("env".utf8), audio: audio, fileName: "\(requestId).m4a"
+        )
+        guard case .enqueued(let item) = result else { return XCTFail("语音应入队") }
+        first.markInFlight(id: item.id)
+        first.markDelivered(id: item.id)
+
+        // iPhone 重启：Relay 的内存去重（deliveredResultAudio）清零，
+        // Bridge 重放同一 completed 快照——保留期内不得再次入队播放。
+        let reopened = try makeOutbox()
+        let replay = try reopened.enqueueSpeech(
+            requestId: requestId, messageKey: "voice_speech_envelope",
+            envelope: Data("env".utf8), audio: audio, fileName: "\(requestId).m4a"
+        )
+        guard case .duplicate(let existing) = replay else {
+            return XCTFail("保留期内已送达的同 request_id/同载荷语音重放必须判为 duplicate")
+        }
+        XCTAssertEqual(existing.state, .delivered)
+        XCTAssertEqual(reopened.items.count, 1, "条目数不得增加")
+        XCTAssertEqual(reopened.pendingCount(), 0, "重放不得产生新的待投递条目")
+    }
+
+    func testDeliveredEnvelopeIsDedupedInSameProcess() throws {
+        let outbox = try makeOutbox()
+        let item = try XCTUnwrap(enqueueStatus(outbox))
+        outbox.markInFlight(id: item.id)
+        outbox.markDelivered(id: item.id)
+
+        let again = try outbox.enqueue(
+            requestId: requestId, kind: .relayStatus,
+            messageKey: "voice_relay_status", payload: Data("s1".utf8)
+        )
+        guard case .duplicate = again else {
+            return XCTFail("送达后的同载荷重放应判为 duplicate，不得重复播放")
+        }
+        XCTAssertEqual(outbox.items.count, 1)
+    }
+
+    func testDeliveredDedupExpiresWithRetention() throws {
+        let outbox = try makeOutbox(retention: 60)
+        let item = try XCTUnwrap(enqueueStatus(outbox))
+        outbox.markInFlight(id: item.id)
+        outbox.markDelivered(id: item.id)
+
+        // 超过保留期后 delivered 条目被清理，幂等窗口随之关闭——这是文档化的边界。
+        clock = clock.addingTimeInterval(120)
+        _ = outbox.purgeExpired()
+        let again = try outbox.enqueue(
+            requestId: requestId, kind: .relayStatus,
+            messageKey: "voice_relay_status", payload: Data("s1".utf8)
+        )
+        guard case .enqueued = again else {
+            return XCTFail("保留期外的重放允许重新入队")
+        }
+    }
+
     func testSpeechWithDifferentAudioIsNotDeduped() throws {
         let outbox = try makeOutbox()
         _ = try outbox.enqueueSpeech(
@@ -155,6 +217,53 @@ final class WatchDownlinkOutboxTests: XCTestCase {
         guard case .enqueued = second else {
             return XCTFail("同回合换了音频内容，不能按信封摘要误判为重复")
         }
+    }
+
+    // MARK: - 复审阻断项 1：索引落盘失败不可静默吞掉
+
+    /// 用「index.json 位置被目录占住」模拟索引写盘失败（原子写无法覆盖目录），
+    /// 载荷文件本身仍可写——精确命中「载荷写成功、索引写失败」这条此前被 try? 吞掉的路径。
+    func testEnqueueRollsBackAndThrowsWhenIndexPersistFails() throws {
+        try FileManager.default.createDirectory(
+            at: directory.appendingPathComponent("index.json"), withIntermediateDirectories: true
+        )
+        let outbox = try makeOutbox()
+
+        XCTAssertThrowsError(
+            try outbox.enqueueSpeech(
+                requestId: requestId, messageKey: "voice_speech_envelope",
+                envelope: Data("env".utf8), audio: Data("audio".utf8), fileName: "a.m4a"
+            ),
+            "索引落盘失败必须向调用方抛错，不能返回已入队"
+        ) { error in
+            guard case WatchDownlinkError.storageFailure = error else {
+                return XCTFail("应抛 storageFailure，实际：\(error)")
+            }
+        }
+
+        XCTAssertTrue(outbox.items.isEmpty, "落盘失败必须回滚内存，不能留下幽灵条目")
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+            .filter { $0 != "index.json" }
+        XCTAssertTrue(leftovers.isEmpty, "回滚必须清掉刚写的载荷与暂存音频，实际残留：\(leftovers)")
+    }
+
+    func testStateTransitionPersistFailureIsReported() throws {
+        var events: [WatchDownlinkLogEvent] = []
+        let outbox = try makeOutbox(log: { events.append($0) })
+        let item = try XCTUnwrap(enqueueStatus(outbox))
+
+        // 入队成功后索引位置被破坏（模拟后续写盘故障）。
+        try FileManager.default.removeItem(at: directory.appendingPathComponent("index.json"))
+        try FileManager.default.createDirectory(
+            at: directory.appendingPathComponent("index.json"), withIntermediateDirectories: true
+        )
+        outbox.markInFlight(id: item.id)
+
+        XCTAssertTrue(events.contains {
+            if case .persistFailed(let operation, _) = $0 { return operation == "mark-in-flight" }
+            return false
+        }, "状态迁移写盘失败必须留痕，不能静默宣称成功")
+        XCTAssertEqual(outbox.items.first?.state, .inFlight, "内存状态仍推进，等待下次成功落盘收敛")
     }
 
     // MARK: - 过期

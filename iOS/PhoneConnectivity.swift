@@ -230,19 +230,20 @@ extension PhoneConnectivity: WatchFeedbackChannel {
     ///
     /// ESS-21 B1：音频先复制进下行队列自持有的目录再投递——调用方的临时文件
     /// 随时可能被清理，且会话未激活时本条必须留在队列里等重投，不能像原先那样直接 return。
-    func transferSpeech(fileURL: URL, envelope: VoiceStatusEnvelope) {
-        guard let data = try? envelope.jsonData() else { return }
+    @discardableResult
+    func transferSpeech(fileURL: URL, envelope: VoiceStatusEnvelope) -> Bool {
+        guard let data = try? envelope.jsonData() else { return false }
         guard let downlink else {
             Self.downlinkLogger.error(
                 "下行队列不可用，语音无法保证送达 request_id=\(envelope.requestId, privacy: .public)"
             )
-            return
+            return false
         }
         guard let audio = try? Data(contentsOf: fileURL) else {
             Self.downlinkLogger.error(
                 "结果语音读取失败 request_id=\(envelope.requestId, privacy: .public)"
             )
-            return
+            return false
         }
         do {
             _ = try downlink.enqueueSpeech(
@@ -256,10 +257,11 @@ extension PhoneConnectivity: WatchFeedbackChannel {
             Self.downlinkLogger.error(
                 "语音入队失败 request_id=\(envelope.requestId, privacy: .public) error=\(String(describing: error), privacy: .public)"
             )
-            return
+            return false
         }
         refreshDownlinkCount()
         flushDownlink(trigger: "speech-enqueue")
+        return true
     }
 
     private func enqueueDownlink(
@@ -402,6 +404,8 @@ extension PhoneConnectivity: WatchFeedbackChannel {
             downlinkLogger.error("downlink failed request_id=\(requestId, privacy: .public) kind=\(kind.rawValue, privacy: .public) item=\(itemId, privacy: .public) attempt=\(attempt) reason=\(reason, privacy: .public)")
         case .expired(let requestId, let kind, let itemId):
             downlinkLogger.error("downlink expired request_id=\(requestId, privacy: .public) kind=\(kind.rawValue, privacy: .public) item=\(itemId, privacy: .public)")
+        case .persistFailed(let operation, let reason):
+            downlinkLogger.fault("downlink index persist failed operation=\(operation, privacy: .public) reason=\(reason, privacy: .public)")
         }
     }
 }
