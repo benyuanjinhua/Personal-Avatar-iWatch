@@ -9,7 +9,10 @@ import UserNotifications
 protocol WatchFeedbackChannel: AnyObject {
     func notifyWatch(status: RelayStatusUpdate)
     func notifyWatch(result: VoiceRelayResultPayload)
-    func transferResultAudio(fileURL: URL, payload: VoiceRelayResultPayload)
+    /// 状态/权限/结果信封 → Watch VoiceTurnJournal（ESS-29 时间线 UI 的入账单位）。
+    func notifyWatch(voiceStatus: VoiceStatusEnvelope)
+    /// 结果语音 transferFile；metadata 带含 speechSha256 的信封，Watch 校验后入加密仓。
+    func transferSpeech(fileURL: URL, envelope: VoiceStatusEnvelope)
 }
 
 /// WristAgentPhoneRelay（ESS-28）：iPhone Companion Relay 编排器。
@@ -42,10 +45,16 @@ final class WristAgentPhoneRelay: ObservableObject {
     private var eventsLoopTask: Task<Void, Never>?
     private var eventsReconnectAttempt = 0
     private var notifiedStuckRequestIds: Set<String> = []
+    /// 已交付的结果语音（requestId|sha）：快照重放/补挂事件不重复 transferFile。
+    private var deliveredResultAudio: Set<String> = []
+    /// 下载中的结果语音（requestId|sha）：避免并发重复下载。
+    private var activeAudioDownloads: Set<String> = []
 
     private static let bridgeURLKey = "wristagent.relay.bridge_url"
     /// 连续失败到该次数时提醒用户打开 App（后台网络受限时人工兜底）。
     private static let stuckNotificationThreshold = 3
+    /// 结果语音本地上限（最后一道防线；Bridge 侧已有转码上限）。
+    private static let maxResultAudioBytes = 20 * 1024 * 1024
 
     init(session: URLSession = .shared) {
         self.session = session
@@ -287,49 +296,138 @@ final class WristAgentPhoneRelay: ObservableObject {
         connectEventsIfNeeded()
     }
 
+    /// Bridge 事件入口（ESS-38）：真实契约是 `turn.state` 增量 + 连接回放
+    /// `snapshot`（非终态回合）。快照重放靠 request_id + 音频 sha 幂等去重。
     private func handleEvent(data: Data) {
-        guard let event = VoiceRelayEvent.decode(from: data) else { return }
-        switch event.event {
-        case "status":
-            guard let phase = event.phase else { return }
-            notify(status: RelayStatusUpdate(
-                requestId: event.requestId, phase: phase, detail: event.errorCode ?? event.text
-            ))
-        case "permission_required":
-            notify(status: RelayStatusUpdate(
-                requestId: event.requestId, phase: .permissionRequired, detail: event.text
-            ))
-        case "result":
-            deliverResult(event)
+        guard let message = BridgeEventMessage.decode(from: data) else { return }
+        switch message.type {
+        case "turn.state":
+            if let turn = message.turn { process(projection: turn) }
+        case "snapshot":
+            message.turns?.forEach { process(projection: $0) }
         default:
             break // 未知事件类型：忽略，不中断事件流。
         }
     }
 
-    private func deliverResult(_ event: VoiceRelayEvent) {
-        var audioSha: String?
-        var audioURL: URL?
-        if let base64 = event.audioBase64, let audioData = Data(base64Encoded: base64) {
-            let sha = RelayWire.sha256Hex(audioData)
-            let url = resultAudioDirectory.appendingPathComponent("\(event.requestId).m4a")
-            if (try? audioData.write(to: url, options: .atomic)) != nil {
-                audioSha = sha
-                audioURL = url
+    private func process(projection: BridgeTurnProjection) {
+        guard let envelope = projection.statusEnvelope() else { return }
+        // 旧版 caption 通道照旧（iPhone 前台状态行）。
+        if let phase = VoiceRelayPhase(rawValue: envelope.state.rawValue) {
+            notify(status: RelayStatusUpdate(
+                requestId: projection.requestId, phase: phase, detail: projection.detailText
+            ))
+        }
+        // 终态先下发文本（§ESS-38：文字先行，语音随后 transferFile 补上）。
+        watchChannel?.notifyWatch(voiceStatus: envelope)
+        guard projection.status == "completed" else { return }
+        notifyResult(VoiceRelayResultPayload(
+            requestId: projection.requestId,
+            text: projection.result?.text ?? projection.result?.speechText,
+            audioSha256: projection.result?.audio?.sha256.lowercased()
+        ))
+        relayStatus = "已回传结果 \(projection.requestId.prefix(8))…"
+        deliverResultAudio(projection: projection)
+    }
+
+    // MARK: - 结果语音下行（ESS-38）
+
+    /// 已（开始）交付的结果语音：requestId|sha。快照重放/迟到补挂事件不重复下发。
+    private func audioDeliveryKey(_ requestId: String, _ sha: String) -> String { "\(requestId)|\(sha)" }
+
+    private func deliverResultAudio(projection: BridgeTurnProjection) {
+        guard let result = projection.result else { return }
+        // inline base64 优先（≤ Bridge 上限时随投影内联下发）。
+        if let base64 = result.audioBase64, let data = Data(base64Encoded: base64) {
+            let sha = RelayWire.sha256Hex(data)
+            if let expected = result.audio?.sha256.lowercased(), expected != sha {
+                // 内联数据与元数据不一致：不用坏数据，转下载路径兜底。
+                relayLog("结果语音内联数据校验失败，转下载")
+            } else {
+                stageAndTransferSpeech(projection: projection, data: data, sha: sha)
+                return
             }
         }
-        let payload = VoiceRelayResultPayload(
-            requestId: event.requestId, text: event.text, audioSha256: audioSha
-        )
-        notifyResult(payload)
-        if let audioURL {
-            watchChannel?.transferResultAudio(fileURL: audioURL, payload: payload)
+        // 无内联（超限被裁）：凭元数据经 HTTPS 有界下载，支持断点续传。
+        guard let meta = result.audio else { return } // 纯文本降级：无音频可交付
+        let key = audioDeliveryKey(projection.requestId, meta.sha256.lowercased())
+        guard !deliveredResultAudio.contains(key), !activeAudioDownloads.contains(key) else { return }
+        activeAudioDownloads.insert(key)
+        Task { [weak self] in
+            await self?.downloadAndTransferSpeech(projection: projection, meta: meta)
+            self?.activeAudioDownloads.remove(key)
         }
-        notify(status: RelayStatusUpdate(
-            requestId: event.requestId,
-            phase: event.phase ?? .completed,
-            detail: event.errorCode
-        ))
-        relayStatus = "已回传结果 \(event.requestId.prefix(8))…"
+    }
+
+    private func stageAndTransferSpeech(projection: BridgeTurnProjection, data: Data, sha: String) {
+        let key = audioDeliveryKey(projection.requestId, sha)
+        guard !deliveredResultAudio.contains(key) else { return }
+        let url = resultAudioDirectory.appendingPathComponent("\(projection.requestId).m4a")
+        guard (try? data.write(to: url, options: .atomic)) != nil else { return }
+        // transferFile 的信封以实际字节的 sha 为准（Watch 端以此校验入库）。
+        guard let envelope = speechEnvelope(projection: projection, sha: sha) else { return }
+        deliveredResultAudio.insert(key)
+        watchChannel?.transferSpeech(fileURL: url, envelope: envelope)
+    }
+
+    private func speechEnvelope(projection: BridgeTurnProjection, sha: String) -> VoiceStatusEnvelope? {
+        let result = VoiceResultPayload(
+            summary: projection.result?.text ?? projection.result?.speechText ?? "已完成",
+            isTruncated: projection.result?.truncated ?? false,
+            speechSha256: sha,
+            speechDurationMs: projection.result?.audio?.durationMs
+        )
+        return VoiceStatusEnvelope.status(
+            requestId: projection.requestId, state: .completed,
+            detail: projection.detailText, result: result
+        )
+    }
+
+    /// 结果语音下载：Range 断点续传 + sha256 校验，校验不过重下、不过夜。
+    private func downloadAndTransferSpeech(
+        projection: BridgeTurnProjection, meta: BridgeResultAudioMeta
+    ) async {
+        guard let client = makeClient() else { return }
+        if let size = meta.sizeBytes, size > Self.maxResultAudioBytes {
+            relayLog("结果语音超出本地上限（\(size)B），保留文本降级")
+            return
+        }
+        let partialURL = resultAudioDirectory
+            .appendingPathComponent("\(projection.requestId).m4a.partial")
+        var assembled = (try? Data(contentsOf: partialURL)) ?? Data()
+        for attempt in 0..<3 {
+            do {
+                let (data, status) = try await client.fetchResultAudio(
+                    requestId: projection.requestId,
+                    rangeStart: assembled.isEmpty ? nil : assembled.count
+                )
+                switch status {
+                case 206: assembled.append(data)
+                case 200: assembled = data
+                case 404: return // 音频已过保留期/不存在：文本降级
+                case 416: assembled = Data() // 断点越界：从头再来
+                default: throw RelayUploadError.bridge(code: "ERR_AUDIO_FETCH", httpStatus: status)
+                }
+                if RelayWire.sha256Hex(assembled) == meta.sha256.lowercased() {
+                    try? FileManager.default.removeItem(at: partialURL)
+                    stageAndTransferSpeech(projection: projection, data: assembled, sha: meta.sha256.lowercased())
+                    return
+                }
+                if let size = meta.sizeBytes, assembled.count >= size {
+                    assembled = Data() // 齐了却校验不过：数据不可信，整体重下
+                }
+            } catch {
+                try? assembled.write(to: partialURL, options: .atomic) // 保留断点
+                let delay = RetryBackoff.outboxDefault.delay(forAttempt: attempt + 1)
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+        }
+        try? assembled.write(to: partialURL, options: .atomic)
+        relayLog("结果语音下载未完成，已保留断点；文本结果已先行送达")
+    }
+
+    private func relayLog(_ message: String) {
+        relayStatus = message
     }
 
     // MARK: - Watch 回执 / 本地通知

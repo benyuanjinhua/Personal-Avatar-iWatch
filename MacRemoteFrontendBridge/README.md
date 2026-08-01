@@ -1,4 +1,21 @@
-# Remote Frontend Bridge（ESS-26 · P1 完整实现，ESS-30 入库）
+# Remote Frontend Bridge（ESS-26 · P1 完整实现，ESS-30 入库，ESS-36 双向链路修复）
+
+ESS-36 修复说明（真机 0 事件超时的根因与对策）：qwen-audio-agent 对**非语音
+所有权持有者**的 `audio.append` 是**静默丢弃**——所有权是注入的前置条件。
+supervisor 现在：① 连接遇 busy 且持有者是另一个 watch-bridge 实例（上一进程
+残留）时自动 takeover，Bridge 重启不再死锁；持有者是其他前台时按
+`takeover_from_frontends` 决定抢占或快速失败 `ERR_VOICE_BUSY`；② 会话中被
+takeover（`voice.deactivated`）立即失效 ready 标志并快速失败当前 turn；
+③ 注入完成后 `inject_ack_timeout_ms` 内 0 事件 → 回收会话重试一次
+（`ERR_REALTIME_NO_EVENTS`）；④ `transcript.discard`（ASR 判定无效语音）
+立即失败 `ERR_TRANSCRIPT_DISCARDED`，不再白等 120s；⑤ origin=announcement
+的后台播报与 turn 结果隔离（音频/转写不混入），但播放回执照常发送（否则
+网关播报窗口阻塞）；origin=agent 是后端 Agent 对本 turn 的应答本体，计入
+结果；⑥ work deadline 在 turn 真正开始注入时重挂，串行积压不再团灭；
+⑦ supervisor journal 全量落 Bridge 结构化日志并携带 request_id，
+`accepted → realtime events → completed` 可按同一 request_id 串起。
+turn 间强制 `turn_gap_ms` 间隔、尾部静音加长到 `trailing_silence_ms`（连续
+注入无停顿会让网关合并相邻 turn、VAD 收不到停止判定 → 60s 后 discard）。
 
 ESS-30 入库说明：本模块由 ESS-23（鉴权/幂等骨架）→ ESS-25（伪前端 WS 注入 + AudioPipe）
 → ESS-26（完整 Bridge）逐步合并而来，`projection/` 为 ESS-27 QwenTaskProjection。
@@ -35,11 +52,28 @@ iPhone Relay ──HTTPS/WSS(HMAC 签名)──▶ server.mjs（北向 API）
 | GET | `/v1/voice/turns/{id}` | 稳定状态投影 + 短结果 |
 | POST | `/v1/voice/turns/{id}/cancel` | 取消（后台任务映射到 `DELETE /api/tasks/:id`） |
 | POST | `/v1/voice/turns/{id}/permission` | `{permission_id, decision: allow\|deny}` |
+| GET | `/v1/voice/turns/{id}/audio` | 结果语音（AAC/M4A）有界取回；支持 `Range` 断点续传，`x-audio-sha256` 响应头供校验（ESS-38） |
 | WSS | `/v1/voice/events` | `turn.state` 事件推送；连接即回放非终态 snapshot |
 | GET | `/v1/health` | 健康检查（无鉴权，仅源 IP 门禁） |
 
 状态投影：`accepted → processing → (permission_required) → completed | failed | cancelled`，
 `detail` 携带子状态（`realtime_processing` / `background_accepted` / `background_running`…）。
+
+结果结构（completed）：`result.text`（任务/直答文本）、`result.speech_text`（Qwen Audio
+Realtime 播报转写，后台路径）、`result.audio_base64`（≤ `max_result_audio_bytes` 时内联）、
+`result.audio = {sha256, codec, duration_ms, size_bytes}`（语音文件元数据，内联被裁时仍在，
+客户端凭它走 `/audio` 端点下载）。
+
+## Realtime 语音下行（ESS-38）
+
+后台任务的结果语音以 `origin=announcement` 经 Realtime WS 到达（Qwen 生成的人物
+状态/口气播报，Bridge 不做二次 TTS）。supervisor 按 `responseId` 聚合 24kHz PCM
+delta 与 assistant transcript（`response.started` 携带 `taskId`），聚合上限
+`max_announcement_pcm_bytes`（超限截断）；聚合完成后按 `taskId → task_id →
+request_id` 绑定回原请求，转码 AAC/M4A 落 `state/result-audio/`（保留期
+`result_audio_retention_ms`），并把元数据补挂到账本结果。到达次序与 task 终态
+无关：文本先投影（终态不等语音），语音随后以第二条 `turn.state` 补上。归属不了
+的播报（Mac 本机任务等）只留日志、绝不乱挂。
 
 ## 关键机制
 
@@ -74,8 +108,9 @@ node server.mjs                 # 配对码写入 state/pairing-code.txt（0600�
 ## 测试
 
 ```bash
-npm test                        # 13 项验收测试（mock 网关，含重启恢复/超时/权限/幂等）
+npm test                        # 26 项验收测试（mock 网关，含所有权仲裁/回执 watchdog/announcement 隔离）
 node test/e2e-real.mjs <direct.m4a> [task.m4a]   # 真网关全链路（127.0.0.1:3101）
+node test/ess36-live.mjs q1.m4a q2.m4a q3.m4a q4.m4a q5.m4a  # ESS-36 连续 5 turn 真网关验收
 ```
 
 ## 已知边界
