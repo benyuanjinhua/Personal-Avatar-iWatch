@@ -422,54 +422,45 @@ describe('D1 read-only switch (write_actions_enabled=false, the default)', () =>
     }
   })
 
-  it('sweeper rejects a terminal-orphan authorization and the denied turn ends with readable copy', async () => {
+  // ESS-34 四眼复审的最小反例：曾短暂存在的「宿主终态即孤儿即 reject」规则
+  // 会在本 Bridge 有任一 turn 在途时，连带拒掉无关会话遗留在终态任务上的
+  // pending 授权——宿主的终态只说明那个任务结束了，不说明授权属于谁。
+  // 该规则已删除，这条用例锁死它不会以任何形式回来。
+  it('sweeper never rejects an unrelated authorization on a terminal host (no terminal-orphan rule)', async () => {
     const ctx = await launch({ scenario: 'background', overrides: { deny_sweep_interval_ms: 200 } })
     try {
       const id = rid()
       await ctx.client.createTurn(id, pcm(400))
       await waitFor(async () => (await ctx.client.getTurn(id)).json.task_id === 'task_bg')
+      // 本 Bridge 确有在途 turn（写嫌疑成立），这正是旧规则会开火的前提。
+      assert.equal(ctx.bridge.watcher.active.size, 1)
 
-      // 真网关错挂缺陷的实测形态（ESS-34 三轮）：写授权 pending 挂在一个
-      // completed 终态任务上，delegation/backendRef 均不可用于归属。终态宿主
-      // 不可能有活跃执行在等这份授权 → 终态孤儿规则定向 reject。
-      ctx.mock.setTask({
-        id: 'task_orphan_host', status: 'completed',
-        authorization: { id: 'perm_orphan', status: 'pending', title: '允许写文件？' },
-      })
+      // 无关会话（Mac UI / 其他 Agent / 人工）的 pending 授权遗留在终态宿主上，
+      // 且没有任何可证明归属的标识：终态三种状态全覆盖。
+      for (const [taskId, status, authId] of [
+        ['task_stranger_done', 'completed', 'perm_unrelated_completed'],
+        ['task_stranger_failed', 'failed', 'perm_unrelated_failed'],
+        ['task_stranger_cancelled', 'cancelled', 'perm_unrelated_cancelled'],
+      ]) {
+        ctx.mock.setTask({
+          id: taskId, status,
+          authorization: { id: authId, status: 'pending', title: '允许部署到生产？' },
+        })
+      }
 
-      await waitFor(() => ctx.mock.permissionDecisions.length > 0, { timeoutMs: 5000 })
-      assert.deepEqual(ctx.mock.permissionDecisions, [{ id: 'perm_orphan', decision: 'reject' }])
-
-      // Codex 收到 reject 后以 cancelled 收尾本 turn 的任务 → 投影层凭拒写
-      // 标记升级为 completed + 用户可读文案，Watch 不露裸 cancelled。
-      ctx.mock.emitTask('task.cancelled', {
-        ...ctx.mock.tasks.get('task_bg'), status: 'cancelled', authorization: null,
-      })
-      const done = await waitFor(async () => {
-        const r = await ctx.client.getTurn(id)
-        return ['completed', 'failed', 'cancelled'].includes(r.json.status) ? r.json : null
-      })
-      assert.equal(done.status, 'completed')
-      assert.match(done.result.text, /只读模式/)
-    } finally {
-      await ctx.bridge.stop()
-      await ctx.mock.stop()
-    }
-  })
-
-  it('terminal-orphan rule is inert without an in-flight bridge turn', async () => {
-    const ctx = await launch({ scenario: 'background', overrides: { deny_sweep_interval_ms: 200 } })
-    try {
-      // 没有任何在途 turn：即使全局列表里出现终态孤儿 authorization，
-      // 本 Bridge 也没有写嫌疑，一概不动。
-      ctx.mock.setTask({
-        id: 'task_orphan_idle', status: 'failed',
-        authorization: { id: 'perm_idle_orphan', status: 'pending', title: '允许写文件？' },
-      })
-
+      // 等待超过两个 sweep interval：三份授权必须全部保持 pending，
+      // respondPermission 一次都不能被调用。
       await new Promise(resolve => setTimeout(resolve, 700))
       assert.deepEqual(ctx.mock.permissionDecisions, [])
-      assert.equal(ctx.mock.tasks.get('task_orphan_idle').authorization.status, 'pending')
+      for (const taskId of ['task_stranger_done', 'task_stranger_failed', 'task_stranger_cancelled']) {
+        assert.equal(ctx.mock.tasks.get(taskId).authorization.status, 'pending', taskId)
+      }
+
+      // 归属判定本身也不认状态：终态宿主拿不到任何归属证据。
+      const owned = ctx.bridge.watcher.activeOwnership()
+      for (const taskId of ['task_stranger_done', 'task_stranger_failed', 'task_stranger_cancelled']) {
+        assert.equal(ctx.bridge.watcher.ownershipOf(ctx.mock.tasks.get(taskId), owned), null, taskId)
+      }
     } finally {
       await ctx.bridge.stop()
       await ctx.mock.stop()

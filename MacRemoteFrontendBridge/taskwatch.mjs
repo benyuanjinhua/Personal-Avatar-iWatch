@@ -73,14 +73,15 @@ export class TaskWatcher {
   //   - task_id：task.id 命中在途 turn 的 task_id（正常挂载）；
   //   - codex_session：task 的 delegation/backendRef session 命中在途 turn 的
   //     codex_session_id（真网关 v0.9.x 运行期两者均为 null——ESS-34 两轮实测，
-  //     此通道留作上游修复后的兜底，不再是主路径）；
-  //   - terminal_orphan：pending authorization 挂在 completed/failed/cancelled
-  //     终态 task 上。终态宿主定义上不可能有活跃执行在等这份授权——任何无关
-  //     活任务的 authorization 都挂在它自己 running 的宿主上（两轮真机实测
-  //     均符合），因此「宿主终态 + 本 Bridge 有在途后台 turn」即可安全 reject，
-  //     不破坏任务隔离。这是真网关错挂缺陷的实测主路径（ESS-34 第三轮）。
-  // 无法归属的 authorization（running 宿主且非本 Bridge 的）一律不动——
-  // Mac UI、其他 Agent/会话/人工任务的权限请求不归本 Bridge 管。
+  //     此通道留作上游修复后的兜底，不再是主路径）。
+  // 宿主 task 的**状态**不是归属证据：曾经短暂存在过一条「宿主终态即孤儿即
+  // reject」的规则（ESS-34 第三轮），已按四眼复审删除——它会把任何无关会话
+  // 遗留在终态 task 上的 pending authorization 一并拒掉，只要本 Bridge 恰好有
+  // 一个 turn 在途，直接违反本单「无关 task/session 保持 pending」的核心要求。
+  // 错挂到 list 之外幽灵宿主的自身写请求由 in-band 主路径（denyRealtimePermission）
+  // 快速拒绝，不需要、也不允许 list 清扫器靠状态推断补位。
+  // 无法归属的 authorization 一律不动——Mac UI、其他 Agent/会话/人工任务的
+  // 权限请求不归本 Bridge 管；归属不了的自身写请求由 turn 硬超时 fail closed。
   startDenySweeper() {
     if (this.cfg.write_actions_enabled !== false || this.denySweeper) return
     const interval = this.cfg.deny_sweep_interval_ms || 5000
@@ -157,13 +158,12 @@ export class TaskWatcher {
     return { taskIds, sessionIds }
   }
 
-  // 返回归属证据（'task_id' | 'codex_session' | 'terminal_orphan'），
-  // 归属不了返回 null。
+  // 返回归属证据（'task_id' | 'codex_session'），归属不了返回 null。
+  // 只接受可证明的归属标识；task.status 一概不参与判定（见 startDenySweeper）。
   ownershipOf(task, { taskIds, sessionIds }) {
     if (taskIds.has(String(task.id))) return 'task_id'
     const session = taskSessionId(task)
     if (session && sessionIds.has(String(session))) return 'codex_session'
-    if (TERMINAL_TASK.has(task.status)) return 'terminal_orphan'
     return null
   }
 

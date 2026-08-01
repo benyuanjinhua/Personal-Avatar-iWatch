@@ -25,10 +25,12 @@ authorization 挂错 task 缺陷的清扫器 `deny_sweep_interval_ms`）。ESS-3
 **主路径是会话内 in-band 拒绝**——网关只把 `task.sessionId` 等于本连接会话的
 权限事件下发到本 Realtime WS（网关源码契约），事件到达即归属证明，与宿主
 task 挂对挂错无关（真机实测错挂宿主可为 `GET /api/tasks` 之外的幽灵任务）。
-list 清扫器降为二道防线，只 reject 有归属证据的 authorization——task_id /
-session 命中在途 turn，或**终态孤儿**（pending authorization 挂在终态任务上，
-定义上不属于任何活跃执行）。无关任务/会话的 pending 权限保持不动。拒写 turn
-以 completed + 可读文案（「只读模式：写操作已被拒绝」）收尾，不露裸错误码。
+list 清扫器降为二道防线，只 reject **可证明归属**的 authorization——task_id 或
+delegation/backendRef session 命中在途 turn；宿主 task 的状态不是归属证据（终态
+孤儿规则已按四眼复审删除：它会连带拒掉无关会话遗留在终态任务上的 pending
+授权）。无关任务/会话的 pending 权限一律保持不动，归属不了的自身写请求由 turn
+硬超时 fail closed。拒写 turn 以 completed + 可读文案（「只读模式：写操作已被
+拒绝」）收尾，不露裸错误码。
 
 Mac mini 上的 tailnet 窄入口：鉴权、幂等、生命周期、北向 API 的完整实现。
 依据《技术架构设计 v2.1》§4.1 / §6 / §7 / §10 P1，在 ESS-23（鉴权/幂等骨架）与
