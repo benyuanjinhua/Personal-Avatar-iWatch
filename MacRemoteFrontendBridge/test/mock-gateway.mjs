@@ -170,13 +170,19 @@ export class MockGateway extends EventEmitter {
             turnScheduled = false
             return
           }
-          if (['background', 'queued', 'queued-announcement-first'].includes(this.scenario)) {
-            const taskId = this.scenario === 'background' ? 'task_bg' : 'task_queued'
-            const queued = this.scenario !== 'background'
+          if (['background', 'background-no-ack', 'queued', 'queued-announcement-first'].includes(this.scenario)) {
+            const taskId = ['background', 'background-no-ack'].includes(this.scenario) ? 'task_bg' : 'task_queued'
+            const queued = !['background', 'background-no-ack'].includes(this.scenario)
             const task = this.tasks.get(taskId) || {
               id: taskId, status: queued ? 'queued' : 'running', authorization: null, resultMetadata: null,
             }
             this.setTask(task)
+            if (this.scenario !== 'background-no-ack') {
+              const interimPcm = Buffer.alloc(9_600, 4) // 200ms，模拟委派前口头回执
+              send({ type: 'response.started', responseId: 'resp_interim', origin: 'model' })
+              send({ type: 'audio.delta', responseId: 'resp_interim', audio: interimPcm.toString('base64'), sampleRate: 24000 })
+              send({ type: 'transcript.final', role: 'assistant', content: '收到，正在处理，请稍后', origin: 'model', responseId: 'resp_interim' })
+            }
             if (this.scenario === 'queued-announcement-first') {
               const pcm = Buffer.alloc(24_000, 6)
               send({ type: 'response.started', responseId: 'resp_queued', origin: 'announcement', taskId })

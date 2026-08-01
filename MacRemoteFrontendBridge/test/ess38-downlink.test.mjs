@@ -146,6 +146,45 @@ describe('ESS-38 announcement downlink (background path)', () => {
     assert.equal(bad.status, 416)
   })
 
+  it('emits one text+audio interim before the background state projection', async () => {
+    const isolated = await launch()
+    try {
+      const events = isolated.client.events()
+      await waitFor(() => events.received.some(e => e.type === 'snapshot'))
+      const id = rid()
+      await isolated.client.createTurn(id, pcm16())
+      const interim = await waitFor(() => events.received.find(
+        e => e.type === 'turn.interim' && e.interim?.request_id === id))
+      assert.equal(interim.interim.delivery_sequence, 1)
+      assert.equal(interim.interim.text, '收到，正在处理，请稍后')
+      assert.equal(interim.interim.audio.codec, 'm4a')
+      assert.ok(Buffer.from(interim.interim.audio.base64, 'base64').subarray(0, 8).equals(FAKE_PREFIX))
+      assert.equal(events.received.filter(
+        e => e.type === 'turn.interim' && e.interim?.request_id === id).length, 1)
+    } finally {
+      await isolated.bridge.stop()
+      await isolated.mock.stop()
+    }
+  })
+
+  it('uses fixed text and pre-generated speech when realtime delegates without an acknowledgement', async () => {
+    const isolated = await launch({ scenario: 'background-no-ack' })
+    try {
+      const events = isolated.client.events()
+      await waitFor(() => events.received.some(e => e.type === 'snapshot'))
+      const id = rid()
+      await isolated.client.createTurn(id, pcm16())
+      const interim = await waitFor(() => events.received.find(
+        e => e.type === 'turn.interim' && e.interim?.request_id === id))
+      assert.equal(interim.interim.text, '收到，正在处理，请稍后')
+      assert.equal(interim.interim.audio.codec, 'm4a')
+      assert.ok(Buffer.from(interim.interim.audio.base64, 'base64').length > 1000)
+    } finally {
+      await isolated.bridge.stop()
+      await isolated.mock.stop()
+    }
+  })
+
   it('binds an early announcement: completed projection carries the audio immediately', async () => {
     ctx.mock.tasks.delete('task_bg')
     const id = rid()
