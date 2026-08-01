@@ -9,9 +9,37 @@ struct BridgeEventMessage: Decodable {
     let type: String
     let turn: BridgeTurnProjection?
     let turns: [BridgeTurnProjection]?
+    let interim: BridgeInterimProjection?
 
     static func decode(from data: Data) -> BridgeEventMessage? {
         try? VoiceProtocolJSON.decoder.decode(BridgeEventMessage.self, from: data)
+    }
+}
+
+struct BridgeInterimProjection: Decodable, Equatable {
+    let requestId: String
+    let deliverySequence: Int
+    let text: String
+    let audio: BridgeInterimAudio?
+
+    enum CodingKeys: String, CodingKey {
+        case requestId = "request_id"
+        case deliverySequence = "delivery_sequence"
+        case text, audio
+    }
+}
+
+struct BridgeInterimAudio: Decodable, Equatable {
+    let base64: String
+    let sha256: String
+    let codec: String
+    let durationMs: Int?
+    let sizeBytes: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case base64, sha256, codec
+        case durationMs = "duration_ms"
+        case sizeBytes = "size_bytes"
     }
 }
 

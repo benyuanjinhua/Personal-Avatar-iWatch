@@ -35,6 +35,7 @@
   "result_audio_retention_ms": 86400000,
   "result_delivery_ttl_ms": 1800000,
   "events_heartbeat_ms": 20000,
+  "interim_fallback_audio_path": "./interim-ack.m4a",
   "sse_backoff_base_ms": 1000,
   "sse_backoff_max_ms": 15000,
   "poll_interval_ms": 3000,
