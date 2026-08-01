@@ -25,12 +25,17 @@ struct WristAgentWatchApp: App {
                     settings.speechVault = pushToTalk.speechVault
                     pushToTalk.onAutoPlayStarted = { welcome.interrupt() }
                     settings.activate()
-                    welcome.greetIfNeeded()
+                    // ESS-55 未读优先：有未读结果直接呈现（触觉 + 全文），欢迎语让路。
+                    if !pushToTalk.presentUnreadIfAny() {
+                        welcome.greetIfNeeded()
+                    }
                 }
                 .onChange(of: scenePhase) { _, newPhase in
                     WatchLog.info("lifecycle", "scene_phase", detail: String(describing: newPhase))
                     switch newPhase {
-                    case .active: WatchLogShipper.shared.ship(reason: "foreground")
+                    case .active:
+                        WatchLogShipper.shared.ship(reason: "foreground")
+                        pushToTalk.presentUnreadIfAny()
                     case .background: WatchLogShipper.shared.ship(reason: "background")
                     default: break
                     }
