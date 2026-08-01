@@ -209,6 +209,25 @@ final class RelayClient {
         return (data, http.statusCode)
     }
 
+    /// 上送一个 Watch 日志 chunk（ESS-42）：POST /v1/client-logs。
+    /// 重试复用同一 chunk_id 作为 request_id（新 nonce/签名），Bridge 按 chunk_id 幂等去重。
+    func uploadClientLogs(chunkId: String, jsonl: String) async throws {
+        let body = try ClientLogUploadBody(chunkId: chunkId, jsonl: jsonl).jsonData()
+        let request = RelaySignedRequestBuilder(baseURL: baseURL, credentials: credentials)
+            .request(method: "POST", path: "/v1/client-logs", requestId: chunkId, body: body)
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw RelayUploadError.transport(error)
+        }
+        guard let http = response as? HTTPURLResponse else { throw RelayUploadError.badResponse }
+        guard http.statusCode == 200 else {
+            let code = (try? JSONDecoder().decode(BridgeErrorBody.self, from: data))?.error ?? "ERR_UNKNOWN"
+            throw RelayUploadError.bridge(code: code, httpStatus: http.statusCode)
+        }
+    }
+
     /// 上送一个 turn；重试时以同一 request_id 重新调用（新 nonce/签名），Bridge 幂等去重。
     func upload(envelope: VoiceRequestEnvelope, audioData: Data) async throws -> VoiceTurnResponse {
         let body = try JSONEncoder().encode(VoiceTurnUpload(envelope: envelope, audioData: audioData))

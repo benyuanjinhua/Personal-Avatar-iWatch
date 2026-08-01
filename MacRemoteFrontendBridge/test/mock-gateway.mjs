@@ -189,12 +189,21 @@ export class MockGateway extends EventEmitter {
             turnScheduled = false
             return
           }
-          if (this.scenario === 'background') {
-            const task = this.tasks.get('task_bg') || {
-              id: 'task_bg', status: 'running', authorization: null, resultMetadata: null,
+          if (['background', 'queued', 'queued-announcement-first'].includes(this.scenario)) {
+            const taskId = this.scenario === 'background' ? 'task_bg' : 'task_queued'
+            const queued = this.scenario !== 'background'
+            const task = this.tasks.get(taskId) || {
+              id: taskId, status: queued ? 'queued' : 'running', authorization: null, resultMetadata: null,
             }
             this.setTask(task)
-            send({ type: 'task.running', task })
+            if (this.scenario === 'queued-announcement-first') {
+              const pcm = Buffer.alloc(24_000, 6)
+              send({ type: 'response.started', responseId: 'resp_queued', origin: 'announcement', taskId })
+              send({ type: 'audio.delta', responseId: 'resp_queued', audio: pcm.toString('base64'), sampleRate: 24000 })
+              send({ type: 'transcript.final', role: 'assistant', content: '排队任务完成。', origin: 'announcement', responseId: 'resp_queued' })
+              send({ type: 'audio.done', responseId: 'resp_queued' })
+            }
+            send({ type: queued ? 'task.accepted' : 'task.running', task })
             send({ type: 'voice.state', state: 'idle' })
           } else if (this.scenario === 'silent') {
             // Never answers: exercises the bridge-side hard timeout.

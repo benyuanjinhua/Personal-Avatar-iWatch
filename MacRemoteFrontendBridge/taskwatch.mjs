@@ -244,17 +244,28 @@ export class TaskWatcher {
   }
 
   // Returns true when the turn reached a terminal state.
+  //
+  // ESS-41 B1（P0 回归修复）：预算只统计 SSE/task 生命周期事件——Realtime
+  // 观测计数走 ledger.bumpEvents 单独分账，一轮正常语音的数百条逐字/音频
+  // delta 不再喂爆熔断。预算耗尽的降级动作是收敛投影 + 降采样取证日志，
+  // 绝不取消仍在健康推进的任务（失控 SSE 的最终兜底是 300s 硬超时）。
   onEvent(requestId, taskId, event) {
-    const count = this.ledger.bumpEvents(requestId)
-    if (count > this.cfg.max_turn_events) {
-      // Event budget exhausted: cancel the work and fail with a stable code.
-      this.log({ evt: 'event_budget_exhausted', request_id: requestId, count })
-      this.cancelUpstream(taskId)
-      this.ledger.fail(requestId, 'ERR_EVENT_LIMIT')
-      return true
-    }
+    const count = this.ledger.bumpTaskEvents(requestId)
     const task = event.task
-    if (!task || typeof task.status !== 'string') return false
+    const hasTask = task && typeof task.status === 'string'
+    if (count > this.cfg.max_turn_events) {
+      if (count === this.cfg.max_turn_events + 1) {
+        this.log({ evt: 'event_budget_exhausted', request_id: requestId, task_id: taskId, count, action: 'degrade' })
+      } else if ((count - this.cfg.max_turn_events) % 100 === 0) {
+        this.log({ evt: 'event_budget_over', request_id: requestId, task_id: taskId, count })
+      }
+      // 超预算后只投影仍然必要的转折点（终态 / pending 权限），进度噪声丢弃。
+      if (!hasTask) return false
+      const pivotal = TERMINAL_TASK.has(task.status)
+        || (task.authorization?.id && task.authorization.status === 'pending')
+      if (!pivotal) return false
+    }
+    if (!hasTask) return false
     return this.projectTask(requestId, task, event.type)
   }
 

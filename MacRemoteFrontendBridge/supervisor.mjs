@@ -694,7 +694,7 @@ class TurnCapture {
   onEvent(event) {
     const TURN_EVENTS = [
       'turn.started', 'transcript.delta', 'transcript.final', 'response.started',
-      'task.running', 'task.delegated', 'task.progress',
+      'task.accepted', 'task.running', 'task.delegated', 'task.progress',
     ]
     if (TURN_EVENTS.includes(event.type)
       || (event.type === 'voice.state' && event.state !== 'idle')) {
@@ -731,6 +731,7 @@ class TurnCapture {
           ))
         }
         break
+      case 'task.accepted':
       case 'task.running':
       case 'task.delegated': {
         const task = event.task

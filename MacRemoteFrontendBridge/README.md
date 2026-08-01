@@ -86,8 +86,13 @@ request_id` 绑定回原请求，转码 AAC/M4A 落 `state/result-audio/`（保�
   true`，绝不二次执行）；同 id 不同 body → `409 ERR_IDEMPOTENCY_CONFLICT`。
 - **300 秒硬超时**：受理即计时。实时阶段超时中止注入；后台阶段超时先 `DELETE
   /api/tasks/:id` 再投影 `failed / ERR_WORK_TIMEOUT`。绝无无期限等待。
-- **上限**：单请求事件数（`max_turn_events`）、结果文本（`max_result_chars`）、结果音频
+- **上限**：单请求 SSE/task 事件数（`max_turn_events`，ESS-41 起只统计 SSE/task
+  生命周期事件，Realtime 观测计数单独分账；超预算降级为收敛投影 + 降采样日志，
+  绝不取消健康任务，最终兜底是 300s 硬超时）、结果文本（`max_result_chars`）、结果音频
   （`max_result_audio_bytes`，超限丢音频保文本摘要）。
+- **空音频快速失败**（ESS-41）：解码后不足 `min_audio_ms`（默认 300ms）或 RMS 低于
+  `min_audio_rms` 的空/误触音频直接 `ERR_AUDIO_TOO_SHORT`（Watch 提示「没听清，请重
+  说」），不进 Realtime 注入与停摆重放机器。
 - **防御性校验**：所有网关响应先验 HTTP 状态 + Content-Type + 最小 Schema。真实网关对
   未知 `/api/*` 路由返回 HTML（web UI 兜底路由），绝不被当 JSON 解析。
 - **断线恢复**：重启后仅恢复可安全查询的状态——有 `task_id` 的 turn 重挂 SSE/REST
