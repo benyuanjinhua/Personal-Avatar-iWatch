@@ -10,6 +10,8 @@
 
   "max_audio_bytes": 5242880,
   "max_duration_ms": 60000,
+  "min_audio_ms": 300,
+  "min_audio_rms": 100,
   "max_body_bytes": 8388608,
   "timestamp_skew_ms": 300000,
   "pairing_code_ttl_ms": 600000,

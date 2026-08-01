@@ -78,7 +78,8 @@ export class TurnLedger extends EventEmitter {
       permission: null,           // { id, ...bounded summary } while permission_required
       result: null,               // { text, audio_base64?, truncated? } once terminal
       error: null,                // stable ERR_* code once failed
-      event_count: 0,
+      event_count: 0,             // 全量观测计数（Realtime + SSE，ESS-37 取证口径）
+      task_event_count: 0,        // 仅 SSE/task 生命周期事件（taskwatch 熔断预算，ESS-41）
       created_at: now,
       updated_at: now,
     }
@@ -149,6 +150,17 @@ export class TurnLedger extends EventEmitter {
     if (!turn) return 0
     turn.event_count += 1
     return turn.event_count
+  }
+
+  // ESS-41 B1：熔断预算与观测计数分账。Realtime 逐字 delta / audio.delta 只进
+  // event_count（取证口径不变），SSE/task 生命周期事件才进 task_event_count——
+  // taskwatch 的 max_turn_events 只看这里，健康的高频语音流喂不爆它。
+  bumpTaskEvents(requestId) {
+    const turn = this.turns.get(requestId)
+    if (!turn) return 0
+    turn.event_count += 1
+    turn.task_event_count = (turn.task_event_count || 0) + 1
+    return turn.task_event_count
   }
 
   emitState(turn) {

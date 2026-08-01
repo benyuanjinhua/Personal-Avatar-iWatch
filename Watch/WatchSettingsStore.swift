@@ -1,7 +1,6 @@
 import Combine
 import Foundation
 import WatchConnectivity
-import os
 
 @MainActor
 final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
@@ -14,8 +13,6 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
     weak var speechVault: EncryptedAudioVault?
     private let defaults = UserDefaults.standard
     private let storageKey = "wristagent.watch.configuration"
-    /// ESS-38 复测取证：语音落地/校验/入库全分支留痕（真机按 subsystem 过滤）。
-    private static let speechLogger = Logger(subsystem: "com.benyuan.wristagent.watch", category: "SpeechIngest")
 
     override init() {
         super.init()
@@ -54,8 +51,16 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         activationDidCompleteWith activationState: WCSessionActivationState,
         error: Error?
     ) {
+        if let error {
+            WatchLog.error("wcsession", "activation_failed", error: error)
+        } else {
+            WatchLog.info("wcsession", "activation_completed", detail: "state=\(activationState.rawValue)")
+        }
         guard activationState == .activated else { return }
-        Task { @MainActor in self.voiceTransport?.retryPending() }
+        Task { @MainActor in
+            self.voiceTransport?.retryPending()
+            WatchLogShipper.shared.ship(reason: "session_activated")
+        }
     }
 
     nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
@@ -69,7 +74,15 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         error: Error?
     ) {
         let fileName = fileTransfer.file.fileURL.lastPathComponent
-        Task { @MainActor in self.voiceTransport?.handleTransferFinished(fileName: fileName, error: error) }
+        // 日志 chunk 与语音上行共用 transferFile 回执，按 metadata 分流。
+        let isLogChunk = fileTransfer.file.metadata?[WatchClientLogMessage.fileKey] != nil
+        Task { @MainActor in
+            if isLogChunk {
+                WatchLogShipper.shared.handleTransferFinished(fileName: fileName, error: error)
+            } else {
+                self.voiceTransport?.handleTransferFinished(fileName: fileName, error: error)
+            }
+        }
     }
 
     nonisolated func session(
@@ -110,7 +123,9 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
 
     nonisolated func session(_ session: WCSession, didReceive file: WCSessionFile) {
         // 系统会在本方法返回后删除临时文件，必须同步读出/搬移。
+        let size = (try? file.fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? -1
         if let payloadData = file.metadata?[VoiceMessage.resultKey] as? Data {
+            WatchLog.info("wcsession", "file_received", detail: "kind=result_audio bytes=\(size)")
             let stagedURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("relay-result-\(UUID().uuidString).m4a")
             try? FileManager.default.moveItem(at: file.fileURL, to: stagedURL)
@@ -121,14 +136,16 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             return
         }
         guard let envelopeData = file.metadata?[VoiceSpeechMessage.envelopeKey] as? Data else {
-            Self.speechLogger.error("file received without known metadata keys (name=\(file.fileURL.lastPathComponent, privacy: .public))")
+            WatchLog.error(
+                "wcsession", "file_received_unknown", detail: "bytes=\(size)", code: "ERR_UNKNOWN_FILE"
+            )
             return
         }
         guard let audioData = try? Data(contentsOf: file.fileURL) else {
-            Self.speechLogger.error("speech file unreadable (name=\(file.fileURL.lastPathComponent, privacy: .public))")
+            WatchLog.error("wcsession", "file_received_unreadable", detail: "kind=speech", code: "ERR_FILE_READ")
             return
         }
-        Self.speechLogger.info("speech file received (name=\(file.fileURL.lastPathComponent, privacy: .public), bytes=\(audioData.count))")
+        WatchLog.info("wcsession", "file_received", detail: "kind=speech bytes=\(audioData.count)")
         Task { @MainActor in self.storeSpeech(envelopeData: envelopeData, audioData: audioData) }
     }
 
@@ -144,34 +161,60 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
 
     @MainActor
     private func applyVoiceStatus(_ data: Data) {
-        guard let envelope = try? VoiceStatusEnvelope.decode(from: data) else { return }
-        voiceJournal?.apply(envelope)
+        guard let envelope = try? VoiceStatusEnvelope.decode(from: data) else {
+            WatchLog.error("turn", "status_envelope_undecodable", detail: "bytes=\(data.count)", code: "ERR_DECODE")
+            return
+        }
+        let applied = voiceJournal?.apply(envelope) ?? false
+        // 每次请求的状态机变迁取证：accepted/processing/failed + 失败环节；
+        // 被状态机拒绝的乱序/重复事件也留痕（applied=false）。
+        let failure = envelope.failureStage.map { " failure_stage=\($0.rawValue)" } ?? ""
+        let detailText = envelope.detail.map { " detail=\($0)" } ?? ""
+        WatchLog.info(
+            "turn", "state_event", requestId: envelope.requestId,
+            detail: "state=\(envelope.state.rawValue) applied=\(applied)\(failure)\(detailText)"
+        )
+        if envelope.state.isTerminal {
+            WatchLogShipper.shared.ship(reason: "turn_terminal")
+        }
     }
 
-    /// 结果语音入库（ESS-38 复测取证）：SpeechIngest 强校验（信封 + sha256）
-    /// 通过才加密落盘；每个拒收/失败分支都留 os.Logger 痕迹，绝不静默。
+    /// 结果语音入库（ESS-38 复测取证）：`SpeechIngest` 强校验（信封 + sha256）
+    /// 通过才加密落盘。ESS-41 L3 取证：每个拒收/失败分支必须留 request_id +
+    /// 原因，禁止静默 return。
+    ///
+    /// 注意与 ESS-41 版本的差异：`speechSha256` 缺失不再放行——没有校验值的
+    /// 音频一律拒收（宁缺毋滥，文本结果不受影响）。
     @MainActor
     private func storeSpeech(envelopeData: Data, audioData: Data) {
         switch SpeechIngest.validate(envelopeData: envelopeData, audioData: audioData) {
         case .envelopeInvalid(let reason):
-            Self.speechLogger.error("speech rejected: \(reason, privacy: .public) (bytes=\(audioData.count))")
+            WatchLog.error(
+                "turn", "speech_envelope_invalid",
+                detail: "reason=\(reason) bytes=\(audioData.count)", code: "ERR_DECODE"
+            )
         case .shaMismatch(let expected, let actual):
-            Self.speechLogger.error("speech sha mismatch expected=\(expected.prefix(12), privacy: .public) actual=\(actual.prefix(12), privacy: .public)")
+            WatchLog.error(
+                "turn", "speech_sha_mismatch",
+                detail: "bytes=\(audioData.count) expected=\(expected.prefix(12)) actual=\(actual.prefix(12))",
+                code: "ERR_SHA_MISMATCH"
+            )
         case .accepted(let envelope, let sha256):
             voiceJournal?.apply(envelope)
             let fileName = "\(envelope.requestId).m4a"
-            guard let vault = speechVault else {
-                Self.speechLogger.error("speech vault unavailable request_id=\(envelope.requestId, privacy: .public)")
+            guard let vault = speechVault, (try? vault.store(audioData, name: fileName)) != nil else {
+                WatchLog.error(
+                    "turn", "speech_vault_store_failed", requestId: envelope.requestId,
+                    detail: "vault=\(speechVault != nil)", code: "ERR_VAULT_STORE"
+                )
                 return
             }
-            do {
-                try vault.store(audioData, name: fileName)
-            } catch {
-                Self.speechLogger.error("vault store failed request_id=\(envelope.requestId, privacy: .public): \(String(describing: error), privacy: .public)")
-                return
-            }
+            WatchLog.info(
+                "turn", "speech_stored", requestId: envelope.requestId,
+                detail: "bytes=\(audioData.count) sha=\(sha256.prefix(12))"
+            )
             voiceJournal?.attachSpeech(requestId: envelope.requestId, fileName: fileName)
-            Self.speechLogger.info("speech stored request_id=\(envelope.requestId, privacy: .public) bytes=\(audioData.count) sha=\(sha256.prefix(12), privacy: .public)")
+            WatchLogShipper.shared.ship(reason: "speech_stored")
         }
     }
 }

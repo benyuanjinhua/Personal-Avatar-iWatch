@@ -1,6 +1,7 @@
 import Combine
 import CryptoKit
 import Foundation
+import os
 import Security
 import UserNotifications
 
@@ -12,7 +13,10 @@ protocol WatchFeedbackChannel: AnyObject {
     /// 状态/权限/结果信封 → Watch VoiceTurnJournal（ESS-29 时间线 UI 的入账单位）。
     func notifyWatch(voiceStatus: VoiceStatusEnvelope)
     /// 结果语音 transferFile；metadata 带含 speechSha256 的信封，Watch 校验后入加密仓。
-    func transferSpeech(fileURL: URL, envelope: VoiceStatusEnvelope)
+    /// 返回 true 表示本条已**持久入队**（或同载荷已在队列/保留期内送达过，属幂等重复）；
+    /// 返回 false 表示未能持久化——调用方不得记为已交付，必须允许后续快照重试。
+    @discardableResult
+    func transferSpeech(fileURL: URL, envelope: VoiceStatusEnvelope) -> Bool
 }
 
 /// WristAgentPhoneRelay（ESS-28）：iPhone Companion Relay 编排器。
@@ -24,6 +28,7 @@ protocol WatchFeedbackChannel: AnyObject {
 /// - 只持有 Bridge 设备凭据（Keychain），不保存 DashScope/Codex/Vault 凭据。
 @MainActor
 final class WristAgentPhoneRelay: ObservableObject {
+    private static let downlinkLogger = Logger(subsystem: "com.benyuan.wristagent.phone", category: "VoiceDownlink")
     @Published private(set) var outboxEntries: [VoiceOutboxEntry] = []
     @Published private(set) var relayStatus = "Relay 未配对"
     @Published private(set) var eventsConnected = false
@@ -38,6 +43,8 @@ final class WristAgentPhoneRelay: ObservableObject {
     private var credentials: RelayDeviceCredentials?
     private let session: URLSession
     private let resultAudioDirectory: URL
+    /// Watch 交互日志 chunk → Bridge /v1/client-logs（ESS-42）。
+    private(set) var clientLogUplink: ClientLogUplink!
 
     private var drainTask: Task<Void, Never>?
     private var scheduledDrainTask: Task<Void, Never>?
@@ -45,7 +52,8 @@ final class WristAgentPhoneRelay: ObservableObject {
     private var eventsLoopTask: Task<Void, Never>?
     private var eventsReconnectAttempt = 0
     private var notifiedStuckRequestIds: Set<String> = []
-    /// 已交付的结果语音（requestId|sha）：快照重放/补挂事件不重复 transferFile。
+    /// 已确认持久入下行队列的结果语音（requestId|sha）：快照重放/补挂事件不重复 transferFile。
+    /// 只有 transferSpeech 返回成功才写入——入队失败必须留给后续快照重试的机会。
     private var deliveredResultAudio: Set<String> = []
     /// 下载中的结果语音（requestId|sha）：避免并发重复下载。
     private var activeAudioDownloads: Set<String> = []
@@ -71,6 +79,10 @@ final class WristAgentPhoneRelay: ObservableObject {
         credentials = RelayCredentialsStore.read()
         isPaired = credentials != nil
         relayStatus = isPaired ? "已配对，等待请求" : "Relay 未配对"
+        clientLogUplink = ClientLogUplink(
+            directory: base.appendingPathComponent("ClientLogQueue", isDirectory: true),
+            makeClient: { [weak self] in self?.makeClient() }
+        )
         refreshEntries()
     }
 
@@ -79,6 +91,7 @@ final class WristAgentPhoneRelay: ObservableObject {
         purgeExpired()
         scheduleDrain(after: 0)
         connectEventsIfNeeded()
+        clientLogUplink.start()
     }
 
     // MARK: - 配对
@@ -98,6 +111,7 @@ final class WristAgentPhoneRelay: ObservableObject {
             relayStatus = "配对成功"
             scheduleDrain(after: 0)
             connectEventsIfNeeded()
+            clientLogUplink.start()
         } catch {
             relayStatus = "配对失败：\((error as? RelayUploadError)?.stableCode ?? error.localizedDescription)"
         }
@@ -366,8 +380,13 @@ final class WristAgentPhoneRelay: ObservableObject {
         guard (try? data.write(to: url, options: .atomic)) != nil else { return }
         // transferFile 的信封以实际字节的 sha 为准（Watch 端以此校验入库）。
         guard let envelope = speechEnvelope(projection: projection, sha: sha) else { return }
+        Self.downlinkLogger.log("l2_relay_audio_ready request_id=\(projection.requestId, privacy: .public) bytes=\(data.count) sha256=\(sha, privacy: .public) source=\(projection.path ?? "unknown", privacy: .public)")
+        guard watchChannel?.transferSpeech(fileURL: url, envelope: envelope) == true else {
+            // 编码/读文件/落盘任一环失败：不写内存去重，下一次快照重放还能重试这条语音。
+            relayLog("结果语音入队失败，等待快照重试 \(projection.requestId.prefix(8))…")
+            return
+        }
         deliveredResultAudio.insert(key)
-        watchChannel?.transferSpeech(fileURL: url, envelope: envelope)
     }
 
     private func speechEnvelope(projection: BridgeTurnProjection, sha: String) -> VoiceStatusEnvelope? {

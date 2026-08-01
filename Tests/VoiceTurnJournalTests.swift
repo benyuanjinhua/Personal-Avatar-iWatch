@@ -95,6 +95,28 @@ final class VoiceTurnJournalTests: XCTestCase {
         UUIDv7.generate().uuidString.lowercased()
     }
 
+    func testAttachSpeechFiresCallbackAndLookupFindsInactiveTurn() {
+        // ESS-41 B3：播放触发下沉到 attachSpeech 事件——即使该回合已被新回合
+        // 顶掉（不再是 activeTurn）甚至已判失败，回调仍按 request_id 精确命中。
+        let journal = VoiceTurnJournal(directory: directory)
+        let older = newRequestId()
+        let newer = newRequestId()
+        journal.begin(requestId: older)
+        journal.recordLocal(.failed, requestId: older, detail: "ERR_WORK_TIMEOUT")
+        journal.begin(requestId: newer)
+        XCTAssertEqual(journal.activeTurn?.requestId, newer, "旧回合已终态且被顶掉")
+
+        var attached: [String] = []
+        journal.onSpeechAttached = { attached.append($0) }
+        journal.attachSpeech(requestId: older, fileName: "\(older).m4a")
+        XCTAssertEqual(attached, [older])
+        XCTAssertEqual(journal.turn(withId: older)?.speechFileName, "\(older).m4a")
+
+        // 未知 request_id：不落盘也不回调
+        journal.attachSpeech(requestId: newRequestId(), fileName: "ghost.m4a")
+        XCTAssertEqual(attached, [older])
+    }
+
     func testBeginIsIdempotent() {
         let journal = VoiceTurnJournal(directory: directory)
         let id = newRequestId()

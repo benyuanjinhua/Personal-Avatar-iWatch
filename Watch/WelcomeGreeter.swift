@@ -9,6 +9,10 @@ import Foundation
 /// - 语音缺失/解码失败 → 静默降级为文字欢迎，不阻塞主界面；
 /// - 同一进程会话只播一次；把 `wristagent.watch.welcome.every-entry`
 ///   置为 true 可改成每次进入都播（可配置开关）。
+///
+/// ESS-42 取证：全路径走统一 WatchLog（os.Logger + JSONL 回传），每次
+/// 尝试生成 welcome-<uuidv7> 作为 request_id，资源查找/会话激活/路由/
+/// play 结果/完成回调按同一 id 串成完整日志链。
 @MainActor
 final class WelcomeGreeter: ObservableObject {
     static let welcomeText = "你好Jackson，我是你的AI分身"
@@ -36,33 +40,71 @@ final class WelcomeGreeter: ObservableObject {
 
     /// 首次进入触发；同一会话内重复进入不重复播放（可配置放开）。
     func greetIfNeeded() {
-        guard !greetedThisSession || defaults.bool(forKey: Self.everyEntryDefaultsKey) else { return }
+        let everyEntry = defaults.bool(forKey: Self.everyEntryDefaultsKey)
+        guard !greetedThisSession || everyEntry else {
+            WatchLog.info(
+                "welcome", "dedup_skip",
+                detail: "greeted_this_session=\(greetedThisSession) every_entry=\(everyEntry)"
+            )
+            return
+        }
         greetedThisSession = true
+        let attemptId = "welcome-\(UUIDv7.generate().uuidString.lowercased())"
+        WatchLog.info(
+            "welcome", "greet_start", requestId: attemptId,
+            detail: "greeted_this_session=false every_entry=\(everyEntry)"
+        )
 
-        guard
-            let url = Bundle.main.url(forResource: "WelcomeSpeech", withExtension: "m4a"),
-            let data = try? Data(contentsOf: url)
-        else {
+        guard let url = Bundle.main.url(forResource: "WelcomeSpeech", withExtension: "m4a") else {
+            WatchLog.error(
+                "welcome", "resource_missing", requestId: attemptId,
+                detail: "WelcomeSpeech.m4a not in bundle \(Bundle.main.bundlePath)",
+                code: "ERR_WELCOME_ASSET_MISSING"
+            )
             fallBackToText()
             return
         }
-        stage = .playing
-        let started = player.play(data: data) { [weak self] _ in
-            guard let self, self.stage == .playing else { return }
-            self.stage = .finished
+        guard let data = try? Data(contentsOf: url) else {
+            WatchLog.error(
+                "welcome", "resource_unreadable", requestId: attemptId,
+                detail: url.path, code: "ERR_WELCOME_ASSET_UNREADABLE"
+            )
+            fallBackToText()
+            return
         }
-        if !started { fallBackToText() }
+        WatchLog.info("welcome", "resource_found", requestId: attemptId, detail: "path=\(url.path) bytes=\(data.count)")
+        stage = .playing
+        // 欢迎语的完成回调不区分成败：失败分支已由 started == false 与
+        // SpeechPlayer 的取证日志覆盖，这里只负责收尾。
+        let started = player.play(data: data, context: attemptId) { [weak self] _ in
+            guard let self, self.stage == .playing else { return }
+            WatchLog.info("welcome", "playback_completed", requestId: attemptId)
+            self.stage = .finished
+            WatchLogShipper.shared.ship(reason: "welcome_completed")
+        }
+        if started {
+            WatchLog.info("welcome", "playback_started", requestId: attemptId, detail: "bytes=\(data.count)")
+        } else {
+            // 失败环节由 SpeechPlayer 按同一 attemptId 落了具体 error；这里记降级决策。
+            WatchLog.error(
+                "welcome", "playback_start_failed", requestId: attemptId,
+                detail: "fallback=text", code: "ERR_WELCOME_PLAYBACK_START"
+            )
+            fallBackToText()
+        }
     }
 
     /// 用户开始按住说话时打断欢迎，绝不挡住真实链路。
     func interrupt() {
         guard isActive else { return }
+        WatchLog.info("welcome", "interrupted_by_user")
         player.stop()
         stage = .finished
     }
 
     private func fallBackToText() {
         stage = .textOnly
+        WatchLogShipper.shared.ship(reason: "welcome_fallback")
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(4))
             if self?.stage == .textOnly { self?.stage = .finished }
