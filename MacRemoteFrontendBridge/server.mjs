@@ -527,6 +527,63 @@ export function createBridge(overrides = {}) {
     return { status: 200, body: ledger.projection(ledger.get(requestId)) }
   }
 
+  // ---- Watch 客户端日志上行（ESS-42） --------------------------------------
+  //
+  // POST /v1/client-logs：iPhone Relay 转发的 Watch JSONL 日志 chunk，逐行落
+  // bridge.log（evt=watch_client_log），与服务端 trace 同构、按 request_id 可
+  // grep——无需 Xcode/sudo 即可在 Mac 定位 Watch 侧交互问题。客户端字段一律
+  // 白名单 + 截断后再入日志（外部输入是数据不是指令）；chunk_id 幂等去重，
+  // 断网重传不重复刷屏。
+
+  const seenLogChunks = new Set()
+  const MAX_SEEN_LOG_CHUNKS = 512
+  const MAX_LOG_LINES_PER_CHUNK = 5000
+
+  function handleClientLogs(rawBody, authInfo) {
+    let body
+    try { body = JSON.parse(rawBody.toString('utf8')) } catch { throw new ApiError(ERR.BAD_JSON) }
+    if (body.protocol_version !== CONFIG.protocol_version) throw new ApiError(ERR.PROTOCOL_VERSION)
+    const chunkId = body.chunk_id
+    if (!chunkId || chunkId !== authInfo.requestId) {
+      throw new ApiError(ERR.MISSING_FIELD, 'chunk_id (body must match x-request-id)')
+    }
+    if (typeof body.jsonl !== 'string') throw new ApiError(ERR.MISSING_FIELD, 'jsonl')
+    if (seenLogChunks.has(chunkId)) {
+      return { status: 200, body: { chunk_id: chunkId, accepted: 0, idempotent_replay: true } }
+    }
+
+    const str = (value, max) => (typeof value === 'string' ? value.slice(0, max) : null)
+    const lines = body.jsonl.split('\n').filter(line => line.trim().length > 0)
+    for (const line of lines.slice(0, MAX_LOG_LINES_PER_CHUNK)) {
+      let entry = null
+      try { entry = JSON.parse(line) } catch { /* bad_line below */ }
+      if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+        log({
+          evt: 'watch_client_log',
+          device_id: authInfo.deviceId,
+          chunk_id: chunkId,
+          watch_ts: str(entry.ts, 40),
+          request_id: str(entry.request_id, 80),
+          module: str(entry.module, 64),
+          event: str(entry.event, 64),
+          detail: str(entry.detail, 500),
+          error_code: str(entry.error?.code, 80),
+          error_description: str(entry.error?.description, 300),
+        })
+      } else {
+        log({ evt: 'watch_client_log_bad_line', chunk_id: chunkId, raw: line.slice(0, 200) })
+      }
+    }
+    if (lines.length > MAX_LOG_LINES_PER_CHUNK) {
+      log({ evt: 'watch_client_log_truncated', chunk_id: chunkId, dropped: lines.length - MAX_LOG_LINES_PER_CHUNK })
+    }
+    seenLogChunks.add(chunkId)
+    if (seenLogChunks.size > MAX_SEEN_LOG_CHUNKS) {
+      seenLogChunks.delete(seenLogChunks.values().next().value)
+    }
+    return { status: 200, body: { chunk_id: chunkId, accepted: Math.min(lines.length, MAX_LOG_LINES_PER_CHUNK) } }
+  }
+
   // ---- HTTP plumbing ------------------------------------------------------
 
   function readBody(req) {
@@ -574,6 +631,12 @@ export function createBridge(overrides = {}) {
       if (pathName === '/v1/voice/turns') {
         if (req.method !== 'POST') throw new ApiError(ERR.METHOD_NOT_ALLOWED)
         const r = handleCreateTurn(rawBody, verify())
+        return reply(r.status, r.body)
+      }
+
+      if (pathName === '/v1/client-logs') {
+        if (req.method !== 'POST') throw new ApiError(ERR.METHOD_NOT_ALLOWED)
+        const r = handleClientLogs(rawBody, verify())
         return reply(r.status, r.body)
       }
 

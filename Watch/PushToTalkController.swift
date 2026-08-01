@@ -138,6 +138,7 @@ final class PushToTalkController: ObservableObject {
     /// 取消当前进行中的回合：上行取消请求，本地立即投影为已取消。
     func cancelActiveTurn() {
         guard let turn = journal.activeTurn, turn.isActive else { return }
+        WatchLog.info("turn", "cancel_requested", requestId: turn.requestId)
         transport.send(cancel: VoiceCancelEnvelope.cancel(requestId: turn.requestId))
         journal.recordLocal(.cancelled, requestId: turn.requestId, detail: "你取消了本次请求")
     }
@@ -146,23 +147,17 @@ final class PushToTalkController: ObservableObject {
     func playResult(for turn: VoiceTurnRecord) {
         let requestId = turn.requestId
         guard let fileName = turn.speechFileName else {
-            Self.logger.error("play skipped: no speech file attached (request_id=\(requestId, privacy: .public))")
+            WatchLog.error("player", "result_speech_missing", requestId: requestId, code: "ERR_NO_SPEECH_FILE")
             return
         }
-        guard let vault = speechVault else {
-            Self.logger.error("play skipped: speech vault unavailable (request_id=\(requestId, privacy: .public))")
+        guard let vault = speechVault, let data = try? vault.load(name: fileName) else {
+            WatchLog.error(
+                "player", "result_speech_load_failed", requestId: requestId,
+                detail: "vault=\(speechVault != nil)", code: "ERR_VAULT_LOAD"
+            )
             return
         }
-        let data: Data
-        do {
-            data = try vault.load(name: fileName)
-        } catch {
-            Self.logger.error("play skipped: vault load failed (request_id=\(requestId, privacy: .public)): \(error.localizedDescription, privacy: .public)")
-            return
-        }
-        let background = turn.events.contains { $0.state == .backgroundAccepted || $0.state == .backgroundProcessing }
-        let context = SpeechPlaybackContext(requestId: requestId, source: background ? "result_background" : "result_direct")
-        player.play(data: data, context: context) { [weak self] in
+        player.play(data: data, context: requestId) { [weak self] in
             self?.speechVault?.remove(name: fileName)
             self?.journal.clearSpeech(requestId: requestId)
         }

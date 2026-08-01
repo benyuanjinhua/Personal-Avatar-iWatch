@@ -25,6 +25,8 @@
 		3F6EA24FB3A3B46BD00BC2D0 /* WristAgentApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36A3DD675D9E3E4CDC7C7C5A /* WristAgentApp.swift */; };
 		402E9DC1E4E2E918917E9B58 /* WatchSettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C85D18E0360A2A1EBDF04975 /* WatchSettingsStore.swift */; };
 		41214906A025D5C1E7C4ECA9 /* SecureTokenStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC28E8D4A89C399924568EEB /* SecureTokenStore.swift */; };
+		42DFE528414D5974292532FB /* WatchLogShipper.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA80AE8DA7716EC314B4D3C7 /* WatchLogShipper.swift */; };
+		486B5477826ED3933D89132E /* ClientLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 234EBF336FF2F9724F289524 /* ClientLog.swift */; };
 		487F199E241E68A3B8696D31 /* WristAgentWatchApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10B09D1AD3BA287A3856E6E /* WristAgentWatchApp.swift */; };
 		4EACD0A9A1C336AA8BCB6677 /* VoiceTurnState.swift in Sources */ = {isa = PBXBuildFile; fileRef = F928ACBF6FA59402D5EB1275 /* VoiceTurnState.swift */; };
 		54817C157F20C92848363962 /* ConversationHistory.swift in Sources */ = {isa = PBXBuildFile; fileRef = E92A4F28175D63C6FBD62D7E /* ConversationHistory.swift */; };
@@ -34,15 +36,15 @@
 		6367A07D0292627141725AB1 /* VoiceTurnState.swift in Sources */ = {isa = PBXBuildFile; fileRef = F928ACBF6FA59402D5EB1275 /* VoiceTurnState.swift */; };
 		72AEE3274DC1730DAB22022E /* VoiceTurnJournal.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6F558DCDF4B9CA8F0BA2E2D /* VoiceTurnJournal.swift */; };
 		72E757EA3A1C9DBEF705D3A5 /* VoiceStatusEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0EAD7935F2F128D8408C210F /* VoiceStatusEnvelope.swift */; };
-		770DB683BEC61B9851F2B0D1 /* WatchDownlinkOutbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA60FA5DC7EA82EC5729B54B /* WatchDownlinkOutbox.swift */; };
+		74339B1DE6A6C27DBE1885DD /* ClientLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 234EBF336FF2F9724F289524 /* ClientLog.swift */; };
 		7CE7CD69630867506FAD3360 /* VoiceRequestInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AB8CD6D695437D845CE87AF /* VoiceRequestInbox.swift */; };
 		7F172712436C104970B3035C /* VoiceRelayWire.swift in Sources */ = {isa = PBXBuildFile; fileRef = 035DF4EEFBF9F540A0B791F7 /* VoiceRelayWire.swift */; };
 		8D74BBCA5601E569150562B6 /* PhoneHistoryViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0A1CA98E116775B1257DB33 /* PhoneHistoryViews.swift */; };
-		8E707FCD5F8E34356AF80305 /* WatchDownlinkOutbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA60FA5DC7EA82EC5729B54B /* WatchDownlinkOutbox.swift */; };
 		9FE3E5082197E2851CD75F30 /* WatchVoiceTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = F16E394DC77EF14BAE142B32 /* WatchVoiceTransport.swift */; };
 		A9E722341F5CCE1CCF5D65CD /* WelcomeSpeech.m4a in Resources */ = {isa = PBXBuildFile; fileRef = 4872AA5D7D68F48548C7ABF5 /* WelcomeSpeech.m4a */; };
 		AB38F702523DAB57ECDB758F /* AudioRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98840DEEAC5DA7B6F8FCC628 /* AudioRecorder.swift */; };
 		AC284F28E28E5427A577455B /* AgentModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB1D464D47EC34B55A8C8411 /* AgentModels.swift */; };
+		AF4B996A0E38234DCEE5FC09 /* WatchLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDF08FF1AA89A3FD36122100 /* WatchLog.swift */; };
 		B61FF83E4DCF49ED91557083 /* EncryptedAudioVault.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7C56A17FC91DC667B51B7D6 /* EncryptedAudioVault.swift */; };
 		BF1A28E74E549CDAB4F6DB58 /* VoiceRelayEvents.swift in Sources */ = {isa = PBXBuildFile; fileRef = C58AEB9B4C54F952DFC96AB2 /* VoiceRelayEvents.swift */; };
 		C2FE93AC9C1274EE211A3714 /* WelcomeGreeter.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9FA489FA1C53D0A43298601 /* WelcomeGreeter.swift */; };
@@ -59,6 +61,7 @@
 		FD2534104A35901AC28B604D /* VoiceRelayEvents.swift in Sources */ = {isa = PBXBuildFile; fileRef = C58AEB9B4C54F952DFC96AB2 /* VoiceRelayEvents.swift */; };
 		FD6002847EC794CD155710D5 /* VoiceOutbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB7ABFE8DE51D05121E27317 /* VoiceOutbox.swift */; };
 		FF0CBF3B2F165CCB9D3F426C /* ConversationHistory.swift in Sources */ = {isa = PBXBuildFile; fileRef = E92A4F28175D63C6FBD62D7E /* ConversationHistory.swift */; };
+		FF6E483DDC04EDE981F240A3 /* ClientLogUplink.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF28D500590D9DF5BF4D748A /* ClientLogUplink.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -94,6 +97,7 @@
 		13F51C6DCBABB59C404B307D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		16A065FFB735532D201B2183 /* VoiceRequestEnvelope.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRequestEnvelope.swift; sourceTree = "<group>"; };
 		1AB8CD6D695437D845CE87AF /* VoiceRequestInbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRequestInbox.swift; sourceTree = "<group>"; };
+		234EBF336FF2F9724F289524 /* ClientLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientLog.swift; sourceTree = "<group>"; };
 		2E4C7D8E5213EE0C04CA8BEC /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		2E88D71F4696224E69D652E8 /* WristAgent Watch App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "WristAgent Watch App.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		36A3DD675D9E3E4CDC7C7C5A /* WristAgentApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WristAgentApp.swift; sourceTree = "<group>"; };
@@ -111,15 +115,17 @@
 		937C17EC6A16413E34C276A2 /* WatchContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchContentView.swift; sourceTree = "<group>"; };
 		98840DEEAC5DA7B6F8FCC628 /* AudioRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRecorder.swift; sourceTree = "<group>"; };
 		9A2CDFE23539DF4DB5ADDAF7 /* CompanionContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionContentView.swift; sourceTree = "<group>"; };
+		BF28D500590D9DF5BF4D748A /* ClientLogUplink.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientLogUplink.swift; sourceTree = "<group>"; };
 		C10B09D1AD3BA287A3856E6E /* WristAgentWatchApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WristAgentWatchApp.swift; sourceTree = "<group>"; };
 		C58AEB9B4C54F952DFC96AB2 /* VoiceRelayEvents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRelayEvents.swift; sourceTree = "<group>"; };
 		C6F558DCDF4B9CA8F0BA2E2D /* VoiceTurnJournal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceTurnJournal.swift; sourceTree = "<group>"; };
 		C85D18E0360A2A1EBDF04975 /* WatchSettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchSettingsStore.swift; sourceTree = "<group>"; };
-		CA60FA5DC7EA82EC5729B54B /* WatchDownlinkOutbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchDownlinkOutbox.swift; sourceTree = "<group>"; };
 		CB1D464D47EC34B55A8C8411 /* AgentModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentModels.swift; sourceTree = "<group>"; };
 		CB7ABFE8DE51D05121E27317 /* VoiceOutbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceOutbox.swift; sourceTree = "<group>"; };
 		CC28E8D4A89C399924568EEB /* SecureTokenStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureTokenStore.swift; sourceTree = "<group>"; };
 		D0A1CA98E116775B1257DB33 /* PhoneHistoryViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneHistoryViews.swift; sourceTree = "<group>"; };
+		DA80AE8DA7716EC314B4D3C7 /* WatchLogShipper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchLogShipper.swift; sourceTree = "<group>"; };
+		DDF08FF1AA89A3FD36122100 /* WatchLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchLog.swift; sourceTree = "<group>"; };
 		DE20A46446B578002D231E7D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		E36424AC38F0A8BB28751248 /* UUIDv7.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UUIDv7.swift; sourceTree = "<group>"; };
 		E92A4F28175D63C6FBD62D7E /* ConversationHistory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationHistory.swift; sourceTree = "<group>"; };
@@ -136,6 +142,7 @@
 			children = (
 				CB1D464D47EC34B55A8C8411 /* AgentModels.swift */,
 				5A61F7EAFB8A0CCF3D03F1D2 /* BridgeTurnProjection.swift */,
+				234EBF336FF2F9724F289524 /* ClientLog.swift */,
 				E92A4F28175D63C6FBD62D7E /* ConversationHistory.swift */,
 				F7C56A17FC91DC667B51B7D6 /* EncryptedAudioVault.swift */,
 				CC28E8D4A89C399924568EEB /* SecureTokenStore.swift */,
@@ -148,7 +155,6 @@
 				0EAD7935F2F128D8408C210F /* VoiceStatusEnvelope.swift */,
 				C6F558DCDF4B9CA8F0BA2E2D /* VoiceTurnJournal.swift */,
 				F928ACBF6FA59402D5EB1275 /* VoiceTurnState.swift */,
-				CA60FA5DC7EA82EC5729B54B /* WatchDownlinkOutbox.swift */,
 			);
 			path = Shared;
 			sourceTree = "<group>";
@@ -165,6 +171,7 @@
 			isa = PBXGroup;
 			children = (
 				2E4C7D8E5213EE0C04CA8BEC /* Assets.xcassets */,
+				BF28D500590D9DF5BF4D748A /* ClientLogUplink.swift */,
 				9A2CDFE23539DF4DB5ADDAF7 /* CompanionContentView.swift */,
 				0DFA30C0EEFD46DDC835A5B6 /* CompanionSettings.swift */,
 				DE20A46446B578002D231E7D /* Info.plist */,
@@ -191,6 +198,8 @@
 				7669A09014913EDDEC887BBE /* SpeechPlayer.swift */,
 				8CA853AA557CCC08A3446DED /* VoiceOrbView.swift */,
 				937C17EC6A16413E34C276A2 /* WatchContentView.swift */,
+				DDF08FF1AA89A3FD36122100 /* WatchLog.swift */,
+				DA80AE8DA7716EC314B4D3C7 /* WatchLogShipper.swift */,
 				C85D18E0360A2A1EBDF04975 /* WatchSettingsStore.swift */,
 				F16E394DC77EF14BAE142B32 /* WatchVoiceTransport.swift */,
 				F9FA489FA1C53D0A43298601 /* WelcomeGreeter.swift */,
@@ -326,6 +335,8 @@
 			files = (
 				E0C092AAB8EB860FC6D5A0B7 /* AgentModels.swift in Sources */,
 				CD555D87536F29C54A475DFB /* BridgeTurnProjection.swift in Sources */,
+				486B5477826ED3933D89132E /* ClientLog.swift in Sources */,
+				FF6E483DDC04EDE981F240A3 /* ClientLogUplink.swift in Sources */,
 				3213E1FAF48D79262E5EA9FC /* CompanionContentView.swift in Sources */,
 				DADA85367CAACD55C3514A81 /* CompanionSettings.swift in Sources */,
 				FF0CBF3B2F165CCB9D3F426C /* ConversationHistory.swift in Sources */,
@@ -342,7 +353,6 @@
 				20A0B47A1FB2A2099BE53146 /* VoiceStatusEnvelope.swift in Sources */,
 				72AEE3274DC1730DAB22022E /* VoiceTurnJournal.swift in Sources */,
 				4EACD0A9A1C336AA8BCB6677 /* VoiceTurnState.swift in Sources */,
-				770DB683BEC61B9851F2B0D1 /* WatchDownlinkOutbox.swift in Sources */,
 				3F6EA24FB3A3B46BD00BC2D0 /* WristAgentApp.swift in Sources */,
 				D482537406EC7EC94069E3AF /* WristAgentPhoneRelay.swift in Sources */,
 			);
@@ -355,6 +365,7 @@
 				AC284F28E28E5427A577455B /* AgentModels.swift in Sources */,
 				AB38F702523DAB57ECDB758F /* AudioRecorder.swift in Sources */,
 				E817250A3DAFD3D2F889876B /* BridgeTurnProjection.swift in Sources */,
+				74339B1DE6A6C27DBE1885DD /* ClientLog.swift in Sources */,
 				54817C157F20C92848363962 /* ConversationHistory.swift in Sources */,
 				2600C4D0F1086887A7E1B04A /* ConversationTimelineView.swift in Sources */,
 				34140BE278C262CF0BACEABE /* EncryptedAudioVault.swift in Sources */,
@@ -374,7 +385,8 @@
 				5B434395A63D5C4B37CCFD72 /* VoiceTurnJournal.swift in Sources */,
 				6367A07D0292627141725AB1 /* VoiceTurnState.swift in Sources */,
 				E67E11F4044782400305330E /* WatchContentView.swift in Sources */,
-				8E707FCD5F8E34356AF80305 /* WatchDownlinkOutbox.swift in Sources */,
+				AF4B996A0E38234DCEE5FC09 /* WatchLog.swift in Sources */,
+				42DFE528414D5974292532FB /* WatchLogShipper.swift in Sources */,
 				402E9DC1E4E2E918917E9B58 /* WatchSettingsStore.swift in Sources */,
 				9FE3E5082197E2851CD75F30 /* WatchVoiceTransport.swift in Sources */,
 				C2FE93AC9C1274EE211A3714 /* WelcomeGreeter.swift in Sources */,
