@@ -1,0 +1,19 @@
+#!/usr/bin/env node
+// Test stand-in for the Swift AudioPipe binary (ESS-38 tests).
+// decode <in> <out> <rate>  → 原样拷贝（测试音频已是 16k PCM）
+// encode <in> <rate> <out>  → 'FAKEM4A0' 前缀 + 原始 PCM（可校验字节与 sha256）
+import fs from 'node:fs'
+
+const [cmd, ...args] = process.argv.slice(2)
+if (cmd === 'decode') {
+  const [input, output] = args
+  fs.copyFileSync(input, output)
+  process.stdout.write(JSON.stringify({ ok: true, op: 'decode' }))
+} else if (cmd === 'encode') {
+  const [input, , output] = args
+  const pcm = fs.readFileSync(input)
+  fs.writeFileSync(output, Buffer.concat([Buffer.from('FAKEM4A0'), pcm]))
+  process.stdout.write(JSON.stringify({ ok: true, op: 'encode', pcmBytes: pcm.length }))
+} else {
+  process.exit(2)
+}

@@ -25,10 +25,33 @@ export class MockGateway extends EventEmitter {
     this.playbackReceipts = []  // { type, responseId }
     this.droppedFrames = 0
     this.voiceClients = new Set()
+    this.announceSeq = 0
   }
 
   setTask(task) {
     this.tasks.set(task.id, task)
+  }
+
+  // ESS-38：向当前语音持有者（Bridge 的 Realtime 连接）推送一条后台任务播报
+  // （origin=announcement），事件序列与真实网关同构：response.started(taskId)
+  // → audio.delta* → transcript.final → audio.done → voice.state idle。
+  announce({ taskId, responseId = `resp_ann_${++this.announceSeq}`, transcript = '任务完成。', pcm = Buffer.alloc(4800, 3), deltaBytes = 2400 } = {}) {
+    const target = [...this.voiceClients].find(c => this.holder?.ws === c.ws) || [...this.voiceClients][0]
+    if (!target) throw new Error('no realtime client connected for announcement')
+    target.send({ type: 'response.started', responseId, origin: 'announcement', taskId })
+    for (let offset = 0; offset < (pcm?.length || 0); offset += deltaBytes) {
+      target.send({
+        type: 'audio.delta',
+        responseId,
+        audio: pcm.subarray(offset, offset + deltaBytes).toString('base64'),
+        sampleRate: 24000,
+      })
+    }
+    if (transcript) {
+      target.send({ type: 'transcript.final', role: 'assistant', content: transcript, origin: 'announcement', responseId })
+    }
+    target.send({ type: 'audio.done', responseId })
+    target.send({ type: 'voice.state', state: 'idle', origin: 'announcement' })
   }
 
   // Push an SSE event to subscribers and keep the store in sync.
