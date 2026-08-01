@@ -5,7 +5,7 @@
   "tls_cert": "./certs/bridge.crt",
   "tls_key": "./certs/bridge.key",
   "state_dir": "./state",
-  "allowed_peer_ips": ["100.80.229.218"],
+  "allowed_peer_ips": ["100.80.229.218", "100.80.125.22"],
   "protocol_version": 1,
 
   "max_audio_bytes": 5242880,
@@ -18,6 +18,10 @@
   "device_id": "jackson-iphone",
   "idle_disconnect_ms": 900000,
   "turn_timeout_ms": 120000,
+  "inject_ack_timeout_ms": 15000,
+  "takeover_from_frontends": true,
+  "trailing_silence_ms": 2500,
+  "turn_gap_ms": 1500,
 
   "write_actions_enabled": false,
 

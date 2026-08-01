@@ -63,7 +63,18 @@ export function createBridge(overrides = {}) {
     deviceId: CONFIG.device_id,
     idleDisconnectMs: CONFIG.idle_disconnect_ms,
     turnTimeoutMs: CONFIG.turn_timeout_ms,
+    injectAckTimeoutMs: CONFIG.inject_ack_timeout_ms ?? 15_000,
+    takeoverFromFrontends: CONFIG.takeover_from_frontends === true,
+    ...(CONFIG.trailing_silence_ms ? { trailingSilenceMs: CONFIG.trailing_silence_ms } : {}),
+    ...(CONFIG.turn_gap_ms !== undefined ? { turnGapMs: CONFIG.turn_gap_ms } : {}),
     log: (...args) => log({ evt: 'supervisor', detail: args.map(String).join(' ').slice(0, 500) }),
+  })
+  // ESS-36 可观测性：supervisor journal 全量落 Bridge 结构化日志，request_id
+  // 由 journal 的 label 字段携带 —— accepted → realtime events → completed
+  // 可按同一 request_id 串起来。原始音频永不落日志（journal 只记字节数）。
+  supervisor.listeners.add(item => {
+    const { ts, label, event, ...rest } = item
+    log({ evt: 'realtime', request_id: label ?? null, event, ...rest })
   })
   const sourceAllowed = makeSourceGate(CONFIG.allowed_peer_ips)
 
@@ -72,6 +83,7 @@ export function createBridge(overrides = {}) {
   const workTimers = new Map() // request_id → deadline timer (realtime phase)
 
   function armWorkDeadline(requestId) {
+    disarmWorkDeadline(requestId) // 重挂（注入真正开始时重置预算），不叠加旧定时器
     const timer = setTimeout(async () => {
       workTimers.delete(requestId)
       const turn = ledger.get(requestId)
@@ -100,7 +112,14 @@ export function createBridge(overrides = {}) {
 
       if (ledger.get(requestId)?.state === 'cancelled') return
       ledger.update(requestId, { state: 'processing', detail: 'realtime_processing' })
-      const result = await supervisor.injectTurn(pcm16k, { label: requestId })
+      const result = await supervisor.injectTurn(pcm16k, {
+        label: requestId,
+        // 串行队列：work deadline 在轮到本 turn 注入时重挂——按受理时刻起算
+        // 的话，积压队尾在排队期就被判死（ESS-36 真机 4×ERR_WORK_TIMEOUT）。
+        onStart: () => armWorkDeadline(requestId),
+        // 排队期间已被取消/超时判死的 turn 不再浪费一个 Realtime 会话轮次
+        shouldRun: () => !['completed', 'failed', 'cancelled'].includes(ledger.get(requestId)?.state),
+      })
 
       if (ledger.get(requestId)?.state === 'cancelled') {
         // Result arrived after a cancel during injection — do not overwrite.
@@ -138,12 +157,23 @@ export function createBridge(overrides = {}) {
     } catch (error) {
       const turn = ledger.get(requestId)
       if (!turn || ['completed', 'failed', 'cancelled'].includes(turn.state)) return
-      if (error.cancelled) {
-        ledger.update(requestId, { state: 'cancelled' })
+      if (error.cancelled || error.skipped) {
+        // skipped：排队期间已进入终态（cancel / work timeout），保持原状即可
+        if (error.cancelled) ledger.update(requestId, { state: 'cancelled' })
       } else if (/work timeout/.test(String(error.message))) {
         ledger.fail(requestId, 'ERR_WORK_TIMEOUT')
       } else if (/turn timeout/.test(String(error.message))) {
         ledger.fail(requestId, 'ERR_REALTIME_TIMEOUT')
+      } else if (error.code === 'ERR_VOICE_BUSY') {
+        // 语音所有权被其他前台占用且不允许抢占：快速、确定地失败，
+        // 客户端可提示用户关闭占用方后重试，而不是白等 120s 超时
+        log({ evt: 'voice_busy', request_id: requestId, holder: error.holder ?? null })
+        ledger.fail(requestId, 'ERR_VOICE_BUSY')
+      } else if (error.code === 'ERR_REALTIME_NO_EVENTS') {
+        ledger.fail(requestId, 'ERR_REALTIME_NO_EVENTS')
+      } else if (error.code === 'ERR_TRANSCRIPT_DISCARDED') {
+        // 语音未被识别为有效指令：稳定错误码，Watch 端可提示"没听清，请重说"
+        ledger.fail(requestId, 'ERR_TRANSCRIPT_DISCARDED')
       } else {
         log({ evt: 'turn_failed', request_id: requestId, err: String(error.message).slice(0, 300) })
         ledger.fail(requestId, 'ERR_PROCESSING_FAILED')

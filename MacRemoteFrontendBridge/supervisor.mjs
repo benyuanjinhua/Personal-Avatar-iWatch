@@ -1,4 +1,4 @@
-// QwenRealtimeSessionSupervisor — ESS-25 PoC, extended for ESS-26
+// QwenRealtimeSessionSupervisor — ESS-25 PoC, extended for ESS-26/ESS-30/ESS-36
 // (abortCurrentTurn for northbound cancel; text-only direct answers finish too)
 //
 // 以伪前端身份常驻连接 qwen-audio-agent v0.9.1 的 loopback WS /api/realtime，
@@ -8,10 +8,27 @@
 // - WebSocket 协议层 ping/pong 存活检测（pingIntervalMs / pingTimeoutMs）
 // - 断线指数退避 + 抖动重连（backoffBaseMs..backoffMaxMs）
 // - 空闲 idleDisconnectMs（默认 15 分钟，配置化）主动断开，下一 turn 按需重建
-// - 语音所有权：默认不抢占；仅当持有者是自身旧连接（同 label 的僵尸）
-//   且无其他活跃本地前台时才允许 takeover
+// - 语音所有权（ESS-36）：网关对非 owner 的 audio.append 是静默丢弃——所有权
+//   不是可选项而是注入的前置条件。规则：
+//     * 持有者是另一个 watch-bridge 实例（上一进程的残留连接）→ 自动 takeover，
+//       否则 Bridge 重启后永久死锁在 busy；
+//     * 持有者是其他前台（Mac 本机 UI / web）→ 仅当 takeoverFromFrontends=true
+//       才抢占（Watch 按键说话是显式用户意图），否则快速失败 ERR_VOICE_BUSY，
+//       绝不让 turn 白烧 120s 超时；
+//     * 会话中被 takeover（voice.deactivated）→ 立即置 voiceReady=false 并失败
+//       当前 turn；旧实现只失败 turn 不清 ready 标志，后续 turn 全部注入进
+//       被静默丢弃的黑洞（ESS-36 真机 0 事件超时的根因之一）。
+// - 注入回执 watchdog（ESS-36）：帧全部发出后 injectAckTimeoutMs 内一个 turn
+//   相关事件都没有（上游 dashscope 掉线重连时帧被网关 pendingAudio 截尾丢弃
+//   的典型表现）→ 回收会话并重试一次；重试仅在 0 事件时安全（模型从未开始
+//   处理，不会产生重复回答）。
 // - 播放回执：收到 audio.delta 即上报 playback.started，audio.done 后上报
-//   playback.ended —— 否则网关不会下发 assistant transcript / 确认播报
+//   playback.ended —— 否则网关不会下发 assistant transcript / 确认播报。
+//   回执在 supervisor 层发送（不挂在 turn 上）：turn 间隙到达的后台任务播报
+//   （announcement）也必须回执，否则网关播报窗口阻塞后续 turn 响应。
+// - announcement 隔离（ESS-36）：origin=announcement 的响应是后台任务播报，
+//   不属于当前 turn——其音频/转写不得混入 turn 结果，其 idle 状态不得提前
+//   结束 turn。
 
 import WebSocket from 'ws'
 import { randomUUID } from 'node:crypto'
@@ -29,19 +46,27 @@ export class QwenRealtimeSessionSupervisor {
     backoffMaxMs = 30_000,
     frameMs = 100,               // audio.append 帧长
     paceMs = 40,                 // 帧注入间隔（快于实时，留服务端缓冲余量）
-    trailingSilenceMs = 1200,    // 触发 smart_turn 停止判定的尾部静音
+    trailingSilenceMs = 2500,    // 触发 smart_turn 停止判定的尾部静音
+                                 // （真机实测 1.2s 边缘化：VAD 收不到停止判定
+                                 //   → 60s 后 transcript.discard，ESS-36）
+    turnGapMs = 1500,            // turn 间最小间隔：连续注入无停顿会让网关把
+                                 // 相邻 turn 语音合并/错关联（ESS-36 真机实测）
     turnTimeoutMs = 120_000,
+    injectAckTimeoutMs = 15_000, // 注入完成后等待首个 turn 事件的上限
+    takeoverFromFrontends = false,
     log = (...args) => console.error(new Date().toISOString(), ...args),
   } = {}) {
     this.cfg = {
       gatewayUrl, deviceId, idleDisconnectMs, pingIntervalMs, pingTimeoutMs,
-      backoffBaseMs, backoffMaxMs, frameMs, paceMs, trailingSilenceMs, turnTimeoutMs,
+      backoffBaseMs, backoffMaxMs, frameMs, paceMs, trailingSilenceMs, turnGapMs,
+      turnTimeoutMs, injectAckTimeoutMs, takeoverFromFrontends,
     }
+    this.lastTurnEndedAt = 0
     this.sessionId = `watch-bridge-v1-${deviceId}`
     this.instanceId = `bridge_${randomUUID()}`
     this.log = log
     this.ws = null
-    this.state = 'disconnected'   // disconnected|connecting|ready|zombie
+    this.state = 'disconnected'   // disconnected|connecting|ready|busy|zombie
     this.ownership = 'unknown'    // unknown|active|busy|available
     this.ownershipHolder = null
     this.voiceReady = false
@@ -54,15 +79,26 @@ export class QwenRealtimeSessionSupervisor {
     this.pingTimer = null
     this.pongTimer = null
     this.suspectZombie = false    // 上一连接因 ping 超时被判僵尸
+    this.announcementResponses = new Set() // origin=announcement 的 responseId
+    this.playbackStarted = new Set()       // 已回执 playback.started 的 responseId
   }
 
   record(entry) {
-    const item = { ts: new Date().toISOString(), ...entry }
+    const item = { ts: new Date().toISOString(), label: this.currentTurn?.label, ...entry }
+    if (item.label === undefined) delete item.label
     this.journal.push(item)
     for (const fn of this.listeners) fn(item)
   }
 
   // ---- 连接生命周期 -------------------------------------------------------
+
+  // takeover 判定（ESS-36）：另一个 watch-bridge 实例必然是本 Bridge 的残留
+  // （单机只应有一个 Bridge），无条件可回收；其他前台仅在配置允许时抢占。
+  takeoverEligible(holder) {
+    if (!holder) return this.suspectZombie // 持有者未知：仅僵尸恢复场景抢占
+    if (holder.label === CLIENT_LABEL) return true
+    return this.cfg.takeoverFromFrontends === true
+  }
 
   connect({ takeover = false } = {}) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN && this.voiceReady) {
@@ -70,14 +106,46 @@ export class QwenRealtimeSessionSupervisor {
     }
     if (this.connectPromise) return this.connectPromise
     this.closedByUs = false
-    this.connectPromise = new Promise((resolve, reject) => {
+    this.connectPromise = (async () => {
+      let withTakeover = takeover
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const outcome = await this.connectOnce(withTakeover)
+        if (outcome.ready) return
+        // busy：持有者可回收且尚未 takeover → 立即带 takeover 重试一次
+        if (!withTakeover && this.takeoverEligible(outcome.holder)) {
+          this.record({ event: 'takeover.retry', holder: outcome.holder })
+          withTakeover = true
+          continue
+        }
+        this.state = 'busy'
+        return // 保持 busy：voiceReady=false，由调用方决定失败语义
+      }
+    })().finally(() => { this.connectPromise = null })
+    return this.connectPromise
+  }
+
+  // 单次连接尝试：resolve {ready:true} | {ready:false, holder}；网络失败 reject。
+  connectOnce(takeover) {
+    return new Promise((resolve, reject) => {
+      // 旧 socket（busy 残留 / 半开）先显式回收，绝不悬挂第二条连接
+      if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
+        this.ws.abandoned = true
+        this.ws.terminate()
+      }
       const url = `${this.cfg.gatewayUrl}?sessionId=${encodeURIComponent(this.sessionId)}`
       this.state = 'connecting'
       this.record({ event: 'ws.connecting', url, takeover })
       const ws = new WebSocket(url)   // loopback、无 Origin → CLI 通道
       this.ws = ws
+      let settled = false
+      const settle = (fn, value) => {
+        if (settled) return
+        settled = true
+        clearTimeout(connectTimeout)
+        fn(value)
+      }
       const connectTimeout = setTimeout(() => {
-        reject(new Error('connect timeout'))
+        settle(reject, new Error('connect timeout'))
         ws.terminate()
       }, 10_000)
 
@@ -101,35 +169,33 @@ export class QwenRealtimeSessionSupervisor {
         try { event = JSON.parse(raw.toString()) } catch { return }
         this.handleServerEvent(event)
         if (event.type === 'voice.ready') {
-          clearTimeout(connectTimeout)
           this.state = 'ready'
           this.voiceReady = true
           this.reconnectAttempt = 0
           this.suspectZombie = false
           this.touchIdle()
-          resolve()
+          settle(resolve, { ready: true })
         }
-        if (event.type === 'voice.ownership' && event.state === 'busy') {
-          // 未获授权：不重试抢占，交由 takeover 规则判定
-          clearTimeout(connectTimeout)
-          resolve()
+        if (event.type === 'voice.ownership' && event.state === 'busy' && !this.voiceReady) {
+          // 未获授权：所有权被他人持有，本连接不可注入
+          settle(resolve, { ready: false, holder: event.holder || null })
         }
       })
       ws.on('close', (code, reason) => {
-        clearTimeout(connectTimeout)
         this.stopPing()
+        if (ws.abandoned || this.ws !== ws) return // 已被新连接取代的旧 socket
         this.voiceReady = false
         const wasReady = this.state === 'ready'
         this.state = 'disconnected'
         this.record({ event: 'ws.close', code, reason: String(reason || '') })
+        settle(reject, new Error(`ws closed during connect (code=${code})`))
         if (!this.closedByUs) this.scheduleReconnect(wasReady)
       })
       ws.on('error', error => {
         this.record({ event: 'ws.error', message: error.message })
-        reject(error)
+        settle(reject, error)
       })
-    }).finally(() => { this.connectPromise = null })
-    return this.connectPromise
+    })
   }
 
   scheduleReconnect() {
@@ -141,23 +207,15 @@ export class QwenRealtimeSessionSupervisor {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
       // 自身旧连接可能仍占有所有权（服务端未感知断开）→ 僵尸恢复场景。
-      // 规则：仅当怀疑僵尸为自身实例且当前无其他活跃本地前台时 takeover。
-      const takeover = this.takeoverAllowed()
+      const takeover = this.suspectZombie && this.takeoverEligible(this.ownershipHolder)
+      if (takeover) {
+        this.record({ event: 'takeover.decision', suspectZombie: this.suspectZombie, holder: this.ownershipHolder, allowed: true })
+      }
       this.connect({ takeover }).catch(error => {
         this.record({ event: 'ws.reconnect.failed', message: error.message })
         this.scheduleReconnect()
       })
     }, delay)
-  }
-
-  takeoverAllowed() {
-    if (!this.suspectZombie) return false
-    const holder = this.ownershipHolder
-    // 持有者未知（可能是我们的僵尸连接）或明确是本 Bridge 的旧实例 → 允许；
-    // 持有者是其他类型前台（Mac 本机 UI 等）→ 绝不抢占。
-    const holderIsSelf = !holder || holder.label === CLIENT_LABEL
-    this.record({ event: 'takeover.decision', suspectZombie: this.suspectZombie, holder, allowed: holderIsSelf })
-    return holderIsSelf
   }
 
   // ---- 应用层存活（上游无心跳，用 WS 协议层 ping/pong） -------------------
@@ -209,29 +267,61 @@ export class QwenRealtimeSessionSupervisor {
       this.ws.send(JSON.stringify({ type: 'mute' }))  // 释放语音所有权
       this.ws.close()
     }
+    this.voiceReady = false
     this.record({ event: 'ws.closed-by-bridge', reason })
   }
 
   // ---- 服务端事件 ---------------------------------------------------------
 
   handleServerEvent(event) {
+    // origin=announcement 的响应登记在册：其音频只回执、不进 turn 结果。
+    // 注意 origin 有三种：model（Realtime 直答）、agent（后端 Agent 对本 turn
+    // 的应答呈现）、announcement（无关后台任务播报）——只有最后一种要隔离，
+    // agent 应答是 turn 结果本体（ESS-36 真机实测）。
+    if (event.type === 'response.started' && event.responseId
+      && event.origin === 'announcement') {
+      this.announcementResponses.add(event.responseId)
+    }
     if (event.type === 'audio.delta') {
+      const announcement = this.announcementResponses.has(event.responseId)
+      // 播放回执：Bridge 即转码转发，收到即视为开始"播放"。turn 间隙的
+      // announcement 音频同样回执，否则网关播报窗口卡死。
+      if (event.responseId && !this.playbackStarted.has(event.responseId)) {
+        this.playbackStarted.add(event.responseId)
+        this.wsSend({ type: 'playback.started', responseId: event.responseId })
+      }
       // 24kHz PCM base64 → 聚合缓冲；日志不落原始音频
-      this.currentTurn?.onAudioDelta(event)
-      this.record({ event: 'audio.delta', responseId: event.responseId, bytes: Buffer.from(event.audio || '', 'base64').length, sampleRate: event.sampleRate })
+      this.record({ event: 'audio.delta', responseId: event.responseId, bytes: Buffer.from(event.audio || '', 'base64').length, sampleRate: event.sampleRate, announcement })
+      if (!announcement) this.currentTurn?.onAudioDelta(event)
       return
+    }
+    if (event.type === 'audio.done') {
+      if (event.responseId && this.playbackStarted.has(event.responseId)) {
+        this.playbackStarted.delete(event.responseId)
+        this.wsSend({ type: 'playback.ended', responseId: event.responseId })
+      }
+      this.announcementResponses.delete(event.responseId)
     }
     if (event.type === 'voice.ownership') {
       this.ownership = event.state
-      this.ownershipHolder = event.holder
+      this.ownershipHolder = event.holder || null
+      // 不再是 owner → 本会话的注入会被网关静默丢弃，ready 标志必须同步失效
+      if (event.state !== 'active') this.voiceReady = false
     }
     this.record({ event: event.type, ...summarize(event) })
-    this.currentTurn?.onEvent(event)
+    const announcementEvent = event.origin === 'announcement'
+      && event.type !== 'voice.deactivated'
+    if (!announcementEvent) this.currentTurn?.onEvent(event)
     if (event.type === 'voice.deactivated') {
       // 被其他前台 takeover：立即停止注入，不反抢
+      this.voiceReady = false
       this.record({ event: 'ownership.lost', holder: event.holder })
-      this.currentTurn?.fail(new Error('voice ownership lost'))
+      this.currentTurn?.fail(Object.assign(new Error('voice ownership lost'), { code: 'ERR_VOICE_BUSY' }))
     }
+  }
+
+  wsSend(obj) {
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(obj))
   }
 
   // F2 watchdog（ESS-30）：turn 超时意味着 Realtime 会话已停摆——连接层仍然
@@ -243,6 +333,7 @@ export class QwenRealtimeSessionSupervisor {
     this.record({ event: 'ws.recycle.turn-timeout' })
     this.state = 'zombie'
     this.suspectZombie = true
+    this.voiceReady = false
     this.ws.terminate()   // close 事件触发既有 scheduleReconnect 退避流程
   }
 
@@ -257,12 +348,40 @@ export class QwenRealtimeSessionSupervisor {
   // ---- turn 串行注入 ------------------------------------------------------
 
   // pcm16k: Buffer（16kHz mono PCM16LE）。串行：上一 turn 完成前不注入下一条。
-  injectTurn(pcm16k, { label = '' } = {}) {
+  // opts.onStart：轮到本 turn 真正开始注入时回调（server 用它把 work deadline
+  //   从"受理时刻"改为"开始处理时刻"起算——串行积压下按受理起算必然团灭）。
+  // opts.shouldRun：注入前询问是否仍需执行（排队期间被取消/判死的 turn 直接跳过）。
+  injectTurn(pcm16k, { label = '', onStart, shouldRun } = {}) {
     const run = async () => {
-      await this.connect()
-      if (!this.voiceReady) throw new Error(`voice not ready (ownership=${this.ownership})`)
-      this.touchIdle()
-      return await this.runTurn(pcm16k, label)
+      if (shouldRun && !shouldRun()) {
+        throw Object.assign(new Error('turn skipped before injection'), { skipped: true })
+      }
+      // turn 间最小间隔：给网关留出上一响应作用域的收尾时间
+      const sinceLast = Date.now() - this.lastTurnEndedAt
+      if (this.lastTurnEndedAt && sinceLast < this.cfg.turnGapMs) {
+        await sleep(this.cfg.turnGapMs - sinceLast)
+      }
+      onStart?.()
+      for (let attempt = 0; ; attempt++) {
+        await this.connect()
+        if (!this.voiceReady) {
+          throw Object.assign(
+            new Error(`voice not ready (ownership=${this.ownership})`),
+            { code: 'ERR_VOICE_BUSY', holder: this.ownershipHolder },
+          )
+        }
+        this.touchIdle()
+        try {
+          return await this.runTurn(pcm16k, label)
+        } catch (error) {
+          // 仅"0 事件"失败可安全重试一次：模型从未开始处理这条音频
+          if (error.retryable && attempt < 1) {
+            this.record({ event: 'turn.retry', reason: error.message })
+            continue
+          }
+          throw error
+        }
+      }
     }
     const next = this.turnQueue.then(run, run)
     this.turnQueue = next.catch(() => {})
@@ -275,8 +394,9 @@ export class QwenRealtimeSessionSupervisor {
     const payload = Buffer.concat([pcm16k, silence])
     const turn = new TurnCapture(this, label)
     this.currentTurn = turn
-    this.record({ event: 'turn.inject.start', label, pcmBytes: pcm16k.length, frames: Math.ceil(payload.length / frameBytes) })
+    this.record({ event: 'turn.inject.start', pcmBytes: pcm16k.length, frames: Math.ceil(payload.length / frameBytes) })
 
+    let ackTimer = null
     const sendFrames = async () => {
       for (let offset = 0; offset < payload.length; offset += frameBytes) {
         if (turn.settled) return
@@ -285,7 +405,20 @@ export class QwenRealtimeSessionSupervisor {
         this.ws.send(JSON.stringify({ type: 'audio.append', audio: frame.toString('base64') }))
         await sleep(this.cfg.paceMs)
       }
-      this.record({ event: 'turn.inject.done', label })
+      this.record({ event: 'turn.inject.done' })
+      // 注入回执 watchdog：帧发完后限时等待首个 turn 事件；0 事件说明音频
+      // 在网关侧被丢弃（非 owner 静默丢弃 / 上游断线 pendingAudio 截尾）
+      if (!turn.settled && !turn.sawTurnEvent) {
+        ackTimer = setTimeout(() => {
+          if (turn.settled || turn.sawTurnEvent) return
+          this.record({ event: 'turn.no-events', afterMs: this.cfg.injectAckTimeoutMs })
+          turn.fail(Object.assign(
+            new Error(`no realtime events within ${this.cfg.injectAckTimeoutMs}ms after injection`),
+            { code: 'ERR_REALTIME_NO_EVENTS', retryable: true },
+          ))
+          this.recycleAfterTurnTimeout()
+        }, this.cfg.injectAckTimeoutMs)
+      }
     }
     const timeout = setTimeout(() => {
       turn.fail(new Error(`turn timeout after ${this.cfg.turnTimeoutMs}ms`))
@@ -295,6 +428,8 @@ export class QwenRealtimeSessionSupervisor {
       .then(([, result]) => result)
       .finally(() => {
         clearTimeout(timeout)
+        clearTimeout(ackTimer)
+        this.lastTurnEndedAt = Date.now()
         if (this.currentTurn === turn) this.currentTurn = null
       })
   }
@@ -306,6 +441,7 @@ class TurnCapture {
     this.supervisor = supervisor
     this.label = label
     this.settled = false
+    this.sawTurnEvent = false   // 注入后是否收到过任何 turn 相关事件
     this.audioChunks = []
     this.result = {
       label,
@@ -325,24 +461,31 @@ class TurnCapture {
     })
   }
 
-  ws() { return this.supervisor.ws }
-
   onAudioDelta(event) {
+    this.sawTurnEvent = true
     if (this.settled) return
     if (event.audio) {
       this.audioChunks.push(Buffer.from(event.audio, 'base64'))
       this.result.audioBytes24k += Buffer.from(event.audio, 'base64').length
     }
-    // 播放回执：首个 delta 即视为开始"播放"（Bridge 即转码转发）
-    if (event.responseId && !this.result.responseIds.has(event.responseId)) {
-      this.result.responseIds.add(event.responseId)
-      this.ws()?.send(JSON.stringify({ type: 'playback.started', responseId: event.responseId }))
-    }
+    if (event.responseId) this.result.responseIds.add(event.responseId)
   }
 
   onEvent(event) {
+    const TURN_EVENTS = [
+      'turn.started', 'transcript.delta', 'transcript.final', 'response.started',
+      'task.running', 'task.delegated', 'task.progress',
+    ]
+    if (TURN_EVENTS.includes(event.type)
+      || (event.type === 'voice.state' && event.state !== 'idle')) {
+      this.sawTurnEvent = true
+    }
     if (this.settled) return
     const r = this.result
+    // turnId 关联守卫：本 turn 已绑定 turnId 后，其他 turn 的残留事件
+    //（上一响应作用域的收尾）不得影响本 turn 的状态/完成判定
+    if (r.turnId && event.turnId && event.turnId !== r.turnId
+      && event.type !== 'turn.started') return
     switch (event.type) {
       case 'turn.started':
         r.turnId = event.turnId
@@ -354,9 +497,16 @@ class TurnCapture {
           r.assistantTranscript = (r.assistantTranscript || '') + event.content
         }
         break
-      case 'response.started':
-        if (event.responseId) {
-          // 无音频的响应也要补 playback 回执占位（文本路径）
+      case 'transcript.discard':
+        // ASR 判定本段语音无效（空转写 / turn_invalid）：立即失败，
+        // 不再白等 120s turn 超时（ESS-36 真机实测 60s 后才 discard）。
+        // 仅当本 turn 已 turn.started（turnId 已绑定）才认领 discard——
+        // 上一 turn 的迟到 discard 不得误杀刚排到队首的新 turn。
+        if (event.role === 'user' && !r.userTranscript && r.turnId) {
+          this.fail(Object.assign(
+            new Error(`user transcript discarded (${event.reason || 'unrecognized speech'})`),
+            { code: 'ERR_TRANSCRIPT_DISCARDED' },
+          ))
         }
         break
       case 'task.running':
@@ -377,15 +527,12 @@ class TurnCapture {
       case 'task.cancelled':
         r.taskEvents.push({ type: event.type, taskId: event.task?.id, status: event.task?.status })
         break
-      case 'audio.done': {
-        if (event.responseId && this.result.responseIds.has(event.responseId)) {
-          this.ws()?.send(JSON.stringify({ type: 'playback.ended', responseId: event.responseId }))
-        }
-        break
-      }
       case 'voice.state':
-        // 回到 idle 且已拿到用户转写 + （直答音频 或 已受理后台任务）→ turn 完成
-        if (event.state === 'idle' && r.userTranscript) {
+        // 回到 idle 且（已受理后台任务 或 已有直答内容）→ turn 完成。
+        // 不再要求 userTranscript：网关可能把相邻 turn 的语音合并（上一段被
+        // discard、应答挂在旧 turnId 上，ESS-36 真机实测）——只要拿到了应答
+        // 内容就应交付，而不是白等 120s 超时。
+        if (event.state === 'idle') {
           if (r.taskId) return this.finish()
           // 直答完成：有音频或有文本转写即可（纯文本回复也要能结束 turn）
           if (r.audioBytes24k > 0 || r.assistantTranscript !== null) {

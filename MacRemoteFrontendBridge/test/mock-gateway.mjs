@@ -7,7 +7,10 @@ import { EventEmitter } from 'node:events'
 import { WebSocketServer } from 'ws'
 
 export class MockGateway extends EventEmitter {
-  constructor({ scenario = 'direct' } = {}) {
+  // preHolder: 预置的语音所有权持有者 descriptor（模拟残留 Bridge 实例或
+  //   Mac 本机/web 前台占用）。真实网关对非 owner 的 audio.append 静默丢弃，
+  //   mock 复刻该行为（ESS-36 回归的关键语义）。
+  constructor({ scenario = 'direct', preHolder = null } = {}) {
     super()
     this.scenario = scenario
     this.tasks = new Map()
@@ -17,6 +20,11 @@ export class MockGateway extends EventEmitter {
     this.sseClients = new Map() // taskId → Set(res)
     this.server = null
     this.port = null
+    this.holder = preHolder ? { descriptor: preHolder, ws: null } : null
+    this.connects = []          // { descriptor, takeover }
+    this.playbackReceipts = []  // { type, responseId }
+    this.droppedFrames = 0
+    this.voiceClients = new Set()
   }
 
   setTask(task) {
@@ -48,29 +56,92 @@ export class MockGateway extends EventEmitter {
     return new Promise(resolve => this.server.close(resolve))
   }
 
+  // 所有权仲裁与真实网关同构：connect 时 takeover=false 且已有持有者 →
+  // voice.ownership busy 且不下发 voice.ready；takeover=true → 顶掉旧持有者
+  // （旧连接收到 voice.deactivated）；非 owner 的 audio.append 静默丢弃。
   handleRealtime(ws) {
     const send = obj => ws.readyState === ws.OPEN && ws.send(JSON.stringify(obj))
+    const client = { ws, send, descriptor: null }
+    this.voiceClients.add(client)
+    const broadcast = () => {
+      const holderDesc = this.holder?.descriptor || null
+      for (const c of this.voiceClients) {
+        c.send({
+          type: 'voice.ownership',
+          state: this.holder?.ws === c.ws ? 'active' : holderDesc ? 'busy' : 'available',
+          holder: holderDesc,
+        })
+      }
+    }
     let turnScheduled = false
+    ws.on('close', () => {
+      this.voiceClients.delete(client)
+      if (this.holder?.ws === ws) { this.holder = null; broadcast() }
+    })
     ws.on('message', raw => {
       let msg
       try { msg = JSON.parse(raw.toString()) } catch { return }
       if (msg.type === 'connect') {
-        send({ type: 'voice.ready' })
+        client.descriptor = { type: msg.clientType, label: msg.clientLabel, instanceId: msg.clientInstanceId }
+        this.connects.push({ descriptor: client.descriptor, takeover: msg.takeover === true })
+        if (this.holder && this.holder.ws !== ws && msg.takeover !== true) {
+          broadcast() // 未获授权：只广播 busy，不下发 voice.ready
+          return
+        }
+        const previous = this.holder
+        this.holder = { descriptor: client.descriptor, ws }
+        if (previous?.ws && previous.ws !== ws) {
+          const prev = [...this.voiceClients].find(c => c.ws === previous.ws)
+          prev?.send({ type: 'voice.deactivated', holder: client.descriptor })
+        }
+        broadcast()
+        send({ type: 'voice.ready', inputSampleRate: 16000 })
         return
       }
-      if (msg.type === 'audio.append' && !turnScheduled) {
+      if (msg.type === 'mute' && this.holder?.ws === ws) {
+        this.holder = null
+        broadcast()
+        return
+      }
+      if (msg.type === 'playback.started' || msg.type === 'playback.ended') {
+        this.playbackReceipts.push({ type: msg.type, responseId: msg.responseId })
+        return
+      }
+      if (msg.type === 'audio.append') {
+        if (this.holder?.ws !== ws) {
+          this.droppedFrames += 1 // 真实网关行为：非 owner 的帧静默丢弃
+          return
+        }
+        if (turnScheduled) return
         turnScheduled = true
         this.realtimeTurns += 1
+        const turnIndex = this.realtimeTurns
         setTimeout(() => {
-          send({ type: 'turn.started', turnId: `turn_${this.realtimeTurns}` })
+          if (this.scenario === 'no-events-once' && turnIndex === 1) {
+            // 第一轮完全静默（模拟上游掉线导致帧被丢）：驱动注入回执 watchdog
+            turnScheduled = false
+            return
+          }
+          send({ type: 'turn.started', turnId: `turn_${turnIndex}` })
+          if (this.scenario === 'discard') {
+            // ASR 判定语音无效：真实网关在 speech_stopped(turn_invalid) 或空
+            // 转写时下发 discard + idle，不会再有任何响应
+            send({ type: 'transcript.discard', role: 'user', turnId: `turn_${turnIndex}`, reason: 'turn_invalid' })
+            send({ type: 'voice.state', state: 'idle', turnId: `turn_${turnIndex}`, origin: 'model' })
+            turnScheduled = false
+            return
+          }
           send({ type: 'transcript.final', role: 'user', content: '现在几点了？' })
-          if (this.scenario === 'direct') {
-            const pcm = Buffer.alloc(4800) // 100ms of 24k silence
-            send({ type: 'audio.delta', responseId: 'resp_1', audio: pcm.toString('base64'), sampleRate: 24000 })
-            send({ type: 'transcript.final', role: 'assistant', content: '现在是上午九点。' })
-            send({ type: 'audio.done', responseId: 'resp_1' })
-            send({ type: 'voice.state', state: 'idle' })
-          } else if (this.scenario === 'background') {
+          if (this.scenario === 'agent-origin') {
+            // 后端 Agent 应答呈现路径（origin=agent）：这是 turn 结果本体
+            send({ type: 'response.started', responseId: 'resp_agent', origin: 'agent' })
+            send({ type: 'transcript.final', role: 'assistant', content: '今天是星期五。', origin: 'agent', responseId: 'resp_agent' })
+            send({ type: 'audio.done', responseId: 'resp_agent' })
+            send({ type: 'voice.state', state: 'idle', origin: 'agent' })
+            turnScheduled = false
+            return
+          }
+          if (this.scenario === 'background') {
             const task = this.tasks.get('task_bg') || {
               id: 'task_bg', status: 'running', authorization: null, resultMetadata: null,
             }
@@ -79,6 +150,22 @@ export class MockGateway extends EventEmitter {
             send({ type: 'voice.state', state: 'idle' })
           } else if (this.scenario === 'silent') {
             // Never answers: exercises the bridge-side hard timeout.
+          } else { // direct / no-events-once 第二轮
+            if (this.scenario === 'announcement') {
+              // turn 响应前插入一条后台任务播报：音频不得混入 turn 结果
+              const noise = Buffer.alloc(2400, 7)
+              send({ type: 'response.started', responseId: 'resp_ann', origin: 'announcement', taskId: 'task_ann' })
+              send({ type: 'audio.delta', responseId: 'resp_ann', audio: noise.toString('base64'), sampleRate: 24000 })
+              send({ type: 'transcript.final', role: 'assistant', content: '后台任务已完成。', origin: 'announcement', responseId: 'resp_ann' })
+              send({ type: 'audio.done', responseId: 'resp_ann' })
+              send({ type: 'voice.state', state: 'idle', origin: 'announcement' })
+            }
+            const pcm = Buffer.alloc(4800) // 100ms of 24k silence
+            send({ type: 'response.started', responseId: 'resp_1', origin: 'model' })
+            send({ type: 'audio.delta', responseId: 'resp_1', audio: pcm.toString('base64'), sampleRate: 24000 })
+            send({ type: 'transcript.final', role: 'assistant', content: '现在是上午九点。' })
+            send({ type: 'audio.done', responseId: 'resp_1' })
+            send({ type: 'voice.state', state: 'idle' })
           }
           turnScheduled = false
         }, 150)
