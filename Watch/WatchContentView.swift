@@ -1,133 +1,209 @@
 import SwiftUI
 
+/// 主界面（ESS-40）：首屏即「按住说话」真实链路（ESS-29 PoC 转正，静态 demo 已删除）。
+/// 要素：语音球 + 状态文案 + 按住说话手势 + 结果时间线入口 + 欢迎语（下行音频链验证）。
+/// 半双工：录完即传；退出 App 任务继续，重开从 VoiceTurnJournal 恢复。
 struct WatchContentView: View {
-    @EnvironmentObject private var conversation: ConversationViewModel
-    @EnvironmentObject private var settings: WatchSettingsStore
-    @EnvironmentObject private var pushToTalk: PushToTalkController
+    @ObservedObject private var pushToTalk: PushToTalkController
+    @ObservedObject private var welcome: WelcomeGreeter
+    @ObservedObject private var transport: WatchVoiceTransport
+    @ObservedObject private var journal: VoiceTurnJournal
+    @ObservedObject private var player: SpeechPlayer
+
+    init(pushToTalk: PushToTalkController, welcome: WelcomeGreeter) {
+        self.pushToTalk = pushToTalk
+        self.welcome = welcome
+        self.transport = pushToTalk.transport
+        self.journal = pushToTalk.journal
+        self.player = pushToTalk.player
+    }
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 10) {
-                    orb
+                    VoiceOrbView(mode: orbMode, size: 70)
                         .padding(.top, 4)
+                        .gesture(
+                            DragGesture(minimumDistance: 0)
+                                .onChanged { _ in
+                                    welcome.interrupt()
+                                    pushToTalk.pressBegan()
+                                }
+                                .onEnded { _ in pushToTalk.pressEnded() }
+                        )
 
-                    Text(conversation.title)
-                        .font(.headline)
+                    if showWelcomeBanner {
+                        welcomeBanner
+                    }
+
+                    Text(statusTitle)
+                        .font(.footnote.bold())
                         .multilineTextAlignment(.center)
                         .lineLimit(2)
 
-                    Text(conversation.detail)
-                        .font(.footnote)
+                    Text(statusSubtitle)
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
-                        .lineLimit(4)
+                        .lineLimit(3)
 
-                    if !conversation.transcript.isEmpty {
-                        Text("“\(conversation.transcript)”")
+                    if transport.pendingCount > 0 {
+                        Text("待送达 \(transport.pendingCount) 条")
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                            .lineLimit(2)
-                            .padding(.vertical, 2)
+                            .foregroundStyle(.orange)
                     }
 
-                    if let confirmation = conversation.confirmation {
-                        confirmationCard(confirmation)
-                    }
-
-                    Button {
-                        Task { await conversation.mainAction() }
-                    } label: {
-                        Text(conversation.mainButtonTitle)
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(conversation.phase == .confirmation ? .orange : .cyan)
-
-                    if conversation.canReject {
-                        Button("取消操作", role: .cancel) {
-                            Task { await conversation.answerConfirmation(approved: false) }
-                        }
-                        .font(.footnote)
-                    }
-
-                    if conversation.canUndo {
-                        Button("撤回刚才的操作") {
-                            Task { await conversation.undo() }
-                        }
-                        .font(.footnote)
-                        .tint(.orange)
+                    if let turn = activeTurn {
+                        turnContent(turn)
                     }
 
                     NavigationLink {
-                        PushToTalkView(
-                            transport: pushToTalk.transport,
-                            journal: pushToTalk.journal,
-                            player: pushToTalk.player
-                        )
+                        ConversationTimelineView(journal: journal)
                     } label: {
-                        Label("按住说话", systemImage: "mic.circle.fill")
-                    }
-                    .font(.footnote)
-                    .buttonStyle(.bordered)
-                    .tint(.cyan)
-
-                    NavigationLink {
-                        WatchHistoryListView(
-                            entries: conversation.historyEntries,
-                            onClear: conversation.clearHistory
-                        )
-                    } label: {
-                        Label(
-                            conversation.historyEntries.isEmpty
-                                ? "历史对话"
-                                : "历史对话 \(conversation.historyEntries.count)",
-                            systemImage: "clock.arrow.circlepath"
-                        )
+                        Label("状态时间线", systemImage: "list.bullet.rectangle")
                     }
                     .font(.footnote)
                     .buttonStyle(.bordered)
                     .tint(.secondary)
 
-                    if settings.configuration.mode == .demo {
-                        Text("DEMO")
-                            .font(.system(size: 8, weight: .bold))
-                            .foregroundStyle(.secondary)
+                    if let remote = transport.remoteStatus {
+                        Text(remote.detail ?? remote.phase.displayText)
+                            .font(.caption2)
+                            .foregroundStyle(remote.phase == .failed ? .red : .secondary)
+                            .lineLimit(2)
                     }
                 }
                 .padding(.horizontal, 6)
             }
         }
+        .onChange(of: journal.activeTurn?.speechFileName) { _, fileName in
+            // 结果语音到达时自动播放一次（播放即交付，随后删除密文文件）。
+            guard fileName != nil, let turn = journal.activeTurn else { return }
+            welcome.interrupt()
+            pushToTalk.playResult(for: turn)
+        }
     }
 
-    /// 语音球统一由 VoiceOrbView 渲染（ESS-29）。
-    private var orb: some View {
-        VoiceOrbView(mode: orbMode, size: 62)
+    // MARK: - 欢迎语（ESS-40）
+
+    private var showWelcomeBanner: Bool {
+        welcome.isActive && !isRecording && activeTurn == nil
     }
 
-    private var orbMode: VoiceOrbView.Mode {
-        switch conversation.phase {
-        case .idle: return .idle
-        case .listening: return .listening(level: conversation.recordingLevel)
-        case .understanding, .running: return .processing
-        case .confirmation: return .confirmation
-        case .completed: return .completed
-        case .failed: return .failed
+    private var welcomeBanner: some View {
+        VStack(spacing: 3) {
+            Text(WelcomeGreeter.welcomeText)
+                .font(.footnote.bold())
+                .multilineTextAlignment(.center)
+
+            if welcome.stage == .playing {
+                Label("欢迎语播放中", systemImage: "speaker.wave.2.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.cyan)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(8)
+        .background(Color.cyan.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    // MARK: - 当前回合区块
+
+    @ViewBuilder
+    private func turnContent(_ turn: VoiceTurnRecord) -> some View {
+        if turn.currentState == .permissionRequired, let permission = turn.permission {
+            PermissionRequestView(
+                permission: permission,
+                decision: turn.permissionApproved
+            ) { approved in
+                pushToTalk.respondPermission(approved: approved)
+            }
+        }
+
+        if let result = turn.result, turn.currentState == .completed {
+            resultCard(turn: turn, result: result)
+        }
+
+        if turn.isActive && !isRecording && turn.currentState != .permissionRequired {
+            Button("取消本次请求", role: .cancel) {
+                pushToTalk.cancelActiveTurn()
+            }
+            .font(.caption2)
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
         }
     }
 
     @ViewBuilder
-    private func confirmationCard(_ confirmation: AgentConfirmation) -> some View {
+    private func resultCard(turn: VoiceTurnRecord, result: VoiceResultPayload) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Label(confirmation.target, systemImage: "person.2.fill")
-                .font(.caption.bold())
-            Text(confirmation.impact)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+            Text(result.displaySummary)
+                .font(.footnote)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if result.displayIsTruncated {
+                Text("已截断，完整内容在 Mac 上")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+
+            if turn.speechFileName != nil {
+                Button {
+                    pushToTalk.playResult(for: turn)
+                } label: {
+                    Label(
+                        player.isPlaying ? "播放中…" : "播放语音",
+                        systemImage: player.isPlaying ? "speaker.wave.2.fill" : "play.circle.fill"
+                    )
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(.green)
+                .font(.footnote)
+                .disabled(player.isPlaying)
+            }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(9)
-        .background(Color.orange.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
+        .background(Color.green.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    // MARK: - 投影
+
+    private var isRecording: Bool { pushToTalk.state == .recording }
+
+    private var activeTurn: VoiceTurnRecord? { journal.activeTurn }
+
+    private var isSpeaking: Bool {
+        player.isPlaying || welcome.stage == .playing
+    }
+
+    private var orbMode: VoiceOrbView.Mode {
+        if isRecording { return .listening(level: pushToTalk.recordingLevel) }
+        guard let phase = activeTurn?.phase else { return .idle }
+        switch phase {
+        case .sending, .waitingForPhone, .waitingForMac: return .waiting
+        case .delivered, .processing: return .processing
+        case .needsConfirmation: return .confirmation
+        case .completed: return .completed
+        case .failed: return .failed
+        case .cancelled: return .idle
+        }
+    }
+
+    private var statusTitle: String {
+        if let error = pushToTalk.errorMessage { return error }
+        if isRecording { return "我在听" }
+        if isSpeaking { return "播放中" }
+        guard let turn = activeTurn else { return "按住说话" }
+        return turn.phase.title
+    }
+
+    private var statusSubtitle: String {
+        if isRecording { return "松开发送（最长 60 秒）" }
+        if case .failed(let message) = transport.phase { return message }
+        if showWelcomeBanner { return "按住语音球开始对话" }
+        guard let turn = activeTurn else { return "松开即发送，结果回来会响铃" }
+        return turn.phase.subtitle
     }
 }

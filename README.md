@@ -84,14 +84,15 @@ export WRISTAGENT_BUNDLE_ID=com.yourname.WristAgent
 
 未设置 `IPHONE_UDID` 时，脚本会列出 Xcode 当前识别到的设备。
 
-默认运行在“离线演示”模式。每录一段语音会依次体验：
+App 启动即进入「按住说话」真实链路首屏（ESS-40，本地静态演示已删除）：
 
-1. 只读日程查询。
-2. 长任务执行与结果回传。
-3. 创建提醒与撤回。
-4. 发送消息前的高风险确认。
-
-Demo 模式不会把录音发送到任何服务器。
+1. 冷启动播放欢迎语「你好Jackson，我是你的AI分身」。语音由
+   qwen-audio-realtime 预生成并随 App 包预置
+   （`MacRemoteFrontendBridge/generate-welcome-speech.mjs` 重新生成），
+   加载失败时静默降级为文字欢迎；同一会话内重复进入不重复播放。
+2. 按住语音球说话、松开发送，请求经 iPhone Relay 送达 Mac Bridge，
+   结果语音（Qwen Audio Realtime 音色）回传后自动播放。
+3. 「状态时间线」查看每次请求的完整状态推进。
 
 ## 接入真实云端 Agent
 

@@ -43,6 +43,12 @@ WatchConnectivity、URLSession、Keychain 或 UserDefaults。
 | `WristAgentWatchUI` | Watch App 入口、会话和历史界面、App Intent | 其余 `Watch/*.swift` | Conversation、Audio、Domain |
 | `WristAgentPhoneUI` | iPhone App 入口、设置和历史界面 | `iOS/*.swift` 中的 UI 和设置组合 | Domain、Persistence、WatchConnectivity |
 
+> 注（ESS-40）：本地静态演示链路已删除——`Watch/DemoAgentService.swift`、
+> `Watch/ConversationViewModel.swift`、`Watch/AgentService.swift`、
+> `Watch/WatchHistoryViews.swift` 不复存在，`WristAgentDemo`、
+> `WristAgentConversation`、`WristAgentTransport` 三行仅作历史参考。
+> Watch 首屏即「按住说话」真实链路（ESS-22/28/29/38 的 WC Relay 通道）。
+
 ## 4. 建议目录
 
 MVP 阶段继续使用两个 Xcode Application Target，通过目录边界和协议解耦；当核心逻辑

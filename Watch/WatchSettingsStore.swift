@@ -35,12 +35,6 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         }
     }
 
-    func sendHistory(_ entries: [ConversationHistoryEntry]) {
-        guard WCSession.isSupported(), WCSession.default.activationState == .activated else { return }
-        guard let data = try? JSONEncoder().encode(entries) else { return }
-        try? WCSession.default.updateApplicationContext([HistoryMessage.key: data])
-    }
-
     private func apply(_ data: Data) {
         guard let value = try? JSONDecoder().decode(AgentConfiguration.self, from: data) else { return }
         configuration = value
