@@ -2,38 +2,49 @@ import SwiftUI
 
 /// 状态时间线（ESS-29）：把 §6 状态机的每一步以用户可读方式展示。
 /// 当前回合展开完整时间线，更早的回合折叠成一行可点开。
+/// 诊断入口放在本页底部（ESS-53 §3）：调试信息离开主屏，但排障时两步可达。
 struct ConversationTimelineView: View {
     @ObservedObject var journal: VoiceTurnJournal
+    @ObservedObject var transport: WatchVoiceTransport
 
     var body: some View {
-        Group {
+        List {
             if journal.turns.isEmpty {
                 ContentUnavailableView(
                     "暂无语音请求",
                     systemImage: "waveform.badge.magnifyingglass",
                     description: Text("按住说话发出请求后，进度会显示在这里")
                 )
-            } else {
-                List {
-                    if let active = journal.activeTurn {
-                        Section("当前请求") {
-                            TurnTimelineSection(turn: active)
-                        }
-                    }
+                .listRowBackground(Color.clear)
+            }
 
-                    let others = journal.turns.filter { $0.requestId != journal.activeTurn?.requestId }
-                    if !others.isEmpty {
-                        Section("更早") {
-                            ForEach(others) { turn in
-                                NavigationLink {
-                                    List { TurnTimelineSection(turn: turn) }
-                                        .navigationTitle("请求详情")
-                                } label: {
-                                    TurnSummaryRow(turn: turn)
-                                }
-                            }
+            if let active = journal.activeTurn {
+                Section("当前请求") {
+                    TurnTimelineSection(turn: active)
+                }
+            }
+
+            let others = journal.turns.filter { $0.requestId != journal.activeTurn?.requestId }
+            if !others.isEmpty {
+                Section("更早") {
+                    ForEach(others) { turn in
+                        NavigationLink {
+                            List { TurnTimelineSection(turn: turn) }
+                                .navigationTitle("请求详情")
+                        } label: {
+                            TurnSummaryRow(turn: turn)
                         }
                     }
+                }
+            }
+
+            Section {
+                NavigationLink {
+                    DiagnosticsView(transport: transport, journal: journal)
+                } label: {
+                    Label("诊断", systemImage: "stethoscope")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
             }
         }

@@ -59,20 +59,14 @@ struct WatchContentView: View {
                     }
 
                     NavigationLink {
-                        ConversationTimelineView(journal: journal)
+                        ConversationTimelineView(journal: journal, transport: transport)
                     } label: {
                         Label("状态时间线", systemImage: "list.bullet.rectangle")
                     }
                     .font(.footnote)
                     .buttonStyle(.bordered)
                     .tint(.secondary)
-
-                    if let remote = transport.remoteStatus {
-                        Text(remote.detail ?? remote.phase.displayText)
-                            .font(.caption2)
-                            .foregroundStyle(remote.phase == .failed ? .red : .secondary)
-                            .lineLimit(2)
-                    }
+                    // Relay 原始状态行已移入诊断页（ESS-53 §3）：主屏只留人话状态。
                 }
                 .padding(.horizontal, 6)
             }
@@ -83,7 +77,9 @@ struct WatchContentView: View {
         // 会静默漏播。
         // 字幕式播放视图（ESS-48）：播放开始/纯文本结果到达时由控制器置入会话。
         .sheet(item: $pushToTalk.subtitleSession) { session in
-            SubtitlePlaybackView(session: session, player: pushToTalk.player)
+            SubtitlePlaybackView(session: session, player: pushToTalk.player) {
+                pushToTalk.replayResult(requestId: session.requestId)
+            }
         }
     }
 
@@ -127,6 +123,10 @@ struct WatchContentView: View {
             resultCard(turn: turn, result: result)
         }
 
+        if turn.currentState == .failed {
+            failureCard(turn)
+        }
+
         if turn.isActive && !isRecording && turn.currentState != .permissionRequired {
             Button("取消本次请求", role: .cancel) {
                 pushToTalk.cancelActiveTurn()
@@ -135,6 +135,37 @@ struct WatchContentView: View {
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
         }
+    }
+
+    /// 失败卡片（ESS-53 §5）：失败不能只有红叉——原因 + 差异化恢复动作。
+    @ViewBuilder
+    private func failureCard(_ turn: VoiceTurnRecord) -> some View {
+        let stage = turn.failureStage ?? .execution
+        VStack(alignment: .leading, spacing: 4) {
+            Label(stage.displayName, systemImage: "exclamationmark.triangle.fill")
+                .font(.footnote.bold())
+                .foregroundStyle(.red)
+
+            Text(stage.recoveryHint)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            // 录音还压在待送达队列里（手机不可达型失败）：给一键重试，
+            // request_id 不变、接收端幂等，触发 outbox 重新提交。
+            if stage == .phoneUnreachable && transport.pendingCount > 0 {
+                Button {
+                    transport.retryPending()
+                } label: {
+                    Label("立即重试", systemImage: "arrow.clockwise")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(.orange)
+                .font(.footnote)
+            }
+        }
+        .padding(9)
+        .background(Color.red.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
     }
 
     @ViewBuilder
@@ -150,20 +181,17 @@ struct WatchContentView: View {
                     .foregroundStyle(.secondary)
             }
 
-            if turn.speechFileName != nil {
+            // 播放/暂停/继续/重播（ESS-53 §6）：播完加密仓已删仍可从内存缓存重播。
+            if pushToTalk.hasPlayableAudio(for: turn) {
                 Button {
-                    pushToTalk.playResult(for: turn)
+                    pushToTalk.togglePlayback(for: turn)
                 } label: {
-                    Label(
-                        player.isPlaying ? "播放中…" : "播放语音",
-                        systemImage: player.isPlaying ? "speaker.wave.2.fill" : "play.circle.fill"
-                    )
-                    .frame(maxWidth: .infinity)
+                    Label(playbackButtonTitle(for: turn), systemImage: playbackButtonIcon(for: turn))
+                        .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
                 .tint(.green)
                 .font(.footnote)
-                .disabled(player.isPlaying)
             }
 
             // 回看入口（ESS-48）：语音播完（音频交付后已删）仍可完整查看全文。
@@ -184,6 +212,20 @@ struct WatchContentView: View {
     }
 
     // MARK: - 投影
+
+    private func playbackButtonTitle(for turn: VoiceTurnRecord) -> String {
+        if player.progress(matching: turn.requestId) != nil {
+            return player.isPlaying ? "暂停" : "继续播放"
+        }
+        return turn.speechFileName != nil ? "播放语音" : "重播"
+    }
+
+    private func playbackButtonIcon(for turn: VoiceTurnRecord) -> String {
+        if player.progress(matching: turn.requestId) != nil {
+            return player.isPlaying ? "pause.circle.fill" : "play.circle.fill"
+        }
+        return turn.speechFileName != nil ? "play.circle.fill" : "arrow.counterclockwise.circle.fill"
+    }
 
     private var isRecording: Bool { pushToTalk.state == .recording }
 

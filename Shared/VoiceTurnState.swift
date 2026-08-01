@@ -92,6 +92,15 @@ enum VoiceFailureStage: String, Codable, Equatable {
         }
     }
 
+    /// 每种失败环节的差异化恢复提示（ESS-53 §5）：失败不能只有红叉，必须给下一步。
+    var recoveryHint: String {
+        switch self {
+        case .phoneUnreachable: return "靠近 iPhone 后会自动重发，也可点下方立即重试"
+        case .macUnreachable: return "语音已在手机上，Mac 恢复后会继续；急的话按住重说一次"
+        case .execution: return "按住语音球，再说一次"
+        }
+    }
+
     /// 从失败前最后一个状态推断失败阶段（信封未显式给出时的兜底）。
     static func inferred(from lastState: VoiceTurnState) -> VoiceFailureStage {
         switch lastState {
@@ -138,7 +147,7 @@ enum VoiceTurnPhase: Equatable {
             return background ? "退出页面任务也会继续" : "很快给你结果"
         case .needsConfirmation: return "未确认前不会执行"
         case .completed: return "点击可播放结果"
-        case .failed: return "可以重新说一次"
+        case .failed(let stage): return stage.recoveryHint
         case .cancelled: return "需要时再叫我"
         }
     }

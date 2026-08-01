@@ -20,6 +20,8 @@ struct SpeechPlaybackContext {
 @MainActor
 final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published private(set) var isPlaying = false
+    /// 用户主动暂停（ESS-53 §6）：与 stop 区分，保留播放器与进度，可继续。
+    @Published private(set) var isPaused = false
 
     private var audioPlayer: AVAudioPlayer?
     private var onFinish: (() -> Void)?
@@ -58,6 +60,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @discardableResult
     func play(data: Data, context: String? = nil, onFinish: (() -> Void)? = nil) -> Bool {
         stop()
+        isPaused = false
         self.context = context
         let session = AVAudioSession.sharedInstance()
         do {
@@ -110,20 +113,39 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     /// 当前播放进度快照（ESS-48 字幕对位）。按 context 对账：player 正在播
     /// 别的内容（如欢迎语）或已停止时返回 nil，字幕视图据此进入回看态。
+    /// 暂停中仍返回进度（ESS-53 §6）：暂停不是结束，字幕停在原句。
     func progress(matching context: String) -> (time: TimeInterval, duration: TimeInterval)? {
-        guard isPlaying, self.context == context, let audioPlayer, audioPlayer.duration > 0 else {
+        guard isPlaying || isPaused, self.context == context, let audioPlayer, audioPlayer.duration > 0 else {
             return nil
         }
         return (audioPlayer.currentTime, audioPlayer.duration)
     }
 
+    /// 暂停当前播放（ESS-53 §6）：保留播放器与 onFinish，可 resume 继续。
+    func pause() {
+        guard isPlaying, let audioPlayer else { return }
+        audioPlayer.pause()
+        isPlaying = false
+        isPaused = true
+        WatchLog.info("player", "paused", requestId: context)
+    }
+
+    /// 从暂停处继续播放。
+    func resume() {
+        guard isPaused, let audioPlayer else { return }
+        isPaused = false
+        isPlaying = audioPlayer.play()
+        WatchLog.info("player", "resumed", requestId: context, detail: "success=\(isPlaying)")
+    }
+
     func stop() {
-        if isPlaying {
+        if isPlaying || isPaused {
             WatchLog.info("player", "stopped", requestId: context)
         }
         audioPlayer?.stop()
         audioPlayer = nil
         isPlaying = false
+        isPaused = false
         onFinish = nil
         context = nil
     }
@@ -132,6 +154,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         Task { @MainActor in
             WatchLog.info("player", "play_finished", requestId: self.context, detail: "successfully=\(flag)")
             self.isPlaying = false
+            self.isPaused = false
             self.audioPlayer = nil
             self.context = nil
             let callback = self.onFinish

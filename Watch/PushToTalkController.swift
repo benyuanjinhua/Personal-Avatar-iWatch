@@ -28,6 +28,13 @@ final class PushToTalkController: ObservableObject {
     /// ESS-45：录音 → 等待 → 播放整个回合期间持有 ExtendedRuntimeSession，
     /// 降腕/熄屏不挂起；空闲即释放。
     let sessionKeeper = VoiceSessionKeeper()
+    /// 触觉反馈（ESS-53 §4）：录音启停直接触发；回合变迁由 feedbackPolicy diff 驱动。
+    let haptics = WatchHaptics()
+    private var feedbackPolicy = TurnFeedbackPolicy()
+    private var cancellables = Set<AnyCancellable>()
+    /// 内存重播缓存（ESS-53 §6）：仅保留最近一条已播结果语音。加密仓照删、
+    /// ACK 照发（交付协议不变），本次会话内可重播；退出 App 即失。
+    private var lastPlayedAudio: (requestId: String, data: Data)?
 
     /// 结果语音自动播放即将开始（App 层用来打断欢迎语）。
     var onAutoPlayStarted: (() -> Void)?
@@ -63,6 +70,19 @@ final class PushToTalkController: ObservableObject {
             playing: player.$isPlaying.eraseToAnyPublisher(),
             recording: $state.map { $0 != .idle }.eraseToAnyPublisher()
         )
+
+        // 触觉由状态机变迁驱动（ESS-53 §4）：不依赖 UI 挂载；首次快照静默 seed，
+        // 重开 App 恢复历史回合不补发触觉。
+        journal.$turns
+            .receive(on: RunLoop.main)
+            .sink { [weak self] turns in
+                guard let self else { return }
+                let events = self.feedbackPolicy.observe(
+                    turns: turns.map { ($0.requestId, $0.currentState) }
+                )
+                events.forEach { self.haptics.play(event: $0) }
+            }
+            .store(in: &cancellables)
     }
 
     /// 展示纯文本结果全文。录音期间不弹（打断按住说话手势），文字仍在结果卡片里可点开。
@@ -114,12 +134,14 @@ final class PushToTalkController: ObservableObject {
         errorMessage = nil
         player.stop()
         state = .recording
+        haptics.playRecordStarted()
         Task {
             do {
                 try await recorder.start()
             } catch {
                 state = .idle
-                errorMessage = error.localizedDescription
+                errorMessage = Self.friendlyRecorderMessage(for: error)
+                haptics.playLocalFailure()
             }
         }
     }
@@ -133,6 +155,7 @@ final class PushToTalkController: ObservableObject {
         }
         do {
             let recording = try recorder.finish()
+            haptics.playRecordStopped()
             let envelope = VoiceRequestEnvelope.voiceRequest(
                 audio: VoiceAudioDescriptor(
                     codec: "aac",
@@ -144,8 +167,18 @@ final class PushToTalkController: ObservableObject {
             )
             transport.send(envelope: envelope, recording: recording)
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = Self.friendlyRecorderMessage(for: error)
+            haptics.playLocalFailure()
         }
+    }
+
+    /// 技术错误 → 人话（ESS-53 §5）：RecorderError 自带可读文案；
+    /// 其余（AVAudioSession 激活失败等）不把系统原文抛给用户。
+    static func friendlyRecorderMessage(for error: Error) -> String {
+        if let recorderError = error as? RecorderError {
+            return recorderError.localizedDescription
+        }
+        return "无法开始录音，请稍后重试"
     }
 
     func pressCancelled() {
@@ -179,23 +212,36 @@ final class PushToTalkController: ObservableObject {
         journal.recordLocal(.cancelled, requestId: turn.requestId, detail: "你取消了本次请求")
     }
 
+    /// 结果语音当前是否可播/可重播（加密仓仍有文件，或命中本会话内存重播缓存）。
+    func hasPlayableAudio(for turn: VoiceTurnRecord) -> Bool {
+        turn.speechFileName != nil || lastPlayedAudio?.requestId == turn.requestId
+    }
+
+    /// 结果卡片播放按钮（ESS-53 §6）：播放中→暂停，暂停中→继续，否则（重新）播放。
+    func togglePlayback(for turn: VoiceTurnRecord) {
+        if player.progress(matching: turn.requestId) != nil {
+            if player.isPlaying {
+                player.pause()
+            } else {
+                player.resume()
+            }
+            return
+        }
+        playResult(for: turn)
+    }
+
     /// 播放结果语音：从加密仓解密到内存播放，播完即删（交付后删除）。
+    /// 播完后加密仓文件已删时回落到内存重播缓存（ESS-53 §6），本次会话内可重播。
     func playResult(for turn: VoiceTurnRecord) {
         let requestId = turn.requestId
-        guard let fileName = turn.speechFileName else {
-            WatchLog.error("player", "result_speech_missing", requestId: requestId, code: "ERR_NO_SPEECH_FILE")
-            return
-        }
-        guard let vault = speechVault, let data = try? vault.load(name: fileName) else {
-            WatchLog.error(
-                "player", "result_speech_load_failed", requestId: requestId,
-                detail: "vault=\(speechVault != nil)", code: "ERR_VAULT_LOAD"
-            )
-            return
-        }
+        guard let data = loadPlayableAudio(for: turn) else { return }
+        lastPlayedAudio = (requestId, data)
+        let fileName = turn.speechFileName
         let started = player.play(data: data, context: requestId) { [weak self] in
-            self?.speechVault?.remove(name: fileName)
-            self?.journal.clearSpeech(requestId: requestId)
+            if let fileName {
+                self?.speechVault?.remove(name: fileName)
+                self?.journal.clearSpeech(requestId: requestId)
+            }
             // ESS-45×ESS-46：只有终态回合的结果语音播完才算交付——interim
             // （回合仍在处理中）播完不算，否则 completed 后等待最终语音的
             // 120s grace 持有会被跳过，App 挂起、最终结果播不出来。
@@ -212,5 +258,31 @@ final class PushToTalkController: ObservableObject {
         } else if !text.isEmpty {
             subtitleSession = SubtitleSession(requestId: requestId, text: text, hasAudio: false)
         }
+    }
+
+    /// 字幕视图重播入口（ESS-53 §6）。
+    func replayResult(requestId: String) {
+        guard let turn = journal.turn(withId: requestId) else { return }
+        playResult(for: turn)
+    }
+
+    /// 取可播放的音频数据：优先加密仓；播完已删时回落内存重播缓存（ESS-53 §6）。
+    private func loadPlayableAudio(for turn: VoiceTurnRecord) -> Data? {
+        let requestId = turn.requestId
+        if let fileName = turn.speechFileName {
+            if let vault = speechVault, let data = try? vault.load(name: fileName) {
+                return data
+            }
+            WatchLog.error(
+                "player", "result_speech_load_failed", requestId: requestId,
+                detail: "vault=\(speechVault != nil)", code: "ERR_VAULT_LOAD"
+            )
+        }
+        if let cached = lastPlayedAudio, cached.requestId == requestId {
+            WatchLog.info("player", "replay_from_memory", requestId: requestId, detail: "bytes=\(cached.data.count)")
+            return cached.data
+        }
+        WatchLog.error("player", "result_speech_missing", requestId: requestId, code: "ERR_NO_SPEECH_FILE")
+        return nil
     }
 }

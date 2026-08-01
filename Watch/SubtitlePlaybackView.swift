@@ -23,6 +23,9 @@ struct SubtitleSession: Identifiable, Equatable {
 struct SubtitlePlaybackView: View {
     let session: SubtitleSession
     @ObservedObject var player: SpeechPlayer
+    /// 重播回调（ESS-53 §6）：播完后音频可能已从加密仓删除，由控制器
+    /// 从内存重播缓存重新起播；nil 时不显示重播按钮。
+    var onReplay: (() -> Void)?
 
     private let script: SubtitleScript
     @State private var currentIndex = 0
@@ -32,9 +35,10 @@ struct SubtitlePlaybackView: View {
     /// 200ms 轮询 currentTime：句级高亮足够，且远低于表盘刷新成本敏感区。
     private let ticker = Timer.publish(every: 0.2, on: .main, in: .common).autoconnect()
 
-    init(session: SubtitleSession, player: SpeechPlayer) {
+    init(session: SubtitleSession, player: SpeechPlayer, onReplay: (() -> Void)? = nil) {
         self.session = session
         self.player = player
+        self.onReplay = onReplay
         self.script = SubtitleScript.make(text: session.text)
     }
 
@@ -81,13 +85,21 @@ struct SubtitlePlaybackView: View {
 
     // MARK: - 播放状态
 
-    /// 音频仍在为本会话播放（player 可能在播别的内容，如欢迎语，按 request_id 对账）。
-    private var isPlayingThisSession: Bool {
+    /// 本会话音频仍在播放器里（播放中或暂停中；player 可能在播别的内容，按 request_id 对账）。
+    private var isActiveThisSession: Bool {
         session.hasAudio && player.progress(matching: session.requestId) != nil
     }
 
+    private var isPlayingThisSession: Bool {
+        isActiveThisSession && player.isPlaying
+    }
+
+    private var isPausedThisSession: Bool {
+        isActiveThisSession && player.isPaused
+    }
+
     private var isFinished: Bool {
-        session.hasAudio && hasTracked && !isPlayingThisSession
+        session.hasAudio && hasTracked && !isActiveThisSession
     }
 
     /// 高亮仅在播放中且多句时生效：单句不闪烁；播完/纯文本全量正常展示。
@@ -106,15 +118,38 @@ struct SubtitlePlaybackView: View {
 
     @ViewBuilder
     private var statusHeader: some View {
-        if isPlayingThisSession {
-            Label("播放中", systemImage: "speaker.wave.2.fill")
-                .font(.caption2)
-                .foregroundStyle(.cyan)
-        } else if isFinished {
-            Label("已播完，可回看", systemImage: "checkmark.circle")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+        HStack(spacing: 6) {
+            if isPlayingThisSession {
+                Label("播放中", systemImage: "speaker.wave.2.fill")
+                    .foregroundStyle(.cyan)
+            } else if isPausedThisSession {
+                Label("已暂停", systemImage: "pause.circle")
+                    .foregroundStyle(.orange)
+            } else if isFinished {
+                Label("已播完，可回看", systemImage: "checkmark.circle")
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 0)
+
+            // 播放控制（ESS-53 §6）：暂停/继续；播完后可重播（内存缓存起播）。
+            if isActiveThisSession {
+                Button {
+                    player.isPlaying ? player.pause() : player.resume()
+                } label: {
+                    Image(systemName: player.isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                        .font(.title3)
+                }
+                .buttonStyle(.plain)
+            } else if isFinished, let onReplay {
+                Button(action: onReplay) {
+                    Image(systemName: "arrow.counterclockwise.circle.fill")
+                        .font(.title3)
+                }
+                .buttonStyle(.plain)
+            }
         }
+        .font(.caption2)
     }
 
     /// 中断恢复（降腕/来电，依赖 ESS-45）后无需特判：currentTime 即恢复点，

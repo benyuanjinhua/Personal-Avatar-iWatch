@@ -27,6 +27,10 @@ struct WristAgentWatchApp: App {
                     settings.activate()
                     welcome.greetIfNeeded()
                 }
+                // 触觉总开关（ESS-53 §4）：沿用 iPhone 伴侣 App 的"触感反馈"配置。
+                .onReceive(settings.$configuration) { configuration in
+                    pushToTalk.haptics.isEnabled = configuration.hapticsEnabled
+                }
                 .onChange(of: scenePhase) { _, newPhase in
                     WatchLog.info("lifecycle", "scene_phase", detail: String(describing: newPhase))
                     switch newPhase {
