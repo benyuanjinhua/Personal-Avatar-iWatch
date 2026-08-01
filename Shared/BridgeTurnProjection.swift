@@ -107,8 +107,15 @@ extension BridgeTurnProjection {
     }
 
     /// 面向用户的补充说明：失败时给稳定错误码，其余透传子状态。
+    /// 「没听清」类失败（ESS-41 B2）翻译成可执行的中文提示，不裸露错误码。
     var detailText: String? {
-        status == "failed" ? (error ?? detail) : detail
+        guard status == "failed" else { return detail }
+        switch error {
+        case "ERR_AUDIO_TOO_SHORT", "ERR_TRANSCRIPT_DISCARDED":
+            return "没听清，请重说"
+        default:
+            return error ?? detail
+        }
     }
 
     /// completed 投影 → Watch 结果载荷。speechSha256/speechDurationMs 来自

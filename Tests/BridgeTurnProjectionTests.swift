@@ -116,6 +116,16 @@ final class BridgeTurnProjectionTests: XCTestCase {
         XCTAssertEqual(envelope.failureStage, .execution)
     }
 
+    func testAudioTooShortMapsToFriendlyRetryHint() throws {
+        // ESS-41 B2：「没听清」类失败给可执行中文提示，不裸露错误码。
+        for code in ["ERR_AUDIO_TOO_SHORT", "ERR_TRANSCRIPT_DISCARDED"] {
+            let turn = try XCTUnwrap(projection(status: "failed", extra: #""error":"\#(code)""#))
+            XCTAssertEqual(turn.detailText, "没听清，请重说")
+        }
+        let other = try XCTUnwrap(projection(status: "failed", extra: #""error":"ERR_WORK_TIMEOUT""#))
+        XCTAssertEqual(other.detailText, "ERR_WORK_TIMEOUT", "其余失败仍透传稳定错误码")
+    }
+
     func testPermissionRequiredNeedsPayload() throws {
         let without = try XCTUnwrap(projection(status: "permission_required"))
         XCTAssertNil(without.statusEnvelope(), "权限载荷缺失时宁缺毋滥")
