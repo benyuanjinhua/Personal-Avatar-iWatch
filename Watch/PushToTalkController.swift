@@ -22,6 +22,9 @@ final class PushToTalkController: ObservableObject {
     let speechVault: EncryptedAudioVault?
     let player = SpeechPlayer()
     let transport: WatchVoiceTransport
+    /// ESS-45：录音 → 等待 → 播放整个回合期间持有 ExtendedRuntimeSession，
+    /// 降腕/熄屏不挂起；空闲即释放。
+    let sessionKeeper = VoiceSessionKeeper()
 
     /// 结果语音自动播放即将开始（App 层用来打断欢迎语）。
     var onAutoPlayStarted: (() -> Void)?
@@ -46,6 +49,12 @@ final class PushToTalkController: ObservableObject {
         journal.onSpeechAttached = { [weak self] requestId in
             self?.autoPlayResult(requestId: requestId)
         }
+
+        sessionKeeper.bind(
+            turns: journal.$turns.eraseToAnyPublisher(),
+            playing: player.$isPlaying.eraseToAnyPublisher(),
+            recording: $state.map { $0 != .idle }.eraseToAnyPublisher()
+        )
     }
 
     /// 录音期间到达的结果语音先挂起，录音结束后补播（不静默丢弃）。
@@ -160,6 +169,12 @@ final class PushToTalkController: ObservableObject {
         player.play(data: data, context: requestId) { [weak self] in
             self?.speechVault?.remove(name: fileName)
             self?.journal.clearSpeech(requestId: requestId)
+            // ESS-45×ESS-46：只有终态回合的结果语音播完才算交付——interim
+            // （回合仍在处理中）播完不算，否则 completed 后等待最终语音的
+            // 120s grace 持有会被跳过，App 挂起、最终结果播不出来。
+            if self?.journal.turn(withId: requestId)?.currentState.isTerminal == true {
+                self?.sessionKeeper.markDelivered(requestId: requestId)
+            }
         }
     }
 }

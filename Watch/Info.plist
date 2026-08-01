@@ -31,6 +31,11 @@
 	<string>腕语需要使用麦克风，把你的语音指令发送给云端 Agent。</string>
 	<key>WKApplication</key>
 	<true/>
+	<key>WKBackgroundModes</key>
+	<array>
+		<string>audio</string>
+		<string>self-care</string>
+	</array>
 	<key>WKCompanionAppBundleIdentifier</key>
 	<string>$(WRISTAGENT_BUNDLE_ID)</string>
 	<key>WKRunsIndependentlyOfCompanionApp</key>
