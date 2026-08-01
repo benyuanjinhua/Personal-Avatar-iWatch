@@ -20,6 +20,16 @@ enum RuntimeSessionPolicy {
         let reviewAt: Date?
     }
 
+    /// Interactive recording already keeps the app in the foreground. Starting a
+    /// WKExtendedRuntimeSession while the press gesture is still active can cancel
+    /// that gesture on device, producing a 10-60 ms AAC header-only recording.
+    /// Defer the system session until release; the newly recorded active turn then
+    /// immediately supplies the hold reason for the background wait.
+    static func shouldStartExtendedSession(for decision: Decision) -> Bool {
+        guard case .hold(let reason) = decision else { return false }
+        return reason != "recording"
+    }
+
     /// - Parameters:
     ///   - turns: 回合日志全量（新的在前，最多 20 条）。
     ///   - deliveredRequestIds: 本次进程内已完成播放交付的 request_id

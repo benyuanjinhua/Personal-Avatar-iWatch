@@ -70,6 +70,14 @@ final class VoiceRequestEnvelopeTests: XCTestCase {
             audio: VoiceAudioDescriptor(codec: "aac", sampleRate: 16_000, channels: 1, durationMs: 61_000, sha256: String(repeating: "a", count: 64))
         )
         XCTAssertNotNil(tooLong.validate(), "超过 60 秒必须被拒")
+        let tooShort = VoiceRequestEnvelope.voiceRequest(
+            audio: VoiceAudioDescriptor(codec: "aac", sampleRate: 16_000, channels: 1, durationMs: 60, sha256: String(repeating: "a", count: 64))
+        )
+        XCTAssertEqual(
+            tooShort.validate(),
+            .invalidAudio("duration_ms 超出 [300, 60000]"),
+            "Bridge 无法处理的短录音必须在 Watch 侧拒绝"
+        )
     }
 }
 

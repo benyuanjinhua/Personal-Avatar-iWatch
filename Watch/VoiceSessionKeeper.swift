@@ -20,6 +20,7 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
     /// 否则 10 分钟上限形同虚设。新的按住说话会清除此标记。
     private var restartSuppressed = false
     private var holdReason: String?
+    private var recordingStartDeferred = false
 
     private var latestTurns: [VoiceTurnRecord] = []
     private var deliveredRequestIds: Set<String> = []
@@ -81,9 +82,19 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
         switch verdict.decision {
         case .hold(let reason):
             holdReason = reason
-            startSessionIfNeeded(reason: reason)
+            if RuntimeSessionPolicy.shouldStartExtendedSession(for: verdict.decision) {
+                recordingStartDeferred = false
+                startSessionIfNeeded(reason: reason)
+            } else if !recordingStartDeferred {
+                recordingStartDeferred = true
+                WatchLog.info(
+                    "runtime", "session_start_deferred",
+                    detail: "reason=recording until=gesture_released"
+                )
+            }
         case .release:
             holdReason = nil
+            recordingStartDeferred = false
             restartSuppressed = false
             releaseSession(cause: "idle")
         }

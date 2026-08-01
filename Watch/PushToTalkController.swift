@@ -34,6 +34,9 @@ final class PushToTalkController: ObservableObject {
 
     private static let logger = Logger(subsystem: "com.benyuan.wristagent.watch", category: "PlaybackTrigger")
     private let recorder = AudioRecorder()
+    /// A release can arrive while AVAudioRecorder is still being prepared. Keep
+    /// it pending and finish only after record() has actually succeeded.
+    private var releaseRequestedWhileStarting = false
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -112,11 +115,21 @@ final class PushToTalkController: ObservableObject {
     func pressBegan() {
         guard state == .idle else { return }
         errorMessage = nil
+        releaseRequestedWhileStarting = false
         player.stop()
         state = .recording
         Task {
             do {
                 try await recorder.start()
+                guard state == .recording else {
+                    WatchLog.info("recorder", "late_start_cancelled", detail: "state=\(String(describing: state))")
+                    recorder.cancel()
+                    return
+                }
+                if releaseRequestedWhileStarting {
+                    WatchLog.info("recorder", "deferred_release_applied")
+                    finishRecording()
+                }
             } catch {
                 state = .idle
                 errorMessage = error.localizedDescription
@@ -126,13 +139,34 @@ final class PushToTalkController: ObservableObject {
 
     func pressEnded() {
         guard state == .recording else { return }
+        guard recorder.isRecording else {
+            releaseRequestedWhileStarting = true
+            WatchLog.info("recorder", "release_deferred_until_started")
+            return
+        }
+        finishRecording()
+    }
+
+    private func finishRecording() {
+        guard state == .recording else { return }
         state = .finishing
         defer {
             state = .idle
+            releaseRequestedWhileStarting = false
             flushPendingAutoPlay()
         }
         do {
             let recording = try recorder.finish()
+            guard recording.durationMs >= VoiceRequestEnvelope.minimumAudioDurationMs else {
+                try? FileManager.default.removeItem(at: recording.fileURL)
+                WatchLog.error(
+                    "recorder", "recording_too_short_local",
+                    detail: "duration_ms=\(recording.durationMs) bytes=\(recording.data.count)",
+                    code: "ERR_AUDIO_TOO_SHORT"
+                )
+                errorMessage = "按住说话时间太短，请重试。"
+                return
+            }
             let envelope = VoiceRequestEnvelope.voiceRequest(
                 audio: VoiceAudioDescriptor(
                     codec: "aac",
@@ -151,6 +185,7 @@ final class PushToTalkController: ObservableObject {
     func pressCancelled() {
         guard state == .recording else { return }
         recorder.cancel()
+        releaseRequestedWhileStarting = false
         state = .idle
         flushPendingAutoPlay()
     }
