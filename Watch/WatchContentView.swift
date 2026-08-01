@@ -3,6 +3,7 @@ import SwiftUI
 struct WatchContentView: View {
     @EnvironmentObject private var conversation: ConversationViewModel
     @EnvironmentObject private var settings: WatchSettingsStore
+    @EnvironmentObject private var pushToTalk: PushToTalkController
 
     var body: some View {
         NavigationStack {
@@ -60,6 +61,19 @@ struct WatchContentView: View {
                     }
 
                     NavigationLink {
+                        PushToTalkView(
+                            transport: pushToTalk.transport,
+                            journal: pushToTalk.journal,
+                            player: pushToTalk.player
+                        )
+                    } label: {
+                        Label("按住说话", systemImage: "mic.circle.fill")
+                    }
+                    .font(.footnote)
+                    .buttonStyle(.bordered)
+                    .tint(.cyan)
+
+                    NavigationLink {
                         WatchHistoryListView(
                             entries: conversation.historyEntries,
                             onClear: conversation.clearHistory
@@ -87,52 +101,19 @@ struct WatchContentView: View {
         }
     }
 
+    /// 语音球统一由 VoiceOrbView 渲染（ESS-29）。
     private var orb: some View {
-        ZStack {
-            Circle()
-                .fill(
-                    RadialGradient(
-                        colors: orbColors,
-                        center: .topLeading,
-                        startRadius: 2,
-                        endRadius: 44
-                    )
-                )
-                .frame(width: orbSize, height: orbSize)
-                .shadow(color: orbColors.last?.opacity(0.55) ?? .clear, radius: 14)
-                .animation(.easeInOut(duration: 0.12), value: conversation.recordingLevel)
-
-            Image(systemName: orbSymbol)
-                .font(.title3.bold())
-                .foregroundStyle(.white)
-                .symbolEffect(.pulse, isActive: conversation.phase == .understanding || conversation.phase == .running)
-        }
+        VoiceOrbView(mode: orbMode, size: 62)
     }
 
-    private var orbSize: CGFloat {
-        conversation.phase == .listening
-            ? 58 + CGFloat(conversation.recordingLevel * 16)
-            : 62
-    }
-
-    private var orbColors: [Color] {
+    private var orbMode: VoiceOrbView.Mode {
         switch conversation.phase {
-        case .listening: return [.white, .purple, .indigo]
-        case .confirmation: return [.yellow, .orange, .red]
-        case .completed: return [.white, .green, .mint]
-        case .failed: return [.white, .red, .pink]
-        default: return [.white, .cyan, .blue]
-        }
-    }
-
-    private var orbSymbol: String {
-        switch conversation.phase {
-        case .listening: return "waveform"
-        case .understanding, .running: return "ellipsis"
-        case .confirmation: return "exclamationmark"
-        case .completed: return "checkmark"
-        case .failed: return "xmark"
-        case .idle: return "sparkles"
+        case .idle: return .idle
+        case .listening: return .listening(level: conversation.recordingLevel)
+        case .understanding, .running: return .processing
+        case .confirmation: return .confirmation
+        case .completed: return .completed
+        case .failed: return .failed
         }
     }
 

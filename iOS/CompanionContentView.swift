@@ -4,6 +4,7 @@ struct CompanionContentView: View {
     @EnvironmentObject private var settings: CompanionSettings
     @EnvironmentObject private var connectivity: PhoneConnectivity
     @State private var tokenVisible = false
+    @State private var pairingCode = ""
 
     var body: some View {
         NavigationStack {
@@ -51,6 +52,54 @@ struct CompanionContentView: View {
                     Label(connectivity.status, systemImage: "applewatch.radiowaves.left.and.right")
                     Button("立即同步到手表") {
                         connectivity.send(settings.configuration)
+                    }
+                }
+
+                Section("语音收件箱（PoC）") {
+                    Label(connectivity.voiceStatus, systemImage: "waveform.circle")
+                        .font(.footnote)
+                    ForEach(connectivity.voiceEntries.suffix(5).reversed()) { entry in
+                        LabeledContent {
+                            Text("\(entry.durationMs) ms · \(entry.sizeBytes / 1024) KB")
+                                .foregroundStyle(.secondary)
+                                .font(.caption)
+                        } label: {
+                            Text(entry.requestId.prefix(8) + "…")
+                                .font(.caption.monospaced())
+                        }
+                    }
+                    if !connectivity.voiceEntries.isEmpty {
+                        LabeledContent("累计接收", value: "\(connectivity.voiceEntries.count) 条")
+                    }
+                }
+
+                Section("Mac Relay（ESS-28）") {
+                    Label(connectivity.relay.relayStatus, systemImage: "antenna.radiowaves.left.and.right")
+                        .font(.footnote)
+                    LabeledContent("事件通道", value: connectivity.relay.eventsConnected ? "已连接" : "未连接")
+                        .font(.footnote)
+                    let queued = connectivity.relay.outboxEntries.filter { $0.state == .queued }
+                    if !queued.isEmpty {
+                        LabeledContent("待上送", value: "\(queued.count) 条")
+                            .font(.footnote)
+                    }
+                    TextField("Bridge 地址（tailnet）", text: Binding(
+                        get: { connectivity.relay.bridgeURLString },
+                        set: { connectivity.relay.bridgeURLString = $0 }
+                    ))
+                    .textInputAutocapitalization(.never)
+                    .keyboardType(.URL)
+                    .font(.footnote)
+                    if !connectivity.relay.isPaired {
+                        HStack {
+                            TextField("配对码", text: $pairingCode)
+                                .textInputAutocapitalization(.never)
+                            Button("配对") {
+                                let code = pairingCode
+                                Task { await connectivity.relay.pair(code: code, deviceName: "Jackson-iPhone") }
+                            }
+                            .disabled(pairingCode.isEmpty)
+                        }
                     }
                 }
 

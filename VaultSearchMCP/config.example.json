@@ -1,0 +1,12 @@
+{
+  "vaultRoot": "/Users/you/Obsidian/MainVault",
+  "auditLogPath": "/Users/you/Library/Logs/vault-mcp/audit.jsonl",
+  "allowedExtensions": [".md"],
+  "limits": {
+    "maxResults": 20,
+    "defaultResults": 10,
+    "snippetMaxChars": 300,
+    "readMaxChars": 20000,
+    "indexTtlMs": 30000
+  }
+}

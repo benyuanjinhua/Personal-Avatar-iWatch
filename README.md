@@ -25,6 +25,7 @@ WristAgent/
 ├── Docs/PRD.md              # 产品需求与 iPhone Relay 网络架构
 ├── Docs/API.md              # 云端 Agent Gateway 协议
 ├── Docs/ARCHITECTURE_CONSTRAINTS.md # 架构约束清单（评审对照）
+├── Docs/ARCHITECTURE.md     # 模块划分、依赖规则与渐进迁移方案
 ├── Docs/WATCH_INSTALL_TROUBLESHOOTING.md # Watch 真机安装排障
 ├── Tools/mock-gateway.mjs   # 本地联调服务
 ├── Brand/AppIcon.svg        # iPhone/Watch 共用图标母版

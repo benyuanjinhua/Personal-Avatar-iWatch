@@ -6,16 +6,51 @@ import WatchConnectivity
 final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     @Published private(set) var status = "尚未连接 Apple Watch"
     @Published private(set) var history: [ConversationHistoryEntry] = []
+    @Published private(set) var voiceEntries: [VoiceInboxEntry] = []
+    @Published private(set) var voiceStatus = "尚未收到语音请求"
+    /// ESS-28：加密 outbox + Tailscale 上送 + 结果回传编排器。
+    let relay: WristAgentPhoneRelay
     private var pendingConfiguration: AgentConfiguration?
     private let historyStorageKey = "wristagent.phone.conversation.history"
+    private let voiceInbox: VoiceRequestInbox?
 
     override init() {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        voiceInbox = try? VoiceRequestInbox(directory: base.appendingPathComponent("VoiceInbox", isDirectory: true))
+        relay = WristAgentPhoneRelay()
         super.init()
+        relay.watchChannel = self
+        voiceEntries = voiceInbox?.entries ?? []
         if
             let data = UserDefaults.standard.data(forKey: historyStorageKey),
             let saved = try? JSONDecoder().decode([ConversationHistoryEntry].self, from: data)
         {
             history = saved
+        }
+    }
+
+    /// Watch 端 transferFile 落地：sha256 校验 + request_id 幂等去重，失败不送往 Mac。
+    private func ingestVoiceFile(envelopeData: Data, audioData: Data) {
+        guard let inbox = voiceInbox else {
+            voiceStatus = "收件箱不可用"
+            return
+        }
+        switch inbox.ingest(envelopeData: envelopeData, audioData: audioData) {
+        case .accepted(let envelope, let fileURL):
+            voiceEntries = inbox.entries
+            voiceStatus = "已接收 \(envelope.requestId.prefix(8))…（\(envelope.audio.durationMs) ms）"
+            // 交给 Relay：加密入队 + 回执 Watch + 异步上送 Mac。
+            relay.handleAccepted(envelope: envelope, audioData: audioData)
+            // 明文副本删除；音频仅以 outbox 密文形式保留（§8）。
+            try? FileManager.default.removeItem(at: fileURL)
+        case .duplicate(let requestId):
+            voiceStatus = "重复请求 \(requestId.prefix(8))…，已幂等丢弃"
+            // 幂等重发：不产生第二个请求，由 Relay 重发当前状态。
+            if let envelope = try? VoiceRequestEnvelope.decode(from: envelopeData) {
+                relay.handleAccepted(envelope: envelope, audioData: audioData)
+            }
+        case .rejected(let error):
+            voiceStatus = "已拒收：\(error.description)"
         }
     }
 
@@ -26,6 +61,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         }
         WCSession.default.delegate = self
         WCSession.default.activate()
+        relay.start()
     }
 
     func send(_ configuration: AgentConfiguration) {
@@ -70,6 +106,39 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
 
     nonisolated func session(
         _ session: WCSession,
+        didReceiveMessage message: [String: Any]
+    ) {
+        guard
+            let envelopeData = message[VoiceMessage.envelopeKey] as? Data,
+            let envelope = try? VoiceRequestEnvelope.decode(from: envelopeData)
+        else { return }
+        Task { @MainActor in
+            self.voiceStatus = "收到元数据预告 \(envelope.requestId.prefix(8))…，等待音频文件"
+        }
+    }
+
+    nonisolated func session(_ session: WCSession, didReceive file: WCSessionFile) {
+        // 系统会在本方法返回后删除临时文件，必须同步读出。
+        guard let audioData = try? Data(contentsOf: file.fileURL) else { return }
+        guard let envelopeData = file.metadata?[VoiceMessage.envelopeKey] as? Data else { return }
+        Task { @MainActor in
+            self.ingestVoiceFile(envelopeData: envelopeData, audioData: audioData)
+        }
+    }
+
+    nonisolated func session(
+        _ session: WCSession,
+        didFinish fileTransfer: WCSessionFileTransfer,
+        error: Error?
+    ) {
+        let fileName = fileTransfer.file.fileURL.lastPathComponent
+        Task { @MainActor in
+            self.relay.handleResultAudioTransferFinished(fileName: fileName, error: error)
+        }
+    }
+
+    nonisolated func session(
+        _ session: WCSession,
         didReceiveApplicationContext applicationContext: [String: Any]
     ) {
         guard let data = applicationContext[HistoryMessage.key] as? Data else { return }
@@ -79,6 +148,42 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
             }
             self.history = entries
             UserDefaults.standard.set(data, forKey: self.historyStorageKey)
+        }
+    }
+}
+
+// MARK: - Relay → Watch 回执通道（ESS-28）
+
+extension PhoneConnectivity: WatchFeedbackChannel {
+    /// 状态/结果短文本：可达时 sendMessage 即时送达；不可达时 transferUserInfo 排队，
+    /// 由系统在下次连接时交付（Watch 离线也不丢）。
+    func notifyWatch(status: RelayStatusUpdate) {
+        guard let data = try? status.jsonData() else { return }
+        sendToWatch(key: VoiceMessage.relayStatusKey, data: data)
+    }
+
+    func notifyWatch(result: VoiceRelayResultPayload) {
+        guard let data = try? result.jsonData() else { return }
+        sendToWatch(key: VoiceMessage.resultKey, data: data)
+    }
+
+    /// 结果音频走系统托管 transferFile；metadata 带结果载荷用于 Watch 端关联与 sha256 校验。
+    func transferResultAudio(fileURL: URL, payload: VoiceRelayResultPayload) {
+        guard WCSession.default.activationState == .activated,
+              let data = try? payload.jsonData() else { return }
+        WCSession.default.transferFile(fileURL, metadata: [VoiceMessage.resultKey: data])
+    }
+
+    private func sendToWatch(key: String, data: Data) {
+        let session = WCSession.default
+        guard session.activationState == .activated else { return }
+        if session.isReachable {
+            session.sendMessage([key: data], replyHandler: nil) { _ in
+                // 即时通道失败退回系统排队通道。
+                session.transferUserInfo([key: data])
+            }
+        } else {
+            session.transferUserInfo([key: data])
         }
     }
 }
