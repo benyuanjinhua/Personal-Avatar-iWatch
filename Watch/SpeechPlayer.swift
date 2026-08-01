@@ -108,6 +108,15 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         return isPlaying
     }
 
+    /// 当前播放进度快照（ESS-48 字幕对位）。按 context 对账：player 正在播
+    /// 别的内容（如欢迎语）或已停止时返回 nil，字幕视图据此进入回看态。
+    func progress(matching context: String) -> (time: TimeInterval, duration: TimeInterval)? {
+        guard isPlaying, self.context == context, let audioPlayer, audioPlayer.duration > 0 else {
+            return nil
+        }
+        return (audioPlayer.currentTime, audioPlayer.duration)
+    }
+
     func stop() {
         if isPlaying {
             WatchLog.info("player", "stopped", requestId: context)

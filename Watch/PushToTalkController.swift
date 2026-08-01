@@ -17,6 +17,9 @@ final class PushToTalkController: ObservableObject {
     @Published private(set) var state: State = .idle
     @Published private(set) var errorMessage: String?
     @Published private(set) var recordingLevel: Float = 0
+    /// 当前字幕播放会话（ESS-48）：结果播放/纯文本结果到达时置值，
+    /// UI 以 sheet(item:) 呈现；用户关闭视图时由绑定置回 nil。
+    @Published var subtitleSession: SubtitleSession?
 
     let journal: VoiceTurnJournal
     let speechVault: EncryptedAudioVault?
@@ -46,6 +49,30 @@ final class PushToTalkController: ObservableObject {
         journal.onSpeechAttached = { [weak self] requestId in
             self?.autoPlayResult(requestId: requestId)
         }
+
+        // 纯文本降级（ESS-48）：没有语音可播，直接展示全文，不进播放态。
+        journal.onResultWithoutSpeech = { [weak self] requestId in
+            self?.presentTranscriptOnly(requestId: requestId)
+        }
+    }
+
+    /// 展示纯文本结果全文。录音期间不弹（打断按住说话手势），文字仍在结果卡片里可点开。
+    private func presentTranscriptOnly(requestId: String) {
+        guard state == .idle else { return }
+        guard let turn = journal.turn(withId: requestId), let result = turn.result else { return }
+        subtitleSession = SubtitleSession(
+            requestId: requestId, text: result.displaySummary, hasAudio: false
+        )
+    }
+
+    /// 结果卡片「查看全文」入口：正在播本回合语音则接入实时字幕，否则纯回看。
+    func showTranscript(for turn: VoiceTurnRecord) {
+        guard let result = turn.result else { return }
+        subtitleSession = SubtitleSession(
+            requestId: turn.requestId,
+            text: result.displaySummary,
+            hasAudio: player.progress(matching: turn.requestId) != nil
+        )
     }
 
     /// 录音期间到达的结果语音先挂起，录音结束后补播（不静默丢弃）。
@@ -157,9 +184,18 @@ final class PushToTalkController: ObservableObject {
             )
             return
         }
-        player.play(data: data, context: requestId) { [weak self] in
+        let started = player.play(data: data, context: requestId) { [weak self] in
             self?.speechVault?.remove(name: fileName)
             self?.journal.clearSpeech(requestId: requestId)
+        }
+        // 字幕式播放（ESS-48）：播放开始即进入全文视图，按进度逐句高亮；
+        // 播放起不来但有文字时降级为纯文本展示，不留空白。
+        // interim 播放中最终结果到达：play() 已 stop 前一段，会话整体替换，不叠加。
+        let text = turn.result?.displaySummary ?? ""
+        if started {
+            subtitleSession = SubtitleSession(requestId: requestId, text: text, hasAudio: true)
+        } else if !text.isEmpty {
+            subtitleSession = SubtitleSession(requestId: requestId, text: text, hasAudio: false)
         }
     }
 }

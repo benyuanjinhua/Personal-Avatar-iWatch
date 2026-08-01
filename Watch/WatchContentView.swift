@@ -81,6 +81,10 @@ struct WatchContentView: View {
         // 按 request_id 定向触发，ESS-41 B3）：不再依赖本视图挂载或该回合仍是
         // activeTurn——旧的 onChange 触发在「语音后到 + 回合已切换/已判失败」时
         // 会静默漏播。
+        // 字幕式播放视图（ESS-48）：播放开始/纯文本结果到达时由控制器置入会话。
+        .sheet(item: $pushToTalk.subtitleSession) { session in
+            SubtitlePlaybackView(session: session, player: pushToTalk.player)
+        }
     }
 
     // MARK: - 欢迎语（ESS-40）
@@ -160,6 +164,19 @@ struct WatchContentView: View {
                 .tint(.green)
                 .font(.footnote)
                 .disabled(player.isPlaying)
+            }
+
+            // 回看入口（ESS-48）：语音播完（音频交付后已删）仍可完整查看全文。
+            if !result.displaySummary.isEmpty {
+                Button {
+                    pushToTalk.showTranscript(for: turn)
+                } label: {
+                    Label("查看全文", systemImage: "text.alignleft")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(.secondary)
+                .font(.footnote)
             }
         }
         .padding(9)
