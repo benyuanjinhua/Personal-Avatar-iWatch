@@ -1,0 +1,34 @@
+{
+  "port": 8443,
+  "bind_loopback": "127.0.0.1",
+  "bind_tailscale_ip": "auto",
+  "tls_cert": "./certs/bridge.crt",
+  "tls_key": "./certs/bridge.key",
+  "state_dir": "./state",
+  "allowed_peer_ips": ["100.80.229.218"],
+  "protocol_version": 1,
+
+  "max_audio_bytes": 5242880,
+  "max_duration_ms": 60000,
+  "max_body_bytes": 8388608,
+  "timestamp_skew_ms": 300000,
+  "pairing_code_ttl_ms": 600000,
+
+  "gateway_url": "http://127.0.0.1:3101",
+  "device_id": "jackson-iphone",
+  "idle_disconnect_ms": 900000,
+  "turn_timeout_ms": 120000,
+
+  "write_actions_enabled": false,
+
+  "max_work_ms": 300000,
+  "max_turn_events": 500,
+  "max_result_chars": 4000,
+  "max_result_audio_bytes": 2097152,
+  "sse_backoff_base_ms": 1000,
+  "sse_backoff_max_ms": 15000,
+  "poll_interval_ms": 3000,
+
+  "audiopipe_path": "./audiopipe",
+  "allow_test_pcm": false
+}
