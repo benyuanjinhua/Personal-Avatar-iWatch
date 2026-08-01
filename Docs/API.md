@@ -117,6 +117,37 @@
 
 成功时返回任务对象；已经进入不可撤销工具调用时，服务端应返回明确错误。
 
+## 6. 链路追踪（trace_id）
+
+全链路共用一个 `trace_id`，用于确认一次输入在每个模块是否成功执行。
+
+- 客户端可通过请求体 `trace_id` 字段或 `X-Trace-Id` 头指定（格式
+  `[A-Za-z0-9_-]{1,64}`，例如 `223lkjl`）；缺省时网关生成 `trc-xxxxxxxx`。
+- 所有响应回显 `trace_id` 字段和 `X-Trace-Id` 头；同一轮的后续请求
+  （轮询、撤回、确认）应携带同一 `X-Trace-Id`。
+- 每个模块写独立 JSONL 日志：`logs/trace/h5-mock.log`、
+  `logs/trace/main-agent.log`、`logs/trace/codex-cli.log`（目录可用
+  `WRIST_AGENT_TRACE_DIR` 覆盖），每行都含 `trace_id`、`module`、
+  `event`、`status`。
+
+`GET /v1/trace/{trace_id}` 返回该链路经过的模块及各模块是否全部成功：
+
+```json
+{
+  "trace_id": "223lkjl",
+  "found": true,
+  "modules": {
+    "h5-mock": { "events": 1, "ok": true },
+    "main-agent": { "events": 3, "ok": true },
+    "codex-cli": { "events": 2, "ok": true }
+  },
+  "entries": []
+}
+```
+
+> Mock 网关中 `main-agent` 与 `codex-cli` 是模拟阶段；接入真实主 Agent 和
+> Codex CLI 时沿用同一约定：透传 `X-Trace-Id`，日志行携带 `trace_id`。
+
 ## Agent 侧必须保证
 
 1. 每个请求有独立 `turn_id`，工具调用可追溯。

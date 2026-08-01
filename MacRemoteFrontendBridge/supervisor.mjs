@@ -36,6 +36,14 @@
 //   回调（server 侧按 taskId → request_id 绑定回原请求）。聚合有上限
 //   （maxAnnouncementPcmBytes），超限截断；孤儿聚合由 announcementIdleMs
 //   兜底回收，绝不无界持有 PCM。
+//
+// ESS-37（会话自愈，真机停摆修复）：
+// - 注入前健康预检 probeSession()：unmute → 等 voice.ownership 回播；死会话
+//   先重建再注入，禁止盲注（网关对非活跃客户端的 audio.append 是静默丢弃的）
+// - 零事件 watchdog：注入后 firstEventTimeoutMs 内一个网关事件都没有 → 判停摆，
+//   销毁重建 WS（网关侧随连接关闭同步销毁上游 DashScope frontend）并以同一
+//   幂等键重放当前 turn，最多 maxTurnAttempts 次，不等 120s/300s 超时
+// - WS 中途断链（掐线）同样走重建+重放；voice.deactivated（真实用户抢占）不重放
 
 import WebSocket from 'ws'
 import { randomUUID } from 'node:crypto'
@@ -63,6 +71,10 @@ export class QwenRealtimeSessionSupervisor {
     takeoverFromFrontends = false,
     maxAnnouncementPcmBytes = 5_760_000, // ≈120s @ 24kHz mono PCM16（ESS-38）
     announcementIdleMs = 30_000,         // 孤儿 announcement 聚合的回收兜底
+    probeTimeoutMs = 3_000,      // 注入前活性预检：unmute → voice.ownership 回播时限
+    firstEventTimeoutMs = 12_000, // 注入后零事件停摆判定时限
+    maxTurnAttempts = 2,         // 停摆/断链后同幂等键重放的总尝试次数上限
+    rebuildDelayMs = 250,        // 重建前留给网关跑完旧连接 close 清理的时间
     log = (...args) => console.error(new Date().toISOString(), ...args),
   } = {}) {
     this.cfg = {
@@ -70,6 +82,7 @@ export class QwenRealtimeSessionSupervisor {
       backoffBaseMs, backoffMaxMs, frameMs, paceMs, trailingSilenceMs, turnGapMs,
       turnTimeoutMs, injectAckTimeoutMs, takeoverFromFrontends,
       maxAnnouncementPcmBytes, announcementIdleMs,
+      probeTimeoutMs, firstEventTimeoutMs, maxTurnAttempts, rebuildDelayMs,
     }
     this.lastTurnEndedAt = 0
     this.sessionId = `watch-bridge-v1-${deviceId}`
@@ -193,17 +206,21 @@ export class QwenRealtimeSessionSupervisor {
         }
       })
       ws.on('close', (code, reason) => {
+        clearTimeout(connectTimeout)
+        // 取证：close code/reason 永远入日志（1006=异常断开，4xxx=网关自定义）
+        this.record({ event: 'ws.close', code, reason: String(reason || ''), stale: this.ws !== ws })
+        if (ws.abandoned || this.ws !== ws) return // 旧连接迟到的 close 不得污染新连接状态
         this.stopPing()
-        if (ws.abandoned || this.ws !== ws) return // 已被新连接取代的旧 socket
         this.voiceReady = false
-        const wasReady = this.state === 'ready'
         this.state = 'disconnected'
-        this.record({ event: 'ws.close', code, reason: String(reason || '') })
         settle(reject, new Error(`ws closed during connect (code=${code})`))
-        if (!this.closedByUs) this.scheduleReconnect(wasReady)
+        // 断链即失败当前 turn（可重放），不等 turn 超时
+        this.currentTurn?.fail(Object.assign(
+          new Error(`ws closed mid-turn (code ${code})`), { connectionLost: true }))
+        if (!this.closedByUs) this.scheduleReconnect()
       })
       ws.on('error', error => {
-        this.record({ event: 'ws.error', message: error.message })
+        this.record({ event: 'ws.error', message: error.message, stale: this.ws !== ws })
         settle(reject, error)
       })
     })
@@ -227,6 +244,69 @@ export class QwenRealtimeSessionSupervisor {
         this.scheduleReconnect()
       })
     }, delay)
+  }
+
+  takeoverAllowed() {
+    if (!this.suspectZombie) return false
+    const holder = this.ownershipHolder
+    // 持有者未知（可能是我们的僵尸连接）或明确是本 Bridge 的旧实例 → 允许；
+    // 持有者是其他类型前台（Mac 本机 UI 等）→ 绝不抢占。
+    const holderIsSelf = !holder || holder.label === CLIENT_LABEL
+    this.record({ event: 'takeover.decision', suspectZombie: this.suspectZombie, holder, allowed: holderIsSelf })
+    return holderIsSelf
+  }
+
+  // ---- 会话健康预检 / 重建（ESS-37） --------------------------------------
+
+  // 应用层活性探测：unmute 幂等（已持有所有权时网关仅回播 voice.ownership，
+  // 不触发模型调用），回播在时限内到达 → 网关事件环路存活。
+  probeSession() {
+    if (this.ws?.readyState !== WebSocket.OPEN || !this.voiceReady) return Promise.resolve(false)
+    const started = Date.now()
+    return new Promise(resolve => {
+      const finish = ok => {
+        clearTimeout(timer)
+        this.listeners.delete(onItem)
+        this.record({ event: ok ? 'session.probe.ok' : 'session.probe.timeout', rttMs: Date.now() - started })
+        resolve(ok)
+      }
+      const timer = setTimeout(() => finish(false), this.cfg.probeTimeoutMs)
+      const onItem = item => {
+        if (item.event === 'voice.ownership' || item.event === 'ws.close') finish(item.event === 'voice.ownership')
+      }
+      this.listeners.add(onItem)
+      this.ws.send(JSON.stringify({ type: 'unmute' }))
+    })
+  }
+
+  // 销毁当前 WS 并同步重建：网关在客户端连接关闭时同步销毁上游 DashScope
+  // frontend 并释放语音所有权，因此重建 = 全新上游会话，这是停摆自愈的关键。
+  async rebuildSession(reason) {
+    this.record({ event: 'session.rebuild', reason })
+    clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = null
+    this.suspectZombie = true      // 自己的旧会话可能仍占有所有权 → 允许条件 takeover
+    this.closedByUs = true         // 重连由本方法驱动，不走退避重连
+    const old = this.ws
+    this.ws = null
+    this.voiceReady = false
+    this.state = 'disconnected'
+    try { old?.terminate() } catch { /* already dead */ }
+    await sleep(this.cfg.rebuildDelayMs)
+    await this.connect({ takeover: this.takeoverAllowed() })
+  }
+
+  // 注入前置检查：死会话先重建；重建后仍无响应 → 快速失败（sessionDead），
+  // 绝不向未证明存活的会话盲注音频。
+  async ensureLiveSession() {
+    await this.connect()
+    if (!this.voiceReady) return   // 交由调用方抛出 voice-not-ready
+    if (await this.probeSession()) return
+    await this.rebuildSession('probe-failed')
+    if (!this.voiceReady) return
+    if (!(await this.probeSession())) {
+      throw Object.assign(new Error('realtime session unresponsive after rebuild'), { sessionDead: true })
+    }
   }
 
   // ---- 应用层存活（上游无心跳，用 WS 协议层 ping/pong） -------------------
@@ -465,6 +545,8 @@ export class QwenRealtimeSessionSupervisor {
   // opts.onStart：轮到本 turn 真正开始注入时回调（server 用它把 work deadline
   //   从"受理时刻"改为"开始处理时刻"起算——串行积压下按受理起算必然团灭）。
   // opts.shouldRun：注入前询问是否仍需执行（排队期间被取消/判死的 turn 直接跳过）。
+  // 停摆（零事件）/ 断链 → 销毁重建会话并以同一幂等键重放，最多 maxTurnAttempts
+  // 次；其余失败（超时、所有权被真实用户抢占、cancel）不重放，保持原语义。
   injectTurn(pcm16k, { label = '', onStart, shouldRun } = {}) {
     const run = async () => {
       if (shouldRun && !shouldRun()) {
@@ -476,8 +558,8 @@ export class QwenRealtimeSessionSupervisor {
         await sleep(this.cfg.turnGapMs - sinceLast)
       }
       onStart?.()
-      for (let attempt = 0; ; attempt++) {
-        await this.connect()
+      for (let attempt = 1; ; attempt++) {
+        await this.ensureLiveSession()
         if (!this.voiceReady) {
           throw Object.assign(
             new Error(`voice not ready (ownership=${this.ownership})`),
@@ -486,14 +568,14 @@ export class QwenRealtimeSessionSupervisor {
         }
         this.touchIdle()
         try {
-          return await this.runTurn(pcm16k, label)
+          return await this.runTurn(pcm16k, label, attempt)
         } catch (error) {
-          // 仅"0 事件"失败可安全重试一次：模型从未开始处理这条音频
-          if (error.retryable && attempt < 1) {
-            this.record({ event: 'turn.retry', reason: error.message })
-            continue
-          }
-          throw error
+          const retryable = (error.stalled === true || error.connectionLost === true
+            || error.retryable === true) && !this.closedByUs
+          this.record({ event: 'turn.attempt.failed', label, attempt, retryable, message: error.message })
+          if (!retryable || attempt >= this.cfg.maxTurnAttempts) throw error
+          await this.rebuildSession(error.stalled ? 'turn-stalled'
+            : error.connectionLost ? 'connection-lost' : 'no-events')
         }
       }
     }
@@ -502,19 +584,23 @@ export class QwenRealtimeSessionSupervisor {
     return next
   }
 
-  runTurn(pcm16k, label) {
+  runTurn(pcm16k, label, attempt = 1) {
     const frameBytes = Math.round(16000 * this.cfg.frameMs / 1000) * 2
     const silence = Buffer.alloc(Math.round(16000 * this.cfg.trailingSilenceMs / 1000) * 2)
     const payload = Buffer.concat([pcm16k, silence])
     const turn = new TurnCapture(this, label)
     this.currentTurn = turn
-    this.record({ event: 'turn.inject.start', pcmBytes: pcm16k.length, frames: Math.ceil(payload.length / frameBytes) })
+    this.record({ event: 'turn.inject.start', label, attempt, pcmBytes: pcm16k.length, frames: Math.ceil(payload.length / frameBytes) })
 
     let ackTimer = null
     const sendFrames = async () => {
       for (let offset = 0; offset < payload.length; offset += frameBytes) {
         if (turn.settled) return
-        if (this.ws?.readyState !== WebSocket.OPEN) throw new Error('ws closed during injection')
+        if (this.ws?.readyState !== WebSocket.OPEN) {
+          const error = Object.assign(new Error('ws closed during injection'), { connectionLost: true })
+          turn.fail(error)
+          throw error
+        }
         const frame = payload.subarray(offset, offset + frameBytes)
         this.ws.send(JSON.stringify({ type: 'audio.append', audio: frame.toString('base64') }))
         await sleep(this.cfg.paceMs)
@@ -534,6 +620,14 @@ export class QwenRealtimeSessionSupervisor {
         }, this.cfg.injectAckTimeoutMs)
       }
     }
+    // 零事件 watchdog：注入开始后时限内网关一个事件都没回 → 会话停摆，
+    // 立即失败（可重放），不烧 turnTimeoutMs / 北向 300s 死等。
+    const stallTimer = setTimeout(() => {
+      if (turn.settled || turn.eventCount > 0) return
+      this.record({ event: 'turn.stall.zero-events', label, attempt, waitedMs: this.cfg.firstEventTimeoutMs })
+      turn.fail(Object.assign(
+        new Error(`realtime stalled: zero events within ${this.cfg.firstEventTimeoutMs}ms`), { stalled: true }))
+    }, this.cfg.firstEventTimeoutMs)
     const timeout = setTimeout(() => {
       turn.fail(new Error(`turn timeout after ${this.cfg.turnTimeoutMs}ms`))
       this.recycleAfterTurnTimeout()
@@ -541,6 +635,7 @@ export class QwenRealtimeSessionSupervisor {
     return Promise.all([sendFrames(), turn.promise])
       .then(([, result]) => result)
       .finally(() => {
+        clearTimeout(stallTimer)
         clearTimeout(timeout)
         clearTimeout(ackTimer)
         this.lastTurnEndedAt = Date.now()
@@ -556,6 +651,7 @@ class TurnCapture {
     this.label = label
     this.settled = false
     this.sawTurnEvent = false   // 注入后是否收到过任何 turn 相关事件
+    this.eventCount = 0           // 本 turn 收到的网关事件数（零事件 watchdog 依据）
     this.audioChunks = []
     this.result = {
       label,
@@ -578,6 +674,7 @@ class TurnCapture {
   onAudioDelta(event) {
     this.sawTurnEvent = true
     if (this.settled) return
+    this.eventCount += 1
     if (event.audio) {
       this.audioChunks.push(Buffer.from(event.audio, 'base64'))
       this.result.audioBytes24k += Buffer.from(event.audio, 'base64').length
@@ -595,6 +692,8 @@ class TurnCapture {
       this.sawTurnEvent = true
     }
     if (this.settled) return
+    // voice.ownership 是连接级广播（其他客户端连接也会触发），不算会话活性证据
+    if (event.type !== 'voice.ownership') this.eventCount += 1
     const r = this.result
     // turnId 关联守卫：本 turn 已绑定 turnId 后，其他 turn 的残留事件
     //（上一响应作用域的收尾）不得影响本 turn 的状态/完成判定
@@ -668,6 +767,7 @@ class TurnCapture {
     this.settled = true
     this.result.state = this.result.taskId ? 'background_accepted' : 'completed_direct'
     this.result.responseIds = [...this.result.responseIds]
+    this.result.eventCount = this.eventCount
     this.result.audio24k = Buffer.concat(this.audioChunks)
     this.resolve(this.result)
   }
@@ -676,6 +776,7 @@ class TurnCapture {
     if (this.settled) return
     this.settled = true
     this.result.responseIds = [...this.result.responseIds]
+    this.result.eventCount = this.eventCount
     this.result.error = error.message
     this.reject(Object.assign(error, { partial: this.result }))
   }

@@ -74,13 +74,29 @@ export function createBridge(overrides = {}) {
     maxAnnouncementPcmBytes: CONFIG.max_announcement_pcm_bytes ?? 5_760_000,
     ...(CONFIG.trailing_silence_ms ? { trailingSilenceMs: CONFIG.trailing_silence_ms } : {}),
     ...(CONFIG.turn_gap_ms !== undefined ? { turnGapMs: CONFIG.turn_gap_ms } : {}),
+    probeTimeoutMs: CONFIG.probe_timeout_ms,
+    firstEventTimeoutMs: CONFIG.first_event_timeout_ms,
+    maxTurnAttempts: CONFIG.max_turn_attempts,
     log: (...args) => log({ evt: 'supervisor', detail: args.map(String).join(' ').slice(0, 500) }),
   })
-  // ESS-36 可观测性：supervisor journal 全量落 Bridge 结构化日志，request_id
-  // 由 journal 的 label 字段携带 —— accepted → realtime events → completed
-  // 可按同一 request_id 串起来。原始音频永不落日志（journal 只记字节数）。
+  // ESS-36 可观测性 + ESS-37 取证：supervisor journal（ws.connecting/close
+  // code/error frame、probe、stall、rebuild、全部网关事件摘要）全量落 Bridge
+  // 结构化日志，request_id 由 journal 的 label 字段携带 —— accepted →
+  // realtime events → completed 可按同一 request_id 串起来。原始音频永不落
+  // 日志（journal 只记字节数）。RT_GATEWAY_EVENTS 同步累计账本事件数
+  // （ESS-37：修复 event_count 只统计后台 SSE、从不统计 Realtime 的取证缺口）。
+  const RT_GATEWAY_EVENTS = new Set([
+    'gateway.connected', 'voice.ready', 'voice.state', 'voice.deactivated',
+    'turn.started', 'audio.delta', 'audio.done', 'response.started', 'response.interrupted',
+    'transcript.delta', 'transcript.final', 'transcript.discard', 'timeline.inline',
+    'playback.clear', 'error',
+    'task.running', 'task.delegated', 'task.finalizing', 'task.cancelling', 'task.progress',
+    'task.completed', 'task.failed', 'task.cancelled',
+    'task.permission.requested', 'task.permission.resolved',
+  ])
   supervisor.listeners.add(item => {
     const { ts, label, event, ...rest } = item
+    if (label && RT_GATEWAY_EVENTS.has(event)) ledger.bumpEvents(label)
     log({ evt: 'realtime', request_id: label ?? null, event, ...rest })
   })
   const sourceAllowed = makeSourceGate(CONFIG.allowed_peer_ips)
@@ -276,6 +292,10 @@ export function createBridge(overrides = {}) {
       } else if (error.code === 'ERR_TRANSCRIPT_DISCARDED') {
         // 语音未被识别为有效指令：稳定错误码，Watch 端可提示"没听清，请重说"
         ledger.fail(requestId, 'ERR_TRANSCRIPT_DISCARDED')
+      } else if (error.stalled || error.sessionDead || error.connectionLost) {
+        // 停摆已重放仍失败 / 重建后会话仍无响应：快速终态，禁止头部阻塞
+        log({ evt: 'turn_stalled', request_id: requestId, err: String(error.message).slice(0, 300) })
+        ledger.fail(requestId, 'ERR_REALTIME_STALLED')
       } else {
         log({ evt: 'turn_failed', request_id: requestId, err: String(error.message).slice(0, 300) })
         ledger.fail(requestId, 'ERR_PROCESSING_FAILED')

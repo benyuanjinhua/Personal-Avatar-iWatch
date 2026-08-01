@@ -111,7 +111,8 @@ describe('ESS-36 inject-ack watchdog', () => {
       const result = await supervisor.injectTurn(pcm, { label: 't1' })
       assert.equal(result.assistantTranscript, '现在是上午九点。')
       assert.ok(supervisor.journal.some(e => e.event === 'turn.no-events'))
-      assert.ok(supervisor.journal.some(e => e.event === 'turn.retry'))
+      // ESS-37 合并后重试统一记录为 turn.attempt.failed(retryable=true)
+      assert.ok(supervisor.journal.some(e => e.event === 'turn.attempt.failed' && e.retryable === true))
       assert.equal(mock.realtimeTurns, 2, 'exactly one retry')
     } finally {
       supervisor.close('test-done')

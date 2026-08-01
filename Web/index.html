@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>腕语 Web iWatch Mock</title>
+  <link rel="stylesheet" href="/web/styles.css">
+</head>
+<body>
+  <main>
+    <section class="intro">
+      <p class="eyebrow">WRISTAGENT · WEB TEST HARNESS</p>
+      <h1>用浏览器走完<br>腕上 Agent 全链路</h1>
+      <p>这个 Mock 复刻手表端的核心状态：只读结果、长任务、可撤回操作，以及发送前确认。</p>
+      <ol>
+        <li>启动 <code>node Tools/mock-gateway.mjs</code></li>
+        <li>点击表盘上的主按钮，连续运行四轮 testcase</li>
+        <li>观察右侧事件日志，或执行自动场景</li>
+      </ol>
+      <button id="run-scenario" class="scenario">运行全链路 testcase</button>
+    </section>
+
+    <section class="stage" aria-label="iWatch 模拟器">
+      <div class="watch">
+        <div class="crown"></div>
+        <div class="screen">
+          <div class="status"><span>10:09</span><span id="connection">● ONLINE</span></div>
+          <div id="orb" class="orb"><span id="orb-symbol">✦</span></div>
+          <h2 id="title">有什么要我做？</h2>
+          <p id="detail">点一下，然后直接说</p>
+          <p id="transcript" class="transcript" hidden></p>
+          <div id="confirmation" class="confirmation" hidden>
+            <strong id="confirmation-target"></strong>
+            <span id="confirmation-impact"></span>
+          </div>
+          <button id="main-action" class="main-action">开始说话</button>
+          <button id="secondary-action" class="secondary-action" hidden></button>
+          <small>WEB MOCK</small>
+        </div>
+      </div>
+    </section>
+
+    <aside class="test-panel">
+      <div class="panel-heading">
+        <div><span>TEST RUN</span><strong id="test-summary">0 / 4</strong></div>
+        <button id="reset" title="重置">↻</button>
+      </div>
+      <div id="cases" class="cases"></div>
+      <div class="trace-tools">
+        <input id="custom-query" placeholder="自定义输入，如：杭州天气咋样">
+        <input id="trace-id" placeholder="traceid（可选，如 223lkjl；留空自动生成）">
+        <div class="trace-actions">
+          <button id="send-custom">发送自定义查询</button>
+          <button id="lookup-trace">查询链路</button>
+        </div>
+      </div>
+      <pre id="events" aria-live="polite">等待开始…</pre>
+    </aside>
+  </main>
+  <script type="module" src="/web/app.js"></script>
+</body>
+</html>
