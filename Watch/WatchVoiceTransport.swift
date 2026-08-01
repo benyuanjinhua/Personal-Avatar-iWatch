@@ -115,6 +115,7 @@ final class WatchVoiceTransport: ObservableObject {
             detail: "bytes=\(audioData.count)"
         )
         lastResult = payload
+        sendResultAck(requestId: payload.requestId)
     }
 
     func send(envelope: VoiceRequestEnvelope, recording: AudioRecorder.Recording) {
@@ -194,6 +195,12 @@ final class WatchVoiceTransport: ObservableObject {
         } else {
             session.transferUserInfo(payload)
         }
+    }
+
+    func sendResultAck(requestId: String) {
+        guard let data = try? ResultDeliveryAck(requestId: requestId).jsonData() else { return }
+        deliver(payload: [ResultDeliveryAckMessage.envelopeKey: data])
+        WatchLog.info("transport", "result_ack_enqueued", requestId: requestId)
     }
 
     func handleReachabilityChange(isReachable: Bool) {

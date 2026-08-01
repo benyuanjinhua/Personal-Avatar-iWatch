@@ -679,6 +679,24 @@ export function createBridge(overrides = {}) {
         return reply(r.status, r.body)
       }
 
+      m = pathName.match(/^\/v1\/voice\/turns\/([A-Za-z0-9_-]+)\/ack$/)
+      if (m) {
+        if (req.method !== 'POST') throw new ApiError(ERR.METHOD_NOT_ALLOWED)
+        const authInfo = verify()
+        if (authInfo.requestId !== m[1]) throw new ApiError(ERR.MISSING_FIELD, 'x-request-id must match turn id')
+        let body
+        try { body = JSON.parse(rawBody.toString('utf8')) } catch { throw new ApiError(ERR.BAD_JSON) }
+        if (body.protocol_version !== CONFIG.protocol_version) throw new ApiError(ERR.PROTOCOL_VERSION)
+        const turn = ledger.get(m[1])
+        if (!turn) throw new ApiError(ERR.NOT_FOUND)
+        if (turn.device_id !== authInfo.deviceId) throw new ApiError(ERR.NOT_FOUND)
+        const duplicate = Boolean(turn.delivered_ack)
+        const acked = ledger.acknowledgeResult(m[1], { source: 'watch' })
+        if (!acked) throw new ApiError(ERR.MISSING_FIELD, 'terminal result required')
+        log({ evt: 'result_acked', request_id: m[1], device_id: authInfo.deviceId, duplicate })
+        return reply(200, { request_id: m[1], acknowledged: true, acknowledged_at: acked.delivered_ack.at })
+      }
+
       throw new ApiError(ERR.NOT_FOUND)
     } catch (e) {
       if (e instanceof ApiError) {
@@ -695,6 +713,7 @@ export function createBridge(overrides = {}) {
 
   const wss = new WebSocketServer({ noServer: true })
   const eventClients = new Set() // { ws, deviceId }
+  const eventsHeartbeatMs = CONFIG.events_heartbeat_ms ?? 20_000
 
   ledger.on('turn', projection => {
     const message = JSON.stringify({ type: 'turn.state', turn: projection })
@@ -717,13 +736,23 @@ export function createBridge(overrides = {}) {
       if (pathName !== '/v1/voice/events') return refuse(404, 'ERR_NOT_FOUND')
       const { deviceId } = auth.verify({ headers: req.headers, method: 'GET', pathName, rawBody: Buffer.alloc(0) })
       wss.handleUpgrade(req, socket, head, ws => {
-        const client = { ws, deviceId }
+        const client = { ws, deviceId, alive: true }
         eventClients.add(client)
         log({ evt: 'events_client_connected', device_id: deviceId })
-        // Reconnect recovery: replay the live (non-terminal) turns for this device.
+        ws.on('pong', () => { client.alive = true })
+        // Reconnect recovery: replay live turns plus recent terminal results until
+        // the Watch explicitly confirms durable storage.
+        const replayTurns = ledger.replayable({
+          terminalTtlMs: CONFIG.result_delivery_ttl_ms ?? 30 * 60 * 1000,
+        }).filter(t => t.device_id === deviceId)
+        for (const turn of replayTurns) {
+          if (['completed', 'failed', 'cancelled'].includes(turn.state)) {
+            log({ evt: 'result_redelivered', request_id: turn.request_id, device_id: deviceId, status: turn.state })
+          }
+        }
         ws.send(JSON.stringify({
           type: 'snapshot',
-          turns: ledger.nonTerminal().filter(t => t.device_id === deviceId).map(t => ledger.projection(t)),
+          turns: replayTurns.map(t => ledger.projection(t)),
         }))
         ws.on('close', () => eventClients.delete(client))
         ws.on('error', () => eventClients.delete(client))
@@ -734,6 +763,21 @@ export function createBridge(overrides = {}) {
       refuse(e instanceof ApiError ? e.status : 500, code)
     }
   }
+
+
+  const eventsHeartbeat = setInterval(() => {
+    for (const client of eventClients) {
+      if (!client.alive) {
+        log({ evt: 'events_client_heartbeat_timeout', device_id: client.deviceId })
+        client.ws.terminate()
+        eventClients.delete(client)
+        continue
+      }
+      client.alive = false
+      client.ws.ping()
+    }
+  }, eventsHeartbeatMs)
+  eventsHeartbeat.unref?.()
 
   // ---- restart recovery (§4.1) -------------------------------------------
 
@@ -792,6 +836,7 @@ export function createBridge(overrides = {}) {
     supervisor.close('shutdown')
     resultAudio.stopSweeper()
     clearInterval(pendingAudioSweeper)
+    clearInterval(eventsHeartbeat)
     for (const client of eventClients) client.ws.close()
     for (const timer of workTimers.values()) clearTimeout(timer)
     return Promise.all(servers.map(s => new Promise(r => s.close(r))))

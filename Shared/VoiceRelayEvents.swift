@@ -161,3 +161,29 @@ extension VoiceMessage {
     /// iPhone → Watch 结果载荷的消息键（文本消息与结果音频 transferFile 的 metadata 共用）。
     static let resultKey = "voice_result"
 }
+
+/// Watch → iPhone → Bridge 的最终交付确认。仅在纯文本结果已入内存账本，或
+/// 结果语音通过 sha256 校验并持久落盘后发送。
+struct ResultDeliveryAck: Codable, Equatable {
+    let protocolVersion: String
+    let requestId: String
+
+    enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case requestId = "request_id"
+    }
+
+    init(requestId: String) {
+        protocolVersion = VoiceRequestEnvelope.currentProtocolVersion
+        self.requestId = requestId
+    }
+
+    func jsonData() throws -> Data { try RelayEventCoding.encoder.encode(self) }
+    static func decode(from data: Data) -> ResultDeliveryAck? {
+        try? RelayEventCoding.decoder.decode(ResultDeliveryAck.self, from: data)
+    }
+}
+
+enum ResultDeliveryAckMessage {
+    static let envelopeKey = "result_delivery_ack"
+}

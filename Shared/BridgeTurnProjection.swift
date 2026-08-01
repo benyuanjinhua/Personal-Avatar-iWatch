@@ -1,7 +1,8 @@
 import Foundation
 
 /// Bridge WSS /v1/voice/events 的真实下行契约（ESS-38）。
-/// Bridge 只发两种消息：连接即回放的 `{type:"snapshot", turns:[…]}`（非终态回合）
+/// Bridge 只发两种消息：连接即回放的 `{type:"snapshot", turns:[…]}`（非终态回合
+/// + TTL 内尚未被 Watch 确认的终态回合）
 /// 与增量 `{type:"turn.state", turn:{…}}`。turn 即账本投影（ledger.projection）。
 /// 防御性解码：未知 type/status/字段一律忽略，坏 JSON 返回 nil。
 struct BridgeEventMessage: Decodable {

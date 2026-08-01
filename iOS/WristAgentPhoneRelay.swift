@@ -57,6 +57,9 @@ final class WristAgentPhoneRelay: ObservableObject {
     private var deliveredResultAudio: Set<String> = []
     /// 下载中的结果语音（requestId|sha）：避免并发重复下载。
     private var activeAudioDownloads: Set<String> = []
+    /// Watch 已落盘 ACK 的网络重试。进程存活期间持续重试；若进程被杀，Bridge
+    /// 仍保留未 ACK 终态，下一次 snapshot 会触发 Watch 再发同一幂等 ACK。
+    private var resultAckTasks: [String: Task<Void, Never>] = [:]
 
     private static let bridgeURLKey = "wristagent.relay.bridge_url"
     /// 连续失败到该次数时提醒用户打开 App（后台网络受限时人工兜底）。
@@ -232,6 +235,29 @@ final class WristAgentPhoneRelay: ObservableObject {
         return RelayClient(baseURL: baseURL, credentials: credentials, session: session)
     }
 
+    func acknowledgeResult(requestId: String) {
+        guard resultAckTasks[requestId] == nil else { return }
+        resultAckTasks[requestId] = Task { [weak self] in
+            var attempt = 0
+            while !Task.isCancelled {
+                guard let self else { return }
+                if let client = self.makeClient() {
+                    do {
+                        try await client.acknowledgeResult(requestId: requestId)
+                        self.relayStatus = "手表已确认结果 \(requestId.prefix(8))…"
+                        self.resultAckTasks[requestId] = nil
+                        return
+                    } catch {
+                        self.relayLog("结果确认暂未送达，正在重试")
+                    }
+                }
+                attempt += 1
+                let delay = RetryBackoff.outboxDefault.delay(forAttempt: attempt)
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+        }
+    }
+
     private func purgeExpired() {
         guard let outbox else { return }
         for expired in outbox.purgeExpired() {
@@ -311,7 +337,7 @@ final class WristAgentPhoneRelay: ObservableObject {
     }
 
     /// Bridge 事件入口（ESS-38）：真实契约是 `turn.state` 增量 + 连接回放
-    /// `snapshot`（非终态回合）。快照重放靠 request_id + 音频 sha 幂等去重。
+    /// `snapshot`（非终态 + TTL 内未 ACK 终态）。快照重放靠 request_id + 音频 sha 幂等去重。
     private func handleEvent(data: Data) {
         guard let message = BridgeEventMessage.decode(from: data) else { return }
         switch message.type {
