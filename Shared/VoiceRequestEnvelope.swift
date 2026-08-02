@@ -21,6 +21,9 @@ struct VoiceAudioDescriptor: Codable, Equatable {
 struct VoiceRequestEnvelope: Codable, Equatable {
     static let currentProtocolVersion = "1.0"
     static let voiceRequestType = "voice_request"
+    /// Must match the Bridge decoder gate. Rejecting locally avoids turning an
+    /// interrupted press gesture into a request that can only fail remotely.
+    static let minimumAudioDurationMs = 300
 
     let protocolVersion: String
     let requestId: String
@@ -64,7 +67,9 @@ struct VoiceRequestEnvelope: Codable, Equatable {
         guard type == Self.voiceRequestType else { return .unsupportedType(type) }
         guard UUID(uuidString: requestId) != nil else { return .invalidRequestId }
         guard audio.channels == 1 else { return .invalidAudio("channels 必须为 1") }
-        guard audio.durationMs > 0, audio.durationMs <= 60_000 else { return .invalidAudio("duration_ms 超出 (0, 60000]") }
+        guard audio.durationMs >= Self.minimumAudioDurationMs, audio.durationMs <= 60_000 else {
+            return .invalidAudio("duration_ms 超出 [300, 60000]")
+        }
         guard audio.sha256.count == 64, audio.sha256.allSatisfy(\.isHexDigit) else { return .invalidAudio("sha256 不是 64 位十六进制") }
         return nil
     }

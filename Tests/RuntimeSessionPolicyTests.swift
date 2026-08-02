@@ -53,7 +53,20 @@ final class RuntimeSessionPolicyTests: XCTestCase {
     }
 
     func testRecordingHolds() {
-        XCTAssertEqual(decide(isRecording: true).decision, .hold(reason: "recording"))
+        let decision = decide(isRecording: true).decision
+        XCTAssertEqual(decision, .hold(reason: "recording"))
+        XCTAssertFalse(RuntimeSessionPolicy.shouldStartExtendedSession(for: decision))
+    }
+
+    func testExtendedSessionStartsAfterGestureForActiveTurn() {
+        let turn = makeTurn(states: [.recorded, .waitingForMac])
+        let decision = decide(turns: [turn]).decision
+        XCTAssertEqual(decision, .hold(reason: "turn_active:\(turn.requestId)"))
+        XCTAssertTrue(RuntimeSessionPolicy.shouldStartExtendedSession(for: decision))
+    }
+
+    func testExtendedSessionDoesNotStartWhenIdle() {
+        XCTAssertFalse(RuntimeSessionPolicy.shouldStartExtendedSession(for: .release))
     }
 
     func testPlayingHolds() {

@@ -35,6 +35,8 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     /// 异步激活期间又来了新 play()/stop() 时，旧激活回调据此作废。
     private var playbackGeneration = 0
 
+    var currentContext: String? { isPlaying ? context : nil }
+
     override init() {
         super.init()
         // 播放中断（电话/系统占用）是真机欢迎语「响一半没了」的候选根因，必须留痕。
@@ -199,11 +201,14 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         return (audioPlayer.currentTime, audioPlayer.duration)
     }
 
-    func stop() {
+    func stop(reason: String = "explicit") {
         if isPlaying, let audioPlayer {
             WatchLog.info(
                 "player", "stopped", requestId: context,
-                detail: String(format: "pos=%.2fs duration=%.2fs", audioPlayer.currentTime, audioPlayer.duration)
+                detail: String(
+                    format: "reason=%@ pos=%.2fs duration=%.2fs",
+                    reason, audioPlayer.currentTime, audioPlayer.duration
+                )
             )
         }
         playbackGeneration += 1
@@ -236,6 +241,10 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 "player", "decode_error", requestId: self.context,
                 code: "ERR_AUDIO_DECODE", error: error
             )
+            self.isPlaying = false
+            self.audioPlayer = nil
+            self.onFinish = nil
+            self.context = nil
         }
     }
 

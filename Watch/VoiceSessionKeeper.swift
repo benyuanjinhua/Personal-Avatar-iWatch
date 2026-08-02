@@ -23,6 +23,7 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
     /// 不算预算耗尽，回前台时按 RuntimeSessionPolicy 解除抑制重新持有。
     private var lastInvalidationReasonCode: Int?
     private var holdReason: String?
+    private var recordingStartDeferred = false
 
     private var latestTurns: [VoiceTurnRecord] = []
     private var deliveredRequestIds: Set<String> = []
@@ -98,9 +99,19 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
         switch verdict.decision {
         case .hold(let reason):
             holdReason = reason
-            startSessionIfNeeded(reason: reason)
+            if RuntimeSessionPolicy.shouldStartExtendedSession(for: verdict.decision) {
+                recordingStartDeferred = false
+                startSessionIfNeeded(reason: reason)
+            } else if !recordingStartDeferred {
+                recordingStartDeferred = true
+                WatchLog.info(
+                    "runtime", "session_start_deferred",
+                    detail: "reason=recording until=gesture_released"
+                )
+            }
         case .release:
             holdReason = nil
+            recordingStartDeferred = false
             restartSuppressed = false
             releaseSession(cause: "idle")
         }

@@ -122,7 +122,7 @@ final class VoiceTurnJournalTests: XCTestCase {
         XCTAssertEqual(journal.turn(withId: older)?.speechFileName, "\(older).m4a")
 
         // 未知 request_id：不落盘也不回调
-        journal.attachSpeech(requestId: newRequestId(), fileName: "ghost.m4a")
+        XCTAssertFalse(journal.attachSpeech(requestId: newRequestId(), fileName: "ghost.m4a"))
         XCTAssertEqual(attached, [older])
     }
 
