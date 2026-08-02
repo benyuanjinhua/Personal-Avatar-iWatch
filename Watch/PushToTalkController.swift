@@ -47,6 +47,8 @@ final class PushToTalkController: ObservableObject {
     private let recorder = AudioRecorder()
     /// ESS-55：一键重试用的最近一条录音（失败重发不用重新说话）。
     private let retryStore: RetryRecordingStore
+    /// ESS-60：跨 WS 重连和 App 重启的自动播放去重账本。
+    private let playbackLedger: ResultPlaybackLedger
     /// ESS-55：远端状态 → 触觉 cue 的映射与去重。
     private var cuePolicy = VoiceCuePolicy()
     /// 短于该时长的录音视为误触/没听清：提示重说，不发请求（ESS-55 流程图 <0.3s 分支）。
@@ -58,6 +60,9 @@ final class PushToTalkController: ObservableObject {
         speechVault = try? EncryptedAudioVault(directory: base.appendingPathComponent("SpeechVault", isDirectory: true))
         transport = WatchVoiceTransport(journal: journal)
         retryStore = RetryRecordingStore(directory: base.appendingPathComponent("RetryCache", isDirectory: true))
+        playbackLedger = ResultPlaybackLedger(
+            directory: base.appendingPathComponent("PlaybackLedger", isDirectory: true)
+        )
         notifier = ResultNotifier(policy: ResultNotificationPolicy(
             directory: base.appendingPathComponent("NotificationLedger", isDirectory: true)
         ))
@@ -152,6 +157,10 @@ final class PushToTalkController: ObservableObject {
         guard state == .idle else {
             Self.logger.info("auto-play deferred: recording in progress (request_id=\(requestId, privacy: .public))")
             pendingAutoPlayRequestId = requestId
+            return
+        }
+        guard playbackLedger.claim(requestId: requestId) else {
+            Self.logger.info("auto-play suppressed: already claimed (request_id=\(requestId, privacy: .public))")
             return
         }
         guard let turn = journal.turn(withId: requestId) else {
