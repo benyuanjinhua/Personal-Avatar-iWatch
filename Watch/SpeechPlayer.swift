@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import WatchKit
 
 /// 播放上下文（ESS-41 L4 取证）：request_id + 音频来源贯穿 session 激活、
 /// player init/start/finish/error 全链日志，与 Bridge/iPhone 侧同一
@@ -27,11 +28,13 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published private(set) var isPlaying = false
 
     private var audioPlayer: AVAudioPlayer?
+    private var currentAudioBytes = 0
     /// 收尾回调：true=完整播完；false=未播完（截断/解码失败/起播失败）。
     private var onFinish: ((Bool) -> Void)?
     /// 当前播放的取证关联 id（request_id / welcome attempt id）。
     private var context: String?
     private var interruptionObserver: NSObjectProtocol?
+    private var isSessionInterrupted = false
     /// 异步激活期间又来了新 play()/stop() 时，旧激活回调据此作废。
     private var playbackGeneration = 0
 
@@ -46,11 +49,15 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
             let kind = raw.flatMap(AVAudioSession.InterruptionType.init(rawValue:))
             Task { @MainActor in
-                guard let self, self.isPlaying || kind == .ended else { return }
+                guard let self, let kind else { return }
+                self.isSessionInterrupted = kind == .began
                 WatchLog.info(
                     "player", "session_interruption", requestId: self.context,
-                    detail: kind == .began ? "began" : "ended"
+                    detail: "state=\(kind == .began ? "began" : "ended") "
+                        + self.activationEvidence()
                 )
+                guard kind == .ended else { return }
+                self.resumePendingPlaybackAfterInterruption()
             }
         }
     }
@@ -83,74 +90,151 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }
         player.delegate = self
         audioPlayer = player
+        currentAudioBytes = data.count
         self.onFinish = onFinish
         isPlaying = true
         playbackGeneration += 1
         let generation = playbackGeneration
-        activateSession(context: context) { [weak self] in
-            guard let self, self.playbackGeneration == generation, self.audioPlayer === player else { return }
-            self.beginPlayback(player, bytes: data.count)
-        }
+        requestActivationAndPlayback(player, bytes: data.count, generation: generation)
         return true
+    }
+
+    private func requestActivationAndPlayback(_ player: AVAudioPlayer, bytes: Int, generation: Int) {
+        let action = AudioSessionPolicy.nextPlaybackActivationAction(
+            interrupted: isSessionInterrupted, longFormSucceeded: nil, foregroundSucceeded: nil
+        )
+        guard action == .activateLongForm else {
+            WatchLog.info(
+                "player", "playback_deferred", requestId: context,
+                detail: "reason=interruption_active bytes=\(bytes) \(activationEvidence())"
+            )
+            return
+        }
+        activateSession(context: context) { [weak self] activated in
+            guard let self, self.playbackGeneration == generation, self.audioPlayer === player else { return }
+            guard !self.isSessionInterrupted else {
+                WatchLog.info(
+                    "player", "playback_deferred", requestId: self.context,
+                    detail: "reason=interruption_began_during_activation bytes=\(bytes) "
+                        + self.activationEvidence()
+                )
+                return
+            }
+            if activated {
+                self.beginPlayback(player, bytes: bytes)
+            } else {
+                WatchLog.error(
+                    "player", "playback_activation_exhausted", requestId: self.context,
+                    detail: "long_form=false foreground=false bytes=\(bytes) "
+                        + self.activationEvidence(),
+                    code: "ERR_PLAYBACK_ACTIVATION"
+                )
+                self.finishPlayback(successfully: false)
+            }
+        }
+    }
+
+    private func resumePendingPlaybackAfterInterruption() {
+        guard isPlaying, let player = audioPlayer else { return }
+        playbackGeneration += 1
+        requestActivationAndPlayback(
+            player, bytes: currentAudioBytes, generation: playbackGeneration
+        )
     }
 
     /// ESS-58 方案 A：优先 .longFormAudio + 异步 activate()（watchOS 后台
     /// 音频的系统合同）；setCategory 抛错（旧系统/参数拒绝）时回落原有
     /// 前台同步激活，行为等同 ESS-41 B3，不失声但锁屏会被挂起。
-    private func activateSession(context: String?, completion: @escaping @MainActor () -> Void) {
+    private func activateSession(context: String?, completion: @escaping @MainActor (Bool) -> Void) {
         let session = AVAudioSession.sharedInstance()
+        let requestedAt = Date()
+        WatchLog.info(
+            "player", "session_activation_requested", requestId: context,
+            detail: "policy=long_form requested_at=\(Self.milliseconds(requestedAt)) "
+                + activationEvidence()
+        )
         do {
             try session.setCategory(.playback, mode: .default, policy: .longFormAudio)
         } catch {
             WatchLog.error(
                 "player", "session_policy_rejected", requestId: context,
-                detail: "fallback=foreground", error: error
+                detail: "policy=long_form result=category_rejected fallback=foreground "
+                    + activationEvidence(), error: error
             )
-            activateForegroundFallback(context: context)
-            completion()
+            completion(activateForegroundFallback(context: context))
             return
         }
         session.activate { [weak self] activated, error in
             Task { @MainActor in
                 guard let self else { return }
+                let callbackAt = Date()
+                if self.isSessionInterrupted {
+                    WatchLog.info(
+                        "player", "session_activation_deferred", requestId: context,
+                        detail: "policy=long_form activated=\(activated) "
+                            + "requested_at=\(Self.milliseconds(requestedAt)) "
+                            + "callback_at=\(Self.milliseconds(callbackAt)) "
+                            + self.activationEvidence()
+                    )
+                    completion(false)
+                    return
+                }
                 // ESS-61 F2：activated=false 且 error=nil 也是失败（真机取证
                 // 88 秒静默），一律回落前台会话，不许在未激活的会话上 play()。
                 if AudioSessionPolicy.playbackActivationSucceeded(activated: activated, hasError: error != nil) {
                     WatchLog.info(
                         "player", "session_activated", requestId: context,
                         detail: "category=playback policy=long_form activated=true "
-                            + "route=\(Self.routeDescription(session))"
+                            + "requested_at=\(Self.milliseconds(requestedAt)) "
+                            + "callback_at=\(Self.milliseconds(callbackAt)) "
+                            + "route=\(Self.routeDescription(session)) " + self.activationEvidence()
                     )
+                    completion(true)
                 } else {
                     WatchLog.error(
                         "player", "session_activation_failed", requestId: context,
                         detail: "policy=long_form activated=\(activated) fallback=foreground "
-                            + "route=\(Self.routeDescription(session))",
+                            + "requested_at=\(Self.milliseconds(requestedAt)) "
+                            + "callback_at=\(Self.milliseconds(callbackAt)) "
+                            + "route=\(Self.routeDescription(session)) " + self.activationEvidence(),
                         error: error
                     )
-                    self.activateForegroundFallback(context: context)
+                    completion(self.activateForegroundFallback(context: context))
                 }
-                completion()
             }
         }
     }
 
     /// ESS-41 B3 原路径：watchOS 冷启动默认会话下 AVAudioPlayer 可能静默无
     /// 输出，播放前必须激活 .playback；激活失败不中止播放尝试，但落取证日志。
-    private func activateForegroundFallback(context: String?) {
+    private func activateForegroundFallback(context: String?) -> Bool {
         let session = AVAudioSession.sharedInstance()
+        let requestedAt = Date()
+        WatchLog.info(
+            "player", "session_activation_requested", requestId: context,
+            detail: "policy=foreground requested_at=\(Self.milliseconds(requestedAt)) "
+                + activationEvidence()
+        )
         do {
             try session.setCategory(.playback, mode: .default)
             try session.setActive(true)
             WatchLog.info(
                 "player", "session_activated", requestId: context,
-                detail: "category=playback policy=foreground route=\(Self.routeDescription(session))"
+                detail: "category=playback policy=foreground result=true "
+                    + "requested_at=\(Self.milliseconds(requestedAt)) "
+                    + "callback_at=\(Self.milliseconds(Date())) "
+                    + "route=\(Self.routeDescription(session)) " + activationEvidence()
             )
+            return true
         } catch {
             WatchLog.error(
                 "player", "session_activation_failed", requestId: context,
-                detail: "policy=foreground route=\(Self.routeDescription(session))", error: error
+                detail: "policy=foreground result=false "
+                    + "requested_at=\(Self.milliseconds(requestedAt)) "
+                    + "callback_at=\(Self.milliseconds(Date())) "
+                    + "route=\(Self.routeDescription(session)) " + activationEvidence(), error: error
             )
+            return false
         }
     }
 
@@ -176,6 +260,13 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     /// 判未播完——播放不允许静默消失。
     func recoverAfterForeground() {
         guard let audioPlayer else { return }
+        guard !isSessionInterrupted else {
+            WatchLog.info(
+                "player", "playback_deferred", requestId: context,
+                detail: "reason=foreground_recovery_during_interruption " + activationEvidence()
+            )
+            return
+        }
         let action = PlaybackRecoveryPolicy.onForeground(
             hasActivePlayback: isPlaying,
             playerReportsPlaying: audioPlayer.isPlaying
@@ -217,6 +308,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         playbackGeneration += 1
         audioPlayer?.stop()
         audioPlayer = nil
+        currentAudioBytes = 0
         isPlaying = false
         onFinish = nil
         context = nil
@@ -224,6 +316,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     private func finishPlayback(successfully: Bool) {
         audioPlayer = nil
+        currentAudioBytes = 0
         isPlaying = false
         context = nil
         let callback = onFinish
@@ -256,5 +349,22 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             .map { "\($0.portType.rawValue)(\($0.portName))" }
             .joined(separator: "+")
         return outputs.isEmpty ? "none" : outputs
+    }
+
+    private func activationEvidence() -> String {
+        "scene_phase=\(Self.scenePhaseDescription()) interruption=\(isSessionInterrupted ? "active" : "inactive")"
+    }
+
+    private static func scenePhaseDescription() -> String {
+        switch WKApplication.shared().applicationState {
+        case .active: return "active"
+        case .inactive: return "inactive"
+        case .background: return "background"
+        @unknown default: return "unknown"
+        }
+    }
+
+    private static func milliseconds(_ date: Date) -> Int64 {
+        Int64(date.timeIntervalSince1970 * 1_000)
     }
 }

@@ -9,6 +9,30 @@ import Foundation
 /// 连续 6 次）。同一次取证还发现 activate() 回调 error=nil 但
 /// activated=false 被当成功，88 秒音频一声没出（play_returned_false）。
 enum AudioSessionPolicy {
+    /// 播放激活状态机的下一步。所有路径最终只能到 `play` 或
+    /// `retainForReplay`；中断期间只能等待，不能碰音频会话。
+    enum PlaybackActivationAction: Equatable {
+        case waitForInterruptionEnd
+        case activateLongForm
+        case activateForeground
+        case play
+        case retainForReplay
+    }
+
+    /// `nil` 表示该级激活尚未尝试。把是否允许 `play()` 的判定集中在纯函数
+    /// 中，避免异步回调的某条失败分支绕过门禁。
+    static func nextPlaybackActivationAction(
+        interrupted: Bool,
+        longFormSucceeded: Bool?,
+        foregroundSucceeded: Bool?
+    ) -> PlaybackActivationAction {
+        if interrupted { return .waitForInterruptionEnd }
+        guard let longFormSucceeded else { return .activateLongForm }
+        if longFormSucceeded { return .play }
+        guard let foregroundSucceeded else { return .activateForeground }
+        return foregroundSucceeded ? .play : .retainForReplay
+    }
+
     // MARK: F2 播放激活判定
 
     /// `activated == false` 与 `error != nil` 一律视为激活失败：只有会话
