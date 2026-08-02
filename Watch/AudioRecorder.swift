@@ -4,12 +4,14 @@ import Foundation
 
 enum RecorderError: LocalizedError {
     case permissionDenied
+    case sessionActivationFailed
     case cannotCreateRecorder
     case noRecording
 
     var errorDescription: String? {
         switch self {
         case .permissionDenied: return "没有麦克风权限，请在手表设置中允许腕语使用麦克风。"
+        case .sessionActivationFailed: return "录音启动失败，请松开后再按住重试。"
         case .cannotCreateRecorder: return "无法启动录音，请稍后重试。"
         case .noRecording: return "没有录到语音。"
         }
@@ -42,17 +44,31 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
             throw RecorderError.permissionDenied
         }
 
+        // ESS-61：上一次播放会把共享会话设成 .longFormAudio 路由策略（ESS-58），
+        // 该策略是粘性的且与 .playAndRecord 不相容，不显式复位则 setCategory/
+        // setActive 抛 -50（paramErr），录音全灭。尝试序列见 AudioSessionPolicy。
         let session = AVAudioSession.sharedInstance()
-        do {
-            if #available(watchOS 11.0, *) {
-                try session.setCategory(.playAndRecord, mode: .spokenAudio, options: [.allowBluetooth])
-            } else {
-                try session.setCategory(.playAndRecord, mode: .spokenAudio)
+        var attempt = AudioSessionPolicy.nextRecordingAttempt(after: nil)
+        var configured = false
+        while let current = attempt {
+            do {
+                try Self.configureSession(session, attempt: current)
+                if current != .resetRoutePolicy {
+                    WatchLog.info("recorder", "session_recovered", detail: "attempt=\(current)")
+                }
+                configured = true
+                break
+            } catch {
+                WatchLog.error(
+                    "recorder", "session_activation_failed",
+                    detail: "attempt=\(current)", error: error
+                )
+                attempt = AudioSessionPolicy.nextRecordingAttempt(after: current)
             }
-            try session.setActive(true)
-        } catch {
-            WatchLog.error("recorder", "session_activation_failed", error: error)
-            throw error
+        }
+        guard configured else {
+            // 原始 OSStatus 只进上面的日志；用户看到的是可行动中文文案（F3）。
+            throw RecorderError.sessionActivationFailed
         }
 
         let url = FileManager.default.temporaryDirectory
@@ -132,6 +148,30 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         meterTimer?.invalidate()
         meterTimer = nil
         level = 0
+    }
+
+    /// 录音会话配置（ESS-61 F1）。两条路都要覆盖「上一次播放用过 long_form」
+    /// 的前置状态：先 setActive(false, .notifyOthersOnDeactivation) 清掉播放
+    /// 侧的激活（失败不致命——播放器在 pressBegan 已停，残留激活也会被随后
+    /// 的 setCategory 覆盖），再用带 policy 参数的重载显式声明 .default 复位
+    /// 路由策略。minimal 回落去掉 mode/options，只保留最简 .playAndRecord。
+    private static func configureSession(
+        _ session: AVAudioSession, attempt: AudioSessionPolicy.RecordingAttempt
+    ) throws {
+        try? session.setActive(false, options: .notifyOthersOnDeactivation)
+        switch attempt {
+        case .resetRoutePolicy:
+            if #available(watchOS 11.0, *) {
+                try session.setCategory(
+                    .playAndRecord, mode: .spokenAudio, policy: .default, options: [.allowBluetooth]
+                )
+            } else {
+                try session.setCategory(.playAndRecord, mode: .spokenAudio, policy: .default, options: [])
+            }
+        case .minimal:
+            try session.setCategory(.playAndRecord, mode: .default, policy: .default, options: [])
+        }
+        try session.setActive(true)
     }
 
     private func requestPermission() async -> Bool {
