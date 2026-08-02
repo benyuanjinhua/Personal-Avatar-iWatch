@@ -182,9 +182,12 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     }
 
     /// ESS-137：Watch 端 selfcheck_finished 的快速旁路 microchunk 落地。
-    /// sendMessage / transferUserInfo 都可能重复投递（可达变化后 iOS 会补投
-    /// 前一次同载荷），但 chunk_id 走 Bridge /v1/client-logs 的幂等窗，重复
-    /// 送达一律去重——这里只负责把 bytes 交给 ClientLogUplink。
+    /// 同一 chunk_id 可能通过 sendMessage 与 transferUserInfo 两条子路径
+    /// 各到一次（Watch 侧不可达期间只入 transferUserInfo，reachable 恢复
+    /// 后补发 sendMessage）——`ClientLogUplink.enqueue` 以 chunkId 为文件名，
+    /// 覆盖写幂等，交给 Bridge 后 `/v1/client-logs` 再按 chunk_id 幂等窗
+    /// 去重，`bridge.log` 里只会出现一条。旁路与主路径 chunk_id 各自独立、
+    /// 不跨路去重，详见 `SelfCheckSummaryPayload` 类型注释。
     @MainActor
     private func ingestSelfCheckSummary(data: Data) {
         guard let payload = SelfCheckSummaryPayload.decode(from: data) else {

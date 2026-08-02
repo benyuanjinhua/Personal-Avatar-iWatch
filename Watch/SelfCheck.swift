@@ -340,9 +340,15 @@ final class SelfCheckRunner: ObservableObject {
     static let sessionYieldWaitsMs: [UInt64] = [0, 100, 200, 400]
 
     /// 录音刚结束到起播之间的「会话让出」屏障：轮询式 setCategory(.playback,
-    /// .longFormAudio) 探测，直到通过或探测序列耗尽。
-    /// - setCategory 是幂等且轻量的，通过一次即证明 .playAndRecord 已归还，
-    ///   紧随其后的 SpeechPlayer.activateSession 就不会再撞 561145203；
+    /// .longFormAudio) → setActive(true) 探测，直到 activation 通过或探测
+    /// 序列耗尽。
+    /// - **通过判据是 activation 成功，不是 setCategory 成功**——真机
+    ///   561145203(`resourceNotAvailable`) 出在 activation 阶段而非 category
+    ///   赋值；ESS-137 review（fee56b6a）明确指出「category 成功不等价于
+    ///   硬件已归还」，必须用会话真正激活作为让出证据。
+    /// - 探测通过后**保留 activated 状态**回到调用方：紧随其后的
+    ///   `SpeechPlayer.activateSession`（同 category / policy / activate 语义）
+    ///   会在已激活的会话上瞬间通过——不再需要再等一次硬件握手；
     /// - 未通过也不算失败——把 next 步骤放行，让真实链路拿到 !res 的原始
     ///   错误码进 fallbackCode，可判定的 fail 优于「看不见的静默」。
     /// - 全程留 selfcheck_session_yield 事件（result=ready|unavailable、
@@ -357,27 +363,45 @@ final class SelfCheckRunner: ObservableObject {
         var probes = 0
         var succeeded = false
         var lastErrorCode: String?
+        var lastFailingStage = "none"
         for delayMs in Self.sessionYieldWaitsMs {
             if interrupted { break }
             if delayMs > 0 {
                 try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
             }
             // 再次把 .playAndRecord 会话显式让出——多次调用是幂等的；不成功
-            // 也不致命，靠随后的 setCategory 探测判定。
+            // 也不致命，靠随后的 setCategory + activate 探测判定。
             try? session.setActive(false, options: .notifyOthersOnDeactivation)
             probes += 1
             do {
-                try session.setCategory(.playback, mode: .default, policy: .longFormAudio)
+                // 分两段捕错：让 detail 能区分「category 失败」和「activate
+                // 失败」——真机上后者是主要故障模式（561145203）。
+                do {
+                    try session.setCategory(.playback, mode: .default, policy: .longFormAudio)
+                } catch {
+                    lastFailingStage = "set_category"
+                    let nsError = error as NSError
+                    lastErrorCode = "\(nsError.domain)#\(nsError.code)"
+                    continue
+                }
+                do {
+                    try session.setActive(true)
+                } catch {
+                    lastFailingStage = "activate"
+                    let nsError = error as NSError
+                    lastErrorCode = "\(nsError.domain)#\(nsError.code)"
+                    continue
+                }
                 succeeded = true
                 break
-            } catch {
-                let nsError = error as NSError
-                lastErrorCode = "\(nsError.domain)#\(nsError.code)"
             }
         }
         let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
-        let detail = "from=\(prevStep.rawValue) to=\(nextStep.rawValue) "
+        var detail = "from=\(prevStep.rawValue) to=\(nextStep.rawValue) "
             + "probes=\(probes) elapsed_ms=\(elapsedMs) result=\(succeeded ? "ready" : "unavailable")"
+        if !succeeded {
+            detail += " failing_stage=\(lastFailingStage)"
+        }
         if succeeded {
             WatchLog.info("selfcheck", "selfcheck_session_yield", detail: detail)
         } else {
@@ -503,8 +527,10 @@ final class SelfCheckRunner: ObservableObject {
         // ESS-137 快速旁路：主路径 transferFile 正在批量失败时（真机取证 37
         // 次 chunk_transfer_failed），G9 会读到 ERR_NO_SELFCHECK 与真实 FAIL
         // 混同。用 sendMessage/transferUserInfo 单独直投 selfcheck_finished
-        // 这一行——sendMessage 可达即刻送达，transferUserInfo 系统托管兜底，
-        // Bridge 侧按 chunk_id 幂等窗与主路径合流去重。
+        // 这一行——sendMessage 可达即刻送达（含 reachable 恢复后 5 秒内的
+        // 补发，见 WatchLogShipper.handleReachabilityChange），transferUserInfo
+        // 系统托管兜底。旁路与主路径 chunk_id 不同（前缀不同）不跨路去重；
+        // 详细契约见 `SelfCheckSummaryPayload` 类型注释。
         shipSelfCheckFinishedFastPath(detail: detail, errorInfo: errorInfo)
     }
 
@@ -520,7 +546,10 @@ final class SelfCheckRunner: ObservableObject {
             return
         }
         // 与主路径的 chunk 命名前缀（watchlog-…）区分——iPhone 侧按前缀分流
-        // 到 ClientLogUplink 队列，chunk_id 是 Bridge 侧幂等窗的 key。
+        // 到 ClientLogUplink 队列。旁路自身的两条子路径（sendMessage /
+        // transferUserInfo）共用同一 chunk_id，Bridge 幂等只让第一到达者进
+        // bridge.log；旁路与主路径 id 不同，若两路都到 bridge.log 会各有
+        // 一行 selfcheck_finished，`latestSelfCheckFinished` 取最新即可。
         let chunkId = "selfcheck-\(UUIDv7.generate().uuidString.lowercased()).jsonl"
         let payload = SelfCheckSummaryPayload(chunkId: chunkId, jsonl: jsonlString)
         WatchLogShipper.shared.shipSelfCheckSummary(payload: payload)

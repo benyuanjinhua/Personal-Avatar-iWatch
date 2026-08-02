@@ -189,9 +189,19 @@ enum WatchClientLogMessage {
 /// ESS-137：装机自检收尾快速旁路载荷。Watch 端在 `selfcheck_finished` 落
 /// bridge.log 前，把该行同步的 JSONL bytes 打包成一个「microchunk」，走
 /// `sendMessage`（可达即刻送达）/ `transferUserInfo`（系统托管持久队列）
-/// 双通道推 iPhone。iPhone 侧按 `chunkId` 幂等入 `ClientLogUplink` 队列，
-/// 走 HTTPS POST /v1/client-logs 到 Bridge——与 transferFile 主路径归口
-/// 同一个 chunk_id 幂等窗（重复送达不重复计数）。
+/// 双通道推 iPhone。iPhone 侧按 `chunkId` 入 `ClientLogUplink` 队列，走
+/// HTTPS POST /v1/client-logs 到 Bridge。
+///
+/// **主路径 vs 旁路的 chunk 关系**（ESS-137 review 澄清，fee56b6a）：
+/// 主路径 chunk 前缀 `watchlog-*`，旁路前缀 `selfcheck-*`——两者的
+/// `chunk_id` 各自独立，Bridge 的 `/v1/client-logs` 幂等窗只在自身 id
+/// 范围内去重，不会跨主/旁路合流。若两条都到 Bridge，`bridge.log` 会
+/// 有两条逐字节等价的 `selfcheck_finished` 行；`watch-smoke.mjs` 的
+/// `latestSelfCheckFinished` 按 Bridge 落盘 ts 取最新，业务不受影响。
+///
+/// **快速旁路自身的重复投递**（同一 chunk_id）：sendMessage 与
+/// transferUserInfo 两条子路径共用同一个 chunk_id，Bridge 侧 chunk_id
+/// 幂等只让第一条到达的写进 bridge.log，第二条按 duplicate 静默。
 ///
 /// 背景（ESS-137）：真机 chunk_transfer_failed（WCErrorDomain#7013 /
 /// NSCocoaErrorDomain#4097）连发时，`selfcheck_finished` 无法到 Bridge，
@@ -199,7 +209,10 @@ enum WatchClientLogMessage {
 /// 从 chunk 队列拆出来单独送——WCSession XPC 层同一故障域不至于同时封死
 /// 三个通道（transferFile / sendMessage / transferUserInfo）。
 struct SelfCheckSummaryPayload: Codable, Equatable {
-    /// 与主路径共用一套 chunk_id 幂等窗，重复送达 Bridge 一律去重。
+    /// 旁路专属 chunk_id（前缀 `selfcheck-`）。sendMessage 与
+    /// transferUserInfo 两条子路径共用同一个 id，Bridge chunk_id 幂等
+    /// 只让第一条到达的写进 bridge.log；旁路与主路径 id 不同，不跨路
+    /// 去重（详见类型级注释）。
     let chunkId: String
     /// 一整条 `ClientLogEntry` 的 JSONL 序列化（末尾带 \n），供 iPhone 侧
     /// 直接塞进 `ClientLogUplink.enqueue`；bytes 语义与主路径完全一致。

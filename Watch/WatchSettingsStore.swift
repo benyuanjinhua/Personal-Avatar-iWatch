@@ -68,7 +68,13 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
 
     nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
         let isReachable = session.isReachable
-        Task { @MainActor in self.voiceTransport?.handleReachabilityChange(isReachable: isReachable) }
+        Task { @MainActor in
+            self.voiceTransport?.handleReachabilityChange(isReachable: isReachable)
+            // ESS-137：reachable 变 true 时补发 selfcheck_finished 快速旁路的
+            // pending sendMessage，把不可达期间只入 transferUserInfo 的载荷
+            // 升级到即时通道，满足「reachable 恢复后 5 秒内到 Bridge」契约。
+            WatchLogShipper.shared.handleReachabilityChange(isReachable: isReachable)
+        }
     }
 
     nonisolated func session(

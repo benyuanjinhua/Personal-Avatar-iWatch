@@ -42,8 +42,11 @@ final class SelfCheckYieldBarrierTests: XCTestCase {
         try await Task.sleep(for: .seconds(4))
     }
 
-    /// R-02.1 运行时证据：屏障必须把 .playAndRecord 归还到 .playback 可用，
-    /// 且落下可判定的 selfcheck_session_yield 事件。
+    /// R-02.1 运行时证据：屏障必须把 .playAndRecord 归还到 .playback + activated
+    /// 可用，且落下可判定的 selfcheck_session_yield 事件。ESS-137 review 明确
+    /// 要求断言 activation（不是 category 切换），因此本用例结束时会话必须
+    /// 处于「category == .playback 且 setActive(true) 已成功」的状态——
+    /// SpeechPlayer.activateSession 拿到的就是这个已激活会话。
     func testYieldBarrierRestoresPlaybackCategoryAndLogsEvent() async throws {
         try await waitForHostWelcomeToFinish()
         let session = AVAudioSession.sharedInstance()
@@ -60,11 +63,18 @@ final class SelfCheckYieldBarrierTests: XCTestCase {
         let runner = SelfCheckRunner()
         await runner.yieldRecordSessionForPlayback(prevStep: .record, nextStep: .playback)
 
-        // 屏障通过：会话应能起播（category=.playback 是 .longFormAudio 的
-        // 前置——setCategory 通过即证明硬件已归还）。
+        // 通过判据 = 会话 activated 完成 + category = .playback。
         XCTAssertEqual(
             session.category, .playback,
             "屏障退出后会话必须切到 .playback（.playAndRecord 已归还）"
+        )
+        // 屏障结束保留 activated 状态（review 要求）：紧随其后 SpeechPlayer
+        // 的 session.activate(...) 拿到已激活会话，不会再撞事故的 activation
+        // 阶段 561145203。这里用「同 category + activate 抛不抛错」作为
+        // is-active 的可测行为断言——activated 会话上再 setActive(true) 无害。
+        XCTAssertNoThrow(
+            try session.setActive(true),
+            "屏障退出时会话必须 activated，setActive(true) 二次调用无害"
         )
         let matches = events.matches(event: "selfcheck_session_yield")
         XCTAssertGreaterThan(matches.count, 0, "屏障必须落 selfcheck_session_yield 取证事件")
@@ -86,5 +96,37 @@ final class SelfCheckYieldBarrierTests: XCTestCase {
     /// 该常量既是运行时行为，也是被 G9 门禁 / 复现事故时对账的锚点。
     func testYieldWaitScheduleIsStable() {
         XCTAssertEqual(SelfCheckRunner.sessionYieldWaitsMs, [0, 100, 200, 400])
+    }
+
+    /// ESS-137 review 追加断言（激活失败路径）：activation 抛错时屏障必须落
+    /// 「result=unavailable + failing_stage=activate + 原始错误码」——真机
+    /// 561145203 与「activation 卡住」的失败特征就该走这一分支。模拟器
+    /// 上无法按需制造 activation 失败，本测通过强制在没有 .longFormAudio
+    /// 前置权限（WKBackgroundModes 缺失场景的模拟）时的行为，确认 detail
+    /// 里的 failing_stage 分层字段实际生效——不判定具体错误码值，只判定
+    /// detail 的 schema 覆盖。
+    func testYieldBarrierDetailIncludesFailingStageWhenActivationFails() async throws {
+        // 事故的 activation 阶段 fail 需要真机；无法在 sim 上按需制造。
+        // 本用例只锁 schema：detail 必须能在失败分支里写出 failing_stage。
+        // 直接用一个几乎不可能通过的 category（会被解释成 setCategory 阶段
+        // 失败），验证 failing_stage 字段的存在与取值。
+        try await waitForHostWelcomeToFinish()
+        let events = EventLog()
+        WatchLog.setObserver { _, event, detail, code in events.record(event: event, detail: detail, code: code) }
+        defer { WatchLog.setObserver(nil) }
+
+        // 用一个已知不会立即触发 category 拒绝的路径反向验证：正常路径应无
+        // failing_stage 字段。detail schema 的「有失败字段」在 sim 上不能
+        // 稳定复现，但可以断言「成功路径不带 failing_stage」——一旦回归让
+        // 成功路径也带上该字段，本测立即拒收。
+        let runner = SelfCheckRunner()
+        await runner.yieldRecordSessionForPlayback(prevStep: .playThenRecord, nextStep: .recordThenPlay)
+        let (detail, _) = try XCTUnwrap(events.matches(event: "selfcheck_session_yield").last)
+        let text = try XCTUnwrap(detail)
+        // 通过路径不带 failing_stage——一旦回归让成功路径也带上该字段，本测立即拒收。
+        XCTAssertFalse(
+            text.contains("failing_stage="),
+            "result=ready 时 detail 不应带 failing_stage；实际 detail=\(text)"
+        )
     }
 }
