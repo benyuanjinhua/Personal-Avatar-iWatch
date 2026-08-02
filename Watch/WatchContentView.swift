@@ -6,14 +6,16 @@ import SwiftUI
 struct WatchContentView: View {
     @ObservedObject private var pushToTalk: PushToTalkController
     @ObservedObject private var welcome: WelcomeGreeter
+    @ObservedObject private var selfCheck: SelfCheckRunner
     @ObservedObject private var transport: WatchVoiceTransport
     @ObservedObject private var journal: VoiceTurnJournal
     @ObservedObject private var player: SpeechPlayer
     @ObservedObject private var notifier: ResultNotifier
 
-    init(pushToTalk: PushToTalkController, welcome: WelcomeGreeter) {
+    init(pushToTalk: PushToTalkController, welcome: WelcomeGreeter, selfCheck: SelfCheckRunner) {
         self.pushToTalk = pushToTalk
         self.welcome = welcome
+        self.selfCheck = selfCheck
         self.transport = pushToTalk.transport
         self.journal = pushToTalk.journal
         self.player = pushToTalk.player
@@ -30,6 +32,9 @@ struct WatchContentView: View {
                             DragGesture(minimumDistance: 0)
                                 .onChanged { _ in
                                     welcome.interrupt()
+                                    // ESS-65 铁律 3：自检绝不锁死 App——用户按住说话
+                                    // 即打断自检让出音频会话，结论记 inconclusive。
+                                    selfCheck.interrupt()
                                     pushToTalk.pressBegan()
                                 }
                                 .onEnded { _ in pushToTalk.pressEnded() }
@@ -37,6 +42,14 @@ struct WatchContentView: View {
 
                     if showWelcomeBanner {
                         welcomeBanner
+                    }
+
+                    // ESS-65 / G9：自检期间必须有明确提示（铁律 4），
+                    // 没通过时给出可区分「代码坏了 / 没授权」的文案 + 手动重跑（铁律 5）。
+                    if selfCheck.isRunning {
+                        selfCheckRunningBanner
+                    } else if let attention = selfCheck.pendingAttention {
+                        selfCheckAttentionCard(attention)
                     }
 
                     // ESS-55 主张 2：等待文案随时间推进（阶梯 + 计秒），每秒重算，
@@ -124,6 +137,39 @@ struct WatchContentView: View {
         .frame(maxWidth: .infinity)
         .padding(8)
         .background(Color.cyan.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    // MARK: - 装机音频自检（ESS-65 / G9）
+
+    private var selfCheckRunningBanner: some View {
+        VStack(spacing: 3) {
+            Label("正在自检音频链路，约 15 秒", systemImage: "waveform.badge.magnifyingglass")
+                .font(.caption2.bold())
+            Text("装机门禁 · 按住语音球可跳过")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(8)
+        .background(Color.purple.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func selfCheckAttentionCard(_ outcome: SelfCheckPolicy.Outcome) -> some View {
+        VStack(spacing: 4) {
+            Text(SelfCheckPolicy.userMessage(outcome: outcome))
+                .font(.caption2)
+                .multilineTextAlignment(.center)
+
+            Button("重新自检") {
+                selfCheck.rerun()
+            }
+            .buttonStyle(.bordered)
+            .tint(.purple)
+            .font(.caption2)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(8)
+        .background(Color.purple.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
     }
 
     // MARK: - 通知授权引导（ESS-55）

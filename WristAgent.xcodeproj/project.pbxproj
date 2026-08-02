@@ -31,6 +31,7 @@
 		34523D43C35817094DA2E618 /* PermissionRequestView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0D0D96E379DBB5414F01FA7 /* PermissionRequestView.swift */; };
 		3679C158DB9AD81045389B1A /* VoiceRequestInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AB8CD6D695437D845CE87AF /* VoiceRequestInbox.swift */; };
 		3720FA2BBC2A5376CB24FD23 /* VoiceOutbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB7ABFE8DE51D05121E27317 /* VoiceOutbox.swift */; };
+		389212E3DA6FAA59F9910D22 /* SelfCheckPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5781515B605FE09873311309 /* SelfCheckPolicy.swift */; };
 		3BED828277BCE6296AFDC424 /* PlaybackRecoveryPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 905294A59B10050708A50FBF /* PlaybackRecoveryPolicy.swift */; };
 		3F6EA24FB3A3B46BD00BC2D0 /* WristAgentApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36A3DD675D9E3E4CDC7C7C5A /* WristAgentApp.swift */; };
 		402E9DC1E4E2E918917E9B58 /* WatchSettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C85D18E0360A2A1EBDF04975 /* WatchSettingsStore.swift */; };
@@ -50,6 +51,7 @@
 		74339B1DE6A6C27DBE1885DD /* ClientLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 234EBF336FF2F9724F289524 /* ClientLog.swift */; };
 		7522A68DCE1692BE3EC03F18 /* PlaybackRecoveryPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 905294A59B10050708A50FBF /* PlaybackRecoveryPolicy.swift */; };
 		770DB683BEC61B9851F2B0D1 /* WatchDownlinkOutbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA60FA5DC7EA82EC5729B54B /* WatchDownlinkOutbox.swift */; };
+		7CBCA51C89D61E95EAD52B9D /* SelfCheck.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9D95B86CF79B5796D5EA9DC /* SelfCheck.swift */; };
 		7CE7CD69630867506FAD3360 /* VoiceRequestInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AB8CD6D695437D845CE87AF /* VoiceRequestInbox.swift */; };
 		7E75E969A72336DBE618BEBE /* VoiceInteractionCue.swift in Sources */ = {isa = PBXBuildFile; fileRef = D70795CA9CC1B496467FE2B8 /* VoiceInteractionCue.swift */; };
 		7F172712436C104970B3035C /* VoiceRelayWire.swift in Sources */ = {isa = PBXBuildFile; fileRef = 035DF4EEFBF9F540A0B791F7 /* VoiceRelayWire.swift */; };
@@ -72,6 +74,7 @@
 		C2FE93AC9C1274EE211A3714 /* WelcomeGreeter.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9FA489FA1C53D0A43298601 /* WelcomeGreeter.swift */; };
 		C3D8984AB14E3ECEB93542E0 /* OpenWristAgentIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F9C01710FDC8C90D754460F /* OpenWristAgentIntent.swift */; };
 		CD555D87536F29C54A475DFB /* BridgeTurnProjection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A61F7EAFB8A0CCF3D03F1D2 /* BridgeTurnProjection.swift */; };
+		CFE0EF1FB0CD60D2CA12A03B /* SelfCheckPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5781515B605FE09873311309 /* SelfCheckPolicy.swift */; };
 		D23E8DF58407ADEEE6F36F3A /* SubtitleScript.swift in Sources */ = {isa = PBXBuildFile; fileRef = C426A9FB7C2456FD57F1BA1E /* SubtitleScript.swift */; };
 		D482537406EC7EC94069E3AF /* WristAgentPhoneRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79F87E24A5046DA1229304B2 /* WristAgentPhoneRelay.swift */; };
 		D9B1A7DECC44E46204E0FFF3 /* UUIDv7.swift in Sources */ = {isa = PBXBuildFile; fileRef = E36424AC38F0A8BB28751248 /* UUIDv7.swift */; };
@@ -134,6 +137,7 @@
 		385A7BF623716F8B230FD7E7 /* SubtitlePlaybackView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubtitlePlaybackView.swift; sourceTree = "<group>"; };
 		4872AA5D7D68F48548C7ABF5 /* WelcomeSpeech.m4a */ = {isa = PBXFileReference; path = WelcomeSpeech.m4a; sourceTree = "<group>"; };
 		52E037554E3E0CDA3ACF1D0B /* ResultPlaybackLedger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResultPlaybackLedger.swift; sourceTree = "<group>"; };
+		5781515B605FE09873311309 /* SelfCheckPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfCheckPolicy.swift; sourceTree = "<group>"; };
 		5A61F7EAFB8A0CCF3D03F1D2 /* BridgeTurnProjection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeTurnProjection.swift; sourceTree = "<group>"; };
 		67C6A03628F073DFB7BD92CF /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		6AE6645A23368CC50DBD7CCE /* WristAgent.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = WristAgent.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -153,6 +157,7 @@
 		98840DEEAC5DA7B6F8FCC628 /* AudioRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRecorder.swift; sourceTree = "<group>"; };
 		9A2CDFE23539DF4DB5ADDAF7 /* CompanionContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionContentView.swift; sourceTree = "<group>"; };
 		B1CE1503A0D6F97C52A835D5 /* WatchAppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchAppDelegate.swift; sourceTree = "<group>"; };
+		B9D95B86CF79B5796D5EA9DC /* SelfCheck.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfCheck.swift; sourceTree = "<group>"; };
 		BF28D500590D9DF5BF4D748A /* ClientLogUplink.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientLogUplink.swift; sourceTree = "<group>"; };
 		C10B09D1AD3BA287A3856E6E /* WristAgentWatchApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WristAgentWatchApp.swift; sourceTree = "<group>"; };
 		C426A9FB7C2456FD57F1BA1E /* SubtitleScript.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubtitleScript.swift; sourceTree = "<group>"; };
@@ -196,6 +201,7 @@
 				88E0836FA054B69DBE4F3E16 /* RetryRecordingStore.swift */,
 				2B644F4BEAE260E21C555E9E /* RuntimeSessionPolicy.swift */,
 				CC28E8D4A89C399924568EEB /* SecureTokenStore.swift */,
+				5781515B605FE09873311309 /* SelfCheckPolicy.swift */,
 				C426A9FB7C2456FD57F1BA1E /* SubtitleScript.swift */,
 				E36424AC38F0A8BB28751248 /* UUIDv7.swift */,
 				D70795CA9CC1B496467FE2B8 /* VoiceInteractionCue.swift */,
@@ -250,6 +256,7 @@
 				F0D0D96E379DBB5414F01FA7 /* PermissionRequestView.swift */,
 				7FB53D6920928D88D7BE6631 /* PushToTalkController.swift */,
 				797588258D8FFBB69B05BB71 /* ResultNotifier.swift */,
+				B9D95B86CF79B5796D5EA9DC /* SelfCheck.swift */,
 				7669A09014913EDDEC887BBE /* SpeechPlayer.swift */,
 				385A7BF623716F8B230FD7E7 /* SubtitlePlaybackView.swift */,
 				8CA853AA557CCC08A3446DED /* VoiceOrbView.swift */,
@@ -410,6 +417,7 @@
 				414956366089B530CE9C6F98 /* RetryRecordingStore.swift in Sources */,
 				06E2F65AB24A39F35B1CB39D /* RuntimeSessionPolicy.swift in Sources */,
 				F085E299171F674D4D155E09 /* SecureTokenStore.swift in Sources */,
+				389212E3DA6FAA59F9910D22 /* SelfCheckPolicy.swift in Sources */,
 				D23E8DF58407ADEEE6F36F3A /* SubtitleScript.swift in Sources */,
 				59EF7588E503BBA5DF84681B /* UUIDv7.swift in Sources */,
 				7E75E969A72336DBE618BEBE /* VoiceInteractionCue.swift in Sources */,
@@ -451,6 +459,8 @@
 				90F8E3490182A852E51E21D5 /* RetryRecordingStore.swift in Sources */,
 				F37461CE8CBFD3BCF3959F2D /* RuntimeSessionPolicy.swift in Sources */,
 				41214906A025D5C1E7C4ECA9 /* SecureTokenStore.swift in Sources */,
+				7CBCA51C89D61E95EAD52B9D /* SelfCheck.swift in Sources */,
+				CFE0EF1FB0CD60D2CA12A03B /* SelfCheckPolicy.swift in Sources */,
 				2BE4825B9DE1357E0469CED7 /* SpeechPlayer.swift in Sources */,
 				91EA78B6C755DACBB9576676 /* SubtitlePlaybackView.swift in Sources */,
 				26780BEBF601751525AE9BDD /* SubtitleScript.swift in Sources */,

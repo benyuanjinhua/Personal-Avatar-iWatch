@@ -37,6 +37,12 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private var isSessionInterrupted = false
     /// 异步激活期间又来了新 play()/stop() 时，旧激活回调据此作废。
     private var playbackGeneration = 0
+    /// ESS-65 S6 注入缝：「long-form 与 foreground 双激活失败」在真机上无法
+    /// 按需制造，装机自检靠它把 ESS-64 的 exhausted 分支（不许 play()、音频
+    /// 保留重播）变成可执行断言。命中的策略级不触碰真实 AVAudioSession、
+    /// 直接按失败处理——回落顺序、exhausted 判定、finishPlayback 全走真实
+    /// 代码。仅 SelfCheckRunner 在 S6 窗口内设置；生产路径恒为空集。
+    var selfCheckForcedActivationFailures: Set<String> = []
 
     var currentContext: String? { isPlaying ? context : nil }
 
@@ -153,6 +159,17 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             detail: "policy=long_form requested_at=\(Self.milliseconds(requestedAt)) "
                 + activationEvidence()
         )
+        if selfCheckForcedActivationFailures.contains("long_form") {
+            WatchLog.error(
+                "player", "session_activation_failed", requestId: context,
+                detail: "policy=long_form result=forced_by_selfcheck fallback=foreground "
+                    + "requested_at=\(Self.milliseconds(requestedAt)) "
+                    + "callback_at=\(Self.milliseconds(Date())) " + activationEvidence(),
+                code: "ERR_SELFCHECK_FORCED"
+            )
+            completion(activateForegroundFallback(context: context))
+            return
+        }
         do {
             try session.setCategory(.playback, mode: .default, policy: .longFormAudio)
         } catch {
@@ -215,6 +232,16 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             detail: "policy=foreground requested_at=\(Self.milliseconds(requestedAt)) "
                 + activationEvidence()
         )
+        if selfCheckForcedActivationFailures.contains("foreground") {
+            WatchLog.error(
+                "player", "session_activation_failed", requestId: context,
+                detail: "policy=foreground result=forced_by_selfcheck "
+                    + "requested_at=\(Self.milliseconds(requestedAt)) "
+                    + "callback_at=\(Self.milliseconds(Date())) " + activationEvidence(),
+                code: "ERR_SELFCHECK_FORCED"
+            )
+            return false
+        }
         do {
             try session.setCategory(.playback, mode: .default)
             try session.setActive(true)
