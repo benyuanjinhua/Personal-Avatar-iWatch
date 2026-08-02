@@ -407,7 +407,7 @@ final class PushToTalkController: ObservableObject {
             if self.journal.turn(withId: requestId)?.currentState == .completed {
                 self.journal.markResultViewed(requestId: requestId)
             }
-            self?.flushPendingAutoPlay()
+            self.flushPendingAutoPlay()
         }
         // 字幕式播放（ESS-48）：播放开始即进入全文视图，按进度逐句高亮；
         // 播放起不来但有文字时降级为纯文本展示，不留空白。
