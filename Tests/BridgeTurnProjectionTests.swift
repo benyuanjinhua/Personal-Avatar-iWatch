@@ -77,6 +77,19 @@ final class BridgeTurnProjectionTests: XCTestCase {
         XCTAssertEqual(interim.audio?.durationMs, 900)
     }
 
+    func testDecodesValidatedTextOnlyProgress() throws {
+        let json = """
+        {"type":"turn.progress","progress":{
+          "kind":"progress","request_id":"\(requestId)","sequence":2,
+          "text":"正在翻你的笔记","occurred_at":"2026-08-02T02:00:00Z"
+        }}
+        """
+        let progress = try XCTUnwrap(BridgeEventMessage.decode(from: Data(json.utf8))?.progress)
+        XCTAssertTrue(progress.isValid)
+        XCTAssertEqual(progress.sequence, 2)
+        XCTAssertEqual(progress.text, "正在翻你的笔记")
+    }
+
     func testStateMappingMatrix() {
         XCTAssertEqual(projection(status: "accepted")?.turnState, .accepted)
         XCTAssertEqual(projection(status: "processing", detail: "decoding")?.turnState, .realtimeProcessing)

@@ -10,9 +10,29 @@ struct BridgeEventMessage: Decodable {
     let turn: BridgeTurnProjection?
     let turns: [BridgeTurnProjection]?
     let interim: BridgeInterimProjection?
+    let progress: BridgeProgressProjection?
 
     static func decode(from data: Data) -> BridgeEventMessage? {
         try? VoiceProtocolJSON.decoder.decode(BridgeEventMessage.self, from: data)
+    }
+}
+
+struct BridgeProgressProjection: Decodable, Equatable {
+    let kind: String
+    let requestId: String
+    let sequence: Int
+    let text: String
+    let occurredAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case kind, sequence, text
+        case requestId = "request_id"
+        case occurredAt = "occurred_at"
+    }
+
+    var isValid: Bool {
+        kind == "progress" && UUID(uuidString: requestId) != nil
+            && sequence > 0 && !text.isEmpty && text.count <= 80
     }
 }
 

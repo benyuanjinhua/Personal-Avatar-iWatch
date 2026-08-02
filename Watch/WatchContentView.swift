@@ -37,16 +37,20 @@ struct WatchContentView: View {
                         welcomeBanner
                     }
 
-                    Text(statusTitle)
-                        .font(.footnote.bold())
-                        .multilineTextAlignment(.center)
-                        .lineLimit(2)
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        VStack(spacing: 3) {
+                            Text(statusTitle(at: context.date))
+                                .font(.footnote.bold())
+                                .multilineTextAlignment(.center)
+                                .lineLimit(2)
 
-                    Text(statusSubtitle)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .lineLimit(3)
+                            Text(statusSubtitle(at: context.date))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                                .lineLimit(3)
+                        }
+                    }
 
                     if transport.pendingCount > 0 {
                         Text("待送达 \(transport.pendingCount) 条")
@@ -67,7 +71,8 @@ struct WatchContentView: View {
                     .buttonStyle(.bordered)
                     .tint(.secondary)
 
-                    if let remote = transport.remoteStatus {
+                    if let remote = transport.remoteStatus,
+                       remote.requestId != activeTurn?.requestId {
                         Text(remote.detail ?? remote.phase.displayText)
                             .font(.caption2)
                             .foregroundStyle(remote.phase == .failed ? .red : .secondary)
@@ -206,19 +211,46 @@ struct WatchContentView: View {
         }
     }
 
-    private var statusTitle: String {
+    private func statusTitle(at now: Date) -> String {
         if let error = pushToTalk.errorMessage { return error }
         if isRecording { return "我在听" }
         if isSpeaking { return "播放中" }
         guard let turn = activeTurn else { return "按住说话" }
+        if let progress = currentProgress(for: turn), turn.isActive {
+            if now.timeIntervalSince(progress.updatedAt) >= 20 {
+                return "还在处理，比预期久一些"
+            }
+            return progress.detail ?? progress.phase.displayText
+        }
+        if turn.isActive,
+           [.backgroundAccepted, .backgroundProcessing].contains(turn.currentState),
+           let lastEventAt = turn.events.last?.at,
+           now.timeIntervalSince(lastEventAt) >= 20 {
+            return "还在处理，比预期久一些"
+        }
         return turn.phase.title
     }
 
-    private var statusSubtitle: String {
+    private func statusSubtitle(at now: Date) -> String {
         if isRecording { return "松开发送（最长 60 秒）" }
         if case .failed(let message) = transport.phase { return message }
         if showWelcomeBanner { return "按住语音球开始对话" }
         guard let turn = activeTurn else { return "松开即发送，结果回来会响铃" }
+        if turn.isActive {
+            return "已等待 \(elapsedText(now.timeIntervalSince(turn.createdAt)))"
+        }
         return turn.phase.subtitle
+    }
+
+    private func currentProgress(for turn: VoiceTurnRecord) -> RelayStatusUpdate? {
+        guard let progress = transport.progressStatus,
+              progress.requestId == turn.requestId,
+              progress.phase == .backgroundProcessing else { return nil }
+        return progress
+    }
+
+    private func elapsedText(_ interval: TimeInterval) -> String {
+        let seconds = max(0, Int(interval))
+        return String(format: "%d:%02d", seconds / 60, seconds % 60)
     }
 }

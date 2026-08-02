@@ -154,10 +154,12 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
 
     private nonisolated func forwardRelayPayloads(in userInfo: [String: Any]) {
         let statusData = userInfo[VoiceMessage.relayStatusKey] as? Data
+        let progressData = userInfo[VoiceMessage.progressKey] as? Data
         let resultData = userInfo[VoiceMessage.resultKey] as? Data
-        guard statusData != nil || resultData != nil else { return }
+        guard statusData != nil || progressData != nil || resultData != nil else { return }
         Task { @MainActor in
             if let statusData { self.voiceTransport?.handleRelayStatus(data: statusData) }
+            if let progressData { self.voiceTransport?.handleProgress(data: progressData) }
             if let resultData { self.voiceTransport?.handleResultPayload(data: resultData) }
         }
     }
