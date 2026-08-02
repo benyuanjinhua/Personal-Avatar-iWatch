@@ -18,6 +18,19 @@ enum WatchLog {
     private static let loggersLock = NSLock()
     nonisolated(unsafe) private static var loggers: [String: Logger] = [:]
 
+    /// ESS-65 自检旁路观察：装机自检需要断言「某窗口内 session_activation_failed
+    /// 出现 0 次」，而这些事件由 AudioRecorder/SpeechPlayer 在真实链路内部落日志，
+    /// 不能靠返回值判断（失败可能被回落尝试吞掉）。观察者只读元数据（module/
+    /// event/错误码），不改变日志行为；仅自检期间安装，平时为 nil 零开销。
+    nonisolated(unsafe) private static var observer: (@Sendable (String, String, String?) -> Void)?
+    private static let observerLock = NSLock()
+
+    static func setObserver(_ newValue: (@Sendable (_ module: String, _ event: String, _ errorCode: String?) -> Void)?) {
+        observerLock.lock()
+        defer { observerLock.unlock() }
+        observer = newValue
+    }
+
     private static func logger(for module: String) -> Logger {
         loggersLock.lock()
         defer { loggersLock.unlock() }
@@ -63,5 +76,9 @@ enum WatchLog {
         store.append(ClientLogEntry(
             requestId: requestId, module: module, event: event, detail: detail, error: error
         ))
+        observerLock.lock()
+        let currentObserver = observer
+        observerLock.unlock()
+        currentObserver?(module, event, error?.code)
     }
 }

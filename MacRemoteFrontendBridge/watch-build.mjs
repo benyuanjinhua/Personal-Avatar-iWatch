@@ -30,7 +30,8 @@ export function parseBuildDetail(detail) {
 }
 
 /// `unknown` / 空 / 不可解析 → null（调用方按证据不足处理，不放行）。
-function parseTimestamp(value) {
+/// G9 装机自检门禁（watch-smoke.mjs）复用同一时间语义，不复制粘贴。
+export function parseTimestamp(value) {
   if (typeof value !== 'string' || value.length === 0 || value === 'unknown') return null
   const parsed = Date.parse(value)
   return Number.isNaN(parsed) ? null : new Date(parsed)

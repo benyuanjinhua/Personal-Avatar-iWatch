@@ -12,6 +12,7 @@ final class WatchAppServices {
     let settings = WatchSettingsStore()
     let pushToTalk = PushToTalkController()
     let welcome = WelcomeGreeter()
+    let selfCheck = SelfCheckRunner()
     private var bootstrapped = false
 
     /// 幂等接线 + WCSession 激活；前台启动与后台唤醒共用。
