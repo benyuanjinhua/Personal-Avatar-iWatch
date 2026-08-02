@@ -7,7 +7,7 @@ echo "检查 Gateway 协议测试…"
 node --test Tools/mock-gateway.test.mjs
 
 echo "检查 Swift 语法…"
-for source in Shared/*.swift iOS/*.swift Watch/*.swift Tests/*.swift; do
+for source in Shared/*.swift iOS/*.swift Watch/*.swift Tests/*.swift WatchTests/*.swift; do
   swiftc -frontend -parse "$source"
 done
 

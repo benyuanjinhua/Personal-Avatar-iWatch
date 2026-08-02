@@ -34,6 +34,9 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     /// 当前播放的取证关联 id（request_id / welcome attempt id）。
     private var context: String?
     private var interruptionObserver: NSObjectProtocol?
+    /// ESS-73：仅作取证留痕，不再闸门任何播放路径——.ended 不保证投递，
+    /// 以它为唯一清除路径曾把播放通道永久锁死。清除时机：.ended 到达、
+    /// 回前台恢复、任一次激活成功（硬件已归还的实证）。
     private var isSessionInterrupted = false
     /// 异步激活期间又来了新 play()/stop() 时，旧激活回调据此作废。
     private var playbackGeneration = 0
@@ -56,8 +59,13 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                     detail: "state=\(kind == .began ? "began" : "ended") "
                         + self.activationEvidence()
                 )
-                guard kind == .ended else { return }
-                self.resumePendingPlaybackAfterInterruption()
+                // ESS-73：.began 只负责停当前播放并留痕——系统此刻已暂停
+                // 硬件，把这一段判「未播完」走 retainForReplay，UI 立即离开
+                // 「播放中」、结果卡片给出重播入口。不再挂起等 .ended 恢复：
+                // 该通知不保证投递（中断方不归还会话/App 曾挂起都会丢），
+                // 等待会把播放通道永久锁死（真机取证：6 条 began 0 条 ended）。
+                guard kind == .began else { return }
+                self.haltPlaybackForInterruption()
             }
         }
     }
@@ -100,27 +108,22 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     private func requestActivationAndPlayback(_ player: AVAudioPlayer, bytes: Int, generation: Int) {
-        let action = AudioSessionPolicy.nextPlaybackActivationAction(
-            interrupted: isSessionInterrupted, longFormSucceeded: nil, foregroundSucceeded: nil
-        )
-        guard action == .activateLongForm else {
-            WatchLog.info(
-                "player", "playback_deferred", requestId: context,
-                detail: "reason=interruption_active bytes=\(bytes) \(activationEvidence())"
-            )
-            return
-        }
+        // ESS-73：新播放请求视为用户意图，直接激活，激活结果即唯一门禁
+        // （见 AudioSessionPolicy.nextPlaybackActivationAction）。中断期间
+        // 到来的 .began 会经 haltPlaybackForInterruption 收掉本次播放并使
+        // generation 失效，无需在此处预判中断状态。
         activateSession(context: context) { [weak self] activated in
             guard let self, self.playbackGeneration == generation, self.audioPlayer === player else { return }
-            guard !self.isSessionInterrupted else {
-                WatchLog.info(
-                    "player", "playback_deferred", requestId: self.context,
-                    detail: "reason=interruption_began_during_activation bytes=\(bytes) "
-                        + self.activationEvidence()
-                )
-                return
-            }
             if activated {
+                if self.isSessionInterrupted {
+                    // 激活成功即证明硬件已归还，残留的中断标志是 .ended
+                    // 丢失所致，就地清除。
+                    self.isSessionInterrupted = false
+                    WatchLog.info(
+                        "player", "interruption_flag_cleared", requestId: self.context,
+                        detail: "reason=activation_succeeded " + self.activationEvidence()
+                    )
+                }
                 self.beginPlayback(player, bytes: bytes)
             } else {
                 WatchLog.error(
@@ -134,12 +137,21 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }
     }
 
-    private func resumePendingPlaybackAfterInterruption() {
-        guard isPlaying, let player = audioPlayer else { return }
+    /// ESS-73：中断 .began 收掉当前播放。系统已抢走硬件，这一段不可能
+    /// 继续；判未播完（onFinish(false)）让上层走 retainForReplay，语音留仓
+    /// 可重播。generation 递增使在途激活回调作废。
+    private func haltPlaybackForInterruption() {
+        guard isPlaying, let audioPlayer else { return }
         playbackGeneration += 1
-        requestActivationAndPlayback(
-            player, bytes: currentAudioBytes, generation: playbackGeneration
+        WatchLog.info(
+            "player", "playback_halted_by_interruption", requestId: context,
+            detail: String(
+                format: "pos=%.2fs duration=%.2fs bytes=%d",
+                audioPlayer.currentTime, audioPlayer.duration, currentAudioBytes
+            )
         )
+        audioPlayer.stop()
+        finishPlayback(successfully: false)
     }
 
     /// ESS-58 方案 A：优先 .longFormAudio + 异步 activate()（watchOS 后台
@@ -168,17 +180,8 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             Task { @MainActor in
                 guard let self else { return }
                 let callbackAt = Date()
-                if self.isSessionInterrupted {
-                    WatchLog.info(
-                        "player", "session_activation_deferred", requestId: context,
-                        detail: "policy=long_form activated=\(activated) "
-                            + "requested_at=\(Self.milliseconds(requestedAt)) "
-                            + "callback_at=\(Self.milliseconds(callbackAt)) "
-                            + self.activationEvidence()
-                    )
-                    completion(false)
-                    return
-                }
+                // ESS-73：不再依据 isSessionInterrupted 拦截激活结果——激活
+                // 成功即硬件可用（标志由调用方清除）；失败自然回落/收尾。
                 // ESS-61 F2：activated=false 且 error=nil 也是失败（真机取证
                 // 88 秒静默），一律回落前台会话，不许在未激活的会话上 play()。
                 if AudioSessionPolicy.playbackActivationSucceeded(activated: activated, hasError: error != nil) {
@@ -259,14 +262,16 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     /// App 曾被挂起截断（播放标记在、播放器已停）则原位续播，续不动才
     /// 判未播完——播放不允许静默消失。
     func recoverAfterForeground() {
-        guard let audioPlayer else { return }
-        guard !isSessionInterrupted else {
+        // ESS-73：回前台即清残留中断标志——.ended 不保证投递，Apple 口径
+        // 是前台恢复时重新激活探测；硬件是否真的可用交给下一次激活结果。
+        if isSessionInterrupted {
+            isSessionInterrupted = false
             WatchLog.info(
-                "player", "playback_deferred", requestId: context,
-                detail: "reason=foreground_recovery_during_interruption " + activationEvidence()
+                "player", "interruption_flag_cleared", requestId: context,
+                detail: "reason=foreground_recovery " + activationEvidence()
             )
-            return
         }
+        guard let audioPlayer else { return }
         let action = PlaybackRecoveryPolicy.onForeground(
             hasActivePlayback: isPlaying,
             playerReportsPlaying: audioPlayer.isPlaying
