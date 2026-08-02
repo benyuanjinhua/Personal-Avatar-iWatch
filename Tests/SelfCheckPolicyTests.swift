@@ -76,6 +76,41 @@ final class SelfCheckPolicyTests: XCTestCase {
         )
     }
 
+    // MARK: - S5/S6 观测记录契约（与毕玄在 ESS-65 评论对齐的字段与枚举）
+
+    func testStepRawValuesCoverS5S6() {
+        XCTAssertEqual(SelfCheckPolicy.Step.interruptionGate.rawValue, "S5")
+        XCTAssertEqual(SelfCheckPolicy.Step.dualActivationFailure.rawValue, "S6")
+    }
+
+    func testObservationDetailDeferredPhase() {
+        let detail = SelfCheckPolicy.observationDetail(
+            step: .interruptionGate, phase: "deferred", scenePhase: "active",
+            interruptionState: .began, requestTs: 1754112000000, callbackTs: nil,
+            longFormResult: .skippedInterrupted, fallbackResult: .skippedInterrupted
+        )
+        XCTAssertEqual(
+            detail,
+            "step=S5 phase=deferred scene_phase=active interruption_state=began "
+                + "request_ts=1754112000000 callback_ts=none "
+                + "long_form_result=skipped_interrupted fallback_result=skipped_interrupted"
+        )
+    }
+
+    func testObservationDetailExhaustedPhase() {
+        let detail = SelfCheckPolicy.observationDetail(
+            step: .dualActivationFailure, phase: "exhausted", scenePhase: "active",
+            interruptionState: .none, requestTs: 1754112000000, callbackTs: 1754112000180,
+            longFormResult: .failed, fallbackResult: .failed
+        )
+        XCTAssertEqual(
+            detail,
+            "step=S6 phase=exhausted scene_phase=active interruption_state=none "
+                + "request_ts=1754112000000 callback_ts=1754112000180 "
+                + "long_form_result=failed fallback_result=failed"
+        )
+    }
+
     // MARK: - 结论分类与文案
 
     func testOutcomeResultMapping() {

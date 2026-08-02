@@ -90,6 +90,18 @@ describe('ESS-65 evaluateSmokeGate', () => {
     assert.match(verdict.message, /NSOSStatusErrorDomain#-50/)
   })
 
+  it('labels the appended S5/S6 steps so a controlled-matrix failure reads correctly', () => {
+    const verdict = gateFor([finishedLine({
+      ts: '2026-08-02T07:00:00Z',
+      detail: `result=fail failed_step=S5 ${FRESH}`,
+      errorCode: 'ERR_INTERRUPTION_GATE_LEAK',
+    })])
+    assert.equal(verdict.pass, false)
+    assert.match(verdict.message, /S5/)
+    assert.match(verdict.message, /中断中激活/)
+    assert.match(verdict.message, /ERR_INTERRUPTION_GATE_LEAK/)
+  })
+
   it('blocks on inconclusive but points at permission, not at a code defect', () => {
     const verdict = gateFor([finishedLine({
       ts: '2026-08-02T07:00:00Z',

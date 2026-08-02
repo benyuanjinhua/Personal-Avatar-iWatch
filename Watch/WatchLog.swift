@@ -22,10 +22,12 @@ enum WatchLog {
     /// 出现 0 次」，而这些事件由 AudioRecorder/SpeechPlayer 在真实链路内部落日志，
     /// 不能靠返回值判断（失败可能被回落尝试吞掉）。观察者只读元数据（module/
     /// event/错误码），不改变日志行为；仅自检期间安装，平时为 nil 零开销。
-    nonisolated(unsafe) private static var observer: (@Sendable (String, String, String?) -> Void)?
+    nonisolated(unsafe) private static var observer: (@Sendable (String, String, String?, String?) -> Void)?
     private static let observerLock = NSLock()
 
-    static func setObserver(_ newValue: (@Sendable (_ module: String, _ event: String, _ errorCode: String?) -> Void)?) {
+    static func setObserver(
+        _ newValue: (@Sendable (_ module: String, _ event: String, _ detail: String?, _ errorCode: String?) -> Void)?
+    ) {
         observerLock.lock()
         defer { observerLock.unlock() }
         observer = newValue
@@ -79,6 +81,6 @@ enum WatchLog {
         observerLock.lock()
         let currentObserver = observer
         observerLock.unlock()
-        currentObserver?(module, event, error?.code)
+        currentObserver?(module, event, detail, error?.code)
     }
 }

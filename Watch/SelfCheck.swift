@@ -1,6 +1,7 @@
 import AVFoundation
 import Combine
 import Foundation
+import WatchKit
 
 /// 装机音频自检（ESS-65 / G9）：新 build 首启自动跑一遍「录音 → 播放 →
 /// 播放后立刻录音 → 会话状态复位」四步，结论经 WatchLog → Bridge 回传，
@@ -84,6 +85,7 @@ final class SelfCheckRunner: ObservableObject {
         guard running else { return }
         interrupted = true
         recorder.cancel()
+        player.selfCheckForcedActivationFailures = []
         player.stop(reason: "selfcheck_interrupted")
         pendingPlaybackFinish?(.interrupted)
     }
@@ -95,10 +97,10 @@ final class SelfCheckRunner: ObservableObject {
         running = true
         interrupted = false
         WatchLog.info("selfcheck", "selfcheck_started", detail: SelfCheckPolicy.startedDetail(fingerprint: fingerprint))
-        WatchLog.setObserver { [signals] module, event, code in
-            // 只关心真实链路组件的会话/播放故障信号；自检自身的日志不计入。
+        WatchLog.setObserver { [signals] module, event, detail, code in
+            // 只关心真实链路组件的会话/播放信号；自检自身的日志不计入。
             guard module != "selfcheck" else { return }
-            signals.record(event: event, code: code)
+            signals.record(event: event, detail: detail, code: code)
         }
 
         let outcome = await executeSteps()
@@ -113,8 +115,12 @@ final class SelfCheckRunner: ObservableObject {
         if let failure = await recordStep(.record) { return failure }
 
         // S2 播放可用（ESS-61 缺陷 B）：播内置资产，会话必须真正激活、
-        // play() 不得返回 false。
-        if let failure = await playbackStep() { return failure }
+        // play() 不得返回 false。资产缺失是打包缺陷，按 S2 fail 报。
+        guard let assetData = loadAsset() else {
+            beginStep(.playback)
+            return failStep(.playback, startedAt: Date(), fallbackCode: "ERR_SELFCHECK_ASSET_MISSING")
+        }
+        if let failure = await playbackStep(data: assetData) { return failure }
 
         // S3 播放→录音交替（ESS-61 缺陷 A，今天这个 -50）：播放刚结束立刻再录，
         // 且全程 session_activation_failed 出现 0 次。
@@ -123,7 +129,20 @@ final class SelfCheckRunner: ObservableObject {
         // S4 会话状态复位（ESS-61 根因）：.longFormAudio 路由策略不得残留。
         if let failure = sessionResetStep() { return failure }
 
+        // S5 中断中激活（ESS-64 验收 1、2）：受控 interruption 下不得激活/
+        // 起播；ended 后必须自动激活并起播。
+        if let failure = await interruptionGateStep(data: assetData) { return failure }
+
+        // S6 双激活失败（ESS-64 验收 3）：两级激活都失败时不得 play()，
+        // 落 exhausted 取证，音频按未播完保留可重播。
+        if let failure = await dualActivationFailureStep(data: assetData) { return failure }
+
         return .pass
+    }
+
+    private func loadAsset() -> Data? {
+        guard let url = Bundle.main.url(forResource: "WelcomeSpeech", withExtension: "m4a") else { return nil }
+        return try? Data(contentsOf: url)
     }
 
     /// S1/S3 共用的录音步骤。失败返回 Outcome，通过返回 nil。
@@ -160,17 +179,10 @@ final class SelfCheckRunner: ObservableObject {
         return nil
     }
 
-    private func playbackStep() async -> SelfCheckPolicy.Outcome? {
+    private func playbackStep(data: Data) async -> SelfCheckPolicy.Outcome? {
         let step = SelfCheckPolicy.Step.playback
         beginStep(step)
         let startedAt = Date()
-        // 内置资产复用欢迎语（App 包内唯一音频，3.3s，不联网）；缺失是打包缺陷，判 fail。
-        guard
-            let url = Bundle.main.url(forResource: "WelcomeSpeech", withExtension: "m4a"),
-            let data = try? Data(contentsOf: url)
-        else {
-            return failStep(step, startedAt: startedAt, fallbackCode: "ERR_SELFCHECK_ASSET_MISSING")
-        }
         let waited = await awaitPlayback(data: data)
         switch waited {
         case .interrupted:
@@ -210,6 +222,145 @@ final class SelfCheckRunner: ObservableObject {
         }
         passStep(step, startedAt: startedAt)
         return nil
+    }
+
+    // MARK: - S5/S6：ESS-64 受控矩阵（对 main 上真实中断状态机的可执行断言）
+
+    /// S5 中断中激活：合成 AVAudioSession.interruptionNotification 驱动
+    /// SpeechPlayer 的真实中断状态机（不是旁路模拟）——began 后请求播放必须
+    /// 走 playback_deferred（零激活尝试、零起播），ended 后必须自动激活并起播。
+    private func interruptionGateStep(data: Data) async -> SelfCheckPolicy.Outcome? {
+        let step = SelfCheckPolicy.Step.interruptionGate
+        beginStep(step)
+        let startedAt = Date()
+        // 合成通知会置位进程内所有 SpeechPlayer 实例的中断标记：无论本步
+        // 如何退出（含被用户打断），都必须补一个 ended，否则欢迎语/结果
+        // 播放会被永远挂在「等待中断结束」上。
+        defer { Self.postSyntheticInterruption(.ended) }
+
+        Self.postSyntheticInterruption(.began)
+        // 通知处理经 Task 跳一拍主线程，给状态机落位留一个节拍。
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        if interrupted { return .inconclusive(.interrupted) }
+
+        let requestTs = Self.epochMs()
+        player.play(data: data, context: "selfcheck-s5")
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        if interrupted { player.stop(reason: "selfcheck_interrupted"); return .inconclusive(.interrupted) }
+
+        let deferredSeen = signals.count(of: "playback_deferred") > 0
+        let activationAttempts = signals.count(of: "session_activation_requested")
+        let startedEarly = signals.count(of: "play_started")
+        WatchLog.info(
+            "selfcheck", "selfcheck_observation",
+            detail: SelfCheckPolicy.observationDetail(
+                step: step, phase: "deferred", scenePhase: Self.scenePhase(),
+                interruptionState: .began, requestTs: requestTs, callbackTs: nil,
+                longFormResult: .skippedInterrupted, fallbackResult: .skippedInterrupted
+            )
+        )
+        guard deferredSeen, activationAttempts == 0, startedEarly == 0 else {
+            player.stop(reason: "selfcheck_s5_abort")
+            return failStep(step, startedAt: startedAt, fallbackCode: "ERR_INTERRUPTION_GATE_LEAK")
+        }
+
+        signals.reset()
+        Self.postSyntheticInterruption(.ended)
+        let resumed = await waitFor(timeout: 6) { [signals] in signals.count(of: "play_started") > 0 }
+        let callbackTs = signals.firstTimestamp(of: "play_started").map { Int64($0.timeIntervalSince1970 * 1000) }
+        WatchLog.info(
+            "selfcheck", "selfcheck_observation",
+            detail: SelfCheckPolicy.observationDetail(
+                step: step, phase: "resumed", scenePhase: Self.scenePhase(),
+                interruptionState: .ended, requestTs: requestTs, callbackTs: callbackTs,
+                longFormResult: activationResult(policy: "long_form"),
+                fallbackResult: activationResult(policy: "foreground")
+            )
+        )
+        player.stop(reason: "selfcheck_s5_complete")
+        if interrupted { return .inconclusive(.interrupted) }
+        guard resumed else {
+            return failStep(step, startedAt: startedAt, fallbackCode: "ERR_INTERRUPTION_RESUME_MISSING")
+        }
+        passStep(step, startedAt: startedAt)
+        return nil
+    }
+
+    /// S6 双激活失败：经 SpeechPlayer 的自检注入缝强制 long-form 与
+    /// foreground 都失败（真机无法按需制造），断言真实决策链走到
+    /// playback_activation_exhausted、绝不 play()、onFinish(false) 通知
+    /// 上层保留重播。
+    private func dualActivationFailureStep(data: Data) async -> SelfCheckPolicy.Outcome? {
+        let step = SelfCheckPolicy.Step.dualActivationFailure
+        beginStep(step)
+        let startedAt = Date()
+        player.selfCheckForcedActivationFailures = ["long_form", "foreground"]
+        defer { player.selfCheckForcedActivationFailures = [] }
+
+        let requestTs = Self.epochMs()
+        var retainedForReplay = false
+        player.play(data: data, context: "selfcheck-s6") { finished in
+            // 契约：未播完一律 onFinish(false)，上层据此保留重播——静默丢失即失败。
+            retainedForReplay = !finished
+        }
+        let exhausted = await waitFor(timeout: 4) { [signals] in
+            signals.count(of: "playback_activation_exhausted") > 0
+        }
+        let callbackTs = signals.firstTimestamp(of: "playback_activation_exhausted")
+            .map { Int64($0.timeIntervalSince1970 * 1000) }
+        WatchLog.info(
+            "selfcheck", "selfcheck_observation",
+            detail: SelfCheckPolicy.observationDetail(
+                step: step, phase: "exhausted", scenePhase: Self.scenePhase(),
+                interruptionState: .none, requestTs: requestTs, callbackTs: callbackTs,
+                longFormResult: .failed, fallbackResult: .failed
+            )
+        )
+        if interrupted { player.stop(reason: "selfcheck_interrupted"); return .inconclusive(.interrupted) }
+        guard exhausted, signals.count(of: "play_started") == 0, retainedForReplay else {
+            player.stop(reason: "selfcheck_s6_abort")
+            return failStep(step, startedAt: startedAt, fallbackCode: "ERR_DUAL_FAILURE_LEAK")
+        }
+        passStep(step, startedAt: startedAt)
+        return nil
+    }
+
+    /// 观察到的激活结果 → ESS-64 契约枚举（按 policy 区分同名事件）。
+    private func activationResult(policy: String) -> SelfCheckPolicy.ActivationResult {
+        if signals.count(of: "session_activated", detailContains: "policy=\(policy)") > 0 { return .success }
+        if signals.count(of: "session_activation_failed", detailContains: "policy=\(policy)") > 0 { return .failed }
+        return .notAttempted
+    }
+
+    private func waitFor(timeout: Double, _ predicate: @escaping () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if predicate() { return true }
+            if interrupted { return predicate() }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return predicate()
+    }
+
+    private static func postSyntheticInterruption(_ type: AVAudioSession.InterruptionType) {
+        NotificationCenter.default.post(
+            name: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(),
+            userInfo: [AVAudioSessionInterruptionTypeKey: type.rawValue]
+        )
+    }
+
+    private static func scenePhase() -> String {
+        switch WKApplication.shared().applicationState {
+        case .active: return "active"
+        case .inactive: return "inactive"
+        case .background: return "background"
+        @unknown default: return "unknown"
+        }
+    }
+
+    private static func epochMs() -> Int64 {
+        Int64(Date().timeIntervalSince1970 * 1000)
     }
 
     // MARK: - S2 播放等待
@@ -308,30 +459,49 @@ final class SelfCheckRunner: ObservableObject {
     }
 }
 
-/// 自检窗口内的故障信号计数（WatchLog 观察者回调可能来自任意线程）。
+/// 自检窗口内的故障/进展信号记录（WatchLog 观察者回调可能来自任意线程）。
+/// S5/S6 需要按 detail 区分同名事件（如 session_activated 的
+/// policy=long_form 与 policy=foreground），故整条留存而非只计数。
 private final class SignalCounter: @unchecked Sendable {
+    private struct Signal {
+        let event: String
+        let detail: String?
+        let code: String?
+        let at: Date
+    }
+
     private let lock = NSLock()
-    private var counts: [String: Int] = [:]
+    private var signals: [Signal] = []
     private var latestCode: String?
 
-    func record(event: String, code: String?) {
+    func record(event: String, detail: String?, code: String?) {
         lock.lock()
         defer { lock.unlock() }
-        counts[event, default: 0] += 1
+        signals.append(Signal(event: event, detail: detail, code: code, at: Date()))
         if let code { latestCode = code }
     }
 
     func reset() {
         lock.lock()
         defer { lock.unlock() }
-        counts = [:]
+        signals = []
         latestCode = nil
     }
 
-    func count(of event: String) -> Int {
+    func count(of event: String, detailContains fragment: String? = nil) -> Int {
         lock.lock()
         defer { lock.unlock() }
-        return counts[event] ?? 0
+        return signals.filter { signal in
+            guard signal.event == event else { return false }
+            guard let fragment else { return true }
+            return signal.detail?.contains(fragment) == true
+        }.count
+    }
+
+    func firstTimestamp(of event: String) -> Date? {
+        lock.lock()
+        defer { lock.unlock() }
+        return signals.first { $0.event == event }?.at
     }
 
     var lastErrorCode: String? {

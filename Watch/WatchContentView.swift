@@ -143,7 +143,7 @@ struct WatchContentView: View {
 
     private var selfCheckRunningBanner: some View {
         VStack(spacing: 3) {
-            Label("正在自检音频链路，约 10 秒", systemImage: "waveform.badge.magnifyingglass")
+            Label("正在自检音频链路，约 15 秒", systemImage: "waveform.badge.magnifyingglass")
                 .font(.caption2.bold())
             Text("装机门禁 · 按住语音球可跳过")
                 .font(.system(size: 10))

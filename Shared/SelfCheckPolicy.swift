@@ -16,11 +16,49 @@ import Foundation
 enum SelfCheckPolicy {
     /// 自检步骤，对应真实事故：S1 录音（ESS-52/54）、S2 播放（ESS-61 缺陷 B）、
     /// S3 播放→录音交替（ESS-61 缺陷 A，`-50`）、S4 会话状态复位（ESS-61 根因）。
+    /// S5/S6 为 PM 2026-08-02 追加：承载 ESS-64 的受控矩阵——S5 中断中激活
+    /// （不得激活/起播，`ended` 后自动恢复），S6 双激活失败（不得 play()，
+    /// 音频保留可重播）。
     enum Step: String, CaseIterable {
         case record = "S1"
         case playback = "S2"
         case playThenRecord = "S3"
         case sessionReset = "S4"
+        case interruptionGate = "S5"
+        case dualActivationFailure = "S6"
+    }
+
+    // MARK: - S5/S6 观测记录契约（ESS-64 §最短修法 第 3 条，字段与毕玄对齐）
+
+    enum InterruptionState: String {
+        case none
+        case began
+        case ended
+    }
+
+    enum ActivationResult: String {
+        case success
+        case failed
+        case notAttempted = "not_attempted"
+        case skippedInterrupted = "skipped_interrupted"
+    }
+
+    /// `selfcheck_observation` 的 detail：受控矩阵每一格的取证快照。
+    /// 时间戳 Unix epoch 毫秒；尚未发生的回调 `callback_ts=none`。
+    static func observationDetail(
+        step: Step,
+        phase: String,
+        scenePhase: String,
+        interruptionState: InterruptionState,
+        requestTs: Int64,
+        callbackTs: Int64?,
+        longFormResult: ActivationResult,
+        fallbackResult: ActivationResult
+    ) -> String {
+        "step=\(step.rawValue) phase=\(phase) scene_phase=\(scenePhase) "
+            + "interruption_state=\(interruptionState.rawValue) "
+            + "request_ts=\(requestTs) callback_ts=\(callbackTs.map(String.init) ?? "none") "
+            + "long_form_result=\(longFormResult.rawValue) fallback_result=\(fallbackResult.rawValue)"
     }
 
     enum Result: String {
