@@ -44,6 +44,7 @@
 		54817C157F20C92848363962 /* ConversationHistory.swift in Sources */ = {isa = PBXBuildFile; fileRef = E92A4F28175D63C6FBD62D7E /* ConversationHistory.swift */; };
 		59EF7588E503BBA5DF84681B /* UUIDv7.swift in Sources */ = {isa = PBXBuildFile; fileRef = E36424AC38F0A8BB28751248 /* UUIDv7.swift */; };
 		5B434395A63D5C4B37CCFD72 /* VoiceTurnJournal.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6F558DCDF4B9CA8F0BA2E2D /* VoiceTurnJournal.swift */; };
+		5DE908AEFD1FB51FD79565BA /* PlaybackEndgameChainTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CAC488B088EEC6542FF5CAB /* PlaybackEndgameChainTests.swift */; };
 		5E9988BFEA3673DAA88C1F70 /* PushToTalkController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FB53D6920928D88D7BE6631 /* PushToTalkController.swift */; };
 		6367A07D0292627141725AB1 /* VoiceTurnState.swift in Sources */ = {isa = PBXBuildFile; fileRef = F928ACBF6FA59402D5EB1275 /* VoiceTurnState.swift */; };
 		6B6BB598A338463642687ADC /* SelfCheckYieldBarrierTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE83A54EC29559337BA73D64 /* SelfCheckYieldBarrierTests.swift */; };
@@ -154,6 +155,7 @@
 		53B51BD6D2B825F5E3E2A727 /* WristAgent Watch Tests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "WristAgent Watch Tests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		5781515B605FE09873311309 /* SelfCheckPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfCheckPolicy.swift; sourceTree = "<group>"; };
 		5A61F7EAFB8A0CCF3D03F1D2 /* BridgeTurnProjection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeTurnProjection.swift; sourceTree = "<group>"; };
+		5CAC488B088EEC6542FF5CAB /* PlaybackEndgameChainTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackEndgameChainTests.swift; sourceTree = "<group>"; };
 		67C6A03628F073DFB7BD92CF /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		6AE6645A23368CC50DBD7CCE /* WristAgent.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = WristAgent.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		7669A09014913EDDEC887BBE /* SpeechPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechPlayer.swift; sourceTree = "<group>"; };
@@ -307,6 +309,7 @@
 			isa = PBXGroup;
 			children = (
 				0DAD45847A8F17F8D430ACB9 /* AudioRecorderHandoverTests.swift */,
+				5CAC488B088EEC6542FF5CAB /* PlaybackEndgameChainTests.swift */,
 				CE83A54EC29559337BA73D64 /* SelfCheckYieldBarrierTests.swift */,
 				0D83133781FDC42821BB13DF /* SpeechPlayerInterruptionTests.swift */,
 			);
@@ -550,6 +553,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				95171100A79B4FD51C92AF73 /* AudioRecorderHandoverTests.swift in Sources */,
+				5DE908AEFD1FB51FD79565BA /* PlaybackEndgameChainTests.swift in Sources */,
 				6B6BB598A338463642687ADC /* SelfCheckYieldBarrierTests.swift in Sources */,
 				7C465E62628112B008899B51 /* SpeechPlayerInterruptionTests.swift in Sources */,
 			);
