@@ -153,6 +153,10 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
             Task { @MainActor in self.relay.acknowledgeResult(requestId: ack.requestId) }
             return
         }
+        if let summaryData = message[WatchClientLogMessage.selfCheckSummaryKey] as? Data {
+            Task { @MainActor in self.ingestSelfCheckSummary(data: summaryData) }
+            return
+        }
         guard
             let envelopeData = message[VoiceMessage.envelopeKey] as? Data,
             let envelope = try? VoiceRequestEnvelope.decode(from: envelopeData)
@@ -166,9 +170,32 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         _ session: WCSession,
         didReceiveUserInfo userInfo: [String: Any] = [:]
     ) {
-        guard let data = userInfo[ResultDeliveryAckMessage.envelopeKey] as? Data,
-              let ack = ResultDeliveryAck.decode(from: data) else { return }
-        Task { @MainActor in self.relay.acknowledgeResult(requestId: ack.requestId) }
+        if let ackData = userInfo[ResultDeliveryAckMessage.envelopeKey] as? Data,
+           let ack = ResultDeliveryAck.decode(from: ackData) {
+            Task { @MainActor in self.relay.acknowledgeResult(requestId: ack.requestId) }
+            return
+        }
+        if let summaryData = userInfo[WatchClientLogMessage.selfCheckSummaryKey] as? Data {
+            Task { @MainActor in self.ingestSelfCheckSummary(data: summaryData) }
+            return
+        }
+    }
+
+    /// ESS-137：Watch 端 selfcheck_finished 的快速旁路 microchunk 落地。
+    /// 同一 chunk_id 可能通过 sendMessage 与 transferUserInfo 两条子路径
+    /// 各到一次（Watch 侧不可达期间只入 transferUserInfo，reachable 恢复
+    /// 后补发 sendMessage）——`ClientLogUplink.enqueue` 以 chunkId 为文件名，
+    /// 覆盖写幂等，交给 Bridge 后 `/v1/client-logs` 再按 chunk_id 幂等窗
+    /// 去重，`bridge.log` 里只会出现一条。旁路与主路径 chunk_id 各自独立、
+    /// 不跨路去重，详见 `SelfCheckSummaryPayload` 类型注释。
+    @MainActor
+    private func ingestSelfCheckSummary(data: Data) {
+        guard let payload = SelfCheckSummaryPayload.decode(from: data) else {
+            Self.logger.error("watch selfcheck summary 无法解码（bytes=\(data.count, privacy: .public)）")
+            return
+        }
+        guard let jsonlData = payload.jsonl.data(using: .utf8) else { return }
+        relay.clientLogUplink.enqueue(chunkId: payload.chunkId, data: jsonlData)
     }
 
     nonisolated func session(_ session: WCSession, didReceive file: WCSessionFile) {
