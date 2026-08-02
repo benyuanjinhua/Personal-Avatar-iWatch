@@ -29,6 +29,10 @@ final class PushToTalkController: ObservableObject {
             }
         }
     }
+    /// ESS-58：播放被截断（锁屏挂起/解码失败）的回合。语音留在加密仓、
+    /// 不发交付 ACK，结果卡片显式标出「未播完」并保留重播入口——中断
+    /// 只允许可见，不允许静默。
+    @Published private(set) var unfinishedPlaybackIds: Set<String> = []
 
     let journal: VoiceTurnJournal
     let speechVault: EncryptedAudioVault?
@@ -326,14 +330,31 @@ final class PushToTalkController: ObservableObject {
             )
             return
         }
-        let started = player.play(data: data, context: requestId) { [weak self] in
-            self?.speechVault?.remove(name: fileName)
-            self?.journal.clearSpeech(requestId: requestId)
+        let started = player.play(data: data, context: requestId) { [weak self] finished in
+            guard let self else { return }
             // ESS-45×ESS-46：只有终态回合的结果语音播完才算交付——interim
             // （回合仍在处理中）播完不算，否则 completed 后等待最终语音的
             // 120s grace 持有会被跳过，App 挂起、最终结果播不出来。
-            if self?.journal.turn(withId: requestId)?.currentState.isTerminal == true {
-                self?.sessionKeeper.markDelivered(requestId: requestId)
+            // ESS-58：未播完（锁屏截断/解码失败）不删语音不记交付，保留重播。
+            switch PlaybackRecoveryPolicy.finishOutcome(
+                finishedSuccessfully: finished,
+                turnIsTerminal: self.journal.turn(withId: requestId)?.currentState.isTerminal == true
+            ) {
+            case .retainForReplay:
+                self.unfinishedPlaybackIds.insert(requestId)
+                WatchLog.info(
+                    "player", "playback_retained", requestId: requestId,
+                    detail: "unfinished=true speech kept for replay"
+                )
+            case .deliverInterim:
+                self.unfinishedPlaybackIds.remove(requestId)
+                self.speechVault?.remove(name: fileName)
+                self.journal.clearSpeech(requestId: requestId)
+            case .deliverFinal:
+                self.unfinishedPlaybackIds.remove(requestId)
+                self.speechVault?.remove(name: fileName)
+                self.journal.clearSpeech(requestId: requestId)
+                self.sessionKeeper.markDelivered(requestId: requestId)
             }
             // 播完整段视为已读（ESS-55 未读机制）：熄屏听完也算送达。
             if self?.journal.turn(withId: requestId)?.currentState == .completed {

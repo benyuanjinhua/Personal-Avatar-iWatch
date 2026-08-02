@@ -31,9 +31,14 @@ struct WristAgentWatchApp: App {
                     WatchLog.info("lifecycle", "scene_phase", detail: String(describing: newPhase))
                     switch newPhase {
                     case .active:
+                        // ESS-58：解锁/切回后，被锁屏截断的播放原位续播，
+                        // 被 resignedFrontmost 收回的 runtime session 重新持有。
+                        services.pushToTalk.player.recoverAfterForeground()
+                        services.pushToTalk.sessionKeeper.appDidBecomeActive()
                         WatchLogShipper.shared.ship(reason: "foreground")
                         services.pushToTalk.presentUnreadIfAny()
-                    case .background: WatchLogShipper.shared.ship(reason: "background")
+                    case .background:
+                        WatchLogShipper.shared.ship(reason: "background")
                     default: break
                     }
                 }

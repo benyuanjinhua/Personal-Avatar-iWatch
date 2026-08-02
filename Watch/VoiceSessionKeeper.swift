@@ -19,6 +19,9 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
     /// 会话被系统收回（到期/失活）后，同一持有窗口内不自动重启——
     /// 否则 10 分钟上限形同虚设。新的按住说话会清除此标记。
     private var restartSuppressed = false
+    /// ESS-58：最近一次系统收回的原因码。resignedFrontmost（锁屏/切走）
+    /// 不算预算耗尽，回前台时按 RuntimeSessionPolicy 解除抑制重新持有。
+    private var lastInvalidationReasonCode: Int?
     private var holdReason: String?
 
     private var latestTurns: [VoiceTurnRecord] = []
@@ -59,6 +62,20 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
                 self.reevaluate()
             }
             .store(in: &cancellables)
+    }
+
+    /// 回前台钩子（ESS-58）：锁屏收回会话（resignedFrontmost）后解锁回来，
+    /// 若回合仍有持有理由则重新起会话；到期/出错收回的抑制不在此解除，
+    /// ESS-45 的有界执行边界不变。
+    func appDidBecomeActive() {
+        if restartSuppressed,
+           let code = lastInvalidationReasonCode,
+           RuntimeSessionPolicy.allowsRestartAfterForeground(invalidationReasonCode: code) {
+            restartSuppressed = false
+            WatchLog.info("runtime", "session_rearmed", detail: "after_reason_code=\(code)")
+        }
+        lastInvalidationReasonCode = nil
+        reevaluate()
     }
 
     /// 结果语音播放交付完成（play_finished 后回调）。
@@ -169,8 +186,12 @@ extension VoiceSessionKeeper: WKExtendedRuntimeSessionDelegate {
             self.session = nil
             self.sessionStartedAt = nil
             self.startPending = false
-            // 有界执行：系统收回后本持有窗口不再自动续命，等下一次用户动作。
-            if self.holdReason != nil { self.restartSuppressed = true }
+            // 有界执行：系统收回后本持有窗口不再自动续命，等下一次用户动作
+            // 或回前台重持（仅 resignedFrontmost，见 appDidBecomeActive）。
+            if self.holdReason != nil {
+                self.restartSuppressed = true
+                self.lastInvalidationReasonCode = reason.rawValue
+            }
         }
     }
 }
