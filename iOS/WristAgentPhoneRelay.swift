@@ -364,7 +364,7 @@ final class WristAgentPhoneRelay: ObservableObject {
         )
         let envelope = VoiceStatusEnvelope.status(
             requestId: interim.requestId, state: .backgroundAccepted,
-            detail: interim.text, result: result
+            detail: interim.text, result: result, audioKind: interim.audio?.kind
         )
         watchChannel?.notifyWatch(voiceStatus: envelope)
         guard let audio = interim.audio,
@@ -455,7 +455,7 @@ final class WristAgentPhoneRelay: ObservableObject {
         )
         return VoiceStatusEnvelope.status(
             requestId: projection.requestId, state: .completed,
-            detail: projection.detailText, result: result
+            detail: projection.detailText, result: result, audioKind: projection.result?.audio?.kind
         )
     }
 

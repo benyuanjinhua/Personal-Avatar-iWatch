@@ -72,6 +72,12 @@ final class WelcomeGreeter: ObservableObject {
             fallBackToText()
             return
         }
+        let kind: AudioDownlinkKind = .welcome
+        guard kind == .welcome else {
+            WatchLog.error("audio", "l1_audio_rejected", requestId: attemptId, detail: "reason=unknown_kind source=welcome", code: "ERR_AUDIO_KIND_REJECTED")
+            fallBackToText()
+            return
+        }
         WatchLog.info("welcome", "resource_found", requestId: attemptId, detail: "path=\(url.path) bytes=\(data.count)")
         stage = .playing
         let started = player.play(data: data, context: attemptId) { [weak self] in
