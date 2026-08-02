@@ -113,19 +113,22 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         session.activate { [weak self] activated, error in
             Task { @MainActor in
                 guard let self else { return }
-                if let error {
+                // ESS-61 F2：activated=false 且 error=nil 也是失败（真机取证
+                // 88 秒静默），一律回落前台会话，不许在未激活的会话上 play()。
+                if AudioSessionPolicy.playbackActivationSucceeded(activated: activated, hasError: error != nil) {
+                    WatchLog.info(
+                        "player", "session_activated", requestId: context,
+                        detail: "category=playback policy=long_form activated=true "
+                            + "route=\(Self.routeDescription(session))"
+                    )
+                } else {
                     WatchLog.error(
                         "player", "session_activation_failed", requestId: context,
-                        detail: "policy=long_form fallback=foreground route=\(Self.routeDescription(session))",
+                        detail: "policy=long_form activated=\(activated) fallback=foreground "
+                            + "route=\(Self.routeDescription(session))",
                         error: error
                     )
                     self.activateForegroundFallback(context: context)
-                } else {
-                    WatchLog.info(
-                        "player", "session_activated", requestId: context,
-                        detail: "category=playback policy=long_form activated=\(activated) "
-                            + "route=\(Self.routeDescription(session))"
-                    )
                 }
                 completion()
             }

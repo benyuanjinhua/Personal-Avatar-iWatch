@@ -20,6 +20,7 @@
 		2600C4D0F1086887A7E1B04A /* ConversationTimelineView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D4D9B7BAB821EF5BEF00394 /* ConversationTimelineView.swift */; };
 		26780BEBF601751525AE9BDD /* SubtitleScript.swift in Sources */ = {isa = PBXBuildFile; fileRef = C426A9FB7C2456FD57F1BA1E /* SubtitleScript.swift */; };
 		28EA2E815D8252770E3221F1 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 67C6A03628F073DFB7BD92CF /* Assets.xcassets */; };
+		293E9641FC4B28984DCC0CF9 /* AudioSessionPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC3ECBAA9A62DE9AED7C9C34 /* AudioSessionPolicy.swift */; };
 		2A9E736342EF755E3A8DA8AF /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2E4C7D8E5213EE0C04CA8BEC /* Assets.xcassets */; };
 		2AFB7EE475338CDAB23D6E85 /* VoiceOrbView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CA853AA557CCC08A3446DED /* VoiceOrbView.swift */; };
 		2BE4825B9DE1357E0469CED7 /* SpeechPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7669A09014913EDDEC887BBE /* SpeechPlayer.swift */; };
@@ -52,6 +53,7 @@
 		7CE7CD69630867506FAD3360 /* VoiceRequestInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AB8CD6D695437D845CE87AF /* VoiceRequestInbox.swift */; };
 		7E75E969A72336DBE618BEBE /* VoiceInteractionCue.swift in Sources */ = {isa = PBXBuildFile; fileRef = D70795CA9CC1B496467FE2B8 /* VoiceInteractionCue.swift */; };
 		7F172712436C104970B3035C /* VoiceRelayWire.swift in Sources */ = {isa = PBXBuildFile; fileRef = 035DF4EEFBF9F540A0B791F7 /* VoiceRelayWire.swift */; };
+		8A5EEAA528E32C9DAB749BFD /* AudioSessionPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC3ECBAA9A62DE9AED7C9C34 /* AudioSessionPolicy.swift */; };
 		8D74BBCA5601E569150562B6 /* PhoneHistoryViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0A1CA98E116775B1257DB33 /* PhoneHistoryViews.swift */; };
 		8E707FCD5F8E34356AF80305 /* WatchDownlinkOutbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA60FA5DC7EA82EC5729B54B /* WatchDownlinkOutbox.swift */; };
 		8E7B08D7721A06F71A5C9644 /* ResultPlaybackLedger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52E037554E3E0CDA3ACF1D0B /* ResultPlaybackLedger.swift */; };
@@ -161,6 +163,7 @@
 		CB1D464D47EC34B55A8C8411 /* AgentModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentModels.swift; sourceTree = "<group>"; };
 		CB7ABFE8DE51D05121E27317 /* VoiceOutbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceOutbox.swift; sourceTree = "<group>"; };
 		CC28E8D4A89C399924568EEB /* SecureTokenStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureTokenStore.swift; sourceTree = "<group>"; };
+		CC3ECBAA9A62DE9AED7C9C34 /* AudioSessionPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioSessionPolicy.swift; sourceTree = "<group>"; };
 		D0A1CA98E116775B1257DB33 /* PhoneHistoryViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneHistoryViews.swift; sourceTree = "<group>"; };
 		D0E2B5FAE82F1D44C2C36616 /* VoiceSessionKeeper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceSessionKeeper.swift; sourceTree = "<group>"; };
 		D70795CA9CC1B496467FE2B8 /* VoiceInteractionCue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceInteractionCue.swift; sourceTree = "<group>"; };
@@ -181,6 +184,7 @@
 			isa = PBXGroup;
 			children = (
 				CB1D464D47EC34B55A8C8411 /* AgentModels.swift */,
+				CC3ECBAA9A62DE9AED7C9C34 /* AudioSessionPolicy.swift */,
 				5A61F7EAFB8A0CCF3D03F1D2 /* BridgeTurnProjection.swift */,
 				32C8DAF30CCFE15F09A5351A /* BuildFingerprint.swift */,
 				234EBF336FF2F9724F289524 /* ClientLog.swift */,
@@ -389,6 +393,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				E0C092AAB8EB860FC6D5A0B7 /* AgentModels.swift in Sources */,
+				293E9641FC4B28984DCC0CF9 /* AudioSessionPolicy.swift in Sources */,
 				CD555D87536F29C54A475DFB /* BridgeTurnProjection.swift in Sources */,
 				A74A27941BC416F02C965D17 /* BuildFingerprint.swift in Sources */,
 				486B5477826ED3933D89132E /* ClientLog.swift in Sources */,
@@ -429,6 +434,7 @@
 			files = (
 				AC284F28E28E5427A577455B /* AgentModels.swift in Sources */,
 				AB38F702523DAB57ECDB758F /* AudioRecorder.swift in Sources */,
+				8A5EEAA528E32C9DAB749BFD /* AudioSessionPolicy.swift in Sources */,
 				E817250A3DAFD3D2F889876B /* BridgeTurnProjection.swift in Sources */,
 				1EF906148F17573C9B7D948E /* BuildFingerprint.swift in Sources */,
 				74339B1DE6A6C27DBE1885DD /* ClientLog.swift in Sources */,
