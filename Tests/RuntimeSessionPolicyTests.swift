@@ -53,7 +53,20 @@ final class RuntimeSessionPolicyTests: XCTestCase {
     }
 
     func testRecordingHolds() {
-        XCTAssertEqual(decide(isRecording: true).decision, .hold(reason: "recording"))
+        let decision = decide(isRecording: true).decision
+        XCTAssertEqual(decision, .hold(reason: "recording"))
+        XCTAssertFalse(RuntimeSessionPolicy.shouldStartExtendedSession(for: decision))
+    }
+
+    func testExtendedSessionStartsAfterGestureForActiveTurn() {
+        let turn = makeTurn(states: [.recorded, .waitingForMac])
+        let decision = decide(turns: [turn]).decision
+        XCTAssertEqual(decision, .hold(reason: "turn_active:\(turn.requestId)"))
+        XCTAssertTrue(RuntimeSessionPolicy.shouldStartExtendedSession(for: decision))
+    }
+
+    func testExtendedSessionDoesNotStartWhenIdle() {
+        XCTAssertFalse(RuntimeSessionPolicy.shouldStartExtendedSession(for: .release))
     }
 
     func testPlayingHolds() {
@@ -139,5 +152,24 @@ final class RuntimeSessionPolicyTests: XCTestCase {
             result: VoiceResultPayload(summary: "好的", isTruncated: false, speechSha256: "ab", speechDurationMs: 1000)
         )
         XCTAssertEqual(decide(turns: [turn], isRecording: true).decision, .hold(reason: "recording"))
+    }
+
+    // MARK: ESS-58 锁屏收回后的重持
+
+    func testResignedFrontmostAllowsRestartAfterForeground() {
+        // 锁屏/切走（resignedFrontmost=3，真机日志 reason_code=3）不是预算
+        // 耗尽，解锁回前台应允许重新持有。
+        XCTAssertTrue(RuntimeSessionPolicy.allowsRestartAfterForeground(invalidationReasonCode: 3))
+    }
+
+    func testOtherInvalidationReasonsKeepBoundedExecution() {
+        // error(-1)/none(0)/sessionInProgress(1)/expired(2)/suppressedBySystem(4)：
+        // 维持 ESS-45 有界执行，不自动续命。
+        for code in [-1, 0, 1, 2, 4] {
+            XCTAssertFalse(
+                RuntimeSessionPolicy.allowsRestartAfterForeground(invalidationReasonCode: code),
+                "reason_code=\(code) 不应允许自动重持"
+            )
+        }
     }
 }

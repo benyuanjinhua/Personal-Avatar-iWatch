@@ -84,11 +84,21 @@ enum VoiceFailureStage: String, Codable, Equatable {
     case macUnreachable = "waiting_for_mac"
     case execution
 
+    /// ESS-55：每个失败态有专属、用户能看懂的文案，禁止「执行失败」式兜底。
     var displayName: String {
         switch self {
-        case .phoneUnreachable: return "失败：手机未连接"
-        case .macUnreachable: return "失败：Mac 未响应"
-        case .execution: return "执行失败"
+        case .phoneUnreachable: return "手机没连上"
+        case .macUnreachable: return "Mac 没应答"
+        case .execution: return "任务没能完成"
+        }
+    }
+
+    /// 失败后的恢复提示：配合一键重试（重发已保存的录音，不用重新说话）。
+    var recoveryHint: String {
+        switch self {
+        case .phoneUnreachable: return "录音已保存，手机连上会自动重发；也可点「重试」"
+        case .macUnreachable: return "确认 Mac 端助手在运行，点「重试」不用重新说"
+        case .execution: return "点「重试」再跑一次，不用重新说"
         }
     }
 
@@ -138,7 +148,7 @@ enum VoiceTurnPhase: Equatable {
             return background ? "退出页面任务也会继续" : "很快给你结果"
         case .needsConfirmation: return "未确认前不会执行"
         case .completed: return "点击可播放结果"
-        case .failed: return "可以重新说一次"
+        case .failed(let stage): return stage.recoveryHint
         case .cancelled: return "需要时再叫我"
         }
     }

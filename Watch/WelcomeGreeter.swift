@@ -72,11 +72,21 @@ final class WelcomeGreeter: ObservableObject {
             fallBackToText()
             return
         }
+        let kind: AudioDownlinkKind = .welcome
+        guard kind == .welcome else {
+            WatchLog.error("audio", "l1_audio_rejected", requestId: attemptId, detail: "reason=unknown_kind source=welcome", code: "ERR_AUDIO_KIND_REJECTED")
+            fallBackToText()
+            return
+        }
         WatchLog.info("welcome", "resource_found", requestId: attemptId, detail: "path=\(url.path) bytes=\(data.count)")
         stage = .playing
-        let started = player.play(data: data, context: attemptId) { [weak self] in
+        let started = player.play(data: data, context: attemptId) { [weak self] finished in
             guard let self, self.stage == .playing else { return }
-            WatchLog.info("welcome", "playback_completed", requestId: attemptId)
+            // 欢迎语没有重播语义：截断也直接收尾，只留取证日志区分。
+            WatchLog.info(
+                "welcome", "playback_completed", requestId: attemptId,
+                detail: "finished=\(finished)"
+            )
             self.stage = .finished
             WatchLogShipper.shared.ship(reason: "welcome_completed")
         }

@@ -25,11 +25,18 @@ struct VoiceTurnRecord: Codable, Equatable, Identifiable {
     var failureStage: VoiceFailureStage?
     /// 加密语音文件名（EncryptedAudioVault 内），播放交付后置空并删除文件。
     var speechFileName: String?
+    /// ESS-55 未读机制：结果首次被查看/播放的时间；nil = 未读。
+    /// 结果在用户未查看前不丢失，下次打开仍以未读态呈现。
+    var resultViewedAt: Date?
 
     var id: String { requestId }
     var currentState: VoiceTurnState { events.last?.state ?? .recorded }
     var phase: VoiceTurnPhase { currentState.phase(failureStage: failureStage) }
     var isActive: Bool { !currentState.isTerminal }
+    /// 已完成、有结果、且用户还没看过。
+    var hasUnreadResult: Bool {
+        currentState == .completed && result != nil && resultViewedAt == nil
+    }
 }
 
 /// 语音回合日志（ESS-29）：持久化到本地文件，
@@ -110,6 +117,11 @@ final class VoiceTurnJournal: ObservableObject {
         if envelope.state == .completed, let result = envelope.result, result.speechSha256 == nil {
             onResultWithoutSpeech?(envelope.requestId)
         }
+        // 结果已入账（含摘要文本，ESS-55 通知链路）：与 onStateApplied 的区别是
+        // 此刻 result 已经挂上——通知正文需要结果摘要，不能在状态回调里取。
+        if envelope.state == .completed, envelope.result != nil {
+            onResultRecorded?(envelope.requestId)
+        }
         return true
     }
 
@@ -130,24 +142,54 @@ final class VoiceTurnJournal: ObservableObject {
     /// 语音永远不会到，直接展示全文，不进播放态。
     var onResultWithoutSpeech: ((String) -> Void)?
 
+    /// 状态成功入账（本地或远端）后的回调（ESS-55）：触觉 cue 由此驱动而非 UI
+    /// onChange——结果/失败到达时 App 可能熄屏或视图未挂载，只有事件层触发
+    /// 才能保证「熄屏状态下结果到达能靠触觉感知」。
+    var onStateApplied: ((String, VoiceTurnState) -> Void)?
+
+    /// completed 且结果载荷已挂上后的回调（ESS-55 通知链路）。重复/乱序的
+    /// completed 信封被状态机拒绝时不会触发（幂等第一层；通知记账是第二层）。
+    var onResultRecorded: ((String) -> Void)?
+
+    /// ESS-55 未读机制：最近一个未读结果（新的在前）。
+    var firstUnreadResult: VoiceTurnRecord? {
+        turns.first(where: \.hasUnreadResult)
+    }
+
+    /// 标记结果已读（首次查看/播放时调用；重复调用不覆盖首读时间）。
+    func markResultViewed(requestId: String, at date: Date = Date()) {
+        guard
+            let index = turns.firstIndex(where: { $0.requestId == requestId }),
+            turns[index].result != nil,
+            turns[index].resultViewedAt == nil
+        else { return }
+        turns[index].resultViewedAt = date
+        save()
+    }
+
     /// 按 request_id 查找回合（结果语音定向交付用）。
     func turn(withId requestId: String) -> VoiceTurnRecord? {
         turns.first(where: { $0.requestId == requestId })
     }
 
     /// 结果语音已加密落盘。
-    func attachSpeech(requestId: String, fileName: String) {
-        guard let index = turns.firstIndex(where: { $0.requestId == requestId }) else { return }
+    @discardableResult
+    func attachSpeech(requestId: String, fileName: String) -> Bool {
+        guard let index = turns.firstIndex(where: { $0.requestId == requestId }) else { return false }
         turns[index].speechFileName = fileName
         save()
         onSpeechAttached?(requestId)
+        return true
     }
 
     /// 结果语音已播放交付（文件删除由调用方负责）。
-    func clearSpeech(requestId: String) {
-        guard let index = turns.firstIndex(where: { $0.requestId == requestId }) else { return }
+    @discardableResult
+    func clearSpeech(requestId: String, matching fileName: String? = nil) -> Bool {
+        guard let index = turns.firstIndex(where: { $0.requestId == requestId }) else { return false }
+        if let fileName, turns[index].speechFileName != fileName { return false }
         turns[index].speechFileName = nil
         save()
+        return true
     }
 
     func clear() {
@@ -170,6 +212,7 @@ final class VoiceTurnJournal: ObservableObject {
             turns[index].failureStage = failureStage ?? .inferred(from: current)
         }
         save()
+        onStateApplied?(requestId, state)
         return true
     }
 

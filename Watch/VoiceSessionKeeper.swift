@@ -19,7 +19,11 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
     /// 会话被系统收回（到期/失活）后，同一持有窗口内不自动重启——
     /// 否则 10 分钟上限形同虚设。新的按住说话会清除此标记。
     private var restartSuppressed = false
+    /// ESS-58：最近一次系统收回的原因码。resignedFrontmost（锁屏/切走）
+    /// 不算预算耗尽，回前台时按 RuntimeSessionPolicy 解除抑制重新持有。
+    private var lastInvalidationReasonCode: Int?
     private var holdReason: String?
+    private var recordingStartDeferred = false
 
     private var latestTurns: [VoiceTurnRecord] = []
     private var deliveredRequestIds: Set<String> = []
@@ -61,6 +65,20 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
             .store(in: &cancellables)
     }
 
+    /// 回前台钩子（ESS-58）：锁屏收回会话（resignedFrontmost）后解锁回来，
+    /// 若回合仍有持有理由则重新起会话；到期/出错收回的抑制不在此解除，
+    /// ESS-45 的有界执行边界不变。
+    func appDidBecomeActive() {
+        if restartSuppressed,
+           let code = lastInvalidationReasonCode,
+           RuntimeSessionPolicy.allowsRestartAfterForeground(invalidationReasonCode: code) {
+            restartSuppressed = false
+            WatchLog.info("runtime", "session_rearmed", detail: "after_reason_code=\(code)")
+        }
+        lastInvalidationReasonCode = nil
+        reevaluate()
+    }
+
     /// 结果语音播放交付完成（play_finished 后回调）。
     /// journal 里 speechFileName 随即被清空，凭这份内存标记区分
     /// 「已播完」与「音频还没到」。
@@ -81,9 +99,19 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
         switch verdict.decision {
         case .hold(let reason):
             holdReason = reason
-            startSessionIfNeeded(reason: reason)
+            if RuntimeSessionPolicy.shouldStartExtendedSession(for: verdict.decision) {
+                recordingStartDeferred = false
+                startSessionIfNeeded(reason: reason)
+            } else if !recordingStartDeferred {
+                recordingStartDeferred = true
+                WatchLog.info(
+                    "runtime", "session_start_deferred",
+                    detail: "reason=recording until=gesture_released"
+                )
+            }
         case .release:
             holdReason = nil
+            recordingStartDeferred = false
             restartSuppressed = false
             releaseSession(cause: "idle")
         }
@@ -169,8 +197,12 @@ extension VoiceSessionKeeper: WKExtendedRuntimeSessionDelegate {
             self.session = nil
             self.sessionStartedAt = nil
             self.startPending = false
-            // 有界执行：系统收回后本持有窗口不再自动续命，等下一次用户动作。
-            if self.holdReason != nil { self.restartSuppressed = true }
+            // 有界执行：系统收回后本持有窗口不再自动续命，等下一次用户动作
+            // 或回前台重持（仅 resignedFrontmost，见 appDidBecomeActive）。
+            if self.holdReason != nil {
+                self.restartSuppressed = true
+                self.lastInvalidationReasonCode = reason.rawValue
+            }
         }
     }
 }

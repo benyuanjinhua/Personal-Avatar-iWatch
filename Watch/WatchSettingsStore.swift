@@ -198,6 +198,14 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             WatchLog.error("turn", "speech_envelope_invalid", code: "ERR_DECODE")
             return
         }
+        guard AudioDownlinkPolicy.allows(envelope.audioKind, expected: [.interim, .result]) else {
+            WatchLog.error(
+                "audio", "l1_audio_rejected", requestId: envelope.requestId,
+                detail: "reason=unknown_or_missing_kind kind=\(envelope.audioKind?.rawValue ?? "missing") source=watch_entry",
+                code: "ERR_AUDIO_KIND_REJECTED"
+            )
+            return
+        }
         if let expected = envelope.result?.speechSha256,
            VoiceDigest.sha256Hex(of: audioData) != expected.lowercased() {
             WatchLog.error(
@@ -207,7 +215,12 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             return
         }
         voiceJournal?.apply(envelope)
-        let fileName = "\(envelope.requestId).m4a"
+        let digest = envelope.result?.speechSha256?.lowercased()
+            ?? VoiceDigest.sha256Hex(of: audioData)
+        // interim and final share request_id but are different generations.
+        // Version the vault name by content so an old playback callback cannot
+        // delete a newly arrived final file with the same request_id.
+        let fileName = "\(envelope.requestId)-\(digest).m4a"
         guard let vault = speechVault, (try? vault.store(audioData, name: fileName)) != nil else {
             WatchLog.error(
                 "turn", "speech_vault_store_failed", requestId: envelope.requestId, code: "ERR_VAULT_STORE"
@@ -217,7 +230,14 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         WatchLog.info(
             "turn", "speech_stored", requestId: envelope.requestId, detail: "bytes=\(audioData.count)"
         )
-        voiceJournal?.attachSpeech(requestId: envelope.requestId, fileName: fileName)
+        guard voiceJournal?.attachSpeech(requestId: envelope.requestId, fileName: fileName) == true else {
+            speechVault?.remove(name: fileName)
+            WatchLog.error(
+                "turn", "speech_attach_missing_turn", requestId: envelope.requestId,
+                detail: "file=\(fileName)", code: "ERR_TURN_NOT_FOUND"
+            )
+            return
+        }
         // interim 语音（ESS-46，非终态信封）落盘不算交付：ACK 只对终态结果发，
         // 否则 Bridge 会在回合转终态后接受这个早发的 ACK，final 丢失时不再重投（ESS-47）。
         if envelope.state.isTerminal {

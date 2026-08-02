@@ -30,12 +30,14 @@ final class WatchDownlinkOutboxTests: XCTestCase {
 
     private func makeOutbox(
         retention: TimeInterval = 24 * 3600,
+        inFlightTimeout: TimeInterval = 60,
         log: @escaping (WatchDownlinkLogEvent) -> Void = { _ in }
     ) throws -> WatchDownlinkOutbox {
         var counter = 0
         return try WatchDownlinkOutbox(
             directory: directory,
             retention: retention,
+            inFlightTimeout: inFlightTimeout,
             now: { self.clock },
             random: { _ in 0 },
             makeId: { counter += 1; return "item-\(counter)" },
@@ -76,6 +78,23 @@ final class WatchDownlinkOutboxTests: XCTestCase {
         XCTAssertEqual(outbox.items.first?.state, .delivered)
         XCTAssertEqual(outbox.pendingCount(), 0)
         XCTAssertThrowsError(try outbox.payload(for: item.id), "送达后载荷应删除")
+    }
+
+    func testInFlightWithoutReceiptReturnsToQueueAfterTimeout() throws {
+        var events: [WatchDownlinkLogEvent] = []
+        let outbox = try makeOutbox(inFlightTimeout: 10, log: { events.append($0) })
+        let item = try XCTUnwrap(enqueueStatus(outbox))
+        outbox.markInFlight(id: item.id)
+        XCTAssertTrue(outbox.dueItems().isEmpty)
+
+        clock = clock.addingTimeInterval(11)
+        XCTAssertEqual(outbox.dueItems().map(\.id), [item.id])
+        XCTAssertTrue(events.contains { event in
+            if case .failed(_, _, let id, _, let reason) = event {
+                return id == item.id && reason == "receipt-timeout"
+            }
+            return false
+        })
     }
 
     func testInFlightRecoversToQueuedAcrossRelaunch() throws {
@@ -397,6 +416,28 @@ final class WatchDownlinkOutboxTests: XCTestCase {
         )
         XCTAssertEqual(outbox.dueItems().map(\.id), ["item-1", "item-2", "item-3"],
                        "Watch 时间线依赖状态顺序")
+    }
+
+    func testSnapshotReplayIgnoresOccurredAtForDeduplication() throws {
+        let outbox = try makeOutbox()
+        let first = VoiceStatusEnvelope.status(
+            requestId: requestId, state: .completed,
+            occurredAt: Date(timeIntervalSince1970: 100), detail: "done"
+        )
+        let replay = VoiceStatusEnvelope.status(
+            requestId: requestId, state: .completed,
+            occurredAt: Date(timeIntervalSince1970: 200), detail: "done"
+        )
+        _ = try outbox.enqueue(
+            requestId: requestId, kind: .voiceStatus,
+            messageKey: "voice_status_envelope", payload: first.jsonData()
+        )
+        let result = try outbox.enqueue(
+            requestId: requestId, kind: .voiceStatus,
+            messageKey: "voice_status_envelope", payload: replay.jsonData()
+        )
+        guard case .duplicate = result else { return XCTFail("重放时间戳不得破坏幂等") }
+        XCTAssertEqual(outbox.items.count, 1)
     }
 
     private func enqueueStatus(_ outbox: WatchDownlinkOutbox) throws -> WatchDownlinkItem? {

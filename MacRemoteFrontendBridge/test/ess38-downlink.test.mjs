@@ -146,7 +146,7 @@ describe('ESS-38 announcement downlink (background path)', () => {
     assert.equal(bad.status, 416)
   })
 
-  it('emits one text+audio interim before the background state projection', async () => {
+  it('replaces realtime-generated acknowledgement audio with the product-defined interim', async () => {
     const isolated = await launch()
     try {
       const events = isolated.client.events()
@@ -157,10 +157,30 @@ describe('ESS-38 announcement downlink (background path)', () => {
         e => e.type === 'turn.interim' && e.interim?.request_id === id))
       assert.equal(interim.interim.delivery_sequence, 1)
       assert.equal(interim.interim.text, '收到，正在处理，请稍后')
+      assert.equal(interim.interim.audio.kind, 'interim')
       assert.equal(interim.interim.audio.codec, 'm4a')
-      assert.ok(Buffer.from(interim.interim.audio.base64, 'base64').subarray(0, 8).equals(FAKE_PREFIX))
+      assert.ok(!Buffer.from(interim.interim.audio.base64, 'base64').subarray(0, 8).equals(FAKE_PREFIX),
+        'arbitrary realtime audio must never be repackaged as interim')
       assert.equal(events.received.filter(
         e => e.type === 'turn.interim' && e.interim?.request_id === id).length, 1)
+    } finally {
+      await isolated.bridge.stop()
+      await isolated.mock.stop()
+    }
+  })
+
+  it('session rebuild self-introduction cannot become downlink audio', async () => {
+    const isolated = await launch({ scenario: 'background-self-intro' })
+    try {
+      const events = isolated.client.events()
+      await waitFor(() => events.received.some(e => e.type === 'snapshot'))
+      const id = rid()
+      await isolated.client.createTurn(id, pcm16())
+      const interim = await waitFor(() => events.received.find(
+        e => e.type === 'turn.interim' && e.interim?.request_id === id))
+      assert.equal(interim.interim.text, '收到，正在处理，请稍后')
+      assert.equal(interim.interim.audio.kind, 'interim')
+      assert.ok(!Buffer.from(interim.interim.audio.base64, 'base64').subarray(0, 8).equals(FAKE_PREFIX))
     } finally {
       await isolated.bridge.stop()
       await isolated.mock.stop()
