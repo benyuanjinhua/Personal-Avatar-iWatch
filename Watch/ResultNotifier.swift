@@ -126,6 +126,60 @@ final class ResultNotifier: NSObject, ObservableObject {
         return true
     }
 
+    /// ESS-154 T2：播放终局失败的横幅告知。**不再看 T1 的 `short_task` /
+    /// `app_active`**——播放失败恰好否定了「结果已用别的方式呈现」这个前提。
+    /// 仍受 `notAuthorized`（系统级不可发）与 `hasNotified`（幂等，与 T1 共用
+    /// `ResultNotificationPolicy` 记账，同一 request_id 一辈子只推一条）约束。
+    /// 返回 true 表示已发出（结构化日志有 `result_notified` + `source=`）。
+    @discardableResult
+    func notifyPlaybackFailureIfEligible(
+        requestId: String,
+        resultSummary: String,
+        reasonLabel: String
+    ) -> Bool {
+        cancelProvisional(requestId: requestId)
+        if !isAuthorized {
+            WatchLog.info(
+                "notify", "playback_failure_notify_skipped", requestId: requestId,
+                detail: "reason=not_authorized playback_reason=\(reasonLabel)"
+            )
+            return false
+        }
+        if policy.hasNotified(requestId: requestId) {
+            WatchLog.info(
+                "notify", "playback_failure_notify_skipped", requestId: requestId,
+                detail: "reason=already_notified playback_reason=\(reasonLabel)"
+            )
+            return false
+        }
+        let content = UNMutableNotificationContent()
+        let text = PlaybackEndgamePolicy.failureNotificationContent(resultSummary: resultSummary)
+        content.title = text.title
+        content.body = text.body
+        content.sound = .default
+        content.userInfo = ["request_id": requestId]
+        center.add(UNNotificationRequest(
+            identifier: "result-\(requestId)", content: content, trigger: nil
+        )) { error in
+            Task { @MainActor in
+                if let error {
+                    WatchLog.error(
+                        "notify", "result_notify_failed", requestId: requestId,
+                        detail: "source=playback_failure playback_reason=\(reasonLabel)",
+                        error: error
+                    )
+                } else {
+                    WatchLog.info(
+                        "notify", "result_notified", requestId: requestId,
+                        detail: "source=playback_failure playback_reason=\(reasonLabel)"
+                    )
+                }
+            }
+        }
+        policy.markNotified(requestId: requestId)
+        return true
+    }
+
     // MARK: - 兜底预约（B 路径：结果可能始终没到手表）
 
     /// 长任务受理时预约：超过 ExtendedRuntimeSession 上限仍无终态才触发，
