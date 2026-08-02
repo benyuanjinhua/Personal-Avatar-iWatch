@@ -34,7 +34,13 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     /// 当前播放的取证关联 id（request_id / welcome attempt id）。
     private var context: String?
     private var interruptionObserver: NSObjectProtocol?
-    private var isSessionInterrupted = false
+    /// ESS-73：中断标记从 Bool 改为时间戳。watchOS 不保证投递 .ended（真机
+    /// 取证 .began 后全库 0 条 .ended），闸门只在信任窗口内生效，过期自动
+    /// 失效——否则一次丢失的 .ended 会把播放通道永久锁死到 App 重启。
+    private var interruptionBeganAt: Date?
+    private var isSessionInterrupted: Bool {
+        AudioSessionPolicy.interruptionGateEngaged(beganAt: interruptionBeganAt, now: Date())
+    }
     /// 异步激活期间又来了新 play()/stop() 时，旧激活回调据此作废。
     private var playbackGeneration = 0
     /// ESS-65 S6 注入缝：「long-form 与 foreground 双激活失败」在真机上无法
@@ -56,7 +62,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             let kind = raw.flatMap(AVAudioSession.InterruptionType.init(rawValue:))
             Task { @MainActor in
                 guard let self, let kind else { return }
-                self.isSessionInterrupted = kind == .began
+                self.interruptionBeganAt = kind == .began ? Date() : nil
                 WatchLog.info(
                     "player", "session_interruption", requestId: self.context,
                     detail: "state=\(kind == .began ? "began" : "ended") "
@@ -114,6 +120,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 "player", "playback_deferred", requestId: context,
                 detail: "reason=interruption_active bytes=\(bytes) \(activationEvidence())"
             )
+            scheduleDeferredRetry(player, bytes: bytes, generation: generation)
             return
         }
         activateSession(context: context) { [weak self] activated in
@@ -124,6 +131,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                     detail: "reason=interruption_began_during_activation bytes=\(bytes) "
                         + self.activationEvidence()
                 )
+                self.scheduleDeferredRetry(player, bytes: bytes, generation: generation)
                 return
             }
             if activated {
@@ -146,6 +154,24 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         requestActivationAndPlayback(
             player, bytes: currentAudioBytes, generation: playbackGeneration
         )
+    }
+
+    /// ESS-73：defer 不许无限期。.ended 可能永远不来（watchOS 不保证投递），
+    /// 信任窗口过期后原地重试激活，由激活结果定生死。期间来了 .ended
+    /// （resume 换代）或新 play()/stop()（同样换代）则本次重试作废；
+    /// 若重试时又收到新 .began，会再次 defer 并按新时间戳重新排一次重试。
+    private func scheduleDeferredRetry(_ player: AVAudioPlayer, bytes: Int, generation: Int) {
+        guard let beganAt = interruptionBeganAt else { return }
+        let delay = AudioSessionPolicy.deferredRetryDelay(beganAt: beganAt, now: Date())
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard let self, self.playbackGeneration == generation, self.audioPlayer === player else { return }
+            WatchLog.info(
+                "player", "playback_deferred_retry", requestId: self.context,
+                detail: "bytes=\(bytes) \(self.activationEvidence())"
+            )
+            self.requestActivationAndPlayback(player, bytes: bytes, generation: generation)
+        }
     }
 
     /// ESS-58 方案 A：优先 .longFormAudio + 异步 activate()（watchOS 后台
@@ -292,6 +318,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 "player", "playback_deferred", requestId: context,
                 detail: "reason=foreground_recovery_during_interruption " + activationEvidence()
             )
+            scheduleDeferredRetry(audioPlayer, bytes: currentAudioBytes, generation: playbackGeneration)
             return
         }
         let action = PlaybackRecoveryPolicy.onForeground(

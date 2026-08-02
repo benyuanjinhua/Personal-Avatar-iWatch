@@ -76,6 +76,24 @@ targets:
         TARGETED_DEVICE_FAMILY: "4"
         WATCHOS_DEPLOYMENT_TARGET: "10.0"
 
+  # ESS-73：watchOS 模拟器运行时测试。swift test 编不到 Watch target，
+  # AVAudioSession 行为（中断状态机）只能在真实宿主 App 里驱动断言——
+  # 这是「模拟器产生的 WatchLog 事件」级别的 R-02 证据来源。
+  WristAgentWatchTests:
+    type: bundle.unit-test
+    platform: watchOS
+    sources:
+      - path: WatchTests
+    dependencies:
+      - target: WristAgent Watch App
+    settings:
+      base:
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/WristAgent Watch App.app/WristAgent Watch App"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        PRODUCT_BUNDLE_IDENTIFIER: $(WRISTAGENT_BUNDLE_ID).watchkitapp.tests
+        TARGETED_DEVICE_FAMILY: "4"
+        WATCHOS_DEPLOYMENT_TARGET: "10.0"
+
 schemes:
   WristAgent:
     build:
@@ -86,3 +104,14 @@ schemes:
       config: Debug
     archive:
       config: Release
+  WristAgent Watch App:
+    build:
+      targets:
+        WristAgent Watch App: all
+        WristAgentWatchTests: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - WristAgentWatchTests

@@ -57,6 +57,56 @@ final class AudioSessionPolicyTests: XCTestCase {
         XCTAssertTrue(AudioSessionPolicy.playbackActivationSucceeded(activated: true, hasError: false))
     }
 
+    // MARK: ESS-73 复现：interruption .ended 不保证投递，闸门不得永久生效
+
+    func testInterruptionGateEngagedWithinTrustWindow() {
+        // S5 契约（ESS-64/65）：合成 .began 后 ~400ms 内请求播放必须被 defer，
+        // 信任窗口必须覆盖这个区间。
+        let began = Date(timeIntervalSince1970: 1_000)
+        XCTAssertTrue(
+            AudioSessionPolicy.interruptionGateEngaged(
+                beganAt: began, now: began.addingTimeInterval(0.4)
+            )
+        )
+    }
+
+    func testInterruptionGateDisengagesAfterTrustWindow() {
+        // 真机取证 2026-08-02 09:12：.began ×4 后全库 0 条 .ended，7.5s 后
+        // 语音到达仍被 defer 且永不恢复。窗口过期后闸门必须失效，
+        // 播放请求改为直接尝试激活，由激活结果说话。
+        let began = Date(timeIntervalSince1970: 1_000)
+        XCTAssertFalse(
+            AudioSessionPolicy.interruptionGateEngaged(
+                beganAt: began, now: began.addingTimeInterval(7.5)
+            )
+        )
+    }
+
+    func testInterruptionGateDisengagedWithoutBegan() {
+        XCTAssertFalse(
+            AudioSessionPolicy.interruptionGateEngaged(beganAt: nil, now: Date(timeIntervalSince1970: 1_000))
+        )
+    }
+
+    func testInterruptionGateClearedByEndedIsDisengaged() {
+        // .ended 正常到达的路径等价于 beganAt 被清空。
+        XCTAssertFalse(AudioSessionPolicy.interruptionGateEngaged(beganAt: nil, now: .distantFuture))
+    }
+
+    func testDeferredRetryDelayWaitsForWindowExpiry() {
+        // defer 后的重试要等信任窗口过期，且必须小于窗口本身（不许无限等）。
+        let began = Date(timeIntervalSince1970: 1_000)
+        let delay = AudioSessionPolicy.deferredRetryDelay(beganAt: began, now: began.addingTimeInterval(1))
+        XCTAssertEqual(delay, AudioSessionPolicy.interruptionTrustWindow - 1, accuracy: 0.001)
+    }
+
+    func testDeferredRetryDelayClampedWhenWindowAlreadyExpired() {
+        let began = Date(timeIntervalSince1970: 1_000)
+        let delay = AudioSessionPolicy.deferredRetryDelay(beganAt: began, now: began.addingTimeInterval(60))
+        XCTAssertGreaterThan(delay, 0)
+        XCTAssertLessThanOrEqual(delay, 0.1)
+    }
+
     // MARK: 缺陷 A 复现（F1）：录音配置尝试序列
 
     func testFirstRecordingAttemptResetsRoutePolicy() {

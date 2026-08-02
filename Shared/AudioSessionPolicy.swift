@@ -33,6 +33,29 @@ enum AudioSessionPolicy {
         return foregroundSucceeded ? .play : .retainForReplay
     }
 
+    // MARK: ESS-73 中断信任窗口
+
+    /// watchOS 不保证投递 interruption .ended（真机取证 2026-08-02 09:12：
+    /// .began ×4 后全库 0 条 .ended，后续所有播放被无限 defer，直到重启 App）。
+    /// 中断标记只在本窗口内可信。取值下界：S5 自检在合成 .began 后 ~400ms 内
+    /// 断言 defer 且零激活尝试，窗口必须覆盖它；上界：窗口有多长，
+    /// 「有语音却无声」的死区就有多长。
+    static let interruptionTrustWindow: TimeInterval = 5
+
+    /// 中断闸门是否仍然生效：收到过 .began、尚未被 .ended 清除（beganAt 非
+    /// nil）、且未超过信任窗口。过期后播放请求改为直接尝试激活——真中断下
+    /// 激活自然失败，落入既有 exhausted→retainForReplay 路径，不会更糟。
+    static func interruptionGateEngaged(beganAt: Date?, now: Date) -> Bool {
+        guard let beganAt else { return false }
+        return now.timeIntervalSince(beganAt) < interruptionTrustWindow
+    }
+
+    /// defer 后的自动重试延迟：等信任窗口过期即重试。窗口已过期时给最小
+    /// 正延迟，避免同步重入。
+    static func deferredRetryDelay(beganAt: Date, now: Date) -> TimeInterval {
+        max(0.1, interruptionTrustWindow - now.timeIntervalSince(beganAt))
+    }
+
     // MARK: F2 播放激活判定
 
     /// `activated == false` 与 `error != nil` 一律视为激活失败：只有会话

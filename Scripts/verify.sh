@@ -6,7 +6,7 @@ cd "${0:A:h}/.."
 ./Scripts/bootstrap.sh
 node --test Tools/mock-gateway.test.mjs
 
-for source in Shared/*.swift iOS/*.swift Watch/*.swift Tests/*.swift; do
+for source in Shared/*.swift iOS/*.swift Watch/*.swift WatchTests/*.swift Tests/*.swift; do
   swiftc -frontend -parse "$source"
 done
 
