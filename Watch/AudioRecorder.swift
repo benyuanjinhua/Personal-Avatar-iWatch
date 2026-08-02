@@ -88,7 +88,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
             audioRecorder = try AVAudioRecorder(url: url, settings: settings)
         } catch {
             WatchLog.error("recorder", "recorder_init_failed", error: error)
-            throw error
+            throw RecorderError.cannotCreateRecorder
         }
         audioRecorder.delegate = self
         audioRecorder.isMeteringEnabled = true

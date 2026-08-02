@@ -2,6 +2,7 @@ import XCTest
 
 @testable import WristAgent_Watch_App
 
+@MainActor
 final class RecorderErrorCopyTests: XCTestCase {
     func testPermissionDeniedPointsToMicrophoneSettings() {
         XCTAssertEqual(
@@ -37,5 +38,19 @@ final class RecorderErrorCopyTests: XCTestCase {
             XCTAssertFalse(description.contains("OSStatus"))
             XCTAssertFalse(description.contains("NSOSStatusErrorDomain"))
         }
+    }
+
+    func testUnexpectedSystemErrorIsSanitizedBeforeReachingUI() {
+        let systemError = NSError(
+            domain: "NSOSStatusErrorDomain",
+            code: -50,
+            userInfo: [NSLocalizedDescriptionKey: "The operation failed. (OSStatus error -50.)"]
+        )
+
+        let description = PushToTalkController.recordingErrorDescription(systemError)
+
+        XCTAssertEqual(description, "录音启动失败，请松开后再按住重试。")
+        XCTAssertFalse(description.contains("OSStatus"))
+        XCTAssertFalse(description.contains("NSOSStatusErrorDomain"))
     }
 }
