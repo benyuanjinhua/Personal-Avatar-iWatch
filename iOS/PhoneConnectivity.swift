@@ -153,6 +153,10 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
             Task { @MainActor in self.relay.acknowledgeResult(requestId: ack.requestId) }
             return
         }
+        if let summaryData = message[WatchClientLogMessage.selfCheckSummaryKey] as? Data {
+            Task { @MainActor in self.ingestSelfCheckSummary(data: summaryData) }
+            return
+        }
         guard
             let envelopeData = message[VoiceMessage.envelopeKey] as? Data,
             let envelope = try? VoiceRequestEnvelope.decode(from: envelopeData)
@@ -166,9 +170,29 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         _ session: WCSession,
         didReceiveUserInfo userInfo: [String: Any] = [:]
     ) {
-        guard let data = userInfo[ResultDeliveryAckMessage.envelopeKey] as? Data,
-              let ack = ResultDeliveryAck.decode(from: data) else { return }
-        Task { @MainActor in self.relay.acknowledgeResult(requestId: ack.requestId) }
+        if let ackData = userInfo[ResultDeliveryAckMessage.envelopeKey] as? Data,
+           let ack = ResultDeliveryAck.decode(from: ackData) {
+            Task { @MainActor in self.relay.acknowledgeResult(requestId: ack.requestId) }
+            return
+        }
+        if let summaryData = userInfo[WatchClientLogMessage.selfCheckSummaryKey] as? Data {
+            Task { @MainActor in self.ingestSelfCheckSummary(data: summaryData) }
+            return
+        }
+    }
+
+    /// ESS-137：Watch 端 selfcheck_finished 的快速旁路 microchunk 落地。
+    /// sendMessage / transferUserInfo 都可能重复投递（可达变化后 iOS 会补投
+    /// 前一次同载荷），但 chunk_id 走 Bridge /v1/client-logs 的幂等窗，重复
+    /// 送达一律去重——这里只负责把 bytes 交给 ClientLogUplink。
+    @MainActor
+    private func ingestSelfCheckSummary(data: Data) {
+        guard let payload = SelfCheckSummaryPayload.decode(from: data) else {
+            Self.logger.error("watch selfcheck summary 无法解码（bytes=\(data.count, privacy: .public)）")
+            return
+        }
+        guard let jsonlData = payload.jsonl.data(using: .utf8) else { return }
+        relay.clientLogUplink.enqueue(chunkId: payload.chunkId, data: jsonlData)
     }
 
     nonisolated func session(_ session: WCSession, didReceive file: WCSessionFile) {

@@ -87,4 +87,56 @@ final class ClientLogStoreTests: XCTestCase {
         }
         XCTAssertTrue(json.contains("\"watch\""))
     }
+
+    // MARK: - ESS-137 快速旁路：JSONL 单行与主路径逐字节等价
+
+    func testEntryJsonlLineMatchesStoreEncoding() throws {
+        let entry = ClientLogEntry(
+            ts: "2026-08-02T13:46:18.000Z",
+            module: "selfcheck", event: "selfcheck_finished",
+            detail: "result=fail failed_step=S2 version=0.1.0 build=1 built_at=2026-08-02T10:27:52Z",
+            error: .init(code: "NSOSStatusErrorDomain#561145203", description: "resource_not_available")
+        )
+        // 与 ClientLogStore.append 落盘同一 encoder（sortedKeys + withoutEscapingSlashes）
+        // 编出来的字节，末尾必须带 \n——iPhone 侧 ClientLogUplink 按行透传 Bridge。
+        let line = try entry.jsonlLine()
+        XCTAssertEqual(line.last, 0x0A, "JSONL 末尾必须是换行")
+        let store = ClientLogStore(directory: directory)
+        store.append(entry)
+        let chunk = try XCTUnwrap(store.rotateForShipment().first)
+        let stored = try Data(contentsOf: chunk)
+        XCTAssertEqual(
+            stored, line,
+            "快速旁路 microchunk 必须与 ClientLogStore 落盘字节完全一致，避免 Bridge 侧解析分歧"
+        )
+    }
+
+    func testSelfCheckSummaryPayloadRoundTrip() throws {
+        let payload = SelfCheckSummaryPayload(
+            chunkId: "selfcheck-019fc300-abc.jsonl",
+            jsonl: "{\"event\":\"selfcheck_finished\"}\n"
+        )
+        let encoded = try payload.encoded()
+        let decoded = try XCTUnwrap(SelfCheckSummaryPayload.decode(from: encoded))
+        XCTAssertEqual(decoded, payload)
+        // 契约键必须是 snake_case，Bridge/iPhone 两侧都靠它对账。
+        let json = try XCTUnwrap(String(data: encoded, encoding: .utf8))
+        XCTAssertTrue(json.contains("\"chunk_id\""))
+        XCTAssertTrue(json.contains("\"jsonl\""))
+    }
+
+    func testSelfCheckSummaryPayloadDecodeRejectsGarbage() {
+        XCTAssertNil(SelfCheckSummaryPayload.decode(from: Data("not json".utf8)))
+        // 缺 chunk_id 或 jsonl 字段都必须解码失败——避免 iPhone 侧生成空 chunk。
+        XCTAssertNil(SelfCheckSummaryPayload.decode(from: Data("{\"jsonl\":\"x\"}".utf8)))
+        XCTAssertNil(SelfCheckSummaryPayload.decode(from: Data("{\"chunk_id\":\"x\"}".utf8)))
+    }
+
+    func testSelfCheckSummaryKeyIsStable() {
+        // 该 key 是 Watch ↔ iPhone 的线格式契约，改名要 Bridge/iPhone/Watch 同步。
+        XCTAssertEqual(
+            WatchClientLogMessage.selfCheckSummaryKey,
+            "watch_client_log_selfcheck_summary"
+        )
+    }
 }

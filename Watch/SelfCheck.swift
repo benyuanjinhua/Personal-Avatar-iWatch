@@ -121,6 +121,12 @@ final class SelfCheckRunner: ObservableObject {
             beginStep(.playback)
             return failStep(.playback, startedAt: Date(), fallbackCode: "ERR_SELFCHECK_ASSET_MISSING")
         }
+        // ESS-137：录音刚结束立即起播在真机上会 !res(561145203)——recorder.finish()
+        // 里 setActive(false, .notifyOthersOnDeactivation) 只是提交请求，硬件真正
+        // 归还到 setCategory(.playback, .longFormAudio) 可用之间有毫秒级延迟。
+        // 让实际的 SpeechPlayer.activateSession 先跑一遍会话让出探测，
+        // 直到探测通过或超时。模拟器上一发即中；真机上大多在 100–400ms 内清空。
+        await yieldRecordSessionForPlayback(prevStep: .record, nextStep: .playback)
         if let failure = await playbackStep(.playback, data: assetData) { return failure }
 
         // S3 播放→录音交替（ESS-61 缺陷 A，-50）：播放刚结束立刻再录，
@@ -130,6 +136,8 @@ final class SelfCheckRunner: ObservableObject {
         // S3R 录音→播放交替（ESS-72 的 S3'，真机事故 09:12:15→09:12:17 的
         // 复现链）：S3 的录音刚结束立刻播放——录音会话未交还时两级激活
         // 全 !res(561145203)、play_started 为 0，本步在装机时就拦下。
+        // ESS-137：与 S1→S2 同因同治，让出屏障也要在这里跑一次。
+        await yieldRecordSessionForPlayback(prevStep: .playThenRecord, nextStep: .recordThenPlay)
         if let failure = await playbackStep(.recordThenPlay, data: assetData) { return failure }
 
         // S4 会话状态复位（ESS-61 根因）：.longFormAudio 路由策略不得残留。
@@ -324,6 +332,62 @@ final class SelfCheckRunner: ObservableObject {
         return .notAttempted
     }
 
+    // MARK: - ESS-137 会话让出屏障
+
+    /// 每次探测的等待毫秒序列：首次 0（立即试一次），随后 100 / 200 / 400 ms。
+    /// 累计上限约 700 ms，真机取证 ESS-72 的两级激活在录音收尾后 100–400 ms
+    /// 内即可通过；再长就是硬件真的卡住，让实际步骤跑一次拿到原始错误码即可。
+    static let sessionYieldWaitsMs: [UInt64] = [0, 100, 200, 400]
+
+    /// 录音刚结束到起播之间的「会话让出」屏障：轮询式 setCategory(.playback,
+    /// .longFormAudio) 探测，直到通过或探测序列耗尽。
+    /// - setCategory 是幂等且轻量的，通过一次即证明 .playAndRecord 已归还，
+    ///   紧随其后的 SpeechPlayer.activateSession 就不会再撞 561145203；
+    /// - 未通过也不算失败——把 next 步骤放行，让真实链路拿到 !res 的原始
+    ///   错误码进 fallbackCode，可判定的 fail 优于「看不见的静默」。
+    /// - 全程留 selfcheck_session_yield 事件（result=ready|unavailable、
+    ///   probes、elapsed_ms、last_error），G9 定位时能一眼看清是「屏障没能
+    ///   等到硬件归还」还是「屏障通过后 playback 自己坏了」。
+    /// 内部可见（非 private）以便 WatchTests 直接触发屏障并观察会话/事件——
+    /// 无 mic 的模拟器上 SelfCheckRunner 无法跑完整流程，屏障若不能独立触发
+    /// 就没有运行时证据（R-02.1）。
+    internal func yieldRecordSessionForPlayback(prevStep: SelfCheckPolicy.Step, nextStep: SelfCheckPolicy.Step) async {
+        let session = AVAudioSession.sharedInstance()
+        let startedAt = Date()
+        var probes = 0
+        var succeeded = false
+        var lastErrorCode: String?
+        for delayMs in Self.sessionYieldWaitsMs {
+            if interrupted { break }
+            if delayMs > 0 {
+                try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
+            }
+            // 再次把 .playAndRecord 会话显式让出——多次调用是幂等的；不成功
+            // 也不致命，靠随后的 setCategory 探测判定。
+            try? session.setActive(false, options: .notifyOthersOnDeactivation)
+            probes += 1
+            do {
+                try session.setCategory(.playback, mode: .default, policy: .longFormAudio)
+                succeeded = true
+                break
+            } catch {
+                let nsError = error as NSError
+                lastErrorCode = "\(nsError.domain)#\(nsError.code)"
+            }
+        }
+        let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+        let detail = "from=\(prevStep.rawValue) to=\(nextStep.rawValue) "
+            + "probes=\(probes) elapsed_ms=\(elapsedMs) result=\(succeeded ? "ready" : "unavailable")"
+        if succeeded {
+            WatchLog.info("selfcheck", "selfcheck_session_yield", detail: detail)
+        } else {
+            WatchLog.error(
+                "selfcheck", "selfcheck_session_yield",
+                detail: detail, code: lastErrorCode ?? "ERR_YIELD_UNAVAILABLE"
+            )
+        }
+    }
+
     private func waitFor(timeout: Double, _ predicate: @escaping () -> Bool) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
@@ -419,19 +483,47 @@ final class SelfCheckRunner: ObservableObject {
 
     private func finish(outcome: SelfCheckPolicy.Outcome, fingerprint: String) {
         let detail = SelfCheckPolicy.finishedDetail(outcome: outcome, fingerprint: fingerprint)
+        let errorInfo: ClientLogEntry.ErrorInfo?
         switch outcome {
         case .pass:
             WatchLog.info("selfcheck", "selfcheck_finished", detail: detail)
+            errorInfo = nil
         case .failed(_, let code):
             WatchLog.error("selfcheck", "selfcheck_finished", detail: detail, code: code)
+            errorInfo = ClientLogEntry.ErrorInfo(code: code, description: detail)
         case .inconclusive(let reason):
             let code = reason == .micPermissionMissing ? "ERR_MIC_PERMISSION" : "ERR_SELFCHECK_INTERRUPTED"
             WatchLog.error("selfcheck", "selfcheck_finished", detail: detail, code: code)
+            errorInfo = ClientLogEntry.ErrorInfo(code: code, description: detail)
         }
         saveLastRun(SelfCheckPolicy.RunRecord(fingerprintDetail: fingerprint, result: outcome.result))
         stage = .finished(outcome)
         // 结论必须尽快到 Bridge——门禁判定读的是 bridge.log，不是手表本地文件。
         WatchLogShipper.shared.ship(reason: "selfcheck_finished")
+        // ESS-137 快速旁路：主路径 transferFile 正在批量失败时（真机取证 37
+        // 次 chunk_transfer_failed），G9 会读到 ERR_NO_SELFCHECK 与真实 FAIL
+        // 混同。用 sendMessage/transferUserInfo 单独直投 selfcheck_finished
+        // 这一行——sendMessage 可达即刻送达，transferUserInfo 系统托管兜底，
+        // Bridge 侧按 chunk_id 幂等窗与主路径合流去重。
+        shipSelfCheckFinishedFastPath(detail: detail, errorInfo: errorInfo)
+    }
+
+    /// 把 `selfcheck_finished` 打包成与主路径逐字节一致的 JSONL microchunk，
+    /// 通过 WatchLogShipper 的旁路直投给 iPhone。
+    private func shipSelfCheckFinishedFastPath(detail: String, errorInfo: ClientLogEntry.ErrorInfo?) {
+        let entry = ClientLogEntry(
+            module: "selfcheck", event: "selfcheck_finished",
+            detail: detail, error: errorInfo
+        )
+        guard let jsonl = try? entry.jsonlLine(),
+              let jsonlString = String(data: jsonl, encoding: .utf8) else {
+            return
+        }
+        // 与主路径的 chunk 命名前缀（watchlog-…）区分——iPhone 侧按前缀分流
+        // 到 ClientLogUplink 队列，chunk_id 是 Bridge 侧幂等窗的 key。
+        let chunkId = "selfcheck-\(UUIDv7.generate().uuidString.lowercased()).jsonl"
+        let payload = SelfCheckSummaryPayload(chunkId: chunkId, jsonl: jsonlString)
+        WatchLogShipper.shared.shipSelfCheckSummary(payload: payload)
     }
 
     private func elapsedMs(since startedAt: Date) -> Int {

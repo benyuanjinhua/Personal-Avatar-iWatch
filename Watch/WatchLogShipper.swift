@@ -38,4 +38,62 @@ final class WatchLogShipper {
         }
         store.removeChunk(named: fileName)
     }
+
+    /// ESS-137：关键日志（当前只有 `selfcheck_finished`）走 sendMessage +
+    /// transferUserInfo 双通道旁路直投，绕开正在失败的 transferFile 队列。
+    /// - `chunkId` 与主路径共用幂等窗，重复送达 Bridge 去重（`selfcheck-<uuid>.jsonl`）；
+    /// - `jsonl` 是 `ClientLogEntry.jsonlLine()` 的字节，与主路径逐字节等价；
+    /// - sendMessage 可达即刻送达（约 100–300 ms 到 Bridge），失败静默；
+    /// - transferUserInfo 是系统托管持久队列，reachable 变化后自动补投；
+    /// - 两路都失败时留 `selfcheck_fastpath_unavailable` 取证，主路径 chunk
+    ///   一旦成功也会覆盖同 chunk_id，不会造成 bridge.log 双写。
+    func shipSelfCheckSummary(payload: SelfCheckSummaryPayload) {
+        let session = WCSession.default
+        guard session.activationState == .activated else {
+            WatchLog.info(
+                "watchlog", "selfcheck_fastpath_unavailable",
+                detail: "chunk=\(payload.chunkId) reason=session_not_activated"
+            )
+            return
+        }
+        guard let data = try? payload.encoded() else {
+            WatchLog.error(
+                "watchlog", "selfcheck_fastpath_encode_failed",
+                detail: "chunk=\(payload.chunkId)", code: "ERR_ENCODE"
+            )
+            return
+        }
+        let message = [WatchClientLogMessage.selfCheckSummaryKey: data]
+        // transferUserInfo 无论 reachable 与否都进系统托管队列，是可靠性兜底。
+        session.transferUserInfo(message)
+        WatchLog.info(
+            "watchlog", "selfcheck_fastpath_transfer_queued",
+            detail: "chunk=\(payload.chunkId) bytes=\(data.count)"
+        )
+        // 可达时再走一次 sendMessage，把送达时延压到秒级——不可达时立即失败，
+        // 靠 transferUserInfo 兜底，errorHandler 里不再补动作，避免和上面重复。
+        guard session.isReachable else {
+            WatchLog.info(
+                "watchlog", "selfcheck_fastpath_send_skipped",
+                detail: "chunk=\(payload.chunkId) reason=not_reachable"
+            )
+            return
+        }
+        let chunkId = payload.chunkId
+        session.sendMessage(
+            message,
+            replyHandler: { _ in
+                WatchLog.info(
+                    "watchlog", "selfcheck_fastpath_delivered",
+                    detail: "chunk=\(chunkId) via=send_message"
+                )
+            },
+            errorHandler: { error in
+                WatchLog.error(
+                    "watchlog", "selfcheck_fastpath_send_failed",
+                    detail: "chunk=\(chunkId)", error: error
+                )
+            }
+        )
+    }
 }
