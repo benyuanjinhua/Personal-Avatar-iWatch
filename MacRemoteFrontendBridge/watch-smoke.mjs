@@ -143,6 +143,10 @@ function stepDescription(step) {
     case 'S2': return '播放可用'
     case 'S3': return '播放→录音交替'
     case 'S4': return '会话状态复位'
+    // S5/S6：PM 2026-08-02 拍板并入（承载 ESS-64 受控矩阵），表端实现
+    // 待 PR #37/#36 合入后跟进；门禁先认识这两个步骤名，避免两侧脱节。
+    case 'S5': return '中断中激活'
+    case 'S6': return '双激活失败'
     default: return '未知'
   }
 }
