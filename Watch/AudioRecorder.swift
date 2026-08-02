@@ -8,11 +8,13 @@ enum RecorderError: LocalizedError {
     case cannotCreateRecorder
     case noRecording
 
+    static let recordingTooShortDescription = "录音太短，请按住多说一会儿。"
+
     var errorDescription: String? {
         switch self {
-        case .permissionDenied: return "没有麦克风权限，请在手表设置中允许腕语使用麦克风。"
+        case .permissionDenied: return "麦克风权限未开启，请前往手表设置 → 隐私 → 麦克风，允许腕语访问。"
         case .sessionActivationFailed: return "录音启动失败，请松开后再按住重试。"
-        case .cannotCreateRecorder: return "无法启动录音，请稍后重试。"
+        case .cannotCreateRecorder: return "录音器启动失败，请松开后再按住重试。"
         case .noRecording: return "没有录到语音。"
         }
     }
@@ -86,7 +88,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
             audioRecorder = try AVAudioRecorder(url: url, settings: settings)
         } catch {
             WatchLog.error("recorder", "recorder_init_failed", error: error)
-            throw error
+            throw RecorderError.cannotCreateRecorder
         }
         audioRecorder.delegate = self
         audioRecorder.isMeteringEnabled = true

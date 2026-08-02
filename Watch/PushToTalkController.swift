@@ -16,6 +16,16 @@ final class PushToTalkController: ObservableObject {
 
     @Published private(set) var state: State = .idle
     @Published private(set) var errorMessage: String?
+
+    /// 录音链路的系统错误只进日志；UI 始终显示中文可行动文案。
+    static func recordingErrorDescription(_ error: Error) -> String {
+        if let recorderError = error as? RecorderError,
+           let description = recorderError.errorDescription {
+            return description
+        }
+        return RecorderError.sessionActivationFailed.errorDescription
+            ?? "录音启动失败，请松开后再按住重试。"
+    }
     @Published private(set) var recordingLevel: Float = 0
     /// 当前字幕播放会话（ESS-48）：结果播放/纯文本结果到达时置值，
     /// UI 以 sheet(item:) 呈现；用户关闭视图时由绑定置回 nil。
@@ -264,7 +274,7 @@ final class PushToTalkController: ObservableObject {
                 }
             } catch {
                 state = .idle
-                errorMessage = error.localizedDescription
+                errorMessage = Self.recordingErrorDescription(error)
             }
         }
     }
@@ -298,13 +308,13 @@ final class PushToTalkController: ObservableObject {
                     detail: "duration_ms=\(recording.durationMs) bytes=\(recording.data.count)",
                     code: "ERR_AUDIO_TOO_SHORT"
                 )
-                errorMessage = "没听清，请再按住说一次"
+                errorMessage = RecorderError.recordingTooShortDescription
                 WatchHaptics.play(.turnFailed)
                 return
             }
             submit(recording: recording)
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = Self.recordingErrorDescription(error)
             WatchHaptics.play(.turnFailed)
         }
     }
