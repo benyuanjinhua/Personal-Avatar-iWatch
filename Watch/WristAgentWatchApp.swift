@@ -3,14 +3,15 @@ import WatchKit
 
 @main
 struct WristAgentWatchApp: App {
-    @StateObject private var settings = WatchSettingsStore()
-    @StateObject private var pushToTalk = PushToTalkController()
-    @StateObject private var welcome = WelcomeGreeter()
+    /// ESS-55：后台 WC 唤醒（挂起时结果送达 → 当场发通知）依赖 delegate；
+    /// 服务图上移到 WatchAppServices 单例，前台/后台启动共用一套接线。
+    @WKApplicationDelegateAdaptor(WatchAppDelegate.self) private var appDelegate
+    private let services = WatchAppServices.shared
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
-            WatchContentView(pushToTalk: pushToTalk, welcome: welcome)
+            WatchContentView(pushToTalk: services.pushToTalk, welcome: services.welcome)
                 .task {
                     WatchLog.info(
                         "lifecycle", "cold_start",
@@ -20,14 +21,10 @@ struct WristAgentWatchApp: App {
                     // 与 ExtendedRuntimeSession（VoiceSessionKeeper）叠加覆盖长任务等待。
                     WKExtension.shared().isFrontmostTimeoutExtended = true
                     WatchLog.info("lifecycle", "frontmost_timeout_extended")
-                    settings.voiceTransport = pushToTalk.transport
-                    settings.voiceJournal = pushToTalk.journal
-                    settings.speechVault = pushToTalk.speechVault
-                    pushToTalk.onAutoPlayStarted = { welcome.interrupt() }
-                    settings.activate()
+                    services.bootstrap(reason: "scene_task")
                     // ESS-55 未读优先：有未读结果直接呈现（触觉 + 全文），欢迎语让路。
-                    if !pushToTalk.presentUnreadIfAny() {
-                        welcome.greetIfNeeded()
+                    if !services.pushToTalk.presentUnreadIfAny() {
+                        services.welcome.greetIfNeeded()
                     }
                 }
                 .onChange(of: scenePhase) { _, newPhase in
@@ -35,7 +32,7 @@ struct WristAgentWatchApp: App {
                     switch newPhase {
                     case .active:
                         WatchLogShipper.shared.ship(reason: "foreground")
-                        pushToTalk.presentUnreadIfAny()
+                        services.pushToTalk.presentUnreadIfAny()
                     case .background: WatchLogShipper.shared.ship(reason: "background")
                     default: break
                     }

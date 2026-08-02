@@ -34,6 +34,8 @@ final class PushToTalkController: ObservableObject {
     let speechVault: EncryptedAudioVault?
     let player = SpeechPlayer()
     let transport: WatchVoiceTransport
+    /// ESS-55 超长任务本地通知（JIT 授权 / 结果通知 / 兜底预约 / 点通知直达）。
+    let notifier: ResultNotifier
     /// ESS-45：录音 → 等待 → 播放整个回合期间持有 ExtendedRuntimeSession，
     /// 降腕/熄屏不挂起；空闲即释放。
     let sessionKeeper = VoiceSessionKeeper()
@@ -56,6 +58,9 @@ final class PushToTalkController: ObservableObject {
         speechVault = try? EncryptedAudioVault(directory: base.appendingPathComponent("SpeechVault", isDirectory: true))
         transport = WatchVoiceTransport(journal: journal)
         retryStore = RetryRecordingStore(directory: base.appendingPathComponent("RetryCache", isDirectory: true))
+        notifier = ResultNotifier(policy: ResultNotificationPolicy(
+            directory: base.appendingPathComponent("NotificationLedger", isDirectory: true)
+        ))
 
         recorder.$level
             .receive(on: RunLoop.main)
@@ -77,14 +82,40 @@ final class PushToTalkController: ObservableObject {
         // 触觉 cue（ESS-55）：挂在状态入账事件上而非 UI——熄屏/视图未挂载时
         // 结果到达/失败仍能靠震动感知（ESS-45 的 ExtendedRuntimeSession 保证
         // 回合期间 App 还在运行）。成功交付后清理重试缓存。
+        // resultArrived 例外：是否播触觉取决于是否发本地通知（同一结果只震
+        // 一次），而通知正文需要结果载荷——推迟到 onResultRecorded 决策。
         journal.onStateApplied = { [weak self] requestId, state in
             guard let self else { return }
-            if let cue = self.cuePolicy.cue(for: state, requestId: requestId) {
+            if let cue = self.cuePolicy.cue(for: state, requestId: requestId), cue != .resultArrived {
                 WatchHaptics.play(cue)
+            }
+            switch state {
+            case .backgroundAccepted:
+                // 首次长任务场景：JIT 授权引导 / 已授权则预约兜底通知。
+                self.notifier.longTaskAccepted(requestId: requestId)
+            case .failed, .cancelled:
+                self.notifier.cancelProvisional(requestId: requestId)
+            default:
+                break
             }
             if state == .completed || state == .cancelled {
                 self.retryStore.clear(requestId: requestId)
             }
+        }
+
+        // 结果入账（含摘要，ESS-55 通知链路）：够格就发本地通知（自带震动），
+        // 否则回落到 .notification 触觉——同一结果只震一次。
+        journal.onResultRecorded = { [weak self] requestId in
+            guard let self, let turn = self.journal.turn(withId: requestId) else { return }
+            let notified = self.notifier.notifyResultIfEligible(turn: turn, completedAt: Date())
+            if !notified {
+                WatchHaptics.play(.resultArrived)
+            }
+        }
+
+        // 点通知直达该条结果全文（不播额外触觉——通知本身已震过）。
+        notifier.onOpenResult = { [weak self] requestId in
+            self?.presentResult(requestId: requestId)
         }
 
         sessionKeeper.bind(
@@ -219,8 +250,19 @@ final class PushToTalkController: ObservableObject {
     @discardableResult
     func presentUnreadIfAny() -> Bool {
         guard state == .idle, subtitleSession == nil else { return false }
-        guard let turn = journal.firstUnreadResult, let result = turn.result else { return false }
+        guard let turn = journal.firstUnreadResult else { return false }
         WatchHaptics.play(.resultArrived)
+        presentResult(requestId: turn.requestId)
+        return true
+    }
+
+    /// 直达某条结果的全文视图（点通知进入 / 未读呈现，ESS-55 细则 #3）。
+    /// 不播触觉——调用方各自决定（通知本身已震过）。
+    func presentResult(requestId: String) {
+        guard let turn = journal.turn(withId: requestId), let result = turn.result else {
+            WatchLog.error("notify", "present_result_missing", requestId: requestId, code: "ERR_NO_RESULT")
+            return
+        }
         if turn.speechFileName != nil {
             playResult(for: turn)
         } else {
@@ -228,7 +270,6 @@ final class PushToTalkController: ObservableObject {
                 requestId: turn.requestId, text: result.displaySummary, hasAudio: false
             )
         }
-        return true
     }
 
     func pressCancelled() {
