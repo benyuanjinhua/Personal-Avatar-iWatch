@@ -83,6 +83,11 @@ final class SelfCheckPolicyTests: XCTestCase {
         XCTAssertEqual(SelfCheckPolicy.Step.dualActivationFailure.rawValue, "S6")
     }
 
+    // ESS-72：S3'（录音→播放交替）落地为 S3R，Bridge 侧 stepDescription 同名对应。
+    func testStepRawValueCoversS3R() {
+        XCTAssertEqual(SelfCheckPolicy.Step.recordThenPlay.rawValue, "S3R")
+    }
+
     func testObservationDetailDeferredPhase() {
         let detail = SelfCheckPolicy.observationDetail(
             step: .interruptionGate, phase: "deferred", scenePhase: "active",

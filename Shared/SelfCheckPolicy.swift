@@ -15,14 +15,17 @@ import Foundation
 /// 3. 日志 detail 契约（Bridge 侧 watch-smoke.mjs 按同一格式解析）。
 enum SelfCheckPolicy {
     /// 自检步骤，对应真实事故：S1 录音（ESS-52/54）、S2 播放（ESS-61 缺陷 B）、
-    /// S3 播放→录音交替（ESS-61 缺陷 A，`-50`）、S4 会话状态复位（ESS-61 根因）。
-    /// S5/S6 为 PM 2026-08-02 追加：承载 ESS-64 的受控矩阵——S5 中断中激活
-    /// （不得激活/起播，`ended` 后自动恢复），S6 双激活失败（不得 play()，
-    /// 音频保留可重播）。
+    /// S3 播放→录音交替（ESS-61 缺陷 A，`-50`）、S3R 录音→播放交替（即 ESS-72
+    /// 的 S3'：录音刚结束立刻播放，会话未交还则两级激活全 `!res`）、
+    /// S4 会话状态复位（ESS-61 根因）。
+    /// S5/S6 为 PM 2026-08-02 追加：S6 双激活失败（不得 play()，音频保留
+    /// 可重播）；S5 原为 ESS-64 中断闸门断言，ESS-73 撤闸门后改为断言
+    /// 「中断残留标志不得阻塞新播放」（.ended 不保证投递，激活结果说话）。
     enum Step: String, CaseIterable {
         case record = "S1"
         case playback = "S2"
         case playThenRecord = "S3"
+        case recordThenPlay = "S3R"
         case sessionReset = "S4"
         case interruptionGate = "S5"
         case dualActivationFailure = "S6"

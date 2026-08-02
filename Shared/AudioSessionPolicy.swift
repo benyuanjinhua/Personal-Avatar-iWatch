@@ -10,9 +10,13 @@ import Foundation
 /// activated=false 被当成功，88 秒音频一声没出（play_returned_false）。
 enum AudioSessionPolicy {
     /// 播放激活状态机的下一步。所有路径最终只能到 `play` 或
-    /// `retainForReplay`；中断期间只能等待，不能碰音频会话。
+    /// `retainForReplay`。
+    /// ESS-73：中断标志不再是新播放请求的闸门——`.ended` 通知不保证投递
+    /// （中断方不归还会话、App 曾挂起都会丢），等 `.ended` 会把播放通道
+    /// 永久锁死。新 play() 一律直接尝试激活，让激活结果说话：硬件仍被
+    /// 占用时激活自然失败（'!pla'），落入既有 exhausted→retainForReplay
+    /// 路径，不会更糟。
     enum PlaybackActivationAction: Equatable {
-        case waitForInterruptionEnd
         case activateLongForm
         case activateForeground
         case play
@@ -22,11 +26,9 @@ enum AudioSessionPolicy {
     /// `nil` 表示该级激活尚未尝试。把是否允许 `play()` 的判定集中在纯函数
     /// 中，避免异步回调的某条失败分支绕过门禁。
     static func nextPlaybackActivationAction(
-        interrupted: Bool,
         longFormSucceeded: Bool?,
         foregroundSucceeded: Bool?
     ) -> PlaybackActivationAction {
-        if interrupted { return .waitForInterruptionEnd }
         guard let longFormSucceeded else { return .activateLongForm }
         if longFormSucceeded { return .play }
         guard let foregroundSucceeded else { return .activateForeground }

@@ -142,10 +142,13 @@ function stepDescription(step) {
     case 'S1': return '录音可用'
     case 'S2': return '播放可用'
     case 'S3': return '播放→录音交替'
+    // S3R：ESS-72 的 S3'——录音刚结束立刻播放，拦截会话未交还导致的
+    // 两级激活 !res(561145203)。
+    case 'S3R': return '录音→播放交替'
     case 'S4': return '会话状态复位'
-    // S5/S6：PM 2026-08-02 拍板并入，承载 ESS-64 受控矩阵，
-    // 表端实现见 Watch/SelfCheck.swift，与此处步骤名一一对应。
-    case 'S5': return '中断中激活'
+    // S5/S6：PM 2026-08-02 拍板并入；S5 自 ESS-73 起改为「中断残留不得
+    // 阻塞新播放」。表端实现见 Watch/SelfCheck.swift，与此处步骤名一一对应。
+    case 'S5': return '中断残留不阻塞播放'
     case 'S6': return '双激活失败'
     default: return '未知'
   }
