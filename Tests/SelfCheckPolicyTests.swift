@@ -136,4 +136,15 @@ final class SelfCheckPolicyTests: XCTestCase {
         // PD 约束 3：失败只拦验收，不拦使用——文案必须说清 App 仍可用。
         XCTAssertTrue(defect.contains("仍可正常使用"))
     }
+
+    // MARK: - ESS-137 S1→S2 会话让出屏障
+
+    /// 屏障必须 > 0：模拟器 6ms 可通、真机 !res 复现之间的差就是这个屏障。
+    /// 数值锚点：AVAudioSession route change 通知通常 200ms 内投递（watchOS
+    /// 经验值），本值给到 300ms 是给硬件回收留 100ms 余量。同时不能过大，
+    /// 每次录音后都会等一次，S1/S3 加起来占自检总预算 ~10s 的 6%——本上限是 500ms。
+    func testReleaseSettleMsIsBoundedNonZero() {
+        XCTAssertGreaterThan(SelfCheckPolicy.releaseSettleMs, 0)
+        XCTAssertLessThanOrEqual(SelfCheckPolicy.releaseSettleMs, 500)
+    }
 }

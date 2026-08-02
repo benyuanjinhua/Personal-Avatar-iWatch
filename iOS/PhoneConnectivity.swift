@@ -153,6 +153,16 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
             Task { @MainActor in self.relay.acknowledgeResult(requestId: ack.requestId) }
             return
         }
+        // ESS-137：Watch 直投的单行 JSONL 日志（selfcheck_finished 等），合成
+        // chunk_id 后走既有 clientLogUplink 通道，chunk_id 幂等由 Bridge 侧完成。
+        if let payload = message[WatchClientLogMessage.directLineKey] as? Data {
+            let chunkId = WatchClientLogMessage.directChunkPrefix + UUID().uuidString.lowercased()
+            let normalized = WatchClientLogMessage.normalizeInlinePayload(payload)
+            Task { @MainActor in
+                self.relay.clientLogUplink.enqueue(chunkId: chunkId, data: normalized)
+            }
+            return
+        }
         guard
             let envelopeData = message[VoiceMessage.envelopeKey] as? Data,
             let envelope = try? VoiceRequestEnvelope.decode(from: envelopeData)
@@ -161,6 +171,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
             self.voiceStatus = "收到元数据预告 \(envelope.requestId.prefix(8))…，等待音频文件"
         }
     }
+
 
     nonisolated func session(
         _ session: WCSession,

@@ -31,6 +31,24 @@ enum SelfCheckPolicy {
         case dualActivationFailure = "S6"
     }
 
+    // MARK: - ESS-137 时序契约
+
+    /// 录音收尾到下一步播放之间的会话让出屏障（毫秒）。
+    ///
+    /// 背景：ESS-72 补齐了 `AudioRecorder.releaseSession` 的 `setActive(false,
+    /// .notifyOthersOnDeactivation)` API 契约，但真机上 AVAudioSession 硬件资源
+    /// 的实际让出/重协商并非立即完成——2026-08-02 装机自检 S2 真机复现
+    /// （截图=`.failed(step: .playback, ...)`）：S1 录音刚 `releaseSession` 返回，
+    /// S2 立即 `setCategory(.playback, .longFormAudio)` + `session.activate()`，
+    /// 两级激活撞 `!res(561145203)` → `playback_activation_exhausted`。模拟器 6ms
+    /// 之内完成（headless macOS 不真取硬件），所以 PR #41 的模拟器验证覆盖不到。
+    ///
+    /// 300ms 的依据：AVAudioSession 让出后 route change 通知通常在 200ms 内投递
+    /// （watchOS 实测经验值），留 100ms 余量；自检总预算 ~10s，两次录音（S1/S3）
+    /// 加起来 600ms 开销可接受。这是屏障不是重试——把「时序不确定」压回「时序
+    /// 确定」，避免在 activation 回调里做隐式重试放大 UX 延迟。
+    static let releaseSettleMs: Int = 300
+
     // MARK: - S5/S6 观测记录契约（ESS-64 §最短修法 第 3 条，字段与毕玄对齐）
 
     enum InterruptionState: String {

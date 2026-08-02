@@ -182,6 +182,14 @@ final class SelfCheckRunner: ObservableObject {
             return failStep(step, startedAt: startedAt, fallbackCode: "ERR_SESSION_ACTIVATION")
         }
         passStep(step, startedAt: startedAt)
+        // ESS-137：真机上 AudioRecorder.releaseSession 的 setActive(false) API 已返回，
+        // 但硬件资源未必立即让出。紧接的 S2/S3R playbackStep 会 setCategory(
+        // .playback, .longFormAudio) + activate()，若资源还没归还，两级激活全 !res
+        // （561145203）→ playback_activation_exhausted → S2 fail。屏障放在录音步
+        // 收尾（而不是播放步入口），是让「录音让出」与「让出稳定」原子化，S3 播放
+        // → 录音方向照旧无屏障（那是 ESS-61 想拦的方向缺陷）。可被 interrupt 打断。
+        try? await Task.sleep(nanoseconds: UInt64(SelfCheckPolicy.releaseSettleMs) * 1_000_000)
+        if interrupted { return .inconclusive(.interrupted) }
         return nil
     }
 
@@ -419,19 +427,30 @@ final class SelfCheckRunner: ObservableObject {
 
     private func finish(outcome: SelfCheckPolicy.Outcome, fingerprint: String) {
         let detail = SelfCheckPolicy.finishedDetail(outcome: outcome, fingerprint: fingerprint)
+        let errorInfo: ClientLogEntry.ErrorInfo?
         switch outcome {
         case .pass:
+            errorInfo = nil
             WatchLog.info("selfcheck", "selfcheck_finished", detail: detail)
         case .failed(_, let code):
+            errorInfo = ClientLogEntry.ErrorInfo(code: code, description: detail)
             WatchLog.error("selfcheck", "selfcheck_finished", detail: detail, code: code)
         case .inconclusive(let reason):
             let code = reason == .micPermissionMissing ? "ERR_MIC_PERMISSION" : "ERR_SELFCHECK_INTERRUPTED"
+            errorInfo = ClientLogEntry.ErrorInfo(code: code, description: detail)
             WatchLog.error("selfcheck", "selfcheck_finished", detail: detail, code: code)
         }
         saveLastRun(SelfCheckPolicy.RunRecord(fingerprintDetail: fingerprint, result: outcome.result))
         stage = .finished(outcome)
         // 结论必须尽快到 Bridge——门禁判定读的是 bridge.log，不是手表本地文件。
+        // ESS-137：除 transferFile 通道外，同时用 sendMessage 直投结论行——
+        // 本仓库 chunk_transfer_failed 是常见故障（本次事故 log 里 37 次），
+        // 只走 transferFile 会出现「表上显示 S2 fail、bridge 侧却是 ERR_NO_SELFCHECK」
+        // 的双盲态。直投可达时秒到 bridge，不可达时静默由 transferFile 兜底。
         WatchLogShipper.shared.ship(reason: "selfcheck_finished")
+        WatchLogShipper.shared.shipInline(entry: ClientLogEntry(
+            module: "selfcheck", event: "selfcheck_finished", detail: detail, error: errorInfo
+        ))
     }
 
     private func elapsedMs(since startedAt: Date) -> Int {

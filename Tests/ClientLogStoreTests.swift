@@ -87,4 +87,32 @@ final class ClientLogStoreTests: XCTestCase {
         }
         XCTAssertTrue(json.contains("\"watch\""))
     }
+
+    // MARK: - ESS-137 直投单行 JSONL 通道
+
+    /// 契约锚点：iPhone 侧 didReceiveMessage 只认 directLineKey；改名要同步
+    /// Watch shipper 与 iOS PhoneConnectivity，否则默默两端不通。
+    func testDirectLineContractKeysAreStable() {
+        XCTAssertEqual(WatchClientLogMessage.directLineKey, "watch_client_log_line")
+        XCTAssertEqual(WatchClientLogMessage.directChunkPrefix, "direct-")
+        // 直投的 chunk_id 前缀不能与既有 chunk（watchlog-）撞，否则 bridge 幂等
+        // 去重会误判为同一 chunk 重放。
+        XCTAssertFalse(WatchClientLogMessage.directChunkPrefix.hasPrefix(ClientLogStore.chunkPrefix))
+        XCTAssertFalse(ClientLogStore.chunkPrefix.hasPrefix(WatchClientLogMessage.directChunkPrefix))
+    }
+
+    /// Bridge /v1/client-logs 按 `\n` 分行；单行 payload 必须以 LF 结尾，
+    /// 已带 LF 不重复补——否则 bridge 会记 `watch_client_log_bad_line`（空行）。
+    func testNormalizeInlinePayloadAppendsSingleLF() {
+        let raw = "{\"module\":\"selfcheck\"}"
+        let normalized = WatchClientLogMessage.normalizeInlinePayload(Data(raw.utf8))
+        XCTAssertEqual(normalized.last, 0x0A)
+        XCTAssertEqual(String(data: normalized, encoding: .utf8), raw + "\n")
+    }
+
+    func testNormalizeInlinePayloadDoesNotDoubleLF() {
+        let raw = "{\"module\":\"selfcheck\"}\n"
+        let normalized = WatchClientLogMessage.normalizeInlinePayload(Data(raw.utf8))
+        XCTAssertEqual(normalized, Data(raw.utf8))
+    }
 }

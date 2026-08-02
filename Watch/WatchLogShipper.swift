@@ -10,6 +10,11 @@ final class WatchLogShipper {
     static let shared = WatchLogShipper()
 
     private let store: ClientLogStore
+    private static let inlineEncoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return encoder
+    }()
 
     init(store: ClientLogStore = WatchLog.store) {
         self.store = store
@@ -28,6 +33,40 @@ final class WatchLogShipper {
         for url in chunks where !inFlight.contains(url.lastPathComponent) {
             session.transferFile(url, metadata: [WatchClientLogMessage.fileKey: url.lastPathComponent])
         }
+    }
+
+    /// ESS-137：单行 JSONL 直投（sendMessage）。仅用于 `selfcheck_finished`
+    /// 这类必须秒到 bridge 的取证行——transferFile 走系统托管队列，本仓库
+    /// `chunk_transfer_failed` 是常见故障（2026-08-02 事故 log 里 37 次），
+    /// 只走 transferFile 会出现「表上显示 S2 fail、bridge 侧却 ERR_NO_SELFCHECK」
+    /// 的双盲态。可达时秒到；不可达时静默返回，transferFile 通道自然兜底。
+    /// 不重试、不重复投，chunk_id 幂等由 bridge 侧完成。
+    func shipInline(entry: ClientLogEntry) {
+        guard let payload = try? Self.inlineEncoder.encode(entry) else {
+            WatchLog.error("watchlog", "inline_ship_encode_failed", detail: entry.event)
+            return
+        }
+        let session = WCSession.default
+        guard session.activationState == .activated, session.isReachable else {
+            WatchLog.info(
+                "watchlog", "inline_ship_skipped",
+                detail: "event=\(entry.event) reachable=\(session.isReachable) "
+                    + "state=\(session.activationState.rawValue)"
+            )
+            return
+        }
+        session.sendMessage(
+            [WatchClientLogMessage.directLineKey: payload],
+            replyHandler: nil,
+            errorHandler: { error in
+                Task { @MainActor in
+                    WatchLog.error(
+                        "watchlog", "inline_ship_failed",
+                        detail: "event=\(entry.event)", error: error
+                    )
+                }
+            }
+        )
     }
 
     /// WCSession didFinish 回执：成功即删本地副本；失败保留待重试。

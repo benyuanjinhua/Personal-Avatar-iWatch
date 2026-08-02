@@ -162,6 +162,27 @@ final class ClientLogStore: @unchecked Sendable {
 enum WatchClientLogMessage {
     /// 值为 chunk 文件名；出现该键即视为日志 chunk（与语音 transferFile 分流）。
     static let fileKey = "watch_client_log_file"
+
+    /// ESS-137：`sendMessage` 直投单行 JSONL 的键（值为 `Data`，一行原字节）。
+    /// transferFile 走系统托管队列（reachable=false 时会积压，本仓库 `chunk_transfer_failed`
+    /// 是常见故障），G9 门禁读的是 bridge.log，不能靠概率取证。此路径仅用于
+    /// 装机自检 `selfcheck_finished` 这类必须秒到的取证行：可达时走本路径直投，
+    /// 不可达时静默失败——原有 transferFile 通道自然兜底，不重复投递也不阻塞。
+    static let directLineKey = "watch_client_log_line"
+
+    /// 直投单行的合成 chunk_id 前缀。带 `direct-` 让 bridge 侧 chunk_id 幂等去重
+    /// 与 transferFile 的 chunk 完全区分（万一同一行两条路都送达，chunk_id 也不撞）。
+    static let directChunkPrefix = "direct-"
+
+    /// Watch 侧 JSONEncoder 不带换行；Bridge /v1/client-logs 按 `\n` 逐行解析，
+    /// 补一个终止换行让单行 payload 与 chunk 文件格式一致。已带换行则原样返回，
+    /// 不重复补——避免多送的空行让 Bridge 记 `watch_client_log_bad_line`。
+    static func normalizeInlinePayload(_ data: Data) -> Data {
+        guard let last = data.last, last != 0x0A else { return data }
+        var normalized = data
+        normalized.append(0x0A)
+        return normalized
+    }
 }
 
 /// iPhone → Bridge POST /v1/client-logs 请求体。jsonl 原样透传 Watch 的字节，
