@@ -21,10 +21,16 @@ ESS-30 入库说明：本模块由 ESS-23（鉴权/幂等骨架）→ ESS-25（�
 → ESS-26（完整 Bridge）逐步合并而来，`projection/` 为 ESS-27 QwenTaskProjection。
 ESS-30 追加：F2 turn 超时 watchdog（supervisor 强制重建 WS）、D1 写动作总开关
 `write_actions_enabled`（默认 false：上游权限请求一律自动 reject，含针对上游
-authorization 挂错 task 缺陷的清扫器 `deny_sweep_interval_ms`）。ESS-34 收窄：
-清扫器只 reject 能归属到本 Bridge 在途 turn 的 authorization（task_id 或
-delegation session 命中），无关任务/会话的 pending 权限保持不动；归属不了的
-自身写请求由 turn 硬超时 fail closed。
+authorization 挂错 task 缺陷的清扫器 `deny_sweep_interval_ms`）。ESS-34 归属化：
+**主路径是会话内 in-band 拒绝**——网关只把 `task.sessionId` 等于本连接会话的
+权限事件下发到本 Realtime WS（网关源码契约），事件到达即归属证明，与宿主
+task 挂对挂错无关（真机实测错挂宿主可为 `GET /api/tasks` 之外的幽灵任务）。
+list 清扫器降为二道防线，只 reject **可证明归属**的 authorization——task_id 或
+delegation/backendRef session 命中在途 turn；宿主 task 的状态不是归属证据（终态
+孤儿规则已按四眼复审删除：它会连带拒掉无关会话遗留在终态任务上的 pending
+授权）。无关任务/会话的 pending 权限一律保持不动，归属不了的自身写请求由 turn
+硬超时 fail closed。拒写 turn 以 completed + 可读文案（「只读模式：写操作已被
+拒绝」）收尾，不露裸错误码。
 
 Mac mini 上的 tailnet 窄入口：鉴权、幂等、生命周期、北向 API 的完整实现。
 依据《技术架构设计 v2.1》§4.1 / §6 / §7 / §10 P1，在 ESS-23（鉴权/幂等骨架）与

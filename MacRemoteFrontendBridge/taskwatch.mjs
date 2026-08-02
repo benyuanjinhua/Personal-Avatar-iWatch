@@ -13,6 +13,11 @@
 
 const TERMINAL_TASK = new Set(['completed', 'failed', 'cancelled'])
 
+// D1 拒写后的用户可读收尾文案（ESS-34）：Watch 只对 completed 渲染
+// result.text，failed/cancelled 只会露裸错误码，所以拒写 turn 以
+// completed + 本文案收尾。
+export const READ_ONLY_DENY_TEXT = '只读模式：写操作已被拒绝，未做任何修改。'
+
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
 // Gateway v0.9.x does not consistently populate `delegation`, but the Codex
@@ -91,13 +96,20 @@ export class TaskWatcher {
 
   // D1 权限清扫（ESS-30，收窄于 ESS-34）：上游会把 authorization 挂到错误的
   // task 上（ESS-24/27 已实测的缺陷），仅盯自身 task 会漏掉写权限请求，写任务
-  // 只能烧满 300s 硬超时。写开关关闭时周期清扫 pending authorization，但只
-  // reject 能可靠归属到本 Bridge 在途 turn 的那些：task.id 命中在途 turn 的
-  // task_id，或 task 的 delegation/backendRef session 命中在途 turn 的
-  // codex_session_id。
+  // 只能烧满 300s 硬超时。写开关关闭时周期清扫 pending authorization，只
+  // reject 满足以下任一归属证据的：
+  //   - task_id：task.id 命中在途 turn 的 task_id（正常挂载）；
+  //   - codex_session：task 的 delegation/backendRef session 命中在途 turn 的
+  //     codex_session_id（真网关 v0.9.x 运行期两者均为 null——ESS-34 两轮实测，
+  //     此通道留作上游修复后的兜底，不再是主路径）。
+  // 宿主 task 的**状态**不是归属证据：曾经短暂存在过一条「宿主终态即孤儿即
+  // reject」的规则（ESS-34 第三轮），已按四眼复审删除——它会把任何无关会话
+  // 遗留在终态 task 上的 pending authorization 一并拒掉，只要本 Bridge 恰好有
+  // 一个 turn 在途，直接违反本单「无关 task/session 保持 pending」的核心要求。
+  // 错挂到 list 之外幽灵宿主的自身写请求由 in-band 主路径（denyRealtimePermission）
+  // 快速拒绝，不需要、也不允许 list 清扫器靠状态推断补位。
   // 无法归属的 authorization 一律不动——Mac UI、其他 Agent/会话/人工任务的
-  // 权限请求不归本 Bridge 管（ESS-34：网关级全局拒写破坏任务隔离）。归属不了
-  // 的自身写请求由 turn 的 300s 硬超时 fail closed，不牵连无关任务。
+  // 权限请求不归本 Bridge 管；归属不了的自身写请求由 turn 硬超时 fail closed。
   startDenySweeper() {
     if (this.cfg.write_actions_enabled !== false || this.denySweeper) return
     const interval = this.cfg.deny_sweep_interval_ms || 5000
@@ -117,12 +129,47 @@ export class TaskWatcher {
         if (this.deniedAuths.has(authId)) continue
         this.deniedAuths.add(authId)
         this.log({ evt: 'write_permission_auto_denied', task_id: task.id, authorization_id: authId, via: 'sweeper', owned_via: ownedVia })
+        this.markActiveTurnsWriteDenied()
         this.gateway.respondPermission(authId, 'reject').catch(error => {
           this.log({ evt: 'auto_deny_failed', authorization_id: authId, err: String(error.message) })
         })
       }
     }, interval)
     this.denySweeper.unref?.()
+  }
+
+  // D1 主路径（ESS-34 第三轮）：经本 Bridge 自己的 Realtime WS 到达的
+  // task.permission.requested。网关按 task.sessionId === 本会话 过滤后才下发
+  // （网关源码契约），事件到达本身就是会话级归属证明——不依赖宿主 task 挂载
+  // 正确，也不依赖 GET /api/tasks 能列出宿主（真机实测错挂宿主可为 list 之外
+  // 的幽灵任务）。写开关关闭即定向 reject；写开关打开走既有 permission_required
+  // 投影，不经此路径。
+  denyRealtimePermission(task) {
+    if (this.cfg.write_actions_enabled !== false) return
+    const auth = task?.authorization
+    if (!auth?.id || (auth.status && auth.status !== 'pending')) return
+    const authId = String(auth.id)
+    this.deniedAuths ??= new Set()
+    if (this.deniedAuths.has(authId)) return
+    this.deniedAuths.add(authId)
+    this.log({ evt: 'write_permission_auto_denied', task_id: task?.id ?? null, authorization_id: authId, via: 'realtime_session', owned_via: 'realtime_session' })
+    this.markActiveTurnsWriteDenied()
+    this.gateway.respondPermission(authId, 'reject').catch(error => {
+      this.log({ evt: 'auto_deny_failed', authorization_id: authId, err: String(error.message) })
+    })
+  }
+
+  // 代答了一份归属本 Bridge 的写授权后（realtime_session / 清扫器任一路径），
+  // 把在途后台 turn 标记为拒写嫌疑：上游随后若以 cancelled 收尾（Codex 收到
+  // reject 的常见路径之一），投影层凭该标记把裸 cancelled 升级为用户可读的
+  // 拒写收尾（READ_ONLY_DENY_TEXT）。错挂 authorization 无法映射到具体 turn，
+  // 只能标记全部在途 turn；标记只影响收尾文案、不改变任何任务的执行与状态。
+  markActiveTurnsWriteDenied() {
+    for (const requestId of this.active.keys()) {
+      const turn = this.ledger.get(requestId)
+      if (!turn || TERMINAL_TASK.has(turn.state)) continue
+      this.ledger.update(requestId, { detail: 'write_denied_read_only', permission: null }, { persist: true })
+    }
   }
 
   // 本 Bridge 在途 turn 的归属标识：task_id（正常挂载）与 codex_session_id
@@ -140,6 +187,7 @@ export class TaskWatcher {
   }
 
   // 返回归属证据（'task_id' | 'codex_session'），归属不了返回 null。
+  // 只接受可证明的归属标识；task.status 一概不参与判定（见 startDenySweeper）。
   ownershipOf(task, { taskIds, sessionIds }) {
     if (taskIds.has(String(task.id))) return 'task_id'
     const session = taskSessionId(task)
@@ -292,7 +340,13 @@ export class TaskWatcher {
         const { text } = extractPresentation(task, this.cfg.max_result_chars)
         this.ledger.setResult(requestId, { text, extra: { source: 'task_presentation' } }, 'completed')
       } else if (task.status === 'cancelled') {
-        this.ledger.update(requestId, { ...patch, state: 'cancelled', permission: null })
+        // 拒写后的 cancelled 不是用户取消：以可读文案 completed 收尾（Watch 只
+        // 对 completed 渲染 result.text，裸 cancelled/failed 只露状态与错误码）。
+        if (this.ledger.get(requestId)?.detail === 'write_denied_read_only') {
+          this.ledger.setResult(requestId, { text: READ_ONLY_DENY_TEXT, extra: { source: 'write_denied_read_only' } }, 'completed')
+        } else {
+          this.ledger.update(requestId, { ...patch, state: 'cancelled', permission: null })
+        }
       } else {
         this.ledger.fail(requestId, 'ERR_TASK_FAILED', task.statusReason || null)
       }

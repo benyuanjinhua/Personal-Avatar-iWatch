@@ -105,6 +105,7 @@ export class QwenRealtimeSessionSupervisor {
     this.announcements = new Map() // responseId → 聚合中的 announcement 捕获（ESS-38）
     this.playbackStarted = new Set()       // 已回执 playback.started 的 responseId
     this.onAnnouncement = null    // (capture) => void — 后台播报聚合完成的交付回调
+    this.onPermissionRequested = null // (task) => void — 本会话权限请求（D1/ESS-34）
   }
 
   record(entry) {
@@ -369,6 +370,14 @@ export class QwenRealtimeSessionSupervisor {
   // ---- 服务端事件 ---------------------------------------------------------
 
   handleServerEvent(event) {
+    // D1 主路径（ESS-34 第三轮）：网关只把 sessionId 等于本连接会话的任务的
+    // 权限事件下发到本 WS（realtime-gateway 源码 `task.sessionId !== sessionId
+    // → return`）——事件到达本连接即为会话级归属证明，与宿主 task 挂对挂错
+    // 无关（错挂宿主可能根本不在 GET /api/tasks 里，list 清扫永远看不到）。
+    // 完整 authorization 就在事件的 task 上，交给 Bridge 侧回调裁决。
+    if (event.type === 'task.permission.requested') {
+      this.onPermissionRequested?.(event.task ?? null)
+    }
     // origin=announcement 的响应登记在册并开始聚合（ESS-38）：其音频回执、
     // 不进 turn 结果，但要按 responseId 聚合后绑定回后台任务的 request_id。
     // 注意 origin 有三种：model（Realtime 直答）、agent（后端 Agent 对本 turn

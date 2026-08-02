@@ -28,8 +28,26 @@ export class MockGateway extends EventEmitter {
     this.announceSeq = 0
   }
 
+  // 真网关 v0.9.x 载荷形态（ESS-34 三轮实测强制）：`delegation` 任何状态下都
+  // 不填充；`resultMetadata.backendRef` 是结果元数据，仅在 completed 终态快照
+  // 出现。mock 在入口归一化，测试用例无法构造真机上不存在的载荷（此前 mock
+  // 允许 running 带 backendRef，导致 mock 全绿、真机全挂）。
   setTask(task) {
-    this.tasks.set(task.id, task)
+    const normalized = { ...task, delegation: null }
+    if (normalized.status !== 'completed' && normalized.resultMetadata?.backendRef) {
+      const { backendRef, ...rest } = normalized.resultMetadata
+      normalized.resultMetadata = Object.keys(rest).length ? rest : null
+    }
+    this.tasks.set(normalized.id, normalized)
+  }
+
+  // ESS-34：向 Realtime 连接推送一条会话内任务事件（真网关按 task.sessionId
+  // 过滤后才下发——能到达连接的权限事件都属于该连接的会话；mock 直接推给
+  // 语音客户端复刻「已过滤」的语义）。task 同步入库，权限响应路由可命中。
+  pushTaskEvent(type, task) {
+    this.setTask(task)
+    const normalized = this.tasks.get(task.id)
+    for (const c of this.voiceClients) c.send({ type, task: normalized })
   }
 
   // ESS-38：向当前语音持有者（Bridge 的 Realtime 连接）推送一条后台任务播报
@@ -57,8 +75,9 @@ export class MockGateway extends EventEmitter {
   // Push an SSE event to subscribers and keep the store in sync.
   emitTask(type, task) {
     this.setTask(task)
+    const normalized = this.tasks.get(task.id) // SSE 载荷与存储同源（已归一化）
     for (const res of this.sseClients.get(task.id) || []) {
-      res.write(`data: ${JSON.stringify({ type, task })}\n\n`)
+      res.write(`data: ${JSON.stringify({ type, task: normalized })}\n\n`)
     }
   }
 
