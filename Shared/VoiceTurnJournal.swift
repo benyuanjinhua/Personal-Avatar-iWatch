@@ -117,6 +117,11 @@ final class VoiceTurnJournal: ObservableObject {
         if envelope.state == .completed, let result = envelope.result, result.speechSha256 == nil {
             onResultWithoutSpeech?(envelope.requestId)
         }
+        // 结果已入账（含摘要文本，ESS-55 通知链路）：与 onStateApplied 的区别是
+        // 此刻 result 已经挂上——通知正文需要结果摘要，不能在状态回调里取。
+        if envelope.state == .completed, envelope.result != nil {
+            onResultRecorded?(envelope.requestId)
+        }
         return true
     }
 
@@ -141,6 +146,10 @@ final class VoiceTurnJournal: ObservableObject {
     /// onChange——结果/失败到达时 App 可能熄屏或视图未挂载，只有事件层触发
     /// 才能保证「熄屏状态下结果到达能靠触觉感知」。
     var onStateApplied: ((String, VoiceTurnState) -> Void)?
+
+    /// completed 且结果载荷已挂上后的回调（ESS-55 通知链路）。重复/乱序的
+    /// completed 信封被状态机拒绝时不会触发（幂等第一层；通知记账是第二层）。
+    var onResultRecorded: ((String) -> Void)?
 
     /// ESS-55 未读机制：最近一个未读结果（新的在前）。
     var firstUnreadResult: VoiceTurnRecord? {

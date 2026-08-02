@@ -9,6 +9,7 @@ struct WatchContentView: View {
     @ObservedObject private var transport: WatchVoiceTransport
     @ObservedObject private var journal: VoiceTurnJournal
     @ObservedObject private var player: SpeechPlayer
+    @ObservedObject private var notifier: ResultNotifier
 
     init(pushToTalk: PushToTalkController, welcome: WelcomeGreeter) {
         self.pushToTalk = pushToTalk
@@ -16,6 +17,7 @@ struct WatchContentView: View {
         self.transport = pushToTalk.transport
         self.journal = pushToTalk.journal
         self.player = pushToTalk.player
+        self.notifier = pushToTalk.notifier
     }
 
     var body: some View {
@@ -59,6 +61,12 @@ struct WatchContentView: View {
                         Text("待送达 \(transport.pendingCount) 条")
                             .font(.caption2)
                             .foregroundStyle(.orange)
+                    }
+
+                    // ESS-55 JIT 通知授权：只在首次长任务场景出现，冷启动不弹；
+                    // 「暂不」永久收起，降级为触觉 + 未读，不再骚扰。
+                    if notifier.shouldPromptAuthorization {
+                        notificationPromptCard
                     }
 
                     if let turn = activeTurn {
@@ -111,6 +119,39 @@ struct WatchContentView: View {
                     .font(.caption2)
                     .foregroundStyle(.cyan)
             }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(8)
+        .background(Color.cyan.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    // MARK: - 通知授权引导（ESS-55）
+
+    private var notificationPromptCard: some View {
+        VStack(spacing: 4) {
+            Text("这个任务可能要几分钟")
+                .font(.caption2.bold())
+            Text("开启通知，结果好了第一时间震动提醒你")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+
+            HStack(spacing: 6) {
+                Button("开启提醒") {
+                    notifier.requestAuthorization(
+                        activeLongTaskRequestId: journal.activeTurn?.requestId
+                    )
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.cyan)
+
+                Button("暂不") {
+                    notifier.declinePrompt()
+                }
+                .buttonStyle(.bordered)
+                .tint(.secondary)
+            }
+            .font(.caption2)
         }
         .frame(maxWidth: .infinity)
         .padding(8)
