@@ -97,7 +97,7 @@ final class PushToTalkController: ObservableObject {
         journal.onStateApplied = { [weak self] requestId, state in
             guard let self else { return }
             if let cue = self.cuePolicy.cue(for: state, requestId: requestId), cue != .resultArrived {
-                WatchHaptics.play(cue)
+                WatchHaptics.play(cue, requestId: requestId)
             }
             switch state {
             case .backgroundAccepted:
@@ -119,13 +119,21 @@ final class PushToTalkController: ObservableObject {
             guard let self, let turn = self.journal.turn(withId: requestId) else { return }
             let notified = self.notifier.notifyResultIfEligible(turn: turn, completedAt: Date())
             if !notified {
-                WatchHaptics.play(.resultArrived)
+                WatchHaptics.play(.resultArrived, requestId: requestId)
             }
         }
 
         // 点通知直达该条结果全文（不播额外触觉——通知本身已震过）。
         notifier.onOpenResult = { [weak self] requestId in
             self?.presentResult(requestId: requestId)
+        }
+
+        // ESS-154 T2 播放终局告知：播放失败（激活穷尽 / 中断截断 / 挂起
+        // 超时 / 解码错误）走 PlaybackEndgamePolicy 决策——播触觉、发横幅
+        // （横幅无视 T1 的 short_task/app_active，见 ResultNotifier 里的说明）。
+        // 成功终局（.success）不追加任何动作，T1 已在结果入账时判过。
+        player.onPlaybackEndgame = { [weak self] requestId, endgame in
+            self?.handlePlaybackEndgame(requestId: requestId, endgame: endgame)
         }
 
         sessionKeeper.bind(
@@ -156,6 +164,41 @@ final class PushToTalkController: ObservableObject {
 
     /// 录音期间到达的结果语音先挂起，录音结束后补播（不静默丢弃）。
     private var pendingAutoPlayRequestIds: [String] = []
+    /// ESS-154 T2：同一 request_id 的同种失败终局只播一次触觉（防止
+    /// 重复 finishPlayback 回调把用户震到关通知；横幅幂等在 ResultNotificationPolicy
+    /// 侧按 request_id 一辈子记账，比这里更严——两层配合，不重复）。
+    private var playbackEndgameHapticsSent: [String: Set<PlaybackEndgame>] = [:]
+
+    /// ESS-154 T2 收口：把 SpeechPlayer 的播放终局映射为触觉 + 横幅动作。
+    /// - 用 request_id 定位摘要文案，欢迎语等无 request_id 的终局只留取证。
+    /// - 触觉走 PlaybackEndgamePolicy.outcome（.turnFailed）；同回合同终局
+    ///   去重（本地 Set），跨终局仍会震（比如 halted 后用户重播又 exhausted）。
+    /// - 横幅委托 ResultNotifier.notifyPlaybackFailureIfEligible，那里管
+    ///   授权/幂等/T1 覆写。这里只出「要不要发」的意图。
+    private func handlePlaybackEndgame(requestId: String?, endgame: PlaybackEndgame) {
+        guard let outcome = PlaybackEndgamePolicy.outcome(for: endgame) else { return }
+        WatchLog.info(
+            "player", "playback_endgame", requestId: requestId,
+            detail: "endgame=\(endgame.logToken) reason=\(outcome.reasonLabel)"
+        )
+        if let cue = outcome.haptic, shouldPlayHaptic(requestId: requestId, endgame: endgame) {
+            WatchHaptics.play(cue, requestId: requestId)
+        }
+        guard outcome.shouldNotifyBanner, let requestId else { return }
+        let summary = journal.turn(withId: requestId)?.result?.displaySummary ?? ""
+        notifier.notifyPlaybackFailureIfEligible(
+            requestId: requestId, resultSummary: summary, reasonLabel: outcome.reasonLabel
+        )
+    }
+
+    private func shouldPlayHaptic(requestId: String?, endgame: PlaybackEndgame) -> Bool {
+        guard let requestId else { return true }
+        var sent = playbackEndgameHapticsSent[requestId] ?? []
+        guard !sent.contains(endgame) else { return false }
+        sent.insert(endgame)
+        playbackEndgameHapticsSent[requestId] = sent
+        return true
+    }
 
     private func enqueueAutoPlay(_ requestId: String, reason: String) {
         guard !pendingAutoPlayRequestIds.contains(requestId) else { return }
@@ -308,7 +351,7 @@ final class PushToTalkController: ObservableObject {
     func presentUnreadIfAny() -> Bool {
         guard state == .idle, subtitleSession == nil else { return false }
         guard let turn = journal.firstUnreadResult else { return false }
-        WatchHaptics.play(.resultArrived)
+        WatchHaptics.play(.resultArrived, requestId: turn.requestId)
         presentResult(requestId: turn.requestId)
         return true
     }

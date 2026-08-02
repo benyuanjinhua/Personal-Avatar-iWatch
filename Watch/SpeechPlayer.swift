@@ -34,6 +34,14 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     /// 当前播放的取证关联 id（request_id / welcome attempt id）。
     private var context: String?
     private var interruptionObserver: NSObjectProtocol?
+    /// ESS-154 T2：播放终局告知回调。SpeechPlayer 内部只负责在每次
+    /// finishPlayback（含 30s 挂起超时兜底）时按具体终局回调；决策与
+    /// 是否发触觉/横幅在 PlaybackEndgamePolicy + PushToTalkController。
+    /// 欢迎语与自检不设此回调 → 零开销、行为完全不变。
+    var onPlaybackEndgame: ((_ requestId: String?, _ endgame: PlaybackEndgame) -> Void)?
+    /// ESS-154 T2-4：起播挂起兜底（30s 无 play_started 即认作失败终局）。
+    /// 一旦 beginPlayback 成功起播（或任何终局路径先到）即取消。
+    private var deferredWatchdog: Task<Void, Never>?
     /// ESS-73：仅作取证留痕，不再闸门任何播放路径——.ended 不保证投递，
     /// 以它为唯一清除路径曾把播放通道永久锁死。清除时机：.ended 到达、
     /// 回前台恢复、任一次激活成功（硬件已归还的实证）。
@@ -100,6 +108,9 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             )
             self.context = nil
             onFinish?(false)
+            // player_init_failed 属于 T2「起播前失败」，同 exhausted 语义（用户
+            // 什么也听不到、音频未被消费）；走 T2 追加告知。
+            onPlaybackEndgame?(context, .exhausted)
             return false
         }
         player.delegate = self
@@ -109,8 +120,40 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         isPlaying = true
         playbackGeneration += 1
         let generation = playbackGeneration
+        armDeferredWatchdog(context: context, generation: generation)
         requestActivationAndPlayback(player, bytes: data.count, generation: generation)
         return true
+    }
+
+    /// ESS-154 T2-4：起播挂起兜底。play() 请求发出后 30s 内若激活/播放器都
+    /// 没到任何终局（例如 session.activate 回调丢失），落一条 `playback_deferred_timeout`
+    /// 取证并按 `.deferredTimeout` 收尾。`play_started` / 任何 finishPlayback 先到即取消。
+    private func armDeferredWatchdog(context: String?, generation: Int) {
+        deferredWatchdog?.cancel()
+        let requestId = context
+        deferredWatchdog = Task { [weak self] in
+            let seconds = PlaybackEndgamePolicy.deferredTimeoutSeconds
+            let nanos = UInt64(seconds * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanos)
+            if Task.isCancelled { return }
+            await MainActor.run {
+                guard let self, self.playbackGeneration == generation, self.isPlaying else { return }
+                WatchLog.error(
+                    "player", "playback_deferred_timeout", requestId: requestId,
+                    detail: "threshold_s=\(Int(seconds)) bytes=\(self.currentAudioBytes) "
+                        + self.activationEvidence(),
+                    code: "ERR_PLAYBACK_DEFERRED_TIMEOUT"
+                )
+                self.playbackGeneration += 1
+                self.audioPlayer?.stop()
+                self.finishPlayback(endgame: .deferredTimeout)
+            }
+        }
+    }
+
+    private func cancelDeferredWatchdog() {
+        deferredWatchdog?.cancel()
+        deferredWatchdog = nil
     }
 
     private func requestActivationAndPlayback(_ player: AVAudioPlayer, bytes: Int, generation: Int) {
@@ -138,7 +181,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                         + self.activationEvidence(),
                     code: "ERR_PLAYBACK_ACTIVATION"
                 )
-                self.finishPlayback(successfully: false)
+                self.finishPlayback(endgame: .exhausted)
             }
         }
     }
@@ -157,7 +200,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             )
         )
         audioPlayer.stop()
-        finishPlayback(successfully: false)
+        finishPlayback(endgame: .halted)
     }
 
     /// ESS-58 方案 A：优先 .longFormAudio + 异步 activate()（watchOS 后台
@@ -271,6 +314,9 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private func beginPlayback(_ player: AVAudioPlayer, bytes: Int) {
         let started = player.play()
         if started {
+            // 起播成功 → 撤挂起兜底（30s 挂起超时只覆盖激活阶段，正常播放
+            // 允许 > 30s 长音频，否则会误报）。
+            cancelDeferredWatchdog()
             WatchLog.info(
                 "player", "play_started", requestId: context,
                 detail: String(format: "bytes=%d duration=%.2fs", bytes, player.duration)
@@ -281,7 +327,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 detail: "bytes=\(bytes) duration=\(player.duration)",
                 code: "ERR_PLAY_RETURNED_FALSE"
             )
-            finishPlayback(successfully: false)
+            finishPlayback(endgame: .playRejected)
         }
     }
 
@@ -314,7 +360,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 "player", "play_resume_failed", requestId: context,
                 detail: position, code: "ERR_PLAY_RESUME"
             )
-            finishPlayback(successfully: false)
+            finishPlayback(endgame: .resumeFailed)
         }
     }
 
@@ -337,6 +383,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 )
             )
         }
+        cancelDeferredWatchdog()
         playbackGeneration += 1
         audioPlayer?.stop()
         audioPlayer = nil
@@ -346,33 +393,48 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         context = nil
     }
 
-    private func finishPlayback(successfully: Bool) {
+    private func finishPlayback(endgame: PlaybackEndgame) {
+        cancelDeferredWatchdog()
+        let requestId = context
         audioPlayer = nil
         currentAudioBytes = 0
         isPlaying = false
         context = nil
         let callback = onFinish
         onFinish = nil
-        callback?(successfully)
+        // 现有 Bool 契约不变（.retainForReplay / .deliverInterim / .deliverFinal
+        // 决策仍走 PlaybackRecoveryPolicy.finishOutcome）；T2 决策通过独立
+        // 回调追加，二者互不干扰、welcome/自检不设 T2 回调即零开销。
+        callback?(endgame == .success)
+        onPlaybackEndgame?(requestId, endgame)
     }
 
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         Task { @MainActor in
             WatchLog.info("player", "play_finished", requestId: self.context, detail: "successfully=\(flag)")
-            self.finishPlayback(successfully: flag)
+            // AVAudioPlayer flag=false 出在 stop() 被外部调用或系统占用未走
+            // interruption 通道的边缘场景——用户角度都是「本段没听全」，同
+            // .halted 语义交给 T2；不搞新终局枚举增加认知负担。
+            self.finishPlayback(endgame: flag ? .success : .halted)
         }
     }
 
     nonisolated func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
         Task { @MainActor in
+            let requestId = self.context
             WatchLog.error(
-                "player", "decode_error", requestId: self.context,
+                "player", "decode_error", requestId: requestId,
                 code: "ERR_AUDIO_DECODE", error: error
             )
+            // 保持既有契约：decode 分支不发 onFinish（历史行为，
+            // SelfCheck 依赖不吊死上层，见 SelfCheck.swift:34）。仅补 T2 告知回调，
+            // 让用户能感知「语音没能播出」——原状态下解码失败零反馈。
+            self.cancelDeferredWatchdog()
             self.isPlaying = false
             self.audioPlayer = nil
             self.onFinish = nil
             self.context = nil
+            self.onPlaybackEndgame?(requestId, .exhausted)
         }
     }
 
