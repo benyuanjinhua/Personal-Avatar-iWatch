@@ -4,7 +4,8 @@ import Foundation
 import WatchKit
 
 /// 装机音频自检（ESS-65 / G9）：新 build 首启自动跑一遍「录音 → 播放 →
-/// 播放后立刻录音 → 会话状态复位」四步，结论经 WatchLog → Bridge 回传，
+/// 播放后立刻录音 → 录音后立刻播放 → 会话状态复位 → 中断残留 → 双激活
+/// 失败」（S1/S2/S3/S3R/S4/S5/S6），结论经 WatchLog → Bridge 回传，
 /// Bridge 侧 `Scripts/watch-smoke-gate.mjs` 一条命令判定 PASS/FAIL，
 /// 不 PASS 不进入人工验收。
 ///
@@ -120,17 +121,22 @@ final class SelfCheckRunner: ObservableObject {
             beginStep(.playback)
             return failStep(.playback, startedAt: Date(), fallbackCode: "ERR_SELFCHECK_ASSET_MISSING")
         }
-        if let failure = await playbackStep(data: assetData) { return failure }
+        if let failure = await playbackStep(.playback, data: assetData) { return failure }
 
-        // S3 播放→录音交替（ESS-61 缺陷 A，今天这个 -50）：播放刚结束立刻再录，
+        // S3 播放→录音交替（ESS-61 缺陷 A，-50）：播放刚结束立刻再录，
         // 且全程 session_activation_failed 出现 0 次。
         if let failure = await recordStep(.playThenRecord) { return failure }
+
+        // S3R 录音→播放交替（ESS-72 的 S3'，真机事故 09:12:15→09:12:17 的
+        // 复现链）：S3 的录音刚结束立刻播放——录音会话未交还时两级激活
+        // 全 !res(561145203)、play_started 为 0，本步在装机时就拦下。
+        if let failure = await playbackStep(.recordThenPlay, data: assetData) { return failure }
 
         // S4 会话状态复位（ESS-61 根因）：.longFormAudio 路由策略不得残留。
         if let failure = sessionResetStep() { return failure }
 
-        // S5 中断中激活（ESS-64 验收 1、2）：受控 interruption 下不得激活/
-        // 起播；ended 后必须自动激活并起播。
+        // S5 中断残留（ESS-73）：合成 .began 后不投 .ended，新播放不得被
+        // 挂起等待，必须直接激活并出声。
         if let failure = await interruptionGateStep(data: assetData) { return failure }
 
         // S6 双激活失败（ESS-64 验收 3）：两级激活都失败时不得 play()，
@@ -179,8 +185,11 @@ final class SelfCheckRunner: ObservableObject {
         return nil
     }
 
-    private func playbackStep(data: Data) async -> SelfCheckPolicy.Outcome? {
-        let step = SelfCheckPolicy.Step.playback
+    /// S2/S3R 共用的播放步骤：播内置资产，会话必须真正激活、play() 不得
+    /// 返回 false、两级激活不得耗尽（S3R 专拦 ESS-72 的 !res）。
+    private func playbackStep(
+        _ step: SelfCheckPolicy.Step, data: Data
+    ) async -> SelfCheckPolicy.Outcome? {
         beginStep(step)
         let startedAt = Date()
         let waited = await awaitPlayback(data: data)
@@ -199,7 +208,8 @@ final class SelfCheckRunner: ObservableObject {
         // play() 返回 false 都会由真实链路落对应事件，这里断言它们零出现。
         guard
             signals.count(of: "session_activation_failed") == 0,
-            signals.count(of: "play_returned_false") == 0
+            signals.count(of: "play_returned_false") == 0,
+            signals.count(of: "playback_activation_exhausted") == 0
         else {
             return failStep(step, startedAt: startedAt, fallbackCode: "ERR_SESSION_ACTIVATION")
         }
@@ -224,63 +234,45 @@ final class SelfCheckRunner: ObservableObject {
         return nil
     }
 
-    // MARK: - S5/S6：ESS-64 受控矩阵（对 main 上真实中断状态机的可执行断言）
+    // MARK: - S5/S6：中断残留与双激活失败（ESS-73 / ESS-64）
 
-    /// S5 中断中激活：合成 AVAudioSession.interruptionNotification 驱动
-    /// SpeechPlayer 的真实中断状态机（不是旁路模拟）——began 后请求播放必须
-    /// 走 playback_deferred（零激活尝试、零起播），ended 后必须自动激活并起播。
+    /// S5 中断残留（ESS-73）：合成 .began 且**不投 .ended**，复现真机上
+    /// 「.ended 丢失」的残留状态（全量取证 6 条 began 0 条 ended）。此时发起
+    /// 新播放必须直接激活并起播——不得出现 playback_deferred，残留标志应在
+    /// 激活成功时就地清除（interruption_flag_cleared）。这是对旧 ESS-64
+    /// 「等待 .ended」闸门被撤除后新契约的可执行断言。
     private func interruptionGateStep(data: Data) async -> SelfCheckPolicy.Outcome? {
         let step = SelfCheckPolicy.Step.interruptionGate
         beginStep(step)
         let startedAt = Date()
         // 合成通知会置位进程内所有 SpeechPlayer 实例的中断标记：无论本步
-        // 如何退出（含被用户打断），都必须补一个 ended，否则欢迎语/结果
-        // 播放会被永远挂在「等待中断结束」上。
+        // 如何退出（含被用户打断），都补一个 ended 清理残留留痕。
         defer { Self.postSyntheticInterruption(.ended) }
 
         Self.postSyntheticInterruption(.began)
-        // 通知处理经 Task 跳一拍主线程，给状态机落位留一个节拍。
+        // 通知处理经 Task 跳一拍主线程，给标志落位留一个节拍。
         try? await Task.sleep(nanoseconds: 150_000_000)
         if interrupted { return .inconclusive(.interrupted) }
 
         let requestTs = Self.epochMs()
         player.play(data: data, context: "selfcheck-s5")
-        try? await Task.sleep(nanoseconds: 250_000_000)
-        if interrupted { player.stop(reason: "selfcheck_interrupted"); return .inconclusive(.interrupted) }
-
-        let deferredSeen = signals.count(of: "playback_deferred") > 0
-        let activationAttempts = signals.count(of: "session_activation_requested")
-        let startedEarly = signals.count(of: "play_started")
-        WatchLog.info(
-            "selfcheck", "selfcheck_observation",
-            detail: SelfCheckPolicy.observationDetail(
-                step: step, phase: "deferred", scenePhase: Self.scenePhase(),
-                interruptionState: .began, requestTs: requestTs, callbackTs: nil,
-                longFormResult: .skippedInterrupted, fallbackResult: .skippedInterrupted
-            )
-        )
-        guard deferredSeen, activationAttempts == 0, startedEarly == 0 else {
-            player.stop(reason: "selfcheck_s5_abort")
-            return failStep(step, startedAt: startedAt, fallbackCode: "ERR_INTERRUPTION_GATE_LEAK")
-        }
-
-        signals.reset()
-        Self.postSyntheticInterruption(.ended)
-        let resumed = await waitFor(timeout: 6) { [signals] in signals.count(of: "play_started") > 0 }
+        let started = await waitFor(timeout: 6) { [signals] in signals.count(of: "play_started") > 0 }
         let callbackTs = signals.firstTimestamp(of: "play_started").map { Int64($0.timeIntervalSince1970 * 1000) }
+        let deferredSeen = signals.count(of: "playback_deferred")
+        let flagCleared = signals.count(of: "interruption_flag_cleared")
         WatchLog.info(
             "selfcheck", "selfcheck_observation",
             detail: SelfCheckPolicy.observationDetail(
-                step: step, phase: "resumed", scenePhase: Self.scenePhase(),
-                interruptionState: .ended, requestTs: requestTs, callbackTs: callbackTs,
+                step: step, phase: "stale_flag_play", scenePhase: Self.scenePhase(),
+                interruptionState: .began, requestTs: requestTs, callbackTs: callbackTs,
                 longFormResult: activationResult(policy: "long_form"),
                 fallbackResult: activationResult(policy: "foreground")
             )
         )
         player.stop(reason: "selfcheck_s5_complete")
         if interrupted { return .inconclusive(.interrupted) }
-        guard resumed else {
-            return failStep(step, startedAt: startedAt, fallbackCode: "ERR_INTERRUPTION_RESUME_MISSING")
+        guard started, deferredSeen == 0, flagCleared > 0 else {
+            return failStep(step, startedAt: startedAt, fallbackCode: "ERR_STALE_INTERRUPTION_BLOCKS")
         }
         passStep(step, startedAt: startedAt)
         return nil

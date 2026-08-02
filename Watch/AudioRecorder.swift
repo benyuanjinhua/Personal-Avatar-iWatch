@@ -108,6 +108,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         recorder?.stop()
         stopMetering()
         isRecording = false
+        releaseSession(reason: "finish")
 
         guard let url = currentURL, let data = try? Data(contentsOf: url), !data.isEmpty else {
             WatchLog.error(
@@ -130,6 +131,26 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         recorder = nil
         isRecording = false
         stopMetering()
+        releaseSession(reason: "cancel")
+    }
+
+    /// ESS-72：录音结束必须把共享会话交还出去。录音把会话激活成
+    /// .playAndRecord 后一直占着资源，紧随其后的播放两级激活全部
+    /// !res（AVAudioSession resourceNotAvailable, 561145203）——ESS-61 修了
+    /// 「播放 → 录音」方向，这里补上「录音 → 播放」方向。失败不抛错
+    /// （播放侧激活自会重试并留痕），但必须留 session_released 事件：
+    /// 全量取证里 recorder 模块此前没有任何交还观测点，修没修都无法验证。
+    private func releaseSession(reason: String) {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setActive(false, options: .notifyOthersOnDeactivation)
+            WatchLog.info("recorder", "session_released", detail: "reason=\(reason) result=true")
+        } catch {
+            WatchLog.error(
+                "recorder", "session_released",
+                detail: "reason=\(reason) result=false", error: error
+            )
+        }
     }
 
     private func startMetering() {
