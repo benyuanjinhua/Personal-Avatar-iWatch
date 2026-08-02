@@ -136,18 +136,23 @@ final class VoiceTurnJournal: ObservableObject {
     }
 
     /// 结果语音已加密落盘。
-    func attachSpeech(requestId: String, fileName: String) {
-        guard let index = turns.firstIndex(where: { $0.requestId == requestId }) else { return }
+    @discardableResult
+    func attachSpeech(requestId: String, fileName: String) -> Bool {
+        guard let index = turns.firstIndex(where: { $0.requestId == requestId }) else { return false }
         turns[index].speechFileName = fileName
         save()
         onSpeechAttached?(requestId)
+        return true
     }
 
     /// 结果语音已播放交付（文件删除由调用方负责）。
-    func clearSpeech(requestId: String) {
-        guard let index = turns.firstIndex(where: { $0.requestId == requestId }) else { return }
+    @discardableResult
+    func clearSpeech(requestId: String, matching fileName: String? = nil) -> Bool {
+        guard let index = turns.firstIndex(where: { $0.requestId == requestId }) else { return false }
+        if let fileName, turns[index].speechFileName != fileName { return false }
         turns[index].speechFileName = nil
         save()
+        return true
     }
 
     func clear() {

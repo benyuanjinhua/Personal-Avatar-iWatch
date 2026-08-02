@@ -103,6 +103,7 @@ final class WatchDownlinkOutbox {
     private let indexURL: URL
     private let backoff: RetryBackoff
     private let retention: TimeInterval
+    private let inFlightTimeout: TimeInterval
     private let now: () -> Date
     private let random: (ClosedRange<Double>) -> Double
     private let makeId: () -> String
@@ -120,6 +121,7 @@ final class WatchDownlinkOutbox {
         directory: URL,
         backoff: RetryBackoff = WatchDownlinkOutbox.downlinkBackoff,
         retention: TimeInterval = 24 * 3600,
+        inFlightTimeout: TimeInterval = 60,
         now: @escaping () -> Date = Date.init,
         random: @escaping (ClosedRange<Double>) -> Double = { Double.random(in: $0) },
         makeId: @escaping () -> String = { UUIDv7.generate().uuidString.lowercased() },
@@ -129,6 +131,7 @@ final class WatchDownlinkOutbox {
         self.indexURL = directory.appendingPathComponent("index.json")
         self.backoff = backoff
         self.retention = retention
+        self.inFlightTimeout = inFlightTimeout
         self.now = now
         self.random = random
         self.makeId = makeId
@@ -190,7 +193,7 @@ final class WatchDownlinkOutbox {
         audioFileName: String?
     ) throws -> EnqueueResult {
         // speech 的去重摘要取「信封 + 音频」，避免同一回合换音频却被当成重复。
-        var digestInput = payload
+        var digestInput = semanticPayload(payload, kind: kind)
         if let audio { digestInput.append(contentsOf: SHA256.hash(data: audio)) }
         let sha = RelayWire.sha256Hex(digestInput)
 
@@ -257,6 +260,7 @@ final class WatchDownlinkOutbox {
     /// 到期可投递的条目，按入队顺序返回（Watch 时间线依赖顺序）。
     func dueItems(at date: Date? = nil) -> [WatchDownlinkItem] {
         let reference = date ?? now()
+        recoverStaleInFlight(at: reference)
         return items.filter { $0.state == .queued && $0.nextAttemptAt <= reference }
     }
 
@@ -295,6 +299,9 @@ final class WatchDownlinkOutbox {
         mutate(id: id, operation: "mark-in-flight") { item in
             item.state = .inFlight
             item.attemptCount += 1
+            // Reuse nextAttemptAt as the in-flight receipt deadline. If
+            // WCSession never calls didFinish, dueItems recovers the entry.
+            item.nextAttemptAt = now().addingTimeInterval(inFlightTimeout)
             log(.attempted(
                 requestId: item.requestId, kind: item.kind, itemId: item.id, attempt: item.attemptCount
             ))
@@ -351,6 +358,27 @@ final class WatchDownlinkOutbox {
             changed = true
         }
         if changed { persistIndexReportingFailure(operation: "recover-in-flight") }
+    }
+
+    /// WCSession callbacks are not guaranteed when the process/session is torn
+    /// down. Recover in-process stalls as well as cold-start stalls.
+    private func recoverStaleInFlight(at date: Date) {
+        var changed = false
+        for index in items.indices
+        where items[index].state == .inFlight && items[index].nextAttemptAt <= date {
+            items[index].state = .queued
+            items[index].lastError = "receipt-timeout"
+            items[index].nextAttemptAt = date
+            log(.failed(
+                requestId: items[index].requestId,
+                kind: items[index].kind,
+                itemId: items[index].id,
+                attempt: items[index].attemptCount,
+                reason: "receipt-timeout"
+            ))
+            changed = true
+        }
+        if changed { persistIndexReportingFailure(operation: "recover-receipt-timeout") }
     }
 
     /// 清理：已送达条目超保留期移除；排队条目超保留期放弃并以 `expired` 留痕。
@@ -420,6 +448,24 @@ final class WatchDownlinkOutbox {
 
     private func payloadURL(for id: String) -> URL {
         directory.appendingPathComponent("\(id).payload")
+    }
+
+    /// Bridge snapshots regenerate occurred_at. It is transport metadata, not
+    /// delivery identity; excluding it makes replay idempotent across reconnects.
+    private func semanticPayload(_ payload: Data, kind: WatchDownlinkKind) -> Data {
+        guard kind == .voiceStatus || kind == .speech,
+              let envelope = try? VoiceStatusEnvelope.decode(from: payload),
+              let canonical = try? VoiceStatusEnvelope.status(
+                requestId: envelope.requestId,
+                state: envelope.state,
+                occurredAt: Date(timeIntervalSince1970: 0),
+                detail: envelope.detail,
+                failureStage: envelope.failureStage,
+                permission: envelope.permission,
+                result: envelope.result
+              ).jsonData()
+        else { return payload }
+        return canonical
     }
 
     private func persistIndex() throws {

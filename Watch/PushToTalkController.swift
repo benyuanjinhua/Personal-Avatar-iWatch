@@ -88,13 +88,26 @@ final class PushToTalkController: ObservableObject {
     }
 
     /// 录音期间到达的结果语音先挂起，录音结束后补播（不静默丢弃）。
-    private var pendingAutoPlayRequestId: String?
+    private var pendingAutoPlayRequestIds: [String] = []
+
+    private func enqueueAutoPlay(_ requestId: String, reason: String) {
+        guard !pendingAutoPlayRequestIds.contains(requestId) else { return }
+        pendingAutoPlayRequestIds.append(requestId)
+        WatchLog.info(
+            "player", "auto_play_queued", requestId: requestId,
+            detail: "reason=\(reason) depth=\(pendingAutoPlayRequestIds.count)"
+        )
+    }
 
     /// 结果语音落盘后的定向自动播放（ESS-41 B3）。
     private func autoPlayResult(requestId: String) {
         guard state == .idle else {
             Self.logger.info("auto-play deferred: recording in progress (request_id=\(requestId, privacy: .public))")
-            pendingAutoPlayRequestId = requestId
+            enqueueAutoPlay(requestId, reason: "recording")
+            return
+        }
+        guard !player.isPlaying else {
+            enqueueAutoPlay(requestId, reason: "player_busy")
             return
         }
         guard let turn = journal.turn(withId: requestId) else {
@@ -107,8 +120,9 @@ final class PushToTalkController: ObservableObject {
 
     /// 录音结束/取消后补播挂起的结果语音。
     private func flushPendingAutoPlay() {
-        guard let requestId = pendingAutoPlayRequestId else { return }
-        pendingAutoPlayRequestId = nil
+        guard state == .idle, !player.isPlaying,
+              !pendingAutoPlayRequestIds.isEmpty else { return }
+        let requestId = pendingAutoPlayRequestIds.removeFirst()
         autoPlayResult(requestId: requestId)
     }
 
@@ -116,7 +130,10 @@ final class PushToTalkController: ObservableObject {
         guard state == .idle else { return }
         errorMessage = nil
         releaseRequestedWhileStarting = false
-        player.stop()
+        if let interrupted = player.currentContext {
+            enqueueAutoPlay(interrupted, reason: "recording_interrupted")
+        }
+        player.stop(reason: "recording_started")
         state = .recording
         Task {
             do {
@@ -230,13 +247,14 @@ final class PushToTalkController: ObservableObject {
         }
         let started = player.play(data: data, context: requestId) { [weak self] in
             self?.speechVault?.remove(name: fileName)
-            self?.journal.clearSpeech(requestId: requestId)
+            let cleared = self?.journal.clearSpeech(requestId: requestId, matching: fileName) == true
             // ESS-45×ESS-46：只有终态回合的结果语音播完才算交付——interim
             // （回合仍在处理中）播完不算，否则 completed 后等待最终语音的
             // 120s grace 持有会被跳过，App 挂起、最终结果播不出来。
-            if self?.journal.turn(withId: requestId)?.currentState.isTerminal == true {
+            if cleared, self?.journal.turn(withId: requestId)?.currentState.isTerminal == true {
                 self?.sessionKeeper.markDelivered(requestId: requestId)
             }
+            self?.flushPendingAutoPlay()
         }
         // 字幕式播放（ESS-48）：播放开始即进入全文视图，按进度逐句高亮；
         // 播放起不来但有文字时降级为纯文本展示，不留空白。
