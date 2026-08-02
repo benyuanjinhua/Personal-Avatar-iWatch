@@ -1,5 +1,20 @@
 import Foundation
 
+enum AudioDownlinkKind: String, Codable, Equatable, CaseIterable {
+    case welcome
+    case interim
+    case result
+    /// 仅用于 fail-closed 解码和落拒绝日志，永不属于播放白名单。
+    case unknown
+}
+
+enum AudioDownlinkPolicy {
+    static func allows(_ kind: AudioDownlinkKind?, expected: Set<AudioDownlinkKind>) -> Bool {
+        guard let kind else { return false }
+        return expected.contains(kind)
+    }
+}
+
 /// iPhone → Watch 状态/权限/结果事件，以及 Watch → iPhone 权限决定/取消请求的版本化信封（ESS-29）。
 /// 与 VoiceRequestEnvelope 一样，两端只交换本文件结构的 JSON 编码，不传任意字典。
 enum VoiceProtocolJSON {
@@ -67,6 +82,7 @@ struct VoiceStatusEnvelope: Codable, Equatable {
     let failureStage: VoiceFailureStage?
     let permission: VoicePermissionPayload?
     let result: VoiceResultPayload?
+    let audioKind: AudioDownlinkKind?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
@@ -78,6 +94,25 @@ struct VoiceStatusEnvelope: Codable, Equatable {
         case failureStage = "failure_stage"
         case permission
         case result
+        case audioKind = "audio_kind"
+    }
+
+    init(
+        protocolVersion: String, requestId: String, type: String, state: VoiceTurnState,
+        occurredAt: Date, detail: String?, failureStage: VoiceFailureStage?,
+        permission: VoicePermissionPayload?, result: VoiceResultPayload?,
+        audioKind: AudioDownlinkKind? = nil
+    ) {
+        self.protocolVersion = protocolVersion
+        self.requestId = requestId
+        self.type = type
+        self.state = state
+        self.occurredAt = occurredAt
+        self.detail = detail
+        self.failureStage = failureStage
+        self.permission = permission
+        self.result = result
+        self.audioKind = audioKind
     }
 
     static func status(
@@ -87,7 +122,8 @@ struct VoiceStatusEnvelope: Codable, Equatable {
         detail: String? = nil,
         failureStage: VoiceFailureStage? = nil,
         permission: VoicePermissionPayload? = nil,
-        result: VoiceResultPayload? = nil
+        result: VoiceResultPayload? = nil,
+        audioKind: AudioDownlinkKind? = nil
     ) -> VoiceStatusEnvelope {
         VoiceStatusEnvelope(
             protocolVersion: currentProtocolVersion,
@@ -98,7 +134,8 @@ struct VoiceStatusEnvelope: Codable, Equatable {
             detail: detail,
             failureStage: failureStage,
             permission: permission,
-            result: result
+            result: result,
+            audioKind: audioKind
         )
     }
 

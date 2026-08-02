@@ -2,6 +2,15 @@ import XCTest
 @testable import WristAgentCore
 
 final class VoiceStatusEnvelopeTests: XCTestCase {
+    func testAudioDownlinkPolicyRejectsMissingAndUnknownWireKinds() throws {
+        XCTAssertFalse(AudioDownlinkPolicy.allows(nil, expected: [.interim, .result]))
+        XCTAssertFalse(AudioDownlinkPolicy.allows(.welcome, expected: [.interim, .result]))
+        XCTAssertTrue(AudioDownlinkPolicy.allows(.interim, expected: [.interim, .result]))
+        XCTAssertTrue(AudioDownlinkPolicy.allows(.result, expected: [.interim, .result]))
+        XCTAssertFalse(AudioDownlinkPolicy.allows(.unknown, expected: [.interim, .result]))
+        let unknown = Data("\"unknown\"".utf8)
+        XCTAssertEqual(try VoiceProtocolJSON.decoder.decode(AudioDownlinkKind.self, from: unknown), .unknown)
+    }
     private let requestId = UUIDv7.generate().uuidString.lowercased()
 
     func testStatusJSONUsesSnakeCaseContractKeys() throws {
@@ -239,5 +248,110 @@ final class VoiceTurnJournalTests: XCTestCase {
             journal.begin(requestId: newRequestId())
         }
         XCTAssertEqual(journal.turns.count, 3)
+    }
+}
+
+/// ESS-55：文字与语音解耦 + 未读结果机制。
+@MainActor
+final class VoiceTurnUnreadAndDecouplingTests: XCTestCase {
+    private var directory: URL!
+
+    override func setUp() {
+        super.setUp()
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("voice-unread-tests-\(UUID().uuidString)", isDirectory: true)
+    }
+
+    override func tearDown() {
+        try? FileManager.default.removeItem(at: directory)
+        super.tearDown()
+    }
+
+    private func newRequestId() -> String {
+        UUIDv7.generate().uuidString.lowercased()
+    }
+
+    func testTextSurvivesWhenSpeechPayloadIsDropped() {
+        // 验收硬口径：人为丢弃语音载荷（speech_sha256 承诺了语音但 transferFile
+        // 永远不到、attachSpeech 从不发生），文字仍完整展示。
+        let journal = VoiceTurnJournal(directory: directory)
+        let requestId = newRequestId()
+        journal.begin(requestId: requestId)
+        let applied = journal.apply(VoiceStatusEnvelope.status(
+            requestId: requestId,
+            state: .completed,
+            result: VoiceResultPayload(
+                summary: "明天北京晴，18 到 26 度。",
+                isTruncated: false,
+                speechSha256: String(repeating: "a", count: 64),
+                speechDurationMs: 3200
+            )
+        ))
+        XCTAssertTrue(applied)
+
+        let turn = journal.turn(withId: requestId)
+        XCTAssertEqual(turn?.currentState, .completed)
+        XCTAssertEqual(turn?.result?.displaySummary, "明天北京晴，18 到 26 度。", "语音丢失时文字必须完整在场")
+        XCTAssertNil(turn?.speechFileName, "语音从未落盘")
+        XCTAssertTrue(turn?.hasUnreadResult == true, "只有文字的结果同样进入未读态，不丢失")
+    }
+
+    func testUnreadResultPersistsAcrossRelaunchUntilViewed() {
+        // 验收：结果在用户未查看前不丢失，下次打开仍在（未读态）。
+        let requestId = newRequestId()
+        do {
+            let journal = VoiceTurnJournal(directory: directory)
+            journal.begin(requestId: requestId)
+            journal.apply(VoiceStatusEnvelope.status(
+                requestId: requestId,
+                state: .completed,
+                result: VoiceResultPayload(summary: "查询完成", isTruncated: false, speechSha256: nil, speechDurationMs: nil)
+            ))
+        }
+
+        let relaunched = VoiceTurnJournal(directory: directory)
+        XCTAssertEqual(relaunched.firstUnreadResult?.requestId, requestId, "重开 App 未读结果仍在")
+
+        relaunched.markResultViewed(requestId: requestId)
+        XCTAssertNil(relaunched.firstUnreadResult)
+        XCTAssertNil(VoiceTurnJournal(directory: directory).firstUnreadResult, "已读状态持久化")
+    }
+
+    func testMarkResultViewedKeepsFirstReadTimeAndRequiresResult() {
+        let journal = VoiceTurnJournal(directory: directory)
+        let pending = newRequestId()
+        journal.begin(requestId: pending)
+        journal.markResultViewed(requestId: pending)
+        XCTAssertNil(journal.turn(withId: pending)?.resultViewedAt, "没有结果就没有已读")
+
+        let done = newRequestId()
+        journal.begin(requestId: done)
+        journal.apply(VoiceStatusEnvelope.status(
+            requestId: done,
+            state: .completed,
+            result: VoiceResultPayload(summary: "OK", isTruncated: false, speechSha256: nil, speechDurationMs: nil)
+        ))
+        let first = Date(timeIntervalSince1970: 1_753_920_000)
+        journal.markResultViewed(requestId: done, at: first)
+        journal.markResultViewed(requestId: done, at: first.addingTimeInterval(60))
+        XCTAssertEqual(journal.turn(withId: done)?.resultViewedAt, first, "重复标记不覆盖首读时间")
+    }
+
+    func testOnStateAppliedFiresForLocalAndRemoteEvents() {
+        // ESS-55 触觉链路的事件源：本地状态与远端状态入账都必须回调；
+        // 被去重/非法转移拒绝的事件不回调。
+        let journal = VoiceTurnJournal(directory: directory)
+        let requestId = newRequestId()
+        var received: [VoiceTurnState] = []
+        journal.onStateApplied = { id, state in
+            XCTAssertEqual(id, requestId)
+            received.append(state)
+        }
+        journal.begin(requestId: requestId)
+        journal.recordLocal(.waitingForMac, requestId: requestId)
+        journal.apply(VoiceStatusEnvelope.status(requestId: requestId, state: .accepted))
+        journal.apply(VoiceStatusEnvelope.status(requestId: requestId, state: .accepted))
+        journal.apply(VoiceStatusEnvelope.status(requestId: requestId, state: .completed))
+        XCTAssertEqual(received, [.waitingForMac, .accepted, .completed])
     }
 }

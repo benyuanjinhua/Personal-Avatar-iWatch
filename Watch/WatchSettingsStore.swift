@@ -196,6 +196,14 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             WatchLog.error("turn", "speech_envelope_invalid", code: "ERR_DECODE")
             return
         }
+        guard AudioDownlinkPolicy.allows(envelope.audioKind, expected: [.interim, .result]) else {
+            WatchLog.error(
+                "audio", "l1_audio_rejected", requestId: envelope.requestId,
+                detail: "reason=unknown_or_missing_kind kind=\(envelope.audioKind?.rawValue ?? "missing") source=watch_entry",
+                code: "ERR_AUDIO_KIND_REJECTED"
+            )
+            return
+        }
         if let expected = envelope.result?.speechSha256,
            VoiceDigest.sha256Hex(of: audioData) != expected.lowercased() {
             WatchLog.error(

@@ -63,6 +63,11 @@ targets:
         WKBackgroundModes:
           - audio
           - self-care
+        # ESS-58：单 target watch app 的后台音频键，Apple 文档口径（Playing
+        # Background Audio）写 UIBackgroundModes、Xcode capability 写
+        # WKBackgroundModes——双写兜底，配 .longFormAudio 会话锁屏不断播。
+        UIBackgroundModes:
+          - audio
     entitlements:
       path: Watch/WristAgentWatch.entitlements
     settings:
