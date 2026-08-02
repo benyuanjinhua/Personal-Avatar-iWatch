@@ -6,6 +6,8 @@ import Foundation
 enum WatchDownlinkKind: String, Codable, CaseIterable {
     /// `RelayStatusUpdate`：iPhone 前台状态行文案。
     case relayStatus
+    /// ESS-59：真实任务步骤，仅文字，绝不携带/触发语音文件。
+    case progress
     /// `VoiceRelayResultPayload`：结果短文本。
     case result
     /// `VoiceStatusEnvelope`：Watch 时间线入账单位（ESS-29）。

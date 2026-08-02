@@ -9,6 +9,7 @@ import UserNotifications
 @MainActor
 protocol WatchFeedbackChannel: AnyObject {
     func notifyWatch(status: RelayStatusUpdate)
+    func notifyWatch(progress: RelayStatusUpdate)
     func notifyWatch(result: VoiceRelayResultPayload)
     /// 状态/权限/结果信封 → Watch VoiceTurnJournal（ESS-29 时间线 UI 的入账单位）。
     func notifyWatch(voiceStatus: VoiceStatusEnvelope)
@@ -349,9 +350,19 @@ final class WristAgentPhoneRelay: ObservableObject {
             message.turns?.forEach { process(projection: $0) }
         case "turn.interim":
             if let interim = message.interim { process(interim: interim) }
+        case "turn.progress":
+            if let progress = message.progress, progress.isValid { process(progress: progress) }
         default:
             break // 未知事件类型：忽略，不中断事件流。
         }
+    }
+
+    private func process(progress: BridgeProgressProjection) {
+        // No result/audio payload: progress is always text-only.
+        watchChannel?.notifyWatch(progress: RelayStatusUpdate(
+            requestId: progress.requestId, phase: .backgroundProcessing,
+            detail: progress.text, updatedAt: progress.occurredAt
+        ))
     }
 
     private func process(interim: BridgeInterimProjection) {

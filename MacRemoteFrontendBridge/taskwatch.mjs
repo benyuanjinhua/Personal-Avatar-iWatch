@@ -52,6 +52,32 @@ export function extractPresentation(task, maxChars) {
   return { text, speech, hasInline: inline !== null }
 }
 
+// Gateway activity is untrusted and often contains internal tool/session names.
+// Only map recognised concepts; everything else falls back to the public task
+// state so no identifier or arbitrary model text reaches the Watch.
+export function userProgressText(task) {
+  const activity = Array.isArray(task?.activity) ? task.activity.at(-1) : null
+  const raw = typeof activity === 'string'
+    ? activity
+    : [activity?.tool, activity?.toolName, activity?.name, activity?.summary, activity?.title]
+        .filter(value => typeof value === 'string').join(' ')
+  const normalized = raw.toLowerCase()
+
+  if (/weather|天气/.test(normalized)) return '正在查询天气'
+  if (/vault|note|笔记/.test(normalized)) return '正在翻你的笔记'
+  if (/search|query|检索|搜索|查询/.test(normalized)) return '正在查找相关信息'
+  if (/read|读取|查看/.test(normalized)) return '正在读取所需信息'
+  if (/write|edit|patch|修改|写入/.test(normalized)) return '正在处理内容'
+
+  switch (task?.status) {
+  case 'queued': return '任务已排队，等待开始'
+  case 'delegated': return '已交给执行助手处理'
+  case 'finalizing': return '正在整理结果'
+  case 'cancelling': return '正在取消任务'
+  default: return '正在执行任务'
+  }
+}
+
 export class TaskWatcher {
   constructor({ gateway, ledger, config, log = () => {} }) {
     this.gateway = gateway
@@ -59,6 +85,8 @@ export class TaskWatcher {
     this.cfg = config
     this.log = log
     this.active = new Map() // request_id → { controller, deadlineTimer }
+    this.progress = new Map() // request_id → { lastAt, count, lastText }
+    this.onProgress = () => {}
   }
 
   // D1 权限清扫（ESS-30，收窄于 ESS-34）：上游会把 authorization 挂到错误的
@@ -259,6 +287,7 @@ export class TaskWatcher {
     }
 
     if (TERMINAL_TASK.has(task.status)) {
+      this.progress.delete(requestId)
       if (task.status === 'completed') {
         const { text } = extractPresentation(task, this.cfg.max_result_chars)
         this.ledger.setResult(requestId, { text, extra: { source: 'task_presentation' } }, 'completed')
@@ -270,6 +299,8 @@ export class TaskWatcher {
       return true
     }
 
+    this.emitProgress(requestId, task)
+
     this.ledger.update(requestId, {
       ...patch,
       state: 'processing',
@@ -277,6 +308,18 @@ export class TaskWatcher {
       permission: null,
     }, { persist: eventType !== 'task.progress' }) // progress ticks are frequent; don't fsync each one
     return false
+  }
+
+  emitProgress(requestId, task) {
+    const now = Date.now()
+    const current = this.progress.get(requestId) || { lastAt: 0, count: 0, lastText: null }
+    const minInterval = this.cfg.progress_min_interval_ms ?? 5_000
+    const maximum = this.cfg.max_progress_events ?? 12
+    const text = userProgressText(task)
+    if (current.count >= maximum || now - current.lastAt < minInterval || text === current.lastText) return
+    const next = { lastAt: now, count: current.count + 1, lastText: text }
+    this.progress.set(requestId, next)
+    this.onProgress({ requestId, sequence: next.count, text, occurredAt: new Date(now).toISOString() })
   }
 
   async timeout(requestId, taskId) {

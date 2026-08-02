@@ -30,6 +30,8 @@ final class WatchVoiceTransport: ObservableObject {
     @Published private(set) var pendingCount = 0
     /// iPhone Relay 回执的最新链路状态（ESS-28；完整时间线 UI 归 ESS-29）。
     @Published private(set) var remoteStatus: RelayStatusUpdate?
+    /// 最新服务端真实步骤；独立于通用状态，后者不可覆盖它。
+    @Published private(set) var progressStatus: RelayStatusUpdate?
     /// Mac 返回的最新结果；音频落在 resultsDirectory/<request_id>.m4a。
     @Published private(set) var lastResult: VoiceRelayResultPayload?
 
@@ -61,6 +63,16 @@ final class WatchVoiceTransport: ObservableObject {
             detail: "phase=\(update.phase.rawValue)\(update.detail.map { " detail=\($0)" } ?? "")"
         )
         remoteStatus = update
+    }
+
+    func handleProgress(data: Data) {
+        guard let update = RelayStatusUpdate.decode(from: data),
+              update.phase == .backgroundProcessing else {
+            WatchLog.error("transport", "progress_undecodable", detail: "bytes=\(data.count)", code: "ERR_DECODE")
+            return
+        }
+        progressStatus = update
+        WatchLog.info("turn", "real_progress", requestId: update.requestId, detail: update.detail)
     }
 
     func handleResultPayload(data: Data) {

@@ -235,6 +235,14 @@ extension PhoneConnectivity: WatchFeedbackChannel {
         )
     }
 
+    func notifyWatch(progress: RelayStatusUpdate) {
+        guard let data = try? progress.jsonData() else { return }
+        enqueueDownlink(
+            requestId: progress.requestId, kind: .progress,
+            key: VoiceMessage.progressKey, data: data
+        )
+    }
+
     func notifyWatch(result: VoiceRelayResultPayload) {
         guard let data = try? result.jsonData() else { return }
         enqueueDownlink(
@@ -354,7 +362,7 @@ extension PhoneConnectivity: WatchFeedbackChannel {
                     item.messageKey: payload,
                     Self.downlinkItemIdKey: item.id
                 ])
-            case .relayStatus, .result, .voiceStatus:
+            case .relayStatus, .progress, .result, .voiceStatus:
                 downlink.markInFlight(id: item.id)
                 // transferUserInfo 是系统托管的可靠队列，且有 didFinish 回执——
                 // 它、而不是 sendMessage，才是「送达」的判据。

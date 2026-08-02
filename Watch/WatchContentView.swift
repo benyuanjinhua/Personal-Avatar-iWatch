@@ -82,7 +82,8 @@ struct WatchContentView: View {
                     .buttonStyle(.bordered)
                     .tint(.secondary)
 
-                    if let remote = transport.remoteStatus {
+                    if let remote = transport.remoteStatus,
+                       remote.requestId != activeTurn?.requestId {
                         Text(remote.detail ?? remote.phase.displayText)
                             .font(.caption2)
                             .foregroundStyle(remote.phase == .failed ? .red : .secondary)
@@ -270,8 +271,9 @@ struct WatchContentView: View {
         }
     }
 
-    /// 状态文案（ESS-55）：等待相位交给 WaitingStatusCopy 按已等时长推进，
-    /// elapsed 以回合最后一个状态事件为基准，状态一变阶梯重置。
+    /// 状态文案：ESS-59 的真实进展优先——有 progress 事件时展示真实步骤文本
+    /// 与真实已等时长，20 秒无新进展给出诚实的「比预期久」提示；没有真实
+    /// 进展时回落到 ESS-55 的 WaitingStatusCopy 阶梯（按已等时长推进）。
     private func statusCopy(now: Date) -> WaitingStatusCopy.Entry {
         if isRecording {
             return .init(title: "我在听", subtitle: "松开发送（最长 60 秒）")
@@ -292,11 +294,32 @@ struct WatchContentView: View {
             return .init(title: turn.phase.title, subtitle: message)
         }
         if turn.isActive {
+            if let progress = currentProgress(for: turn) {
+                let title = now.timeIntervalSince(progress.updatedAt) >= 20
+                    ? "还在处理，比预期久一些"
+                    : (progress.detail ?? progress.phase.displayText)
+                return .init(
+                    title: title,
+                    subtitle: "已等待 \(elapsedText(now.timeIntervalSince(turn.createdAt)))"
+                )
+            }
             let lastEventAt = turn.events.last?.at ?? turn.createdAt
             if let entry = WaitingStatusCopy.entry(for: turn.phase, elapsed: now.timeIntervalSince(lastEventAt)) {
                 return entry
             }
         }
         return .init(title: turn.phase.title, subtitle: turn.phase.subtitle)
+    }
+
+    private func currentProgress(for turn: VoiceTurnRecord) -> RelayStatusUpdate? {
+        guard let progress = transport.progressStatus,
+              progress.requestId == turn.requestId,
+              progress.phase == .backgroundProcessing else { return nil }
+        return progress
+    }
+
+    private func elapsedText(_ interval: TimeInterval) -> String {
+        let seconds = max(0, Int(interval))
+        return String(format: "%d:%02d", seconds / 60, seconds % 60)
     }
 }

@@ -158,6 +158,8 @@ enum RelayEventCoding {
 extension VoiceMessage {
     /// iPhone → Watch 状态回执的消息键。
     static let relayStatusKey = "voice_relay_status"
+    /// ESS-59 真实进展专用键；与通用状态分离，避免后续状态快照覆盖步骤文案。
+    static let progressKey = "voice_progress"
     /// iPhone → Watch 结果载荷的消息键（文本消息与结果音频 transferFile 的 metadata 共用）。
     static let resultKey = "voice_result"
 }

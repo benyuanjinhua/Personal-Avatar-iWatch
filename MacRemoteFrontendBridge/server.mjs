@@ -776,6 +776,25 @@ export function createBridge(overrides = {}) {
   const eventClients = new Set() // { ws, deviceId }
   const eventsHeartbeatMs = CONFIG.events_heartbeat_ms ?? 20_000
 
+  // Real task steps are a text-only event and never enter the audio pipeline.
+  watcher.onProgress = progress => {
+    const turn = ledger.get(progress.requestId)
+    if (!turn || ['completed', 'failed', 'cancelled'].includes(turn.state)) return
+    const message = JSON.stringify({
+      type: 'turn.progress',
+      progress: {
+        kind: 'progress', request_id: progress.requestId,
+        sequence: progress.sequence, text: progress.text,
+        occurred_at: progress.occurredAt,
+      },
+    })
+    for (const client of eventClients) {
+      if (client.deviceId === turn.device_id && client.ws.readyState === client.ws.OPEN) {
+        client.ws.send(message)
+      }
+    }
+  }
+
   ledger.on('turn', projection => {
     const event = { type: 'turn.state', turn: projection }
     const message = JSON.stringify(event)
