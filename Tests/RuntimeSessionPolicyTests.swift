@@ -140,4 +140,23 @@ final class RuntimeSessionPolicyTests: XCTestCase {
         )
         XCTAssertEqual(decide(turns: [turn], isRecording: true).decision, .hold(reason: "recording"))
     }
+
+    // MARK: ESS-58 锁屏收回后的重持
+
+    func testResignedFrontmostAllowsRestartAfterForeground() {
+        // 锁屏/切走（resignedFrontmost=3，真机日志 reason_code=3）不是预算
+        // 耗尽，解锁回前台应允许重新持有。
+        XCTAssertTrue(RuntimeSessionPolicy.allowsRestartAfterForeground(invalidationReasonCode: 3))
+    }
+
+    func testOtherInvalidationReasonsKeepBoundedExecution() {
+        // error(-1)/none(0)/sessionInProgress(1)/expired(2)/suppressedBySystem(4)：
+        // 维持 ESS-45 有界执行，不自动续命。
+        for code in [-1, 0, 1, 2, 4] {
+            XCTAssertFalse(
+                RuntimeSessionPolicy.allowsRestartAfterForeground(invalidationReasonCode: code),
+                "reason_code=\(code) 不应允许自动重持"
+            )
+        }
+    }
 }

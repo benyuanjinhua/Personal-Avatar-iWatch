@@ -78,6 +78,8 @@ export class TurnLedger extends EventEmitter {
       permission: null,           // { id, ...bounded summary } while permission_required
       result: null,               // { text, audio_base64?, truncated? } once terminal
       delivered_ack: null,        // { at, source } once Watch has durably stored the result
+      delivery_attempts: 0,       // terminal snapshot redeliveries (bounded + backed off)
+      next_delivery_at: null,
       error: null,                // stable ERR_* code once failed
       event_count: 0,             // 全量观测计数（Realtime + SSE，ESS-37 取证口径）
       task_event_count: 0,        // 仅 SSE/task 生命周期事件（taskwatch 熔断预算，ESS-41）
@@ -198,10 +200,23 @@ export class TurnLedger extends EventEmitter {
     return turn
   }
 
-  replayable({ now = Date.now(), terminalTtlMs = 30 * 60 * 1000 } = {}) {
+  markResultRedelivered(requestId, { now = Date.now(), baseDelayMs = 2_000, maxDelayMs = 300_000 } = {}) {
+    const turn = this.turns.get(requestId)
+    if (!turn || !TERMINAL.has(turn.state) || turn.delivered_ack) return null
+    turn.delivery_attempts = (turn.delivery_attempts || 0) + 1
+    const delay = Math.min(maxDelayMs, baseDelayMs * 2 ** Math.max(0, turn.delivery_attempts - 1))
+    turn.next_delivery_at = new Date(now + delay).toISOString()
+    this.save()
+    return { attempt: turn.delivery_attempts, delay_ms: delay }
+  }
+
+  replayable({ now = Date.now(), terminalTtlMs = 30 * 60 * 1000, maxDeliveryAttempts = 5 } = {}) {
     return [...this.turns.values()].filter(turn => {
       if (!TERMINAL.has(turn.state)) return true
       if (turn.delivered_ack) return false
+      if ((turn.delivery_attempts || 0) >= maxDeliveryAttempts) return false
+      const nextDeliveryAt = Date.parse(turn.next_delivery_at)
+      if (Number.isFinite(nextDeliveryAt) && now < nextDeliveryAt) return false
       const terminalAt = Date.parse(turn.updated_at)
       return Number.isFinite(terminalAt) && now - terminalAt <= terminalTtlMs
     })

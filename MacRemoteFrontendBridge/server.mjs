@@ -806,10 +806,18 @@ export function createBridge(overrides = {}) {
         // the Watch explicitly confirms durable storage.
         const replayTurns = ledger.replayable({
           terminalTtlMs: CONFIG.result_delivery_ttl_ms ?? 30 * 60 * 1000,
+          maxDeliveryAttempts: CONFIG.result_delivery_max_attempts ?? 5,
         }).filter(t => t.device_id === deviceId)
         for (const turn of replayTurns) {
           if (['completed', 'failed', 'cancelled'].includes(turn.state)) {
-            log({ evt: 'result_redelivered', request_id: turn.request_id, device_id: deviceId, status: turn.state })
+            const delivery = ledger.markResultRedelivered(turn.request_id, {
+              baseDelayMs: CONFIG.result_delivery_backoff_base_ms ?? 2_000,
+              maxDelayMs: CONFIG.result_delivery_backoff_max_ms ?? 300_000,
+            })
+            log({
+              evt: 'result_redelivered', request_id: turn.request_id, device_id: deviceId,
+              status: turn.state, attempt: delivery?.attempt, retry_after_ms: delivery?.delay_ms,
+            })
           }
         }
         const snapshot = {
