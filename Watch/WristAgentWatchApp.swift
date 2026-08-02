@@ -12,10 +12,10 @@ struct WristAgentWatchApp: App {
         WindowGroup {
             WatchContentView(pushToTalk: pushToTalk, welcome: welcome)
                 .task {
-                    WatchLog.info(
-                        "lifecycle", "cold_start",
-                        detail: "version=\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] ?? "?")"
-                    )
+                    // ESS-56：版本号在本工程恒为 0.1.0/1，分不出新旧安装——R3 就是
+                    // 因此在旧 build 上白测了一轮。改为上报可执行文件时间戳，
+                    // Bridge 侧据此在开测前判定表端 build 是否覆盖待验收 commit。
+                    WatchLog.info("lifecycle", "cold_start", detail: BuildFingerprint.current().detail)
                     // ESS-45：降腕后 frontmost 保持从默认 ~8s 延长到 70s，
                     // 与 ExtendedRuntimeSession（VoiceSessionKeeper）叠加覆盖长任务等待。
                     WKExtension.shared().isFrontmostTimeoutExtended = true
