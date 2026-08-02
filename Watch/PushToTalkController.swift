@@ -298,7 +298,7 @@ final class PushToTalkController: ObservableObject {
                     detail: "duration_ms=\(recording.durationMs) bytes=\(recording.data.count)",
                     code: "ERR_AUDIO_TOO_SHORT"
                 )
-                errorMessage = "没听清，请再按住说一次"
+                errorMessage = RecorderError.recordingTooShortDescription
                 WatchHaptics.play(.turnFailed)
                 return
             }
