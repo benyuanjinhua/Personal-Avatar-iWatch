@@ -19,7 +19,16 @@ final class PushToTalkController: ObservableObject {
     @Published private(set) var recordingLevel: Float = 0
     /// 当前字幕播放会话（ESS-48）：结果播放/纯文本结果到达时置值，
     /// UI 以 sheet(item:) 呈现；用户关闭视图时由绑定置回 nil。
-    @Published var subtitleSession: SubtitleSession?
+    /// ESS-55 未读机制：用户关闭全文视图（非会话替换）视为「已读」——
+    /// 只有用户主动 dismiss 才可靠地证明看过，结果到达本身不算。
+    @Published var subtitleSession: SubtitleSession? {
+        didSet {
+            guard let closed = oldValue, subtitleSession == nil else { return }
+            if journal.turn(withId: closed.requestId)?.currentState == .completed {
+                journal.markResultViewed(requestId: closed.requestId)
+            }
+        }
+    }
     /// ESS-58：播放被截断（锁屏挂起/解码失败）的回合。语音留在加密仓、
     /// 不发交付 ACK，结果卡片显式标出「未播完」并保留重播入口——中断
     /// 只允许可见，不允许静默。
@@ -29,6 +38,8 @@ final class PushToTalkController: ObservableObject {
     let speechVault: EncryptedAudioVault?
     let player = SpeechPlayer()
     let transport: WatchVoiceTransport
+    /// ESS-55 超长任务本地通知（JIT 授权 / 结果通知 / 兜底预约 / 点通知直达）。
+    let notifier: ResultNotifier
     /// ESS-45：录音 → 等待 → 播放整个回合期间持有 ExtendedRuntimeSession，
     /// 降腕/熄屏不挂起；空闲即释放。
     let sessionKeeper = VoiceSessionKeeper()
@@ -38,12 +49,27 @@ final class PushToTalkController: ObservableObject {
 
     private static let logger = Logger(subsystem: "com.benyuan.wristagent.watch", category: "PlaybackTrigger")
     private let recorder = AudioRecorder()
+    /// ESS-55：一键重试用的最近一条录音（失败重发不用重新说话）。
+    private let retryStore: RetryRecordingStore
+    /// ESS-60：跨 WS 重连和 App 重启的自动播放去重账本。
+    private let playbackLedger: ResultPlaybackLedger
+    /// ESS-55：远端状态 → 触觉 cue 的映射与去重。
+    private var cuePolicy = VoiceCuePolicy()
+    /// 短于该时长的录音视为误触/没听清：提示重说，不发请求（ESS-55 流程图 <0.3s 分支）。
+    static let minimumRecordingMs = 300
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         journal = VoiceTurnJournal(directory: base.appendingPathComponent("VoiceTurns", isDirectory: true))
         speechVault = try? EncryptedAudioVault(directory: base.appendingPathComponent("SpeechVault", isDirectory: true))
         transport = WatchVoiceTransport(journal: journal)
+        retryStore = RetryRecordingStore(directory: base.appendingPathComponent("RetryCache", isDirectory: true))
+        playbackLedger = ResultPlaybackLedger(
+            directory: base.appendingPathComponent("PlaybackLedger", isDirectory: true)
+        )
+        notifier = ResultNotifier(policy: ResultNotificationPolicy(
+            directory: base.appendingPathComponent("NotificationLedger", isDirectory: true)
+        ))
 
         recorder.$level
             .receive(on: RunLoop.main)
@@ -60,6 +86,45 @@ final class PushToTalkController: ObservableObject {
         // 纯文本降级（ESS-48）：没有语音可播，直接展示全文，不进播放态。
         journal.onResultWithoutSpeech = { [weak self] requestId in
             self?.presentTranscriptOnly(requestId: requestId)
+        }
+
+        // 触觉 cue（ESS-55）：挂在状态入账事件上而非 UI——熄屏/视图未挂载时
+        // 结果到达/失败仍能靠震动感知（ESS-45 的 ExtendedRuntimeSession 保证
+        // 回合期间 App 还在运行）。成功交付后清理重试缓存。
+        // resultArrived 例外：是否播触觉取决于是否发本地通知（同一结果只震
+        // 一次），而通知正文需要结果载荷——推迟到 onResultRecorded 决策。
+        journal.onStateApplied = { [weak self] requestId, state in
+            guard let self else { return }
+            if let cue = self.cuePolicy.cue(for: state, requestId: requestId), cue != .resultArrived {
+                WatchHaptics.play(cue)
+            }
+            switch state {
+            case .backgroundAccepted:
+                // 首次长任务场景：JIT 授权引导 / 已授权则预约兜底通知。
+                self.notifier.longTaskAccepted(requestId: requestId)
+            case .failed, .cancelled:
+                self.notifier.cancelProvisional(requestId: requestId)
+            default:
+                break
+            }
+            if state == .completed || state == .cancelled {
+                self.retryStore.clear(requestId: requestId)
+            }
+        }
+
+        // 结果入账（含摘要，ESS-55 通知链路）：够格就发本地通知（自带震动），
+        // 否则回落到 .notification 触觉——同一结果只震一次。
+        journal.onResultRecorded = { [weak self] requestId in
+            guard let self, let turn = self.journal.turn(withId: requestId) else { return }
+            let notified = self.notifier.notifyResultIfEligible(turn: turn, completedAt: Date())
+            if !notified {
+                WatchHaptics.play(.resultArrived)
+            }
+        }
+
+        // 点通知直达该条结果全文（不播额外触觉——通知本身已震过）。
+        notifier.onOpenResult = { [weak self] requestId in
+            self?.presentResult(requestId: requestId)
         }
 
         sessionKeeper.bind(
@@ -98,6 +163,10 @@ final class PushToTalkController: ObservableObject {
             pendingAutoPlayRequestId = requestId
             return
         }
+        guard playbackLedger.claim(requestId: requestId) else {
+            Self.logger.info("auto-play suppressed: already claimed (request_id=\(requestId, privacy: .public))")
+            return
+        }
         guard let turn = journal.turn(withId: requestId) else {
             Self.logger.error("auto-play failed: turn not found (request_id=\(requestId, privacy: .public))")
             return
@@ -118,6 +187,7 @@ final class PushToTalkController: ObservableObject {
         errorMessage = nil
         player.stop()
         state = .recording
+        WatchHaptics.play(.recordingStarted)
         Task {
             do {
                 try await recorder.start()
@@ -137,18 +207,81 @@ final class PushToTalkController: ObservableObject {
         }
         do {
             let recording = try recorder.finish()
-            let envelope = VoiceRequestEnvelope.voiceRequest(
-                audio: VoiceAudioDescriptor(
-                    codec: "aac",
-                    sampleRate: AudioRecorder.sampleRate,
-                    channels: AudioRecorder.channels,
-                    durationMs: recording.durationMs,
-                    sha256: VoiceDigest.sha256Hex(of: recording.data)
-                )
-            )
-            transport.send(envelope: envelope, recording: recording)
+            // 误触/太短（ESS-55）：不发请求，本地提示重说。
+            guard recording.durationMs >= Self.minimumRecordingMs else {
+                try? FileManager.default.removeItem(at: recording.fileURL)
+                errorMessage = "没听清，请再按住说一次"
+                WatchHaptics.play(.turnFailed)
+                WatchLog.info("recorder", "record_too_short", detail: "duration_ms=\(recording.durationMs)")
+                return
+            }
+            submit(recording: recording)
         } catch {
             errorMessage = error.localizedDescription
+            WatchHaptics.play(.turnFailed)
+        }
+    }
+
+    /// 提交录音：生成信封发送，同时留一份重试缓存（失败重发不用重新说话）。
+    private func submit(recording: AudioRecorder.Recording) {
+        let envelope = VoiceRequestEnvelope.voiceRequest(
+            audio: VoiceAudioDescriptor(
+                codec: "aac",
+                sampleRate: AudioRecorder.sampleRate,
+                channels: AudioRecorder.channels,
+                durationMs: recording.durationMs,
+                sha256: VoiceDigest.sha256Hex(of: recording.data)
+            )
+        )
+        retryStore.save(requestId: envelope.requestId, data: recording.data, durationMs: recording.durationMs)
+        transport.send(envelope: envelope, recording: recording)
+        WatchHaptics.play(.requestSubmitted)
+    }
+
+    /// 一键重试（ESS-55）：用缓存的录音换新 request_id 重发，不需要重新说话。
+    func retry(turn: VoiceTurnRecord) {
+        guard case .failed = turn.phase else { return }
+        guard let stored = retryStore.stored(for: turn.requestId) else {
+            errorMessage = "这条录音已清理，请重新说一次"
+            return
+        }
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wristagent-retry-\(UUID().uuidString).m4a")
+        guard (try? stored.data.write(to: tempURL, options: .atomic)) != nil else {
+            errorMessage = "重试失败，请重新说一次"
+            return
+        }
+        errorMessage = nil
+        WatchLog.info("turn", "retry_requested", requestId: turn.requestId)
+        submit(recording: AudioRecorder.Recording(
+            fileURL: tempURL, data: stored.data, durationMs: stored.durationMs
+        ))
+    }
+
+    /// 打开 App/回前台时呈现未读结果（ESS-55 流程图节点 C）：
+    /// 有语音未播则连播带看，只有文字则直接展示全文；配触觉提醒。
+    @discardableResult
+    func presentUnreadIfAny() -> Bool {
+        guard state == .idle, subtitleSession == nil else { return false }
+        guard let turn = journal.firstUnreadResult else { return false }
+        WatchHaptics.play(.resultArrived)
+        presentResult(requestId: turn.requestId)
+        return true
+    }
+
+    /// 直达某条结果的全文视图（点通知进入 / 未读呈现，ESS-55 细则 #3）。
+    /// 不播触觉——调用方各自决定（通知本身已震过）。
+    func presentResult(requestId: String) {
+        guard let turn = journal.turn(withId: requestId), let result = turn.result else {
+            WatchLog.error("notify", "present_result_missing", requestId: requestId, code: "ERR_NO_RESULT")
+            return
+        }
+        if turn.speechFileName != nil {
+            playResult(for: turn)
+        } else {
+            subtitleSession = SubtitleSession(
+                requestId: turn.requestId, text: result.displaySummary, hasAudio: false
+            )
         }
     }
 
@@ -222,6 +355,10 @@ final class PushToTalkController: ObservableObject {
                 self.speechVault?.remove(name: fileName)
                 self.journal.clearSpeech(requestId: requestId)
                 self.sessionKeeper.markDelivered(requestId: requestId)
+            }
+            // 播完整段视为已读（ESS-55 未读机制）：熄屏听完也算送达。
+            if self?.journal.turn(withId: requestId)?.currentState == .completed {
+                self?.journal.markResultViewed(requestId: requestId)
             }
         }
         // 字幕式播放（ESS-48）：播放开始即进入全文视图，按进度逐句高亮；

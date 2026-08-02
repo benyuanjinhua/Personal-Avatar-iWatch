@@ -3,14 +3,15 @@ import WatchKit
 
 @main
 struct WristAgentWatchApp: App {
-    @StateObject private var settings = WatchSettingsStore()
-    @StateObject private var pushToTalk = PushToTalkController()
-    @StateObject private var welcome = WelcomeGreeter()
+    /// ESS-55：后台 WC 唤醒（挂起时结果送达 → 当场发通知）依赖 delegate；
+    /// 服务图上移到 WatchAppServices 单例，前台/后台启动共用一套接线。
+    @WKApplicationDelegateAdaptor(WatchAppDelegate.self) private var appDelegate
+    private let services = WatchAppServices.shared
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
-            WatchContentView(pushToTalk: pushToTalk, welcome: welcome)
+            WatchContentView(pushToTalk: services.pushToTalk, welcome: services.welcome)
                 .task {
                     // ESS-56：版本号在本工程恒为 0.1.0/1，分不出新旧安装——R3 就是
                     // 因此在旧 build 上白测了一轮。改为上报可执行文件时间戳，
@@ -20,12 +21,11 @@ struct WristAgentWatchApp: App {
                     // 与 ExtendedRuntimeSession（VoiceSessionKeeper）叠加覆盖长任务等待。
                     WKExtension.shared().isFrontmostTimeoutExtended = true
                     WatchLog.info("lifecycle", "frontmost_timeout_extended")
-                    settings.voiceTransport = pushToTalk.transport
-                    settings.voiceJournal = pushToTalk.journal
-                    settings.speechVault = pushToTalk.speechVault
-                    pushToTalk.onAutoPlayStarted = { welcome.interrupt() }
-                    settings.activate()
-                    welcome.greetIfNeeded()
+                    services.bootstrap(reason: "scene_task")
+                    // ESS-55 未读优先：有未读结果直接呈现（触觉 + 全文），欢迎语让路。
+                    if !services.pushToTalk.presentUnreadIfAny() {
+                        services.welcome.greetIfNeeded()
+                    }
                 }
                 .onChange(of: scenePhase) { _, newPhase in
                     WatchLog.info("lifecycle", "scene_phase", detail: String(describing: newPhase))
@@ -33,9 +33,10 @@ struct WristAgentWatchApp: App {
                     case .active:
                         // ESS-58：解锁/切回后，被锁屏截断的播放原位续播，
                         // 被 resignedFrontmost 收回的 runtime session 重新持有。
-                        pushToTalk.player.recoverAfterForeground()
-                        pushToTalk.sessionKeeper.appDidBecomeActive()
+                        services.pushToTalk.player.recoverAfterForeground()
+                        services.pushToTalk.sessionKeeper.appDidBecomeActive()
                         WatchLogShipper.shared.ship(reason: "foreground")
+                        services.pushToTalk.presentUnreadIfAny()
                     case .background:
                         WatchLogShipper.shared.ship(reason: "background")
                     default: break

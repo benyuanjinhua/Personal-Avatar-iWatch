@@ -9,6 +9,7 @@ struct WatchContentView: View {
     @ObservedObject private var transport: WatchVoiceTransport
     @ObservedObject private var journal: VoiceTurnJournal
     @ObservedObject private var player: SpeechPlayer
+    @ObservedObject private var notifier: ResultNotifier
 
     init(pushToTalk: PushToTalkController, welcome: WelcomeGreeter) {
         self.pushToTalk = pushToTalk
@@ -16,6 +17,7 @@ struct WatchContentView: View {
         self.transport = pushToTalk.transport
         self.journal = pushToTalk.journal
         self.player = pushToTalk.player
+        self.notifier = pushToTalk.notifier
     }
 
     var body: some View {
@@ -37,21 +39,34 @@ struct WatchContentView: View {
                         welcomeBanner
                     }
 
-                    Text(statusTitle)
-                        .font(.footnote.bold())
-                        .multilineTextAlignment(.center)
-                        .lineLimit(2)
+                    // ESS-55 主张 2：等待文案随时间推进（阶梯 + 计秒），每秒重算，
+                    // 保证任何等待状态 10 秒内至少变化一次，不存在静止转圈。
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        let status = statusCopy(now: context.date)
+                        VStack(spacing: 10) {
+                            Text(status.title)
+                                .font(.footnote.bold())
+                                .multilineTextAlignment(.center)
+                                .lineLimit(2)
 
-                    Text(statusSubtitle)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .lineLimit(3)
+                            Text(status.subtitle)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                                .lineLimit(3)
+                        }
+                    }
 
                     if transport.pendingCount > 0 {
                         Text("待送达 \(transport.pendingCount) 条")
                             .font(.caption2)
                             .foregroundStyle(.orange)
+                    }
+
+                    // ESS-55 JIT 通知授权：只在首次长任务场景出现，冷启动不弹；
+                    // 「暂不」永久收起，降级为触觉 + 未读，不再骚扰。
+                    if notifier.shouldPromptAuthorization {
+                        notificationPromptCard
                     }
 
                     if let turn = activeTurn {
@@ -110,6 +125,39 @@ struct WatchContentView: View {
         .background(Color.cyan.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
     }
 
+    // MARK: - 通知授权引导（ESS-55）
+
+    private var notificationPromptCard: some View {
+        VStack(spacing: 4) {
+            Text("这个任务可能要几分钟")
+                .font(.caption2.bold())
+            Text("开启通知，结果好了第一时间震动提醒你")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+
+            HStack(spacing: 6) {
+                Button("开启提醒") {
+                    notifier.requestAuthorization(
+                        activeLongTaskRequestId: journal.activeTurn?.requestId
+                    )
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.cyan)
+
+                Button("暂不") {
+                    notifier.declinePrompt()
+                }
+                .buttonStyle(.bordered)
+                .tint(.secondary)
+            }
+            .font(.caption2)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(8)
+        .background(Color.cyan.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+    }
+
     // MARK: - 当前回合区块
 
     @ViewBuilder
@@ -125,6 +173,19 @@ struct WatchContentView: View {
 
         if let result = turn.result, turn.currentState == .completed {
             resultCard(turn: turn, result: result)
+        }
+
+        // 一键重试（ESS-55）：重发缓存的录音，不需要重新说话。
+        if case .failed = turn.phase {
+            Button {
+                pushToTalk.retry(turn: turn)
+            } label: {
+                Label("重试（不用重新说）", systemImage: "arrow.clockwise")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.orange)
+            .font(.footnote)
         }
 
         if turn.isActive && !isRecording && turn.currentState != .permissionRequired {
@@ -209,19 +270,33 @@ struct WatchContentView: View {
         }
     }
 
-    private var statusTitle: String {
-        if let error = pushToTalk.errorMessage { return error }
-        if isRecording { return "我在听" }
-        if isSpeaking { return "播放中" }
-        guard let turn = activeTurn else { return "按住说话" }
-        return turn.phase.title
-    }
-
-    private var statusSubtitle: String {
-        if isRecording { return "松开发送（最长 60 秒）" }
-        if case .failed(let message) = transport.phase { return message }
-        if showWelcomeBanner { return "按住语音球开始对话" }
-        guard let turn = activeTurn else { return "松开即发送，结果回来会响铃" }
-        return turn.phase.subtitle
+    /// 状态文案（ESS-55）：等待相位交给 WaitingStatusCopy 按已等时长推进，
+    /// elapsed 以回合最后一个状态事件为基准，状态一变阶梯重置。
+    private func statusCopy(now: Date) -> WaitingStatusCopy.Entry {
+        if isRecording {
+            return .init(title: "我在听", subtitle: "松开发送（最长 60 秒）")
+        }
+        if let error = pushToTalk.errorMessage {
+            return .init(title: error, subtitle: "按住语音球再说一次")
+        }
+        if isSpeaking {
+            return .init(title: "播放中", subtitle: "全文同步展示，播完可回看")
+        }
+        guard let turn = activeTurn else {
+            return .init(
+                title: "按住说话",
+                subtitle: showWelcomeBanner ? "按住语音球开始对话" : "松开即发送，结果回来会震动提醒"
+            )
+        }
+        if case .failed(let message) = transport.phase {
+            return .init(title: turn.phase.title, subtitle: message)
+        }
+        if turn.isActive {
+            let lastEventAt = turn.events.last?.at ?? turn.createdAt
+            if let entry = WaitingStatusCopy.entry(for: turn.phase, elapsed: now.timeIntervalSince(lastEventAt)) {
+                return entry
+            }
+        }
+        return .init(title: turn.phase.title, subtitle: turn.phase.subtitle)
     }
 }

@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test test/bridge.test.mjs test/watchdog.test.mjs test/ess36-realtime.test.mjs test/ess38-downlink.test.mjs test/ess41-event-budget.test.mjs test/ess42-client-logs.test.mjs test/ess56-watch-build-gate.test.mjs"
+    "test": "node --test test/bridge.test.mjs test/ledger-delivery.test.mjs test/watchdog.test.mjs test/ess36-realtime.test.mjs test/ess38-downlink.test.mjs test/ess41-event-budget.test.mjs test/ess42-client-logs.test.mjs test/ess56-watch-build-gate.test.mjs"
   },
   "dependencies": {
     "ws": "^8.21.1"
