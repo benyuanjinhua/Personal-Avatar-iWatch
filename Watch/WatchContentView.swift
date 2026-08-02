@@ -151,17 +151,20 @@ struct WatchContentView: View {
             }
 
             if turn.speechFileName != nil {
+                // ESS-58：播放被截断（锁屏挂起等）的回合显式标「未播完」，
+                // 语音保留在加密仓，可从头重播——中断不静默丢失。
+                let unfinished = pushToTalk.unfinishedPlaybackIds.contains(turn.requestId)
                 Button {
                     pushToTalk.playResult(for: turn)
                 } label: {
                     Label(
-                        player.isPlaying ? "播放中…" : "播放语音",
+                        player.isPlaying ? "播放中…" : (unfinished ? "未播完 · 重播" : "播放语音"),
                         systemImage: player.isPlaying ? "speaker.wave.2.fill" : "play.circle.fill"
                     )
                     .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .tint(.green)
+                .tint(unfinished ? .orange : .green)
                 .font(.footnote)
                 .disabled(player.isPlaying)
             }

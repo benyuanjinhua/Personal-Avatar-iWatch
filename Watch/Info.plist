@@ -29,6 +29,10 @@
 	<string>腕语仅在开发联调时连接同一局域网内的 Agent Gateway。</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>腕语需要使用麦克风，把你的语音指令发送给云端 Agent。</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
 	<key>WKApplication</key>
 	<true/>
 	<key>WKBackgroundModes</key>

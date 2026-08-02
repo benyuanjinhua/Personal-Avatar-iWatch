@@ -20,6 +20,17 @@ enum RuntimeSessionPolicy {
         let reviewAt: Date?
     }
 
+    /// ESS-58：会话被系统收回后，回到前台时是否允许自动重持。
+    /// 入参是 WKExtendedRuntimeSessionInvalidationReason.rawValue（Shared 不
+    /// 依赖 WatchKit，故传裸值；resignedFrontmost=3 已与真机日志
+    /// reason_code=3 对上）。
+    /// - resignedFrontmost(3)：锁屏/切走导致，不是预算耗尽——解锁回前台且
+    ///   仍有持有理由时应重持，否则剩余回合被锁屏吞掉。
+    /// - expired(2)/error(-1)/其它：维持 ESS-45 有界执行，不自动续命。
+    static func allowsRestartAfterForeground(invalidationReasonCode: Int) -> Bool {
+        invalidationReasonCode == 3
+    }
+
     /// - Parameters:
     ///   - turns: 回合日志全量（新的在前，最多 20 条）。
     ///   - deliveredRequestIds: 本次进程内已完成播放交付的 request_id
