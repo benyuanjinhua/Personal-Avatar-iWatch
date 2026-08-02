@@ -170,7 +170,7 @@ export class MockGateway extends EventEmitter {
             turnScheduled = false
             return
           }
-          if (['background', 'background-no-ack', 'queued', 'queued-announcement-first'].includes(this.scenario)) {
+          if (['background', 'background-self-intro', 'background-no-ack', 'queued', 'queued-announcement-first'].includes(this.scenario)) {
             const taskId = ['background', 'background-no-ack'].includes(this.scenario) ? 'task_bg' : 'task_queued'
             const queued = !['background', 'background-no-ack'].includes(this.scenario)
             const task = this.tasks.get(taskId) || {
@@ -181,7 +181,7 @@ export class MockGateway extends EventEmitter {
               const interimPcm = Buffer.alloc(9_600, 4) // 200ms，模拟委派前口头回执
               send({ type: 'response.started', responseId: 'resp_interim', origin: 'model' })
               send({ type: 'audio.delta', responseId: 'resp_interim', audio: interimPcm.toString('base64'), sampleRate: 24000 })
-              send({ type: 'transcript.final', role: 'assistant', content: '收到，正在处理，请稍后', origin: 'model', responseId: 'resp_interim' })
+              send({ type: 'transcript.final', role: 'assistant', content: this.scenario === 'background-self-intro' ? '你好，我是通义千问语音助手。' : '收到，正在处理，请稍后', origin: 'model', responseId: 'resp_interim' })
             }
             if (this.scenario === 'queued-announcement-first') {
               const pcm = Buffer.alloc(24_000, 6)

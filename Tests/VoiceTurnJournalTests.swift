@@ -2,6 +2,15 @@ import XCTest
 @testable import WristAgentCore
 
 final class VoiceStatusEnvelopeTests: XCTestCase {
+    func testAudioDownlinkPolicyRejectsMissingAndUnknownWireKinds() throws {
+        XCTAssertFalse(AudioDownlinkPolicy.allows(nil, expected: [.interim, .result]))
+        XCTAssertFalse(AudioDownlinkPolicy.allows(.welcome, expected: [.interim, .result]))
+        XCTAssertTrue(AudioDownlinkPolicy.allows(.interim, expected: [.interim, .result]))
+        XCTAssertTrue(AudioDownlinkPolicy.allows(.result, expected: [.interim, .result]))
+        XCTAssertFalse(AudioDownlinkPolicy.allows(.unknown, expected: [.interim, .result]))
+        let unknown = Data("\"unknown\"".utf8)
+        XCTAssertEqual(try VoiceProtocolJSON.decoder.decode(AudioDownlinkKind.self, from: unknown), .unknown)
+    }
     private let requestId = UUIDv7.generate().uuidString.lowercased()
 
     func testStatusJSONUsesSnakeCaseContractKeys() throws {

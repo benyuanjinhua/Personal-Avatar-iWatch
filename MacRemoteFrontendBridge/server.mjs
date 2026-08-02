@@ -32,6 +32,7 @@ import { TaskWatcher } from './taskwatch.mjs'
 import { AudioPipeline } from './audio.mjs'
 import { ResultAudioStore } from './result-audio.mjs'
 import { QwenRealtimeSessionSupervisor } from './supervisor.mjs'
+import { allowDownlinkMessage, rejectAudio } from './audio-policy.mjs'
 
 const BASE = dirname(fileURLToPath(import.meta.url))
 
@@ -129,6 +130,7 @@ export function createBridge(overrides = {}) {
     if (deliveredInterims.has(requestId)) return
     deliveredInterims.add(requestId)
     const interim = { kind: 'interim', request_id: requestId, delivery_sequence: 1, ...payload }
+    if (interim.audio) interim.audio.kind = 'interim'
     interimPayloads.set(requestId, interim)
     const message = JSON.stringify({
       type: 'turn.interim',
@@ -137,7 +139,7 @@ export function createBridge(overrides = {}) {
     for (const client of eventClients) {
       const turn = ledger.get(requestId)
       if (turn && client.deviceId === turn.device_id && client.ws.readyState === client.ws.OPEN) {
-        client.ws.send(message)
+        if (allowDownlinkMessage({ type: 'turn.interim', interim }, log)) client.ws.send(message)
       }
     }
   }
@@ -188,6 +190,7 @@ export function createBridge(overrides = {}) {
     try {
       const m4a = await audio.encode24kToM4a(pcm24k)
       const meta = {
+        kind: 'result',
         sha256: sha256hex(m4a),
         codec: 'm4a',
         duration_ms: Math.round(pcm24k.length / 48), // 24kHz mono PCM16 = 48 bytes/ms
@@ -351,25 +354,17 @@ export function createBridge(overrides = {}) {
       if (result.taskId) {
         // Realtime 在委派前生成的口头确认已经随当前 turn 聚合在 result 中。
         // 先下发 interim，再推进 background_accepted，保证 Watch 先看到/听到回执。
-        const interimText = result.assistantTranscript?.trim() || '收到，正在处理，请稍后'
+        // Realtime 的自由生成内容不属于产品定义的 interim。尤其在 session rebuild
+        // 后，模型可能先输出自我介绍；旧实现会把这段任意音频包装成 interim 播放。
+        // 受理回执只允许固定文案 + 预生成资产，保证内容与用户请求有确定因果。
+        const interimText = '收到，正在处理，请稍后'
         let interimAudio = null
         if (result.audio24k?.length) {
-          try {
-            const m4a = await audio.encode24kToM4a(result.audio24k)
-            interimAudio = {
-              base64: m4a.toString('base64'),
-              sha256: sha256hex(m4a),
-              codec: 'm4a',
-              duration_ms: Math.round(result.audio24k.length / 48),
-              size_bytes: m4a.length,
-            }
-            log({ evt: 'l1_audio_ready', request_id: requestId, task_id: result.taskId, source: 'interim', response_id: result.responseIds?.[0] ?? null, codec: 'm4a', duration_ms: interimAudio.duration_ms, size_bytes: interimAudio.size_bytes, sha256: interimAudio.sha256 })
-          } catch (error) {
-            log({ evt: 'l1_audio_failed', request_id: requestId, task_id: result.taskId, source: 'interim', stage: 'encode', reason: String(error.message) })
-          }
+          rejectAudio({ kind: null, requestId, source: 'realtime_interim', causal: true, log })
         }
         if (!interimAudio && fallbackInterimAudio) {
           interimAudio = {
+            kind: 'interim',
             base64: fallbackInterimAudio.toString('base64'),
             sha256: sha256hex(fallbackInterimAudio),
             codec: 'm4a',
@@ -400,6 +395,7 @@ export function createBridge(overrides = {}) {
         try {
           const m4a = await audio.encode24kToM4a(result.audio24k)
           resultAudioMeta = {
+            kind: 'result',
             sha256: sha256hex(m4a),
             codec: 'm4a',
             duration_ms: Math.round(result.audio24k.length / 48),
@@ -781,10 +777,11 @@ export function createBridge(overrides = {}) {
   const eventsHeartbeatMs = CONFIG.events_heartbeat_ms ?? 20_000
 
   ledger.on('turn', projection => {
-    const message = JSON.stringify({ type: 'turn.state', turn: projection })
+    const event = { type: 'turn.state', turn: projection }
+    const message = JSON.stringify(event)
     for (const client of eventClients) {
       if (client.deviceId === projection.device_id && client.ws.readyState === client.ws.OPEN) {
-        client.ws.send(message)
+        if (allowDownlinkMessage(event, log)) client.ws.send(message)
       }
     }
   })
@@ -823,16 +820,18 @@ export function createBridge(overrides = {}) {
             })
           }
         }
-        ws.send(JSON.stringify({
+        const snapshot = {
           type: 'snapshot',
           turns: replayTurns.map(t => ledger.projection(t)),
-        }))
+        }
+        if (allowDownlinkMessage(snapshot, log)) ws.send(JSON.stringify(snapshot))
         // interim 不改变账本状态，但非终态回合重连时仍须重放；客户端用
         // request_id + delivery_sequence 去重，已持久入 Watch 队列的不会重复播。
         for (const [requestId, interim] of interimPayloads) {
           const turn = ledger.get(requestId)
           if (turn?.device_id === deviceId && !['completed', 'failed', 'cancelled'].includes(turn.state)) {
-            ws.send(JSON.stringify({ type: 'turn.interim', interim }))
+            const event = { type: 'turn.interim', interim }
+            if (allowDownlinkMessage(event, log)) ws.send(JSON.stringify(event))
           }
         }
         ws.on('close', () => eventClients.delete(client))

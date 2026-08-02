@@ -30,6 +30,7 @@ struct BridgeInterimProjection: Decodable, Equatable {
 }
 
 struct BridgeInterimAudio: Decodable, Equatable {
+    let kind: AudioDownlinkKind?
     let base64: String
     let sha256: String
     let codec: String
@@ -37,7 +38,7 @@ struct BridgeInterimAudio: Decodable, Equatable {
     let sizeBytes: Int?
 
     enum CodingKeys: String, CodingKey {
-        case base64, sha256, codec
+        case kind, base64, sha256, codec
         case durationMs = "duration_ms"
         case sizeBytes = "size_bytes"
     }
@@ -46,6 +47,7 @@ struct BridgeInterimAudio: Decodable, Equatable {
 /// 结果语音文件元数据（ESS-38）：inline base64 缺席（超限被裁）时，
 /// 凭它经 GET /v1/voice/turns/{id}/audio 有界下载取回，sha256 校验后才可用。
 struct BridgeResultAudioMeta: Codable, Equatable {
+    let kind: AudioDownlinkKind?
     let sha256: String
     let codec: String
     let durationMs: Int?
@@ -53,7 +55,7 @@ struct BridgeResultAudioMeta: Codable, Equatable {
     let truncated: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case sha256
+        case kind, sha256
         case codec
         case durationMs = "duration_ms"
         case sizeBytes = "size_bytes"
