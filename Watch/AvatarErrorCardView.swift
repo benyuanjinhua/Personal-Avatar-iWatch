@@ -26,13 +26,9 @@ struct AvatarErrorCardView: View {
                 .multilineTextAlignment(.leading)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-            if !presentation.audioAttempted {
-                Label("静音提醒（无语音）", systemImage: "speaker.slash")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
+            // ESS-180-B 会补 5 条语气语音；届时 audioAttempted=false 才有意义。
+            // 本包（180-A）不打包语音，暂不展示「静音提醒」小字，避免误导用户
+            // 以为可以通过设置开启语音。
             Button("知道了", action: onDismiss)
                 .buttonStyle(.borderedProminent)
                 .tint(.orange)

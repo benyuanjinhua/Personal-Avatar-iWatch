@@ -323,22 +323,20 @@ struct WatchContentView: View {
         player.isPlaying || welcome.stage == .playing
     }
 
-    /// ESS-180：语音球只有四态。所有中间等待态（sending / waitingForPhone /
-    /// waitingForMac / delivered / processing / needsConfirmation）统统合并到
-    /// `.thinking`——中间态的可视差异改由底部文案承担，球体只表达
-    /// 「输入还是输出、正在还是空闲」。终态（completed/failed/cancelled）
-    /// 一律回到 idle，失败的可见证据由 `AvatarErrorCardView` 承担；这样即使
-    /// 卡片被用户手动关闭，屏幕也不会残留矛盾的失败/成功球。
+    /// 语音球状态映射（ESS-29 原逻辑保留）。ESS-180-A 阶段不改球体行为，
+    /// 拟人化的四态呼吸留给 180-B——本包只解决「失败被 UI 忽略」和「计时
+    /// 傻等」，因此这里保持原有 8 态；失败可见性由顶部的 AvatarErrorCardView
+    /// 承担。
     private var orbMode: VoiceOrbView.Mode {
         if isRecording { return .listening(level: pushToTalk.recordingLevel) }
-        if isSpeaking { return .speaking }
-        guard let phase = activeTurn?.phase, activeTurn?.isActive == true else { return .idle }
+        guard let phase = activeTurn?.phase else { return .idle }
         switch phase {
-        case .sending, .waitingForPhone, .waitingForMac,
-             .delivered, .processing, .needsConfirmation:
-            return .thinking
-        case .completed, .failed, .cancelled:
-            return .idle
+        case .sending, .waitingForPhone, .waitingForMac: return .waiting
+        case .delivered, .processing: return .processing
+        case .needsConfirmation: return .confirmation
+        case .completed: return .completed
+        case .failed: return .failed
+        case .cancelled: return .idle
         }
     }
 

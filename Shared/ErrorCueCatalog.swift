@@ -1,11 +1,17 @@
 import Foundation
 
-/// ESS-180：Bridge 稳定 `ERR_*` → 拟人化错误提示（文字 + 语音片段名 + 触觉）。
+/// ESS-180-A：Bridge 稳定 `ERR_*` → 拟人化错误提示（文字 + 语音片段名 + 触觉）。
 ///
 /// 白梦林拍板：错误必须**语音 + 文字**回给用户，屏幕不再压掉失败终态。
 /// 目录在 Shared 里，是因为 iPhone Relay/单元测试也要按 code 走同一份文案，
 /// 避免各处硬编码分叉。语音片段真正加载 / 播放 / 降级由 Watch 的
 /// `AvatarErrorPresenter` 负责——这里只维护「查表」这一件事，纯数据。
+///
+/// **180-A / 180-B 分包**：本包只落文案 + 触觉，语音资产由 180-B 一并生成
+/// 入包（PM 修正意见，2026-08-03）。因此 `ErrorCueEntry.clip` 现在只是
+/// **预留接口**——Bundle 里没有对应 m4a 时，AvatarErrorPresenter 自动降级
+/// 到「文字 + 触觉」，绝不静音吞错。180-B PR 只需要把 5 条 m4a 补进
+/// Watch/Resources，无需改动本目录。
 ///
 /// 灰度约定：`clip` 为 nil 表示无预置语音、只走文字 + 触觉；`ErrorCueCatalog.cue`
 /// 对未知错误码回落到 `.generic`，绝不返回 nil——「静音吞错」是本 issue 的

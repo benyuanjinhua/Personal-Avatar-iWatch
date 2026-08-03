@@ -138,17 +138,24 @@ final class AvatarErrorPresenterTests: XCTestCase {
         XCTAssertNil(presenter.active)
     }
 
-    func testAllBundledClipsExistInAppBundle() {
-        // ESS-180 R-02.1：真机/模拟器 bundle 里必须能加载 5 条错误语音；缺失
-        // 属于打包遗漏（xcodegen 或 Watch/Resources 被跳过）。
+    /// ESS-180-A 阶段不打包语音资产（属 180-B 范围）。这里断言：Bundle 里没有
+    /// 任何 ErrorCue_*.m4a 时，AvatarErrorPresenter 的默认 clipLoader 走「文字 +
+    /// 触觉」降级路径——绝不静音吞错，也不因资产缺失崩溃。
+    func testAbsentBundleClipsFallBackGracefully() {
         for name in ErrorCueCatalog.allClipNames {
             let url = Bundle(for: type(of: self)).url(forResource: name, withExtension: "m4a")
                 ?? Bundle.main.url(forResource: name, withExtension: "m4a")
-            XCTAssertNotNil(url, "\(name).m4a 不在 App bundle 中")
-            if let url {
-                let bytes = (try? Data(contentsOf: url))?.count ?? 0
-                XCTAssertGreaterThan(bytes, 1_000, "\(name).m4a 太小（可能是空占位）")
-            }
+            XCTAssertNil(url, "180-A 阶段不应打包 \(name).m4a（属 180-B 范围）")
         }
+        // 用真实 Bundle 加载器：无资产 → audioAttempted=false，卡片 + 触觉仍在。
+        let presenter = AvatarErrorPresenter()
+        _ = presenter.present(
+            code: "ERR_VOICE_BUSY", requestId: "req_no_bundle",
+            playAudio: { _, _ in true },  // 就算 playAudio 会成功，也会被没数据挡住
+            playHaptic: haptic
+        )
+        XCTAssertNotNil(presenter.active)
+        XCTAssertEqual(presenter.active?.audioAttempted, false)
+        XCTAssertEqual(hapticsFired.count, 1)
     }
 }
