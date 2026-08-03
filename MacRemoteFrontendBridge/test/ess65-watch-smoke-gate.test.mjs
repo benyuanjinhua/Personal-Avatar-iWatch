@@ -5,7 +5,12 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { latestSelfCheckFinished, evaluateSmokeGate, SMOKE } from '../watch-smoke.mjs'
+import {
+  latestSelfCheckFinished,
+  evaluateSmokeGate,
+  SMOKE,
+  SMOKE_STEP_DESCRIPTIONS,
+} from '../watch-smoke.mjs'
 
 const finishedLine = ({ ts, watchTs, detail, errorCode }) => JSON.stringify({
   ts,
@@ -90,16 +95,17 @@ describe('ESS-65 evaluateSmokeGate', () => {
     assert.match(verdict.message, /NSOSStatusErrorDomain#-50/)
   })
 
-  it('labels the appended S5/S6 steps so a controlled-matrix failure reads correctly', () => {
-    const verdict = gateFor([finishedLine({
-      ts: '2026-08-02T07:00:00Z',
-      detail: `result=fail failed_step=S5 ${FRESH}`,
-      errorCode: 'ERR_INTERRUPTION_GATE_LEAK',
-    })])
-    assert.equal(verdict.pass, false)
-    assert.match(verdict.message, /S5/)
-    assert.match(verdict.message, /中断中激活/)
-    assert.match(verdict.message, /ERR_INTERRUPTION_GATE_LEAK/)
+  it('labels every self-check step from the shared description map', () => {
+    for (const [step, description] of Object.entries(SMOKE_STEP_DESCRIPTIONS)) {
+      const verdict = gateFor([finishedLine({
+        ts: '2026-08-02T07:00:00Z',
+        detail: `result=fail failed_step=${step} ${FRESH}`,
+        errorCode: 'ERR_CONTROLLED_FAILURE',
+      })])
+      assert.equal(verdict.pass, false)
+      assert.ok(verdict.message.includes(`失败于 ${step}（${description}）`))
+      assert.match(verdict.message, /ERR_CONTROLLED_FAILURE/)
+    }
   })
 
   it('blocks on inconclusive but points at permission, not at a code defect', () => {
