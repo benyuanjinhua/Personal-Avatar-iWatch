@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { allowDownlinkMessage } from '../audio-policy.mjs'
+import { allowDownlinkMessage, prepareDownlinkMessage } from '../audio-policy.mjs'
 
 describe('ESS-57 audio downlink allowlist', () => {
   it('rejects injected unknown audio and emits searchable evidence', () => {
@@ -23,5 +23,33 @@ describe('ESS-57 audio downlink allowlist', () => {
     assert.equal(allowDownlinkMessage({ type: 'turn.interim', interim: {
       audio: { kind: 'interim' },
     } }, () => {}), false)
+  })
+
+  it('requires kind on every audio-producing downlink path', () => {
+    const cases = [
+      { name: 'interim', event: { type: 'turn.interim', interim: { request_id: 'i1', text: '处理中', audio: { kind: 'interim' } } } },
+      { name: 'direct result', event: { type: 'turn.state', turn: { request_id: 'd1', path: 'direct', result: { text: '完成', audio: { kind: 'result' } } } } },
+      { name: 'background result', event: { type: 'turn.state', turn: { request_id: 'b1', path: 'background', result: { text: '完成', audio: { kind: 'result' } } } } },
+      { name: 'redelivery snapshot', event: { type: 'snapshot', turns: [{ request_id: 'r1', path: 'background', result: { text: '完成', audio: { kind: 'result' } } }] } },
+    ]
+    for (const { name, event } of cases) {
+      assert.equal(allowDownlinkMessage(event, () => {}), true, name)
+      const missing = structuredClone(event)
+      const audio = missing.interim?.audio ?? missing.turn?.result?.audio ?? missing.turns?.[0]?.result?.audio
+      delete audio.kind
+      assert.equal(allowDownlinkMessage(missing, () => {}), false, `${name} without kind`)
+    }
+  })
+
+  it('keeps visible text when audio is rejected', () => {
+    const logs = []
+    const event = { type: 'turn.interim', interim: {
+      request_id: 'r1', text: '收到，正在处理，请稍后', audio: { base64: 'AAAA' },
+    } }
+    const safe = prepareDownlinkMessage(event, item => logs.push(item))
+    assert.equal(safe.interim.text, event.interim.text)
+    assert.equal(safe.interim.audio, undefined)
+    assert.equal(event.interim.audio.base64, 'AAAA', 'source event must remain intact')
+    assert.equal(logs[0].reason, 'missing_kind')
   })
 })
