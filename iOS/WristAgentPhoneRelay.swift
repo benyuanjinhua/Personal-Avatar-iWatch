@@ -492,21 +492,35 @@ final class WristAgentPhoneRelay: ObservableObject {
         let partialURL = resultAudioDirectory
             .appendingPathComponent("\(projection.requestId).m4a.partial")
         var assembled = (try? Data(contentsOf: partialURL)) ?? Data()
+        Self.downlinkLogger.info(
+            "result audio fetch started request_id=\(projection.requestId, privacy: .public) state=queued bytes_staged=\(assembled.count) expected_bytes=\(meta.sizeBytes ?? -1)"
+        )
         for attempt in 0..<3 {
             do {
+                let rangeStart = assembled.isEmpty ? nil : assembled.count
+                Self.downlinkLogger.info(
+                    "result audio fetch attempted request_id=\(projection.requestId, privacy: .public) state=attempted attempt=\(attempt + 1) range_start=\(rangeStart ?? 0)"
+                )
                 let (data, status) = try await client.fetchResultAudio(
                     requestId: projection.requestId,
-                    rangeStart: assembled.isEmpty ? nil : assembled.count
+                    rangeStart: rangeStart
                 )
                 switch status {
                 case 206: assembled.append(data)
                 case 200: assembled = data
-                case 404: return // 音频已过保留期/不存在：文本降级
+                case 404:
+                    Self.downlinkLogger.error(
+                        "result audio fetch failed request_id=\(projection.requestId, privacy: .public) state=failed reason=not-found attempt=\(attempt + 1)"
+                    )
+                    return // 音频已过保留期/不存在：文本降级
                 case 416: assembled = Data() // 断点越界：从头再来
                 default: throw RelayUploadError.bridge(code: "ERR_AUDIO_FETCH", httpStatus: status)
                 }
                 if RelayWire.sha256Hex(assembled) == meta.sha256.lowercased() {
                     try? FileManager.default.removeItem(at: partialURL)
+                    Self.downlinkLogger.info(
+                        "result audio fetch completed request_id=\(projection.requestId, privacy: .public) state=downloaded bytes=\(assembled.count) attempt=\(attempt + 1)"
+                    )
                     stageAndTransferSpeech(projection: projection, data: assembled, sha: meta.sha256.lowercased())
                     return
                 }
@@ -515,11 +529,17 @@ final class WristAgentPhoneRelay: ObservableObject {
                 }
             } catch {
                 try? assembled.write(to: partialURL, options: .atomic) // 保留断点
+                Self.downlinkLogger.error(
+                    "result audio fetch interrupted request_id=\(projection.requestId, privacy: .public) state=attempted-no-ack bytes_staged=\(assembled.count) attempt=\(attempt + 1) error=\(String(describing: error), privacy: .public)"
+                )
                 let delay = RetryBackoff.outboxDefault.delay(forAttempt: attempt + 1)
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             }
         }
         try? assembled.write(to: partialURL, options: .atomic)
+        Self.downlinkLogger.error(
+            "result audio fetch deferred request_id=\(projection.requestId, privacy: .public) state=queued bytes_staged=\(assembled.count) reason=retry-exhausted"
+        )
         relayLog("结果语音下载未完成，已保留断点；文本结果已先行送达")
     }
 
