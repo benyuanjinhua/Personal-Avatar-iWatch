@@ -25,6 +25,11 @@ struct VoiceTurnRecord: Codable, Equatable, Identifiable {
     var failureStage: VoiceFailureStage?
     /// 加密语音文件名（EncryptedAudioVault 内），播放交付后置空并删除文件。
     var speechFileName: String?
+    /// Watch 收到并校验、加密落盘结果语音的本地时间。用于计算端侧音频 TTFT；
+    /// optional 保持对旧版 voice-turns.json 的向后兼容。
+    var speechAttachedAt: Date? = nil
+    /// Watch 首次收到包含可展示文本的结果信封时间（interim 或 final）。
+    var firstResultAt: Date? = nil
     /// ESS-55 未读机制：结果首次被查看/播放的时间；nil = 未读。
     /// 结果在用户未查看前不丢失，下次打开仍以未读态呈现。
     var resultViewedAt: Date?
@@ -39,6 +44,25 @@ struct VoiceTurnRecord: Codable, Equatable, Identifiable {
     /// 已完成、有结果、且用户还没看过。
     var hasUnreadResult: Bool {
         currentState == .completed && result != nil && resultViewedAt == nil
+    }
+}
+
+/// 以 Watch 录音结束为起点的端侧延迟指标。只记录毫秒数和 request_id，
+/// 不采集转写文本或音频内容，可直接从 watch_client_log 聚合 P50/P95。
+struct VoiceTurnLatency: Equatable {
+    let textTTFTMs: Int?
+    let audioTTFTMs: Int?
+
+    static func measure(_ turn: VoiceTurnRecord) -> VoiceTurnLatency {
+        return VoiceTurnLatency(
+            textTTFTMs: elapsedMilliseconds(from: turn.createdAt, to: turn.firstResultAt),
+            audioTTFTMs: elapsedMilliseconds(from: turn.createdAt, to: turn.speechAttachedAt)
+        )
+    }
+
+    private static func elapsedMilliseconds(from start: Date, to end: Date?) -> Int? {
+        guard let end else { return nil }
+        return max(0, Int((end.timeIntervalSince(start) * 1_000).rounded()))
     }
 }
 
@@ -112,12 +136,16 @@ final class VoiceTurnJournal: ObservableObject {
         // 才生效——append 返回 false 时下面回滚 turns[index] 的临时写。
         let priorPermission = turns[index].permission
         let priorResult = turns[index].result
+        let priorFirstResultAt = turns[index].firstResultAt
         let priorErrorCode = turns[index].errorCode
         if let permission = envelope.permission {
             turns[index].permission = permission
         }
         if let result = envelope.result {
             turns[index].result = result
+            if turns[index].firstResultAt == nil {
+                turns[index].firstResultAt = envelope.occurredAt
+            }
         }
         // 一旦落到 failed 就锁定 errorCode，后续同 request_id 的乱序事件不覆盖。
         if envelope.state == .failed, turns[index].errorCode == nil,
@@ -137,6 +165,7 @@ final class VoiceTurnJournal: ObservableObject {
             // 与信封应用前一致，onStateApplied 未触发。
             turns[index].permission = priorPermission
             turns[index].result = priorResult
+            turns[index].firstResultAt = priorFirstResultAt
             turns[index].errorCode = priorErrorCode
             return false
         }
@@ -203,9 +232,12 @@ final class VoiceTurnJournal: ObservableObject {
 
     /// 结果语音已加密落盘。
     @discardableResult
-    func attachSpeech(requestId: String, fileName: String) -> Bool {
+    func attachSpeech(requestId: String, fileName: String, at date: Date = Date()) -> Bool {
         guard let index = turns.firstIndex(where: { $0.requestId == requestId }) else { return false }
         turns[index].speechFileName = fileName
+        if turns[index].speechAttachedAt == nil {
+            turns[index].speechAttachedAt = date
+        }
         save()
         onSpeechAttached?(requestId)
         return true
