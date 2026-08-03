@@ -141,7 +141,7 @@ final class SelfCheckRunner: ObservableObject {
         if let failure = await playbackStep(.recordThenPlay, data: assetData) { return failure }
 
         // S4 会话状态复位（ESS-61 根因）：.longFormAudio 路由策略不得残留。
-        if let failure = sessionResetStep() { return failure }
+        if let failure = await sessionResetStep() { return failure }
 
         // S5 中断残留（ESS-73）：合成 .began 后不投 .ended，新播放不得被
         // 挂起等待，必须直接激活并出声。
@@ -225,21 +225,51 @@ final class SelfCheckRunner: ObservableObject {
         return nil
     }
 
-    private func sessionResetStep() -> SelfCheckPolicy.Outcome? {
+    /// S4 路由策略复位的探测等待毫秒序列：首次 0（立即读一次），随后 100 /
+    /// 200 / 400 ms。累计上限约 700 ms——ESS-218 真机取证：S3R `play_finished`
+    /// 后 2ms 立即同步读 policy，播放器还没把 `.longFormAudio` 降回去，
+    /// 单点判定必然误报。改为有界轮询后：正常路径首次即通过（elapsed ≈ 0），
+    /// 播放器慢一拍归还也能等到；真正长期残留才在耗尽后判失败。
+    /// 与 [[sessionYieldWaitsMs]] 同款序列，让「让出」和「复位」两处等待
+    /// 上限对称。
+    static let sessionResetWaitsMs: [UInt64] = [0, 100, 200, 400]
+
+    /// 内部可见（非 private）以便 WatchTests 在无 mic 的模拟器上直接触发 S4 并
+    /// 观察 session_state / selfcheck_step 事件——ESS-218 要求「有界轮询」
+    /// 而非单点判定，正常路径与残留注入路径都必须有 R-02.1 运行时证据。
+    internal func sessionResetStep() async -> SelfCheckPolicy.Outcome? {
         let step = SelfCheckPolicy.Step.sessionReset
         beginStep(step)
         let startedAt = Date()
         let session = AVAudioSession.sharedInstance()
-        let policy = session.routeSharingPolicy
-        WatchLog.info(
+        var probes = 0
+        var policy = session.routeSharingPolicy
+        for delayMs in Self.sessionResetWaitsMs {
+            if interrupted { return .inconclusive(.interrupted) }
+            if delayMs > 0 {
+                try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
+            }
+            probes += 1
+            policy = session.routeSharingPolicy
+            if policy != .longFormAudio {
+                let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+                WatchLog.info(
+                    "selfcheck", "session_state",
+                    detail: "category=\(session.category.rawValue) route_policy=\(policy.rawValue)"
+                        + " probes=\(probes) elapsed_ms=\(elapsedMs) result=reset"
+                )
+                passStep(step, startedAt: startedAt)
+                return nil
+            }
+        }
+        let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+        WatchLog.error(
             "selfcheck", "session_state",
             detail: "category=\(session.category.rawValue) route_policy=\(policy.rawValue)"
+                + " probes=\(probes) elapsed_ms=\(elapsedMs) result=residue",
+            code: "ERR_ROUTE_POLICY_RESIDUE"
         )
-        guard policy != .longFormAudio else {
-            return failStep(step, startedAt: startedAt, fallbackCode: "ERR_ROUTE_POLICY_RESIDUE")
-        }
-        passStep(step, startedAt: startedAt)
-        return nil
+        return failStep(step, startedAt: startedAt, fallbackCode: "ERR_ROUTE_POLICY_RESIDUE")
     }
 
     // MARK: - S5/S6：中断残留与双激活失败（ESS-73 / ESS-64）
