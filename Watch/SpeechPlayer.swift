@@ -226,7 +226,9 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             return
         }
         do {
-            try session.setCategory(.playback, mode: .default, policy: .longFormAudio)
+            // ESS-226: 用 .default 让 OS 按当前默认输出设备路由——
+            // BT 连接 → BT，未连 → Watch 扬声器；不再强偏好 BT。
+            try session.setCategory(.playback, mode: .default, policy: .default)
         } catch {
             WatchLog.error(
                 "player", "session_policy_rejected", requestId: context,
