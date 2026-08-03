@@ -326,6 +326,15 @@ extension PhoneConnectivity: WatchFeedbackChannel {
         return true
     }
 
+    /// ESS-171：WSS 快照到达时的兜底触发。
+    /// 快照里出现 completed turn 说明 Bridge 还没拿到 /ack——不管 reachability 有没有
+    /// 抖动、有没有触发 didFinish，都主动调一次 flushDownlink，把此前被 markDeferred / 卡在
+    /// inFlight 超期的条目立刻重投；WatchDownlinkOutbox 内部按 request_id + payloadSha256
+    /// 幂等去重，重复调用只会打空、不会重复上载荷。
+    func retryPendingDownlinks(trigger: String) {
+        flushDownlink(trigger: trigger)
+    }
+
     private func enqueueDownlink(
         requestId: String, kind: WatchDownlinkKind, key: String, data: Data
     ) {
