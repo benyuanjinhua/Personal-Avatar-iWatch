@@ -431,11 +431,40 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         context = nil
         let callback = onFinish
         onFinish = nil
+        // ESS-224：播放结束后归还共享 AVAudioSession。修复前只清进程内状态、
+        // 从不 setActive(false)，`.playback` 会话一直挂在系统上：其它 App
+        // 播不出满音量（secondary_silence 一直生效），且没有交还观测点。
+        // 释放放在回调之前，让回调里紧接着起播的新 play() 从「无我方持有」
+        // 的干净态开始激活；已经不活跃时 setActive(false) 无害，中断 .began
+        // 场景下系统已收走硬件，可能抛错——`try?` 吞掉后落 result=false 事件
+        // 供排查，不影响后续 T2 决策。
+        releaseAudioSession(requestId: requestId, reason: endgame.rawValue)
         // 现有 Bool 契约不变（.retainForReplay / .deliverInterim / .deliverFinal
         // 决策仍走 PlaybackRecoveryPolicy.finishOutcome）；T2 决策通过独立
         // 回调追加，二者互不干扰、welcome/自检不设 T2 回调即零开销。
         callback?(endgame == .success)
         onPlaybackEndgame?(requestId, bytes, endgame)
+    }
+
+    /// ESS-224：与 `AudioRecorder.releaseSession` 对称——播放侧收尾也留一条
+    /// 交还观测点（`session_released`），Bridge 侧才有证据判「会话是否真的
+    /// 交还」。事件名与录音侧一致，`module=player` / `module=recorder` 区分
+    /// 归属。
+    private func releaseAudioSession(requestId: String?, reason: String) {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setActive(false, options: .notifyOthersOnDeactivation)
+            WatchLog.info(
+                "player", "session_released", requestId: requestId,
+                detail: "reason=\(reason) result=true instance=\(instanceTag) " + activationEvidence()
+            )
+        } catch {
+            WatchLog.error(
+                "player", "session_released", requestId: requestId,
+                detail: "reason=\(reason) result=false instance=\(instanceTag) " + activationEvidence(),
+                error: error
+            )
+        }
     }
 
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
@@ -465,6 +494,9 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             self.currentAudioBytes = 0
             self.onFinish = nil
             self.context = nil
+            // ESS-224：解码错误分支不走 finishPlayback，独立补一次会话交还——
+            // 与 finishPlayback 里的调用保持同一契约，避免这一条路径漏交还。
+            self.releaseAudioSession(requestId: requestId, reason: "decode_error")
             self.onPlaybackEndgame?(requestId, bytes, .exhausted)
         }
     }
