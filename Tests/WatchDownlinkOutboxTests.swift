@@ -222,6 +222,96 @@ final class WatchDownlinkOutboxTests: XCTestCase {
         XCTAssertEqual(outbox.pendingCount(), 1)
     }
 
+    /// ESS-208 场景 1/3：条目还在 `queued`（或 `deferred` 留痕过）时收到 snapshot。
+    /// invalidateDeliveredSpeech 仅拆 delivered 墓碑，不能误动仍在队列里等待投递的
+    /// 条目；随后同信封同音频的 re-enqueue 命中原有条目返回 duplicate，dueItems 依旧
+    /// 只返回一条，避免同一次回合被 flush 出去两次。
+    func testSnapshotOnQueuedSpeechKeepsSingleDueItem() throws {
+        var events: [WatchDownlinkLogEvent] = []
+        let audio = Data(repeating: 0xA1, count: 1024)
+        let outbox = try makeOutbox(log: { events.append($0) })
+        let result = try outbox.enqueueSpeech(
+            requestId: requestId, messageKey: "voice_speech_envelope",
+            envelope: Data("env".utf8), audio: audio, fileName: "\(requestId).m4a"
+        )
+        guard case .enqueued(let item) = result else { return XCTFail("语音应入队") }
+        // 模拟 flush 时 WCSession 未激活：条目仍是 queued，只是留痕一次 deferred。
+        outbox.markDeferred(id: item.id, reason: "session-not-activated:enqueue")
+        XCTAssertEqual(outbox.items.first?.state, .queued)
+
+        // Snapshot 到达：Relay 会先兜底调一次 invalidateDeliveredSpeech（对非 delivered
+        // 条目应是纯 no-op），再让 projection 重新入队。
+        XCTAssertFalse(outbox.invalidateDeliveredSpeech(requestId: requestId),
+                       "队列里还没送达的条目不能被 invalidate 误清")
+        XCTAssertEqual(outbox.items.count, 1, "invalidate 不得触碰 queued/deferred 条目")
+
+        let replay = try outbox.enqueueSpeech(
+            requestId: requestId, messageKey: "voice_speech_envelope",
+            envelope: Data("env".utf8), audio: audio, fileName: "\(requestId).m4a"
+        )
+        guard case .duplicate(let existing) = replay else {
+            return XCTFail("同回合 queued 条目已在队列，snapshot 重放不得堆积重复条目")
+        }
+        XCTAssertEqual(existing.id, item.id)
+        XCTAssertEqual(outbox.items.count, 1)
+        XCTAssertEqual(outbox.dueItems().map(\.id), [item.id],
+                       "会话恢复后 flushDownlink 只投递这一条，不会双发")
+        XCTAssertTrue(events.contains(.deferred(
+            requestId: requestId, kind: .speech, itemId: item.id,
+            reason: "session-not-activated:enqueue"
+        )), "deferred 留痕不得因 snapshot 处理被覆盖")
+    }
+
+    /// ESS-208 场景 2/3：条目卡在 `inFlight` 且已过 receipt 超时。此时 didFinish 迟迟
+    /// 不来，但业务上 Bridge 用 snapshot 反复告诉我们「还没 ACK」。invalidate 对非
+    /// delivered 条目 no-op；接着 re-enqueue 命中原条目返回 duplicate；下一次
+    /// dueItems 由 recoverStaleInFlight 兜底把它拉回 queued 并重投。
+    func testSnapshotOnStaleInFlightRecoversAndSendsOnce() throws {
+        var events: [WatchDownlinkLogEvent] = []
+        let audio = Data(repeating: 0xB2, count: 1024)
+        let outbox = try makeOutbox(inFlightTimeout: 10, log: { events.append($0) })
+        let result = try outbox.enqueueSpeech(
+            requestId: requestId, messageKey: "voice_speech_envelope",
+            envelope: Data("env".utf8), audio: audio, fileName: "\(requestId).m4a"
+        )
+        guard case .enqueued(let item) = result else { return XCTFail("语音应入队") }
+        outbox.markInFlight(id: item.id)
+        XCTAssertEqual(outbox.items.first?.state, .inFlight)
+
+        // 超时窗口内的 snapshot：invalidate no-op、dueItems 仍空——没有 didFinish、
+        // 又没过 receipt 期限，绝不能重复交给 WCSession 造成 double transferFile。
+        clock = clock.addingTimeInterval(5)
+        XCTAssertFalse(outbox.invalidateDeliveredSpeech(requestId: requestId))
+        XCTAssertTrue(outbox.dueItems().isEmpty,
+                      "receipt 超时前不得由 snapshot 触发第二次 transferFile")
+
+        // 超过 inFlightTimeout：snapshot 到达 → invalidate 依然 no-op → 再入队
+        // 返回 duplicate → dueItems 兜底把 stale inFlight 拉回 queued。
+        clock = clock.addingTimeInterval(6)
+        XCTAssertFalse(outbox.invalidateDeliveredSpeech(requestId: requestId))
+        let replay = try outbox.enqueueSpeech(
+            requestId: requestId, messageKey: "voice_speech_envelope",
+            envelope: Data("env".utf8), audio: audio, fileName: "\(requestId).m4a"
+        )
+        guard case .duplicate(let existing) = replay else {
+            return XCTFail("同回合 inFlight 条目仍在，snapshot 重放不得堆积重复条目")
+        }
+        XCTAssertEqual(existing.id, item.id)
+        XCTAssertEqual(outbox.items.count, 1)
+
+        let due = outbox.dueItems()
+        XCTAssertEqual(due.map(\.id), [item.id], "受信超时后条目必须回到可投递状态")
+        XCTAssertEqual(outbox.items.first?.state, .queued)
+        XCTAssertTrue(events.contains { event in
+            if case .failed(_, _, let id, _, let reason) = event {
+                return id == item.id && reason == "receipt-timeout"
+            }
+            return false
+        }, "stale inFlight 恢复必须留痕（receipt-timeout）")
+        XCTAssertNoThrow(try outbox.payload(for: item.id), "重投材料必须还在盘上")
+        XCTAssertNotNil(outbox.stagedAudioURL(for: item.id))
+    }
+
     func testDeliveredEnvelopeIsDedupedInSameProcess() throws {
         let outbox = try makeOutbox()
         let item = try XCTUnwrap(enqueueStatus(outbox))
