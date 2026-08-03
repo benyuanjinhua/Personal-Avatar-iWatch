@@ -28,6 +28,9 @@ struct VoiceTurnRecord: Codable, Equatable, Identifiable {
     /// ESS-55 未读机制：结果首次被查看/播放的时间；nil = 未读。
     /// 结果在用户未查看前不丢失，下次打开仍以未读态呈现。
     var resultViewedAt: Date?
+    /// ESS-180：failed 事件的 Bridge 稳定错误码（`ERR_*`）；成功回合恒为 nil。
+    /// UI 拿它查 `ErrorCueCatalog` 决定拟人化文案与语音提示。
+    var errorCode: String?
 
     var id: String { requestId }
     var currentState: VoiceTurnState { events.last?.state ?? .recorded }
@@ -110,6 +113,12 @@ final class VoiceTurnJournal: ObservableObject {
         }
         if let result = envelope.result {
             turns[index].result = result
+        }
+        // ESS-180：把稳定错误码留在回合上，UI 端可直接按 code 查表；一旦
+        // 落到 failed 就锁定，后续同 request_id 的乱序事件不覆盖。
+        if envelope.state == .failed, turns[index].errorCode == nil,
+           let code = envelope.errorCode, !code.isEmpty {
+            turns[index].errorCode = code
         }
         save()
         // 纯文本降级（ESS-48）：结果没有配套语音（speech_sha256 为空），不会有

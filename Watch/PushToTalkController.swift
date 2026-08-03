@@ -47,12 +47,20 @@ final class PushToTalkController: ObservableObject {
     let journal: VoiceTurnJournal
     let speechVault: EncryptedAudioVault?
     let player = SpeechPlayer()
+    /// ESS-180：错误语音专用播放器，与结果语音 `player` 隔离。
+    /// 失败到达时结果语音（如果之前有）不能被覆盖，反过来结果语音在播时
+    /// 收到失败也不能压过来；两个播放器各自持有各自的 AVAudioPlayer，会话
+    /// 抢占由 SpeechPlayer 内部的 generation 兜住，比"用同一个 player.play"
+    /// 更能保住彼此的完整性。
+    let errorSpeech = SpeechPlayer()
     let transport: WatchVoiceTransport
     /// ESS-55 超长任务本地通知（JIT 授权 / 结果通知 / 兜底预约 / 点通知直达）。
     let notifier: ResultNotifier
     /// ESS-45：录音 → 等待 → 播放整个回合期间持有 ExtendedRuntimeSession，
     /// 降腕/熄屏不挂起；空闲即释放。
     let sessionKeeper = VoiceSessionKeeper()
+    /// ESS-180：屏幕分身错误卡片状态机；订阅 `errorPresenter.active` 即得 UI。
+    let errorPresenter = AvatarErrorPresenter()
 
     /// 结果语音自动播放即将开始（App 层用来打断欢迎语）。
     var onAutoPlayStarted: (() -> Void)?
@@ -104,9 +112,16 @@ final class PushToTalkController: ObservableObject {
         // 回合期间 App 还在运行）。成功交付后清理重试缓存。
         // resultArrived 例外：是否播触觉取决于是否发本地通知（同一结果只震
         // 一次），而通知正文需要结果载荷——推迟到 onResultRecorded 决策。
+        //
+        // ESS-180：failed 时把稳定错误码交给 errorPresenter 走「语音 + 文字 + 触觉」——
+        // turnFailed 触觉的落点从此处下沉到 presenter 内部，避免同一次失败震两下。
         journal.onStateApplied = { [weak self] requestId, state in
             guard let self else { return }
-            if let cue = self.cuePolicy.cue(for: state, requestId: requestId), cue != .resultArrived {
+            if state == .failed {
+                let code = self.journal.turn(withId: requestId)?.errorCode
+                self.presentAvatarError(code: code, requestId: requestId)
+            } else if let cue = self.cuePolicy.cue(for: state, requestId: requestId),
+                      cue != .resultArrived, cue != .turnFailed {
                 WatchHaptics.play(cue, requestId: requestId)
             }
             switch state {
@@ -219,6 +234,24 @@ final class PushToTalkController: ObservableObject {
         )
     }
 
+    /// ESS-180：触发一次屏幕分身错误呈现——查表 → 起播语音 → 触觉一次 →
+    /// 卡片停留 5s；语音路径任一步失败自动降级到「文字 + 触觉」，绝不静音吞错。
+    /// requestId 为 nil 表示本地失败（录音太短、启动失败），每次都是新一次呈现。
+    func presentAvatarError(code: String?, requestId: String?) {
+        errorPresenter.present(
+            code: code,
+            requestId: requestId,
+            playAudio: { [weak self] data, ctx in
+                guard let self else { return false }
+                let context = ctx.map { "error-\($0)" } ?? "error-local"
+                return self.errorSpeech.play(data: data, context: context, onFinish: nil)
+            },
+            playHaptic: { requestId in
+                WatchHaptics.play(.turnFailed, requestId: requestId)
+            }
+        )
+    }
+
     /// 结果语音落盘后的定向自动播放（ESS-41 B3）。
     private func autoPlayResult(requestId: String) {
         guard state == .idle else {
@@ -275,6 +308,9 @@ final class PushToTalkController: ObservableObject {
             } catch {
                 state = .idle
                 errorMessage = Self.recordingErrorDescription(error)
+                // ESS-180：录音启动失败也是一次「秒失败」，走分身卡片 + 触觉，
+                // 不让手表只有底部一行灰字，然后就没了。
+                presentAvatarError(code: "ERR_RECORDER_START", requestId: nil)
             }
         }
     }
@@ -309,13 +345,16 @@ final class PushToTalkController: ObservableObject {
                     code: "ERR_AUDIO_TOO_SHORT"
                 )
                 errorMessage = RecorderError.recordingTooShortDescription
-                WatchHaptics.play(.turnFailed)
+                // ESS-180：本地失败与 Bridge 侧 ERR_AUDIO_TOO_SHORT 走同一
+                // 拟人化卡片；触觉在 presenter 内响一次，此处不再重复播放，
+                // 避免同一次「按太短」震两下。
+                presentAvatarError(code: "ERR_AUDIO_TOO_SHORT", requestId: nil)
                 return
             }
             submit(recording: recording)
         } catch {
             errorMessage = Self.recordingErrorDescription(error)
-            WatchHaptics.play(.turnFailed)
+            presentAvatarError(code: "ERR_RECORDER_FINISH", requestId: nil)
         }
     }
 
@@ -336,16 +375,23 @@ final class PushToTalkController: ObservableObject {
     }
 
     /// 一键重试（ESS-55）：用缓存的录音换新 request_id 重发，不需要重新说话。
+    ///
+    /// ESS-180：重试失败也走屏幕分身错误卡片。旧路径把提示塞进 `errorMessage`
+    /// 底部灰字里，主界面重构后已没人读它——用户点了「重试」后要么什么都没
+    /// 发生（缓存丢失），要么静默继续等待（写盘失败），都是本 issue 明确
+    /// 要消灭的「傻等」体验。
     func retry(turn: VoiceTurnRecord) {
         guard case .failed = turn.phase else { return }
         guard let stored = retryStore.stored(for: turn.requestId) else {
             errorMessage = "这条录音已清理，请重新说一次"
+            presentAvatarError(code: "ERR_RETRY_CACHE_MISSING", requestId: nil)
             return
         }
         let tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("wristagent-retry-\(UUID().uuidString).m4a")
         guard (try? stored.data.write(to: tempURL, options: .atomic)) != nil else {
             errorMessage = "重试失败，请重新说一次"
+            presentAvatarError(code: "ERR_RETRY_WRITE_FAILED", requestId: nil)
             return
         }
         errorMessage = nil

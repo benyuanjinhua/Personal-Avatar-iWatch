@@ -11,6 +11,8 @@ struct WatchContentView: View {
     @ObservedObject private var journal: VoiceTurnJournal
     @ObservedObject private var player: SpeechPlayer
     @ObservedObject private var notifier: ResultNotifier
+    /// ESS-180：屏幕分身错误卡片状态机。
+    @ObservedObject private var errorPresenter: AvatarErrorPresenter
 
     init(pushToTalk: PushToTalkController, welcome: WelcomeGreeter, selfCheck: SelfCheckRunner) {
         self.pushToTalk = pushToTalk
@@ -20,12 +22,22 @@ struct WatchContentView: View {
         self.journal = pushToTalk.journal
         self.player = pushToTalk.player
         self.notifier = pushToTalk.notifier
+        self.errorPresenter = pushToTalk.errorPresenter
     }
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 10) {
+                    // ESS-180：屏幕分身错误卡片放在顶部，确保失败终态永远
+                    // 压在等待文案之上——白梦林原始 bug 就是「仍在等 Mac」
+                    // 压过了失败终态，让用户傻等 85 秒。
+                    if let error = errorPresenter.active {
+                        AvatarErrorCardView(presentation: error) {
+                            errorPresenter.dismiss()
+                        }
+                    }
+
                     VoiceOrbView(mode: orbMode, size: 70)
                         .padding(.top, 4)
                         .gesture(
@@ -52,9 +64,10 @@ struct WatchContentView: View {
                         selfCheckAttentionCard(attention)
                     }
 
-                    // ESS-55 主张 2：等待文案随时间推进（阶梯 + 计秒），每秒重算，
-                    // 保证任何等待状态 10 秒内至少变化一次，不存在静止转圈。
-                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                    // ESS-180：主界面禁止「已等待 N 秒」——处理中只允许语义化
+                    // 阶段词（正在思考…/正在查询…），30/60 秒切换文案而非数秒。
+                    // TimelineView 触发文案切换（不显示秒数），每 5 秒重算已够。
+                    TimelineView(.periodic(from: .now, by: 5)) { context in
                         let status = statusCopy(now: context.date)
                         VStack(spacing: 10) {
                             Text(status.title)
@@ -67,6 +80,12 @@ struct WatchContentView: View {
                                 .foregroundStyle(.secondary)
                                 .multilineTextAlignment(.center)
                                 .lineLimit(3)
+                        }
+                        .onChange(of: context.date) { _, now in
+                            // ESS-180：错误卡片最少停留 5s，到点由 UI 心跳负责收起。
+                            if errorPresenter.shouldAutoDismiss(now: now) {
+                                errorPresenter.dismiss()
+                            }
                         }
                     }
 
@@ -304,57 +323,84 @@ struct WatchContentView: View {
         player.isPlaying || welcome.stage == .playing
     }
 
+    /// ESS-180：语音球只有四态。所有中间等待态（sending / waitingForPhone /
+    /// waitingForMac / delivered / processing / needsConfirmation）统统合并到
+    /// `.thinking`——中间态的可视差异改由底部文案承担，球体只表达
+    /// 「输入还是输出、正在还是空闲」。终态（completed/failed/cancelled）
+    /// 一律回到 idle，失败的可见证据由 `AvatarErrorCardView` 承担；这样即使
+    /// 卡片被用户手动关闭，屏幕也不会残留矛盾的失败/成功球。
     private var orbMode: VoiceOrbView.Mode {
         if isRecording { return .listening(level: pushToTalk.recordingLevel) }
-        guard let phase = activeTurn?.phase else { return .idle }
+        if isSpeaking { return .speaking }
+        guard let phase = activeTurn?.phase, activeTurn?.isActive == true else { return .idle }
         switch phase {
-        case .sending, .waitingForPhone, .waitingForMac: return .waiting
-        case .delivered, .processing: return .processing
-        case .needsConfirmation: return .confirmation
-        case .completed: return .completed
-        case .failed: return .failed
-        case .cancelled: return .idle
+        case .sending, .waitingForPhone, .waitingForMac,
+             .delivered, .processing, .needsConfirmation:
+            return .thinking
+        case .completed, .failed, .cancelled:
+            return .idle
         }
     }
 
-    /// 状态文案：ESS-59 的真实进展优先——有 progress 事件时展示真实步骤文本
-    /// 与真实已等时长，20 秒无新进展给出诚实的「比预期久」提示；没有真实
-    /// 进展时回落到 ESS-55 的 WaitingStatusCopy 阶梯（按已等时长推进）。
-    private func statusCopy(now: Date) -> WaitingStatusCopy.Entry {
+    /// 状态文案：ESS-180 严禁「已等待 N 秒」。处理中只允许语义化阶段词
+    /// （分身正在思考… / 正在查询…），30 秒内无阶段变化则文案切换到
+    /// 语义提示，60 秒后追加「任务较慢，可继续等待或取消」——数字仅用于
+    /// 判定切换阈值，不出现在文本里。真实 progress 事件优先，用它的
+    /// 语义文本替换阶梯文案。
+    private func statusCopy(now: Date) -> MainStatusCopy {
         if isRecording {
-            return .init(title: "我在听", subtitle: "松开发送（最长 60 秒）")
-        }
-        if let error = pushToTalk.errorMessage {
-            return .init(title: error, subtitle: "按住语音球再说一次")
+            return MainStatusCopy(title: "我在听", subtitle: "松开发送（最长 60 秒）")
         }
         if isSpeaking {
-            return .init(title: "播放中", subtitle: "全文同步展示，播完可回看")
+            return MainStatusCopy(title: "AI 分身正在说话…", subtitle: "全文同步展示，可点字幕打断")
         }
-        guard let turn = activeTurn else {
-            return .init(
+        guard let turn = activeTurn, turn.isActive else {
+            return MainStatusCopy(
                 title: "按住说话",
                 subtitle: showWelcomeBanner ? "按住语音球开始对话" : "松开即发送，结果回来会震动提醒"
             )
         }
-        if case .failed(let message) = transport.phase {
-            return .init(title: turn.phase.title, subtitle: message)
+        if let progress = currentProgress(for: turn) {
+            let elapsed = now.timeIntervalSince(progress.updatedAt)
+            let title = progress.detail?.isEmpty == false ? progress.detail! : progress.phase.displayText
+            return MainStatusCopy(
+                title: elapsed >= 60 ? "任务较慢，可继续等待或取消" : title,
+                subtitle: elapsed >= 20 ? "分身还在处理…" : "分身正在处理"
+            )
         }
-        if turn.isActive {
-            if let progress = currentProgress(for: turn) {
-                let title = now.timeIntervalSince(progress.updatedAt) >= 20
-                    ? "还在处理，比预期久一些"
-                    : (progress.detail ?? progress.phase.displayText)
-                return .init(
-                    title: title,
-                    subtitle: "已等待 \(elapsedText(now.timeIntervalSince(turn.createdAt)))"
-                )
-            }
-            let lastEventAt = turn.events.last?.at ?? turn.createdAt
-            if let entry = WaitingStatusCopy.entry(for: turn.phase, elapsed: now.timeIntervalSince(lastEventAt)) {
-                return entry
-            }
+        let lastEventAt = turn.events.last?.at ?? turn.createdAt
+        let elapsed = now.timeIntervalSince(lastEventAt)
+        return MainStatusCopy(
+            title: processingTitle(for: turn.phase, elapsed: elapsed),
+            subtitle: processingSubtitle(for: turn.phase, elapsed: elapsed)
+        )
+    }
+
+    /// ESS-180 语义化阶段词：0-30s 走短文案，30s+ 换语义提示，60s+ 追加
+    /// 「较慢，可继续等待或取消」。任何位置都不允许出现秒数或时:分。
+    private func processingTitle(for phase: VoiceTurnPhase, elapsed: TimeInterval) -> String {
+        if elapsed >= 60 { return "任务较慢，可继续等待或取消" }
+        switch phase {
+        case .sending: return "正在送出"
+        case .waitingForPhone: return "等待手机连接"
+        case .waitingForMac: return elapsed >= 30 ? "分身还在联系 Mac…" : "已到手机，等待 Mac"
+        case .delivered: return elapsed >= 30 ? "分身正在准备执行…" : "Mac 已受理"
+        case .processing(let background):
+            if elapsed >= 30 { return background ? "分身还在跑…" : "分身还在想…" }
+            return background ? "分身正在处理…" : "分身正在思考…"
+        case .needsConfirmation: return "需要你的确认"
+        case .completed, .failed, .cancelled: return phase.title
         }
-        return .init(title: turn.phase.title, subtitle: turn.phase.subtitle)
+    }
+
+    private func processingSubtitle(for phase: VoiceTurnPhase, elapsed: TimeInterval) -> String {
+        switch phase {
+        case .waitingForPhone: return "手机连上后自动送出"
+        case .needsConfirmation: return "未确认前不会执行"
+        default:
+            if elapsed >= 60 { return "分身仍在运行，可以先放下手腕" }
+            return "结果好了会震动提醒"
+        }
     }
 
     private func currentProgress(for turn: VoiceTurnRecord) -> RelayStatusUpdate? {
@@ -362,10 +408,5 @@ struct WatchContentView: View {
               progress.requestId == turn.requestId,
               progress.phase == .backgroundProcessing else { return nil }
         return progress
-    }
-
-    private func elapsedText(_ interval: TimeInterval) -> String {
-        let seconds = max(0, Int(interval))
-        return String(format: "%d:%02d", seconds / 60, seconds % 60)
     }
 }
