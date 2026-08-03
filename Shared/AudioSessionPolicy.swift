@@ -1,45 +1,22 @@
 import Foundation
 
-/// ESS-61：共享 AVAudioSession 在「long_form 播放 ↔ 录音」之间切换的决策
+/// ESS-61 / ESS-226：共享 AVAudioSession 在「播放 ↔ 录音」之间切换的决策
 /// （纯函数，可单测）。
-/// 背景：ESS-58 在播放路径把共享会话设成 .longFormAudio 路由策略；该策略
-/// 是粘性的——录音侧不带 policy 参数的 setCategory 重载不会把它复位，
-/// .longFormAudio 与 .playAndRecord 不相容 → setCategory/setActive 抛
+/// 背景：ESS-58 曾在播放路径把共享会话设成 `.longFormAudio` 路由策略；
+/// 该策略是粘性的——录音侧不带 policy 参数的 setCategory 重载不会把它复位，
+/// `.longFormAudio` 与 `.playAndRecord` 不相容 → setCategory/setActive 抛
 /// NSOSStatusErrorDomain#-50（paramErr），录音全灭（真机取证 04:52:45–47
 /// 连续 6 次）。同一次取证还发现 activate() 回调 error=nil 但
 /// activated=false 被当成功，88 秒音频一声没出（play_returned_false）。
+/// ESS-226 后播放默认走 `.default` 路由策略（BT 自动跟随，不强偏好 BT），
+/// 录音侧复位路径不变——用户显式开启高质量长音频模式时仍走 `.longFormAudio`，
+/// 复位/回落序列继续覆盖这个前置态。
 enum AudioSessionPolicy {
-    /// 播放激活状态机的下一步。所有路径最终只能到 `play` 或
-    /// `retainForReplay`。
-    /// ESS-73：中断标志不再是新播放请求的闸门——`.ended` 通知不保证投递
-    /// （中断方不归还会话、App 曾挂起都会丢），等 `.ended` 会把播放通道
-    /// 永久锁死。新 play() 一律直接尝试激活，让激活结果说话：硬件仍被
-    /// 占用时激活自然失败（'!pla'），落入既有 exhausted→retainForReplay
-    /// 路径，不会更糟。
-    enum PlaybackActivationAction: Equatable {
-        case activateLongForm
-        case activateForeground
-        case play
-        case retainForReplay
-    }
-
-    /// `nil` 表示该级激活尚未尝试。把是否允许 `play()` 的判定集中在纯函数
-    /// 中，避免异步回调的某条失败分支绕过门禁。
-    static func nextPlaybackActivationAction(
-        longFormSucceeded: Bool?,
-        foregroundSucceeded: Bool?
-    ) -> PlaybackActivationAction {
-        guard let longFormSucceeded else { return .activateLongForm }
-        if longFormSucceeded { return .play }
-        guard let foregroundSucceeded else { return .activateForeground }
-        return foregroundSucceeded ? .play : .retainForReplay
-    }
-
     // MARK: F2 播放激活判定
 
     /// `activated == false` 与 `error != nil` 一律视为激活失败：只有会话
-    /// 真正激活了才允许 play()，否则回落前台会话重配——宁可锁屏被挂起，
-    /// 也不许在未激活的会话上静默失声。
+    /// 真正激活了才允许 play()。ESS-226 后单阶段激活，失败即走 exhausted
+    /// → retainForReplay，不再有「回落 foreground」的二次尝试。
     static func playbackActivationSucceeded(activated: Bool, hasError: Bool) -> Bool {
         activated && !hasError
     }

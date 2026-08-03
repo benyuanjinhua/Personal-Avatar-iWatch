@@ -114,6 +114,16 @@ struct WatchContentView: View {
                     .buttonStyle(.bordered)
                     .tint(.secondary)
 
+                    // ESS-226：本地音频播放偏好（默认走扬声器，BT 自动跟随）。
+                    NavigationLink {
+                        WatchAudioSettingsView()
+                    } label: {
+                        Label("音频设置", systemImage: "hifispeaker")
+                    }
+                    .font(.footnote)
+                    .buttonStyle(.bordered)
+                    .tint(.secondary)
+
                     if let remote = transport.remoteStatus,
                        remote.requestId != activeTurn?.requestId {
                         Text(remote.detail ?? remote.phase.displayText)
@@ -406,5 +416,34 @@ struct WatchContentView: View {
               progress.requestId == turn.requestId,
               progress.phase == .backgroundProcessing else { return nil }
         return progress
+    }
+}
+
+/// ESS-226：Watch 本地音频偏好设置。默认扬声器优先（BT 连上自动跟随），
+/// 用户显式开启「高质量长音频模式」后才用 `.longFormAudio` 路由策略。
+struct WatchAudioSettingsView: View {
+    @AppStorage(WatchPlaybackPreferences.longFormAudioEnabledKey)
+    private var longFormAudioEnabled: Bool = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                Toggle(isOn: $longFormAudioEnabled) {
+                    Text("高质量长音频模式")
+                        .font(.footnote.bold())
+                }
+                .tint(.cyan)
+
+                Text(longFormAudioEnabled
+                    ? "已开启：优先蓝牙耳机，锁屏/降腕后台仍能续播（BT 未连时回退到扬声器）。"
+                    : "默认：iOS 按当前默认输出决定路由——蓝牙耳机连着走蓝牙，未连走 Watch 扬声器。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 8)
+        }
+        .navigationTitle("音频设置")
     }
 }

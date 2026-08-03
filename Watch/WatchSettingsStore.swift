@@ -3,6 +3,22 @@ import Foundation
 import WatchConnectivity
 import os
 
+/// ESS-226：Watch 端播放路由偏好（真机本地设置，不同步到 iPhone）。
+/// 默认走 `.default` 路由策略——iOS 按当前默认输出设备决策：BT 连上就走
+/// AirPods，没连就走 Watch 扬声器，不强偏好 BT。用户显式打开「高质量长
+/// 音频模式」后才用 `.longFormAudio`（更强的 BT 偏好 + 后台音频保活）。
+enum WatchPlaybackPreferences {
+    /// UserDefaults key。SwiftUI 侧用 `@AppStorage(...)` 同名绑定；SpeechPlayer
+    /// 侧读取运行时值判断策略。默认 false = `.default` 路由（扬声器优先，BT
+    /// 自动跟随）。
+    static let longFormAudioEnabledKey = "wristagent.watch.playback.long_form_audio_enabled"
+
+    /// 当前是否启用高质量长音频模式。`false` = `.default`，`true` = `.longFormAudio`。
+    static var longFormAudioEnabled: Bool {
+        UserDefaults.standard.bool(forKey: longFormAudioEnabledKey)
+    }
+}
+
 @MainActor
 final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
     /// ESS-41 L3 取证：结果语音「到没到手表、为何被丢」全部走这条日志。

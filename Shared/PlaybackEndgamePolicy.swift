@@ -20,8 +20,9 @@ import Foundation
 enum PlaybackEndgame: String, Equatable {
     /// `play_finished successfully=true`：唯一「用户已听见」终局，不再补告知。
     case success
-    /// long-form 与 foreground 两级会话激活均失败（`playback_activation_exhausted`）：
-    /// 从未 `play()`，音频保留可重播。
+    /// 会话激活失败（`playback_activation_exhausted`）：从未 `play()`，
+    /// 音频保留可重播。ESS-226 后单阶段激活（`.default` 或 opt-in `.longFormAudio`），
+    /// 失败即走本终局；此前的 long-form + foreground 两级失败历史仍收敛到这里。
     case exhausted
     /// 播放中被系统中断截断（`playback_halted_by_interruption`）：
     /// 硬件已被抢走，本段作废；语音留仓可重播。
@@ -57,8 +58,8 @@ struct PlaybackEndgameOutcome: Equatable {
 enum PlaybackEndgamePolicy {
     /// T2-4 挂起超时阈值：`play()` 请求发出 30 秒内若无 `play_started`（或
     /// 任何终局事件），视为激活回调丢失/挂起，落地成失败终局并告知用户。
-    /// 30s 覆盖真机取证观测的 long-form + foreground 双激活最坏握手时间
-    /// （<< 数秒）绰绰有余；再等下去用户已经离开界面，告知反而无意义。
+    /// ESS-226 后单阶段激活正常握手 << 数秒；30s 阈值绰绰有余。再等下去
+    /// 用户已经离开界面，告知反而无意义。
     static let deferredTimeoutSeconds: TimeInterval = 30
 
     /// 结果播放终局 → T2 追加动作。

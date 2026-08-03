@@ -77,7 +77,9 @@ final class PlaybackEndgameChainTests: XCTestCase {
     /// 是一条 T2 决策链路走通的证据；真机在真实授权后走的是 `result_notified`。
     func testExhaustedExercisesHapticAndT2NotifierIdempotency() async throws {
         let player = SpeechPlayer()
-        player.selfCheckForcedActivationFailures = ["long_form", "foreground"]
+        // ESS-226：SpeechPlayer 单阶段激活；策略由用户偏好决定（`long_form`
+        // 或 `default`）。两个名字都写入，确保无论宿主偏好如何都能触发 exhausted。
+        player.selfCheckForcedActivationFailures = ["long_form", "default"]
 
         let requestId = "ess154-exhausted-\(UUID().uuidString)"
         let endgameSeen = expectation(description: "T2 endgame callback fired")

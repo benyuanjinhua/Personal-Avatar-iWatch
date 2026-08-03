@@ -1,57 +1,13 @@
 import XCTest
 @testable import WristAgentCore
 
-/// ESS-61：会话切换决策单测——复现 R4 开测即挂的两个缺陷分支：
+/// ESS-61 / ESS-226：会话切换决策单测——复现 R4 开测即挂的两个缺陷分支：
 /// A) long_form 播放后录音 -50，配置必须先复位路由策略、失败有回落；
 /// B) activate 回调 activated=false 却被当成功，88 秒音频静默。
+/// ESS-226 后播放侧改单阶段激活（默认 `.default` 路由，opt-in `.longFormAudio`），
+/// 「long_form → foreground」的状态机不再存在——只保留激活成功判据（F2）
+/// 与录音会话复位序列（F1，覆盖 opt-in 后的 .longFormAudio 前置态）。
 final class AudioSessionPolicyTests: XCTestCase {
-    // MARK: ESS-64/ESS-73 播放激活状态机
-
-    func testFreshPlaybackAlwaysAttemptsActivation() {
-        // ESS-73：状态机入口不再有「等待中断结束」分支——.ended 不保证
-        // 投递，等待会把播放通道永久锁死（真机取证：6 条 began 0 条 ended，
-        // 后续所有 play() 被无限 defer）。新请求一律先激活，激活结果说话。
-        XCTAssertEqual(
-            AudioSessionPolicy.nextPlaybackActivationAction(
-                longFormSucceeded: nil, foregroundSucceeded: nil
-            ),
-            .activateLongForm
-        )
-    }
-
-    func testPlaybackAfterLongFormActivation() {
-        XCTAssertEqual(
-            AudioSessionPolicy.nextPlaybackActivationAction(
-                longFormSucceeded: true, foregroundSucceeded: nil
-            ),
-            .play
-        )
-    }
-
-    func testLongFormFailureFallsBackToForeground() {
-        XCTAssertEqual(
-            AudioSessionPolicy.nextPlaybackActivationAction(
-                longFormSucceeded: false, foregroundSucceeded: nil
-            ),
-            .activateForeground
-        )
-        XCTAssertEqual(
-            AudioSessionPolicy.nextPlaybackActivationAction(
-                longFormSucceeded: false, foregroundSucceeded: true
-            ),
-            .play
-        )
-    }
-
-    func testPlaybackIsRetainedWhenBothActivationsFail() {
-        XCTAssertEqual(
-            AudioSessionPolicy.nextPlaybackActivationAction(
-                longFormSucceeded: false, foregroundSucceeded: false
-            ),
-            .retainForReplay
-        )
-    }
-
     // MARK: 缺陷 B 复现（F2）：activated=false 不是成功
 
     func testActivationFalseWithoutErrorIsFailure() {

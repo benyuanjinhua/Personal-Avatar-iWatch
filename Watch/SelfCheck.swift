@@ -268,13 +268,15 @@ final class SelfCheckRunner: ObservableObject {
         let callbackTs = signals.firstTimestamp(of: "play_started").map { Int64($0.timeIntervalSince1970 * 1000) }
         let deferredSeen = signals.count(of: "playback_deferred")
         let flagCleared = signals.count(of: "interruption_flag_cleared")
+        // ESS-226：单阶段激活后 fallback 槽恒为 notAttempted；主策略名
+        // 由用户偏好决定（`long_form` 或 `default`），SelfCheck 只观察不断言。
         WatchLog.info(
             "selfcheck", "selfcheck_observation",
             detail: SelfCheckPolicy.observationDetail(
                 step: step, phase: "stale_flag_play", scenePhase: Self.scenePhase(),
                 interruptionState: .began, requestTs: requestTs, callbackTs: callbackTs,
-                longFormResult: activationResult(policy: "long_form"),
-                fallbackResult: activationResult(policy: "foreground")
+                longFormResult: activationResult(policy: currentPlaybackPolicyName()),
+                fallbackResult: .notAttempted
             )
         )
         player.stop(reason: "selfcheck_s5_complete")
@@ -286,15 +288,16 @@ final class SelfCheckRunner: ObservableObject {
         return nil
     }
 
-    /// S6 双激活失败：经 SpeechPlayer 的自检注入缝强制 long-form 与
-    /// foreground 都失败（真机无法按需制造），断言真实决策链走到
-    /// playback_activation_exhausted、绝不 play()、onFinish(false) 通知
-    /// 上层保留重播。
+    /// S6 激活失败：经 SpeechPlayer 的自检注入缝强制激活失败（真机无法
+    /// 按需制造），断言真实决策链走到 playback_activation_exhausted、绝不
+    /// play()、onFinish(false) 通知上层保留重播。ESS-226 后 SpeechPlayer
+    /// 单阶段激活；集合内同时写入 `long_form` 与 `default` 兼容两种用户
+    /// 偏好——不管用户是否开启高质量长音频模式，本步都能强制走到 exhausted。
     private func dualActivationFailureStep(data: Data) async -> SelfCheckPolicy.Outcome? {
         let step = SelfCheckPolicy.Step.dualActivationFailure
         beginStep(step)
         let startedAt = Date()
-        player.selfCheckForcedActivationFailures = ["long_form", "foreground"]
+        player.selfCheckForcedActivationFailures = ["long_form", "default"]
         defer { player.selfCheckForcedActivationFailures = [] }
 
         let requestTs = Self.epochMs()
@@ -308,12 +311,15 @@ final class SelfCheckRunner: ObservableObject {
         }
         let callbackTs = signals.firstTimestamp(of: "playback_activation_exhausted")
             .map { Int64($0.timeIntervalSince1970 * 1000) }
+        // ESS-226：单阶段激活的 forced failure 只写一次 session_activation_failed；
+        // fallback 槽恒为 notAttempted。观察值 = 实际生效策略下 forced_by_selfcheck
+        // 命中的失败。
         WatchLog.info(
             "selfcheck", "selfcheck_observation",
             detail: SelfCheckPolicy.observationDetail(
                 step: step, phase: "exhausted", scenePhase: Self.scenePhase(),
                 interruptionState: .none, requestTs: requestTs, callbackTs: callbackTs,
-                longFormResult: .failed, fallbackResult: .failed
+                longFormResult: .failed, fallbackResult: .notAttempted
             )
         )
         if interrupted { player.stop(reason: "selfcheck_interrupted"); return .inconclusive(.interrupted) }
@@ -326,10 +332,17 @@ final class SelfCheckRunner: ObservableObject {
     }
 
     /// 观察到的激活结果 → ESS-64 契约枚举（按 policy 区分同名事件）。
+    /// ESS-226 后 SpeechPlayer 单阶段激活，policy 名为 `long_form` 或 `default`
+    /// 之一——由用户偏好决定当次实际使用哪个。
     private func activationResult(policy: String) -> SelfCheckPolicy.ActivationResult {
         if signals.count(of: "session_activated", detailContains: "policy=\(policy)") > 0 { return .success }
         if signals.count(of: "session_activation_failed", detailContains: "policy=\(policy)") > 0 { return .failed }
         return .notAttempted
+    }
+
+    /// ESS-226：当前用户偏好选中的播放 policy 名。用于 S5/S6 观测的取证字段。
+    private func currentPlaybackPolicyName() -> String {
+        WatchPlaybackPreferences.longFormAudioEnabled ? "long_form" : "default"
     }
 
     // MARK: - ESS-137 会话让出屏障
@@ -574,7 +587,8 @@ final class SelfCheckRunner: ObservableObject {
 
 /// 自检窗口内的故障/进展信号记录（WatchLog 观察者回调可能来自任意线程）。
 /// S5/S6 需要按 detail 区分同名事件（如 session_activated 的
-/// policy=long_form 与 policy=foreground），故整条留存而非只计数。
+/// policy=long_form 与 policy=default，ESS-226 后单阶段激活的两种策略名），
+/// 故整条留存而非只计数。
 private final class SignalCounter: @unchecked Sendable {
     private struct Signal {
         let event: String

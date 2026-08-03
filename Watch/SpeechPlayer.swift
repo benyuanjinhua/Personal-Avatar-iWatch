@@ -18,11 +18,12 @@ struct SpeechPlaybackContext {
 /// ESS-42 取证：会话激活、音频路由、播放器创建、play() 返回、完成/解码
 /// 错误/系统中断回调全部走统一 WatchLog，context 为 request_id（结果播放）
 /// 或 welcome-<id>（欢迎语），Mac 侧按同一 id 串链。
-/// ESS-58 后台音频：watchOS 上锁屏/降腕/切走后还要出声，唯一正路是
-/// WKBackgroundModes=audio + .playback 会话带 .longFormAudio 路由策略 +
-/// 异步 activate()——纯 setActive(true) 的前台会话在 App 挂起时播放被无声
-/// 截断（真机取证 play_started 无 play_finished）。激活失败回落前台会话，
-/// 宁可只在前台响也不失声；未播完一律走 onFinish(false) 交由上层保留重播。
+/// ESS-226：默认使用 `.default` 路由策略——iOS 按当前默认输出设备决策
+/// （BT 连着走 BT，未连走 Watch 扬声器），不再强偏好 AirPods。用户显式
+/// 打开 `WatchPlaybackPreferences.longFormAudioEnabled` 才用 `.longFormAudio`
+/// （保留后台音频保活 + 强 BT 偏好的选择）。原「long-form 激活失败 → 回落
+/// foreground」的两阶段逻辑已删除：新默认下一次成功，无需回落；opt-in
+/// long-form 若失败则直接走 retainForReplay（既有失败终局路径）。
 @MainActor
 final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published private(set) var isPlaying = false
@@ -48,11 +49,12 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private var isSessionInterrupted = false
     /// 异步激活期间又来了新 play()/stop() 时，旧激活回调据此作废。
     private var playbackGeneration = 0
-    /// ESS-65 S6 注入缝：「long-form 与 foreground 双激活失败」在真机上无法
-    /// 按需制造，装机自检靠它把 ESS-64 的 exhausted 分支（不许 play()、音频
-    /// 保留重播）变成可执行断言。命中的策略级不触碰真实 AVAudioSession、
-    /// 直接按失败处理——回落顺序、exhausted 判定、finishPlayback 全走真实
-    /// 代码。仅 SelfCheckRunner 在 S6 窗口内设置；生产路径恒为空集。
+    /// ESS-65 S6 注入缝：activation 失败在真机上无法按需制造，装机自检靠它
+    /// 把 exhausted 分支（不许 play()、音频保留重播）变成可执行断言。集合内
+    /// 应写当前生效的 policy 名（`long_form` 或 `default`）——ESS-226 后
+    /// SpeechPlayer 单阶段激活，命中即失败、走真实 exhausted → finishPlayback
+    /// 代码。SelfCheckRunner 为兼容两种用户偏好一次性写入两个名字；生产
+    /// 路径恒为空集。
     var selfCheckForcedActivationFailures: Set<String> = []
 
     var currentContext: String? { isPlaying ? context : nil }
@@ -157,11 +159,15 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     private func requestActivationAndPlayback(_ player: AVAudioPlayer, bytes: Int, generation: Int) {
-        // ESS-73：新播放请求视为用户意图，直接激活，激活结果即唯一门禁
-        // （见 AudioSessionPolicy.nextPlaybackActivationAction）。中断期间
-        // 到来的 .began 会经 haltPlaybackForInterruption 收掉本次播放并使
-        // generation 失效，无需在此处预判中断状态。
-        activateSession(context: context) { [weak self] activated in
+        // ESS-73：新播放请求视为用户意图，直接激活，激活结果即唯一门禁。
+        // 中断期间到来的 .began 会经 haltPlaybackForInterruption 收掉本次
+        // 播放并使 generation 失效，无需在此处预判中断状态。
+        // ESS-226：单阶段激活——不再回落 foreground 会话。默认 `.default`
+        // 路由策略一次成功；opt-in 的 `.longFormAudio` 若失败也直接走
+        // exhausted → retainForReplay，不做「BT 会话激活失败再前台再试」的
+        // 双阶段——那正是逼用户戴 BT 的根因。
+        let policyName = Self.currentPolicyName()
+        activateSession(context: context, policyName: policyName) { [weak self] activated in
             guard let self, self.playbackGeneration == generation, self.audioPlayer === player else { return }
             if activated {
                 if self.isSessionInterrupted {
@@ -177,7 +183,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             } else {
                 WatchLog.error(
                     "player", "playback_activation_exhausted", requestId: self.context,
-                    detail: "long_form=false foreground=false bytes=\(bytes) "
+                    detail: "policy=\(policyName) bytes=\(bytes) "
                         + self.activationEvidence(),
                     code: "ERR_PLAYBACK_ACTIVATION"
                 )
@@ -203,37 +209,44 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         finishPlayback(endgame: .halted)
     }
 
-    /// ESS-58 方案 A：优先 .longFormAudio + 异步 activate()（watchOS 后台
-    /// 音频的系统合同）；setCategory 抛错（旧系统/参数拒绝）时回落原有
-    /// 前台同步激活，行为等同 ESS-41 B3，不失声但锁屏会被挂起。
-    private func activateSession(context: String?, completion: @escaping @MainActor (Bool) -> Void) {
+    /// ESS-226：单阶段激活。用户未开高质量模式时用 `.default` 路由策略，
+    /// iOS 按当前默认输出设备决策——BT 连上就走 BT，未连走 Watch 扬声器；
+    /// 用户显式开启后用 `.longFormAudio`（保留后台音频保活的强 BT 偏好）。
+    /// 无论哪种策略，异步 `session.activate()` 都是 watchOS 后台音频的系统
+    /// 合同（不用 `setActive(true)` 的前台同步激活——那在 App 挂起时会静默
+    /// 截断，真机取证 play_started 无 play_finished）。激活失败即走 exhausted
+    /// → retainForReplay，不再有「回落 foreground」的二次尝试。
+    private func activateSession(
+        context: String?, policyName: String,
+        completion: @escaping @MainActor (Bool) -> Void
+    ) {
         let session = AVAudioSession.sharedInstance()
         let requestedAt = Date()
         WatchLog.info(
             "player", "session_activation_requested", requestId: context,
-            detail: "policy=long_form requested_at=\(Self.milliseconds(requestedAt)) "
+            detail: "policy=\(policyName) requested_at=\(Self.milliseconds(requestedAt)) "
                 + activationEvidence()
         )
-        if selfCheckForcedActivationFailures.contains("long_form") {
+        if selfCheckForcedActivationFailures.contains(policyName) {
             WatchLog.error(
                 "player", "session_activation_failed", requestId: context,
-                detail: "policy=long_form result=forced_by_selfcheck fallback=foreground "
+                detail: "policy=\(policyName) result=forced_by_selfcheck "
                     + "requested_at=\(Self.milliseconds(requestedAt)) "
                     + "callback_at=\(Self.milliseconds(Date())) " + activationEvidence(),
                 code: "ERR_SELFCHECK_FORCED"
             )
-            completion(activateForegroundFallback(context: context))
+            completion(false)
             return
         }
         do {
-            try session.setCategory(.playback, mode: .default, policy: .longFormAudio)
+            try session.setCategory(.playback, mode: .default, policy: Self.routePolicy(for: policyName))
         } catch {
             WatchLog.error(
                 "player", "session_policy_rejected", requestId: context,
-                detail: "policy=long_form result=category_rejected fallback=foreground "
+                detail: "policy=\(policyName) result=category_rejected "
                     + activationEvidence(), error: error
             )
-            completion(activateForegroundFallback(context: context))
+            completion(false)
             return
         }
         session.activate { [weak self] activated, error in
@@ -241,13 +254,13 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 guard let self else { return }
                 let callbackAt = Date()
                 // ESS-73：不再依据 isSessionInterrupted 拦截激活结果——激活
-                // 成功即硬件可用（标志由调用方清除）；失败自然回落/收尾。
+                // 成功即硬件可用（标志由调用方清除）；失败走 exhausted 收尾。
                 // ESS-61 F2：activated=false 且 error=nil 也是失败（真机取证
-                // 88 秒静默），一律回落前台会话，不许在未激活的会话上 play()。
+                // 88 秒静默），不许在未激活的会话上 play()。
                 if AudioSessionPolicy.playbackActivationSucceeded(activated: activated, hasError: error != nil) {
                     WatchLog.info(
                         "player", "session_activated", requestId: context,
-                        detail: "category=playback policy=long_form activated=true "
+                        detail: "category=playback policy=\(policyName) activated=true "
                             + "requested_at=\(Self.milliseconds(requestedAt)) "
                             + "callback_at=\(Self.milliseconds(callbackAt)) "
                             + "route=\(Self.routeDescription(session)) " + self.activationEvidence()
@@ -256,59 +269,26 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 } else {
                     WatchLog.error(
                         "player", "session_activation_failed", requestId: context,
-                        detail: "policy=long_form activated=\(activated) fallback=foreground "
+                        detail: "policy=\(policyName) activated=\(activated) "
                             + "requested_at=\(Self.milliseconds(requestedAt)) "
                             + "callback_at=\(Self.milliseconds(callbackAt)) "
                             + "route=\(Self.routeDescription(session)) " + self.activationEvidence(),
                         error: error
                     )
-                    completion(self.activateForegroundFallback(context: context))
+                    completion(false)
                 }
             }
         }
     }
 
-    /// ESS-41 B3 原路径：watchOS 冷启动默认会话下 AVAudioPlayer 可能静默无
-    /// 输出，播放前必须激活 .playback；激活失败不中止播放尝试，但落取证日志。
-    private func activateForegroundFallback(context: String?) -> Bool {
-        let session = AVAudioSession.sharedInstance()
-        let requestedAt = Date()
-        WatchLog.info(
-            "player", "session_activation_requested", requestId: context,
-            detail: "policy=foreground requested_at=\(Self.milliseconds(requestedAt)) "
-                + activationEvidence()
-        )
-        if selfCheckForcedActivationFailures.contains("foreground") {
-            WatchLog.error(
-                "player", "session_activation_failed", requestId: context,
-                detail: "policy=foreground result=forced_by_selfcheck "
-                    + "requested_at=\(Self.milliseconds(requestedAt)) "
-                    + "callback_at=\(Self.milliseconds(Date())) " + activationEvidence(),
-                code: "ERR_SELFCHECK_FORCED"
-            )
-            return false
-        }
-        do {
-            try session.setCategory(.playback, mode: .default)
-            try session.setActive(true)
-            WatchLog.info(
-                "player", "session_activated", requestId: context,
-                detail: "category=playback policy=foreground result=true "
-                    + "requested_at=\(Self.milliseconds(requestedAt)) "
-                    + "callback_at=\(Self.milliseconds(Date())) "
-                    + "route=\(Self.routeDescription(session)) " + activationEvidence()
-            )
-            return true
-        } catch {
-            WatchLog.error(
-                "player", "session_activation_failed", requestId: context,
-                detail: "policy=foreground result=false "
-                    + "requested_at=\(Self.milliseconds(requestedAt)) "
-                    + "callback_at=\(Self.milliseconds(Date())) "
-                    + "route=\(Self.routeDescription(session)) " + activationEvidence(), error: error
-            )
-            return false
-        }
+    /// ESS-226：当前用户偏好对应的策略名。日志与 SelfCheck 的 forced 注入缝
+    /// 都以本名字为准（`long_form` / `default`）。
+    private static func currentPolicyName() -> String {
+        WatchPlaybackPreferences.longFormAudioEnabled ? "long_form" : "default"
+    }
+
+    private static func routePolicy(for policyName: String) -> AVAudioSession.RouteSharingPolicy {
+        policyName == "long_form" ? .longFormAudio : .default
     }
 
     private func beginPlayback(_ player: AVAudioPlayer, bytes: Int) {
