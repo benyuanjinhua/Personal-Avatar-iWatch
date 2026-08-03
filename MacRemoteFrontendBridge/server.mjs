@@ -815,10 +815,18 @@ export function createBridge(overrides = {}) {
 
   ledger.on('turn', projection => {
     const event = { type: 'turn.state', turn: projection }
-    for (const client of eventClients) {
-      if (client.deviceId === projection.device_id && client.ws.readyState === client.ws.OPEN) {
-        client.ws.send(JSON.stringify(prepareDownlinkMessage(event, log)))
-      }
+    const clients = [...eventClients].filter(client =>
+      client.deviceId === projection.device_id && client.ws.readyState === client.ws.OPEN)
+    if (['completed', 'failed', 'cancelled'].includes(projection.status)) {
+      // 初次终态发送也推进同一份持久退避账本，避免 1s sweep 把快乐路径
+      // 误判成“尚未投递”并立即向 iPhone/Watch 再发一遍。
+      const client = clients[0]
+      const turn = ledger.get(projection.request_id)
+      if (client && turn) sendTerminalDelivery(turn, client, 'state_change')
+      return
+    }
+    for (const client of clients) {
+      client.ws.send(JSON.stringify(prepareDownlinkMessage(event, log)))
     }
   })
 
@@ -850,8 +858,7 @@ export function createBridge(overrides = {}) {
         }
         // ESS-181 契约：不达标就剥音频保文字，永远不静默丢弃投影。
         ws.send(JSON.stringify(prepareDownlinkMessage(snapshot, log)))
-        // 快照已经承载本轮终态投递，发送后再推进退避账本。不能在构造快照前
-        // mark，否则 replayable 会因 next_delivery_at 被过滤掉。
+        // 快照已经承载本轮终态投递，发送成功后推进同一份持久退避账本。
         for (const turn of replayTurns) {
           if (['completed', 'failed', 'cancelled'].includes(turn.state)) {
             const delivery = ledger.markResultRedelivered(turn.request_id, {
