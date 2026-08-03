@@ -66,6 +66,18 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     /// `instance=` 去重、按 `watch_ts` 分组给出真实频率。
     let instanceTag: String
 
+    /// ESS-224 复审补丁（毕玄 2026-08-03 21:07Z）：进程级 AVAudioSession
+    /// 所有权令牌。四个长期存活的 SpeechPlayer 共用一个 session，谁最后
+    /// 一次激活成功谁就是当前 owner；`releaseAudioSession` 只有在自己仍是
+    /// owner 时才 `setActive(false)`——防止 A 晚到的 finishPlayback 把 B
+    /// 刚激活的会话拆掉、静默截断 B 的播放。
+    ///
+    /// 全部访问点都在 `@MainActor` 上，无需锁；`internal` 只为让 WatchTests
+    /// 直接读写、复现「旧 player 收尾 × 新 player 已激活」交错场景。
+    /// AudioRecorder 走独立 `.playAndRecord` 类别，`releaseAudioSession`
+    /// 里有 category 兜底检查——录音已接管时也不误 deactivate。
+    static var sharedSessionOwner: ObjectIdentifier?
+
     var currentContext: String? { isPlaying ? context : nil }
 
     init(instanceTag: String = "unknown") {
@@ -273,6 +285,11 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 // ESS-61 F2：activated=false 且 error=nil 也是失败（真机取证
                 // 88 秒静默），一律回落前台会话，不许在未激活的会话上 play()。
                 if AudioSessionPolicy.playbackActivationSucceeded(activated: activated, hasError: error != nil) {
+                    // ESS-224 复审补丁：激活成功即声明本实例为当前 owner，
+                    // 覆盖任何更早的 owner 记录。四个长期存活的 player 共用
+                    // 同一 session，谁最后激活谁负责最终 deactivate；旧 owner
+                    // 的 finishPlayback 到达时会看到 owner 已换人、跳过 release。
+                    SpeechPlayer.sharedSessionOwner = ObjectIdentifier(self)
                     WatchLog.info(
                         "player", "session_activated", requestId: context,
                         detail: "category=playback policy=long_form activated=true "
@@ -319,6 +336,10 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         do {
             try session.setCategory(.playback, mode: .default)
             try session.setActive(true)
+            // ESS-224 复审补丁：foreground 分支激活成功同样声明 owner，
+            // 与 long_form 分支保持对称——否则回落路径下 finishPlayback
+            // 永远不会走真 release，session 一直留活。
+            SpeechPlayer.sharedSessionOwner = ObjectIdentifier(self)
             WatchLog.info(
                 "player", "session_activated", requestId: context,
                 detail: "category=playback policy=foreground result=true "
@@ -450,8 +471,37 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     /// 交还观测点（`session_released`），Bridge 侧才有证据判「会话是否真的
     /// 交还」。事件名与录音侧一致，`module=player` / `module=recorder` 区分
     /// 归属。
+    ///
+    /// 复审补丁（毕玄 2026-08-03 21:07Z）：加入两级 owner 校验，防止旧 player
+    /// 的晚到收尾把当前活跃 owner 的会话拆掉——
+    ///  1. `sharedSessionOwner` 令牌：本实例不是当前 owner 则跳过（`session_release_skipped
+    ///     skipped_reason=not_current_owner`）
+    ///  2. category 兜底：录音接管后 category 变成 `.playAndRecord`，即使 owner
+    ///     校验偶然通过也不 deactivate（`skipped_reason=category_taken_over`）
+    /// 跳过路径与真 release 都留取证事件，Bridge 侧可以对账两条路径的比例。
     private func releaseAudioSession(requestId: String?, reason: String) {
         let session = AVAudioSession.sharedInstance()
+        let me = ObjectIdentifier(self)
+        guard SpeechPlayer.sharedSessionOwner == me else {
+            WatchLog.info(
+                "player", "session_release_skipped", requestId: requestId,
+                detail: "reason=\(reason) skipped_reason=not_current_owner "
+                    + "instance=\(instanceTag) " + activationEvidence()
+            )
+            return
+        }
+        // 只要我们仍是记录中的 owner，就先交出令牌——不论下方 setActive 是否
+        // 真的执行（category 兜底可能跳过），令牌都不该再指向本实例。
+        SpeechPlayer.sharedSessionOwner = nil
+        guard session.category == .playback else {
+            WatchLog.info(
+                "player", "session_release_skipped", requestId: requestId,
+                detail: "reason=\(reason) skipped_reason=category_taken_over "
+                    + "actual_category=\(session.category.rawValue) "
+                    + "instance=\(instanceTag) " + activationEvidence()
+            )
+            return
+        }
         do {
             try session.setActive(false, options: .notifyOthersOnDeactivation)
             WatchLog.info(
