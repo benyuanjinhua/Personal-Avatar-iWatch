@@ -274,6 +274,28 @@ final class WatchDownlinkOutbox {
         items.filter { $0.state == .queued }.map(\.nextAttemptAt).min()
     }
 
+    /// Bridge 的 completed snapshot 仍包含该回合，说明 Watch 的业务 ACK 尚未抵达。
+    /// WCSession 的 didFinish 只代表文件交给了 Watch 传输层，不能继续用对应的
+    /// delivered tombstone 阻止业务层重投。先持久化移除 tombstone，下一次
+    /// enqueueSpeech 才能用重新下载的音频建立一个可投递条目。
+    @discardableResult
+    func invalidateDeliveredSpeech(requestId: String) -> Bool {
+        let removed = items.filter {
+            $0.requestId == requestId && $0.kind == .speech && $0.state == .delivered
+        }
+        guard !removed.isEmpty else { return false }
+
+        let snapshot = items
+        let removedIds = Set(removed.map(\.id))
+        items.removeAll { removedIds.contains($0.id) }
+        guard persistIndexReportingFailure(operation: "invalidate-delivered-speech") else {
+            items = snapshot
+            return false
+        }
+        removedIds.forEach { pendingPayloadDiscards.remove($0) }
+        return true
+    }
+
     func payload(for id: String) throws -> Data {
         guard let data = try? Data(contentsOf: payloadURL(for: id)) else {
             throw WatchDownlinkError.payloadUnavailable(itemId: id)

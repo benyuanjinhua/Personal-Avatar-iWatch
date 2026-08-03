@@ -199,6 +199,29 @@ final class WatchDownlinkOutboxTests: XCTestCase {
         XCTAssertEqual(reopened.pendingCount(), 0, "重放不得产生新的待投递条目")
     }
 
+    func testUnackedSnapshotInvalidatesDeliveredSpeechForRedelivery() throws {
+        let audio = Data(repeating: 0xCE, count: 2048)
+        let outbox = try makeOutbox()
+        let result = try outbox.enqueueSpeech(
+            requestId: requestId, messageKey: "voice_speech_envelope",
+            envelope: Data("env".utf8), audio: audio, fileName: "\(requestId).m4a"
+        )
+        guard case .enqueued(let item) = result else { return XCTFail("语音应入队") }
+        outbox.markInFlight(id: item.id)
+        outbox.markDelivered(id: item.id)
+
+        XCTAssertTrue(outbox.invalidateDeliveredSpeech(requestId: requestId))
+        let replay = try outbox.enqueueSpeech(
+            requestId: requestId, messageKey: "voice_speech_envelope",
+            envelope: Data("env".utf8), audio: audio, fileName: "\(requestId).m4a"
+        )
+        guard case .enqueued(let replayed) = replay else {
+            return XCTFail("Bridge 未 ACK 的快照必须允许重新建立 speech 条目")
+        }
+        XCTAssertEqual(replayed.state, .queued)
+        XCTAssertEqual(outbox.pendingCount(), 1)
+    }
+
     func testDeliveredEnvelopeIsDedupedInSameProcess() throws {
         let outbox = try makeOutbox()
         let item = try XCTUnwrap(enqueueStatus(outbox))

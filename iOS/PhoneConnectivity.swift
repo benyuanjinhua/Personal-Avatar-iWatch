@@ -326,12 +326,11 @@ extension PhoneConnectivity: WatchFeedbackChannel {
         return true
     }
 
-    /// ESS-171：WSS 快照到达时的兜底触发。
-    /// 快照里出现 completed turn 说明 Bridge 还没拿到 /ack——不管 reachability 有没有
-    /// 抖动、有没有触发 didFinish，都主动调一次 flushDownlink，把此前被 markDeferred / 卡在
-    /// inFlight 超期的条目立刻重投；WatchDownlinkOutbox 内部按 request_id + payloadSha256
-    /// 幂等去重，重复调用只会打空、不会重复上载荷。
-    func retryPendingDownlinks(trigger: String) {
+    /// Bridge 仍回放 completed turn 说明业务 ACK 未到。WCSession 的 didFinish 不能作为
+    /// 业务送达判据：先撤销已 delivered 的 speech tombstone，让紧随其后的 projection
+    /// 能重新下载并入队；queued / inFlight 条目保持原样，由 flush 正常恢复。
+    func retryPendingDownlinks(requestIds: [String], trigger: String) {
+        requestIds.forEach { _ = downlink?.invalidateDeliveredSpeech(requestId: $0) }
         flushDownlink(trigger: trigger)
     }
 

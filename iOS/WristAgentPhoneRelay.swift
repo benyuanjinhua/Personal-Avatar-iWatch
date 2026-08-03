@@ -20,7 +20,7 @@ protocol WatchFeedbackChannel: AnyObject {
     func transferSpeech(fileURL: URL, envelope: VoiceStatusEnvelope) -> Bool
     /// ESS-171：WSS 快照到达 = Bridge 还没收到我们的 /ack。踢一次下行队列，
     /// 让已 deferred / 到期未交付的条目立刻重投，别等 reachability 抖动触发。
-    func retryPendingDownlinks(trigger: String)
+    func retryPendingDownlinks(requestIds: [String], trigger: String)
 }
 
 /// WristAgentPhoneRelay（ESS-28）：iPhone Companion Relay 编排器。
@@ -359,10 +359,10 @@ final class WristAgentPhoneRelay: ObservableObject {
                     deliveredResultAudio.remove(audioDeliveryKey(turn.requestId, sha))
                 }
             }
+            watchChannel?.retryPendingDownlinks(
+                requestIds: pendingCompleted.map(\.requestId), trigger: "wss-snapshot"
+            )
             message.turns?.forEach { process(projection: $0) }
-            if !pendingCompleted.isEmpty {
-                watchChannel?.retryPendingDownlinks(trigger: "wss-snapshot")
-            }
         case "turn.interim":
             if let interim = message.interim { process(interim: interim) }
         case "turn.progress":
