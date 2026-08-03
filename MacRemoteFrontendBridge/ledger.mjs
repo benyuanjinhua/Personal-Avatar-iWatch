@@ -58,13 +58,14 @@ export class TurnLedger extends EventEmitter {
 
   // Idempotent create. Returns { turn, replay } — replay=true means the
   // request_id already exists and the caller must NOT start a second execution.
-  create({ requestId, deviceId, bodySha256, sessionId }) {
+  create({ requestId, deviceId, bodySha256, sessionId, watchCreatedAt = null }) {
     const existing = this.turns.get(requestId)
     if (existing) {
       if (existing.body_sha256 !== bodySha256) return { turn: existing, conflict: true }
       return { turn: existing, replay: true }
     }
     const now = new Date().toISOString()
+    const watchAt = Number.isFinite(Date.parse(watchCreatedAt)) ? new Date(watchCreatedAt).toISOString() : null
     const turn = {
       request_id: requestId,
       device_id: deviceId,
@@ -85,6 +86,13 @@ export class TurnLedger extends EventEmitter {
       task_event_count: 0,        // 仅 SSE/task 生命周期事件（taskwatch 熔断预算，ESS-41）
       created_at: now,
       updated_at: now,
+      timing: {
+        watch_created_at: watchAt,
+        bridge_accepted_at: now,
+        processing_started_at: null,
+        first_audio_ready_at: null,
+        completed_at: null,
+      },
     }
     this.turns.set(requestId, turn)
     this.save()
@@ -99,7 +107,11 @@ export class TurnLedger extends EventEmitter {
       // Terminal states are final: late gateway events must not resurrect a turn.
       return turn
     }
-    Object.assign(turn, patch, { updated_at: new Date().toISOString() })
+    const updatedAt = new Date().toISOString()
+    const timing = { ...turn.timing, ...patch.timing }
+    if (patch.state === 'processing' && !timing.processing_started_at) timing.processing_started_at = updatedAt
+    if (patch.state && TERMINAL.has(patch.state) && !timing.completed_at) timing.completed_at = updatedAt
+    Object.assign(turn, patch, { updated_at: updatedAt, timing })
     if (persist) this.save()
     this.emitState(turn)
     return turn
@@ -148,6 +160,16 @@ export class TurnLedger extends EventEmitter {
     return this.update(requestId, { state: 'failed', error: errCode, detail, permission: null })
   }
 
+  markFirstAudioReady(requestId, { at = new Date().toISOString(), source = null } = {}) {
+    const turn = this.turns.get(requestId)
+    if (!turn) return null
+    const timing = { ...turn.timing }
+    if (timing.first_audio_ready_at) return turn
+    timing.first_audio_ready_at = at
+    timing.first_audio_source = source
+    return this.update(requestId, { timing })
+  }
+
   bumpEvents(requestId) {
     const turn = this.turns.get(requestId)
     if (!turn) return 0
@@ -175,6 +197,12 @@ export class TurnLedger extends EventEmitter {
   projection(turn) {
     if (typeof turn === 'string') turn = this.turns.get(turn)
     if (!turn) return null
+    const timing = { ...turn.timing }
+    const startAt = Date.parse(timing.watch_created_at || timing.bridge_accepted_at)
+    const firstAudioAt = Date.parse(timing.first_audio_ready_at)
+    const completedAt = Date.parse(timing.completed_at)
+    if (Number.isFinite(startAt) && Number.isFinite(firstAudioAt)) timing.voice_ttft_ms = Math.max(0, firstAudioAt - startAt)
+    if (Number.isFinite(startAt) && Number.isFinite(completedAt)) timing.end_to_end_ms = Math.max(0, completedAt - startAt)
     return {
       request_id: turn.request_id,
       device_id: turn.device_id,
@@ -187,6 +215,7 @@ export class TurnLedger extends EventEmitter {
       error: turn.error,
       created_at: turn.created_at,
       updated_at: turn.updated_at,
+      timing,
     }
   }
 
