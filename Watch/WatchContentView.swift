@@ -11,6 +11,9 @@ struct WatchContentView: View {
     @ObservedObject private var journal: VoiceTurnJournal
     @ObservedObject private var player: SpeechPlayer
     @ObservedObject private var notifier: ResultNotifier
+    /// ESS-163 PD 裁定：首屏零可见开发入口，Debug 面板改用「长按主界面
+    /// 标题 2 秒」隐藏手势进入，不加任何可见提示。
+    @State private var showDebugPanel = false
 
     init(pushToTalk: PushToTalkController, welcome: WelcomeGreeter, selfCheck: SelfCheckRunner) {
         self.pushToTalk = pushToTalk
@@ -53,10 +56,17 @@ struct WatchContentView: View {
                     TimelineView(.periodic(from: .now, by: 1)) { context in
                         let status = statusCopy(now: context.date)
                         VStack(spacing: 10) {
+                            // ESS-163：主界面标题就是这个 status.title——长按 2 秒
+                            // 唤起 Debug 面板；不加可见提示。手势不消费 tap，
+                            // 语音球的 DragGesture 与欢迎语打断均不受影响。
                             Text(status.title)
                                 .font(.footnote.bold())
                                 .multilineTextAlignment(.center)
                                 .lineLimit(2)
+                                .contentShape(Rectangle())
+                                .onLongPressGesture(minimumDuration: 2.0) {
+                                    showDebugPanel = true
+                                }
 
                             Text(status.subtitle)
                                 .font(.caption2)
@@ -91,16 +101,10 @@ struct WatchContentView: View {
                     .buttonStyle(.bordered)
                     .tint(.secondary)
 
-                    // ESS-163：开发者面板入口——把自检结果 / 重跑 / build 指纹
-                    // 收进单一入口，首屏保持最终用户体验。
-                    NavigationLink {
-                        DebugPanelView(selfCheck: selfCheck)
-                    } label: {
-                        Label("开发者面板", systemImage: "wrench.and.screwdriver")
-                    }
-                    .font(.footnote)
-                    .buttonStyle(.bordered)
-                    .tint(.secondary)
+                    // ESS-163 PD 裁定：Debug 面板入口迁出首屏，改为长按主界面
+                    // 标题 2 秒隐藏手势唤起（见上面 status.title 的
+                    // onLongPressGesture）。此处不再放任何可见 NavigationLink /
+                    // Button，避免最终用户看到开发者入口。
 
                     if let remote = transport.remoteStatus,
                        remote.requestId != activeTurn?.requestId {
@@ -120,6 +124,13 @@ struct WatchContentView: View {
         // 字幕式播放视图（ESS-48）：播放开始/纯文本结果到达时由控制器置入会话。
         .sheet(item: $pushToTalk.subtitleSession) { session in
             SubtitlePlaybackView(session: session, player: pushToTalk.player)
+        }
+        // ESS-163：Debug 面板作为覆盖 sheet 呈现——不占用首屏导航栈，
+        // 手表下滑关闭；避免 NavigationLink 在首屏留下可见项。
+        .sheet(isPresented: $showDebugPanel) {
+            NavigationStack {
+                DebugPanelView(selfCheck: selfCheck)
+            }
         }
     }
 

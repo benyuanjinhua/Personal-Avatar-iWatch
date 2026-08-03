@@ -67,23 +67,27 @@ struct DebugPanelView: View {
     }
 
     private var selfCheckStatusText: String {
-        switch selfCheck.stage {
-        case .idle:
-            return "尚未运行"
-        case .running(let step):
+        // ESS-163 复审补丁：`.idle` 覆盖两个场景——本进程从未跑过、
+        // 或冷启动同 build 已跑过（autoRunIfNeeded → selfcheck_skipped）。
+        // 后者的结果在磁盘 RunRecord 里，走 latestOutcome 还原；仍读不出
+        // （首启前 / 旧记录字段不全）才落到「尚未运行」。运行中直接
+        // 展示实时步骤——本面板对开发者不算噪音。
+        if case .running(let step) = selfCheck.stage {
             return "运行中：\(step.rawValue)"
-        case .finished(let outcome):
-            switch outcome {
-            case .pass:
-                return "结果：pass"
-            case .failed(let step, let code):
-                if let code, !code.isEmpty {
-                    return "结果：fail · 失败步骤 \(step.rawValue) · code=\(code)"
-                }
-                return "结果：fail · 失败步骤 \(step.rawValue)"
-            case .inconclusive(let reason):
-                return "结果：inconclusive · \(reason.rawValue)"
+        }
+        guard let outcome = selfCheck.latestOutcome else {
+            return "尚未运行"
+        }
+        switch outcome {
+        case .pass:
+            return "结果：pass"
+        case .failed(let step, let code):
+            if let code, !code.isEmpty {
+                return "结果：fail · 失败步骤 \(step.rawValue) · code=\(code)"
             }
+            return "结果：fail · 失败步骤 \(step.rawValue)"
+        case .inconclusive(let reason):
+            return "结果：inconclusive · \(reason.rawValue)"
         }
     }
 
