@@ -22,15 +22,19 @@ function ts(offsetSec) { return new Date(T0.getTime() + offsetSec * 1000).toISOS
 
 function j(obj) { return JSON.stringify(obj) }
 
+// ESS-207 复审 §2 修复：H1/H3/H5 三处 sha 必须一致；probe_acked 必须带
+// played_ok=true 才算 H5。以下固定 sha 用于 happy-path，负例单独覆盖。
+const HAPPY_SHA = 'a'.repeat(64)
+
 /// 完整 5 跳齐的一场探针（H1=+0.0s，H2=+0.8s，H3=+1.0s，H4=+1.5s→+3.8s，H5=+4.0s）。
 function happyPathLines(requestId = RID) {
   return [
-    j({ ts: ts(0.0), evt: 'l1_audio_ready', request_id: requestId, source: 'direct', kind: 'probe', sha256: 'abc', size_bytes: 40000, duration_ms: 3500, codec: 'm4a' }),
+    j({ ts: ts(0.0), evt: 'l1_audio_ready', request_id: requestId, source: 'direct', kind: 'probe', sha256: HAPPY_SHA, size_bytes: 40000, duration_ms: 3500, codec: 'm4a' }),
     j({ ts: ts(0.8), evt: 'watch_client_log', module: 'wcsession', event: 'file_received', request_id: requestId, detail: 'kind=probe bytes=40000' }),
-    j({ ts: ts(1.0), evt: 'watch_client_log', module: 'turn', event: 'speech_stored', request_id: requestId, detail: 'bytes=40000' }),
+    j({ ts: ts(1.0), evt: 'watch_client_log', module: 'turn', event: 'speech_stored', request_id: requestId, detail: `bytes=40000 sha256=${HAPPY_SHA}` }),
     j({ ts: ts(1.5), evt: 'watch_client_log', module: 'player', event: 'play_started', request_id: requestId }),
     j({ ts: ts(3.8), evt: 'watch_client_log', module: 'player', event: 'play_finished', request_id: requestId, detail: 'successfully=true' }),
-    j({ ts: ts(4.0), evt: 'probe_acked', request_id: requestId, source: 'watch' }),
+    j({ ts: ts(4.0), evt: 'probe_acked', request_id: requestId, source: 'watch', played_ok: true, sha256: HAPPY_SHA }),
   ]
 }
 
@@ -48,8 +52,67 @@ describe('ESS-184 probe log parser', () => {
 
   it('accepts the existing result_acked when a probe-specific ack is not yet wired', () => {
     const lines = happyPathLines().slice(0, 5)
+    // 兼容路径：无 probe_acked、只有 result_acked——仍算 H5，不做 played_ok 断言。
     lines.push(j({ ts: ts(4.0), evt: 'result_acked', request_id: RID, device_id: 'jackson-iphone' }))
     const verdict = evaluateProbe(parseProbeHops(lines, RID), { timeoutMs: 60_000 })
+    assert.equal(verdict.pass, true, verdict.message)
+  })
+
+  // === ESS-207 复审 §2 修复：新增契约 ===
+
+  it('rejects probe_acked with played_ok!==true as H5 (avoids failure ACKs faking PASS)', () => {
+    const lines = happyPathLines().slice(0, 5)
+    lines.push(j({ ts: ts(4.0), evt: 'probe_acked', request_id: RID, played_ok: false, sha256: HAPPY_SHA, error_code: 'ERR_PROBE_PLAYBACK_TRUNCATED' }))
+    const verdict = evaluateProbe(parseProbeHops(lines, RID))
+    assert.equal(verdict.pass, false)
+    assert.equal(verdict.code, PROBE.MISSING_H5,
+      'played_ok=false 的 ACK 不能算 H5——那就等于「播失败也 PASS」')
+  })
+
+  it('rejects probe_acked without played_ok field (defensive: no default-true)', () => {
+    const lines = happyPathLines().slice(0, 5)
+    lines.push(j({ ts: ts(4.0), evt: 'probe_acked', request_id: RID, sha256: HAPPY_SHA }))
+    const verdict = evaluateProbe(parseProbeHops(lines, RID))
+    assert.equal(verdict.pass, false)
+    assert.equal(verdict.code, PROBE.MISSING_H5)
+  })
+
+  it('flags SHA_MISMATCH when H1 and H5 shas diverge (H5 forging: right rid, wrong bytes)', () => {
+    const lines = happyPathLines().slice(0, 5)
+    lines.push(j({ ts: ts(4.0), evt: 'probe_acked', request_id: RID, played_ok: true, sha256: 'b'.repeat(64) }))
+    const verdict = evaluateProbe(parseProbeHops(lines, RID))
+    assert.equal(verdict.pass, false)
+    assert.equal(verdict.code, PROBE.SHA_MISMATCH,
+      'H5 ack 的 sha 与 H1 注入 sha 不一致 → 播的可能不是本次注入的字节，必须挡')
+    assert.equal(verdict.shas.h1, HAPPY_SHA)
+    assert.equal(verdict.shas.h5, 'b'.repeat(64))
+  })
+
+  it('flags SHA_MISMATCH when H1 and H3 shas diverge (Watch played stale vault data)', () => {
+    const lines = [
+      j({ ts: ts(0.0), evt: 'l1_audio_ready', request_id: RID, source: 'direct', kind: 'probe', sha256: HAPPY_SHA, size_bytes: 40000 }),
+      j({ ts: ts(0.8), evt: 'watch_client_log', module: 'wcsession', event: 'file_received', request_id: RID, detail: 'kind=probe bytes=40000' }),
+      j({ ts: ts(1.0), evt: 'watch_client_log', module: 'turn', event: 'speech_stored', request_id: RID, detail: `bytes=40000 sha256=${'c'.repeat(64)}` }),
+      j({ ts: ts(1.5), evt: 'watch_client_log', module: 'player', event: 'play_started', request_id: RID }),
+      j({ ts: ts(3.8), evt: 'watch_client_log', module: 'player', event: 'play_finished', request_id: RID }),
+      j({ ts: ts(4.0), evt: 'probe_acked', request_id: RID, played_ok: true, sha256: HAPPY_SHA }),
+    ]
+    const verdict = evaluateProbe(parseProbeHops(lines, RID))
+    assert.equal(verdict.pass, false)
+    assert.equal(verdict.code, PROBE.SHA_MISMATCH)
+  })
+
+  it('stays backward-compatible when Watch H3 log has no sha256 field (skip sha check silently)', () => {
+    // 旧日志格式没有 sha256=… 时，parser 退化为不做 H3 断言，避免升级窗内误报。
+    const lines = [
+      j({ ts: ts(0.0), evt: 'l1_audio_ready', request_id: RID, source: 'direct', kind: 'probe', sha256: HAPPY_SHA, size_bytes: 40000 }),
+      j({ ts: ts(0.8), evt: 'watch_client_log', module: 'wcsession', event: 'file_received', request_id: RID, detail: 'kind=probe' }),
+      j({ ts: ts(1.0), evt: 'watch_client_log', module: 'turn', event: 'speech_stored', request_id: RID, detail: 'bytes=40000' }), // 无 sha
+      j({ ts: ts(1.5), evt: 'watch_client_log', module: 'player', event: 'play_started', request_id: RID }),
+      j({ ts: ts(3.8), evt: 'watch_client_log', module: 'player', event: 'play_finished', request_id: RID }),
+      j({ ts: ts(4.0), evt: 'probe_acked', request_id: RID, played_ok: true, sha256: HAPPY_SHA }),
+    ]
+    const verdict = evaluateProbe(parseProbeHops(lines, RID))
     assert.equal(verdict.pass, true, verdict.message)
   })
 

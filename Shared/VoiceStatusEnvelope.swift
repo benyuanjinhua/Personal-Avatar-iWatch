@@ -4,6 +4,10 @@ enum AudioDownlinkKind: String, Codable, Equatable, CaseIterable {
     case welcome
     case interim
     case result
+    /// ESS-184/207：下行链路端到端探针。不入 journal、不入结果播放账本、不入
+    /// EncryptedAudioVault，Watch 收到即播、播完发 probe_ack。生产音频白名单
+    /// 契约与 result/interim 相同（`AudioDownlinkPolicy.allows(.probe, ...)`）。
+    case probe
     /// 仅用于 fail-closed 解码和落拒绝日志，永不属于播放白名单。
     case unknown
 }
@@ -276,4 +280,11 @@ enum VoiceCancelMessage {
 /// 结果语音 transferFile 的元数据键，值为携带 result 的 VoiceStatusEnvelope JSON。
 enum VoiceSpeechMessage {
     static let envelopeKey = "voice_speech_envelope"
+}
+
+/// ESS-184/207 下行探针的 transferFile 元数据键；与 speech 分流：
+/// - Watch 端匹配到本键时走探针分支（不落 vault、不入 journal、不入 ledger），
+/// - iOS Relay 也用它给结果链路让路（`ResultAudioLedger` 不占探针的位置）。
+enum VoiceProbeMessage {
+    static let envelopeKey = "voice_probe_envelope"
 }

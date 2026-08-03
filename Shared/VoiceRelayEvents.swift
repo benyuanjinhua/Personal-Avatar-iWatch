@@ -189,3 +189,59 @@ struct ResultDeliveryAck: Codable, Equatable {
 enum ResultDeliveryAckMessage {
     static let envelopeKey = "result_delivery_ack"
 }
+
+/// ESS-184/207 下行链路探针的播放回执。Watch 播完（成功或失败）都发一条，
+/// iPhone 收到即经 `POST /v1/probe/ack` 转发给 Bridge，落 `evt=probe_acked`
+/// 触发 CLI 判定 H5。字段保持最小、跨设备可对账：
+/// - `requestId` 与 Bridge 侧探针 turn 的 request_id 一致（H1..H5 关联主键）；
+/// - `playedAtMs` / `durationMs` 是 Watch 侧的观测；
+/// - `sha256` 便于跨端确认播放的是收到的字节，不是别的。
+struct ProbeAckEnvelope: Codable, Equatable {
+    let protocolVersion: String
+    let requestId: String
+    let playedOk: Bool
+    /// Watch 侧起播时刻的 epoch 毫秒；用于跨端对齐延迟统计。
+    let playedAtMs: Int64
+    let durationMs: Int?
+    let sha256: String
+    /// 播放失败时的原因短码（如 `ERR_PROBE_SHA_MISMATCH` / `ERR_PLAYBACK_ACTIVATION`）。
+    let errorCode: String?
+
+    enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case requestId = "request_id"
+        case playedOk = "played_ok"
+        case playedAtMs = "played_at_ms"
+        case durationMs = "duration_ms"
+        case sha256
+        case errorCode = "error_code"
+    }
+
+    init(
+        requestId: String,
+        playedOk: Bool,
+        playedAtMs: Int64,
+        durationMs: Int?,
+        sha256: String,
+        errorCode: String? = nil
+    ) {
+        self.protocolVersion = VoiceRequestEnvelope.currentProtocolVersion
+        self.requestId = requestId
+        self.playedOk = playedOk
+        self.playedAtMs = playedAtMs
+        self.durationMs = durationMs
+        self.sha256 = sha256
+        self.errorCode = errorCode
+    }
+
+    func jsonData() throws -> Data { try RelayEventCoding.encoder.encode(self) }
+    static func decode(from data: Data) -> ProbeAckEnvelope? {
+        try? RelayEventCoding.decoder.decode(ProbeAckEnvelope.self, from: data)
+    }
+}
+
+/// WatchConnectivity 消息键；Watch → iPhone 走 sendMessage + transferUserInfo，
+/// iPhone → Bridge 由 `WristAgentPhoneRelay` 承接后走 HTTPS。
+enum ProbeAckMessage {
+    static let envelopeKey = "probe_playback_ack"
+}

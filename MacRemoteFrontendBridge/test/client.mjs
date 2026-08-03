@@ -90,6 +90,35 @@ export class BridgeClient {
   getTurn(requestId) { return this.signed('GET', `/v1/voice/turns/${requestId}`) }
   ackTurn(requestId) { return this.signed('POST', `/v1/voice/turns/${requestId}/ack`, { requestId, json: { protocol_version: 1 } }) }
 
+  // ESS-184/207：探针注入是 loopback-only、不签 HMAC；回执与其他北向签名一致。
+  async probeInject({ requestId, audioBuf, text = null, durationMs = null, shaOverride = null }) {
+    const body = JSON.stringify({
+      request_id: requestId,
+      audio_base64: audioBuf.toString('base64'),
+      sha256: shaOverride ?? sha256hex(audioBuf),
+      ...(text ? { text } : {}),
+      ...(durationMs ? { duration_ms: durationMs } : {}),
+    })
+    return this.raw('POST', '/v1/probe/inject', {
+      headers: { 'content-type': 'application/json' },
+      body,
+    })
+  }
+  probeAck({ requestId, playedOk = true, playedAtMs = 0, durationMs = null, sha256 = null, errorCode = null }) {
+    return this.signed('POST', '/v1/probe/ack', {
+      requestId,
+      json: {
+        protocol_version: 1,
+        request_id: requestId,
+        played_ok: playedOk,
+        played_at_ms: playedAtMs,
+        ...(durationMs !== null ? { duration_ms: durationMs } : {}),
+        ...(sha256 ? { sha256 } : {}),
+        ...(errorCode ? { error_code: errorCode } : {}),
+      },
+    })
+  }
+
   // 结果语音下载（ESS-38）：签名 GET，可带 Range 断点续传；返回原始字节。
   async downloadAudio(requestId, { range = null } = {}) {
     const path = `/v1/voice/turns/${requestId}/audio`

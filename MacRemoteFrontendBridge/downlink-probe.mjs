@@ -47,6 +47,24 @@ function detailKind(entry) {
   return match ? match[1] : null
 }
 
+/// 抓 detail 里 `sha256=<hex>` 的 64 位十六进制；Watch H3 探针路径会带这个字段
+/// （ESS-207 补齐），parser 用它做 H1↔H3↔H5 三处 sha 相等断言（ESS-207 P0 修复）。
+function detailSha(entry) {
+  const detail = entry?.detail
+  if (typeof detail !== 'string') return null
+  const match = detail.match(/(?:^|\s)sha256=([0-9a-fA-F]{64})/)
+  return match ? match[1].toLowerCase() : null
+}
+
+/// 顶层 sha256 字段兜底：Bridge 侧 `evt=l1_audio_ready` / `probe_acked` 都在
+/// entry.sha256 上直接落，不进 detail。
+function entrySha(entry) {
+  if (typeof entry?.sha256 === 'string' && /^[0-9a-fA-F]{64}$/.test(entry.sha256)) {
+    return entry.sha256.toLowerCase()
+  }
+  return detailSha(entry)
+}
+
 /// 把一条 bridge.log 条目映射到探针跳编号（H1..H5），返回 null 表示与探针无关。
 ///
 /// 匹配规则严格从紧，不放行貌似相关但语义不合的事件（例如别的 request_id 的
@@ -59,10 +77,13 @@ function classifyEntry(entry, requestId) {
   const module = entry.module ?? null
   const event = entry.event ?? null
 
-  // H5：Bridge 侧的播放成功 ACK。新事件 `probe_acked` 与既有 `result_acked` 都算——
-  // 现阶段 Watch/手机的回执路径复用 result_delivery_ack，落 bridge.log 为
-  // `result_acked`；后续为探针分离新事件时兼容不动。
-  if (evt === 'probe_acked' || evt === 'result_acked') return 'H5'
+  // H5：播放成功回执。毕玄 2026-08-03 15:33Z 复审 §2：`probe_acked` 只在
+  // `played_ok===true` 时才算 H5——播放失败的 ACK 也可能被伪造为「五跳齐」，
+  // 与门禁「播放成功回执」目标矛盾。`result_acked` 是探针未拆分前的兼容通道，
+  // 复用生产 result-ack 语义（Watch 只在落盘成功后发），保留不做 played_ok
+  // 断言。
+  if (evt === 'probe_acked') return entry.played_ok === true ? 'H5' : null
+  if (evt === 'result_acked') return 'H5'
 
   // H1：Bridge 出口写出 l1_audio_ready。要求同 request_id + kind=probe，
   // 不接受同 request_id 但 kind=result（保持语义）。source 允许 direct/background/interim。
@@ -184,6 +205,8 @@ export const PROBE = {
   MISSING_H5: 'ERR_PROBE_STOPPED_AT_H5',
   TIMEOUT: 'ERR_PROBE_TIMEOUT',
   BAD_ORDER: 'ERR_PROBE_HOP_OUT_OF_ORDER',
+  // ESS-207 复审 §2：H1/H3/H5 三处 sha 不一致 → 播放的可能不是本次注入的字节。
+  SHA_MISMATCH: 'ERR_PROBE_SHA_MISMATCH',
 }
 
 /// 依据逐跳观测出裁决。停在第一个缺跳，附每跳耗时（自 H1 起算）。
@@ -222,6 +245,25 @@ export function evaluateProbe(hopResult, { timeoutMs = 60_000 } = {}) {
     previousAt = obs.at ?? previousAt
   }
 
+  // ESS-207 复审 §2：H1（Bridge 出口）、H3（Watch 落盘）、H5（Watch 播完 ACK）
+  // 三处的 sha 必须一致，否则「播的可能不是本次注入的字节」——H5 事件伪造 /
+  // Watch 侧沾了残留 vault 数据都能被这条挡住。任一 sha 缺失（旧日志格式）
+  // 时不强制断言，保留向前兼容窗；两个都有值时必须相等。
+  const h1Sha = entrySha(hops.H1.entry)
+  const h3Sha = entrySha(hops.H3.entry)
+  const h5Sha = entrySha(hops.H5.entry)
+  const observedShas = [h1Sha, h3Sha, h5Sha].filter(Boolean)
+  const uniqueShas = new Set(observedShas)
+  if (observedShas.length >= 2 && uniqueShas.size > 1) {
+    return {
+      pass: false, code: PROBE.SHA_MISMATCH, stoppedAt: 'H5',
+      message: `探针 5 跳齐但 H1/H3/H5 sha 不一致：H1=${h1Sha ?? '?'} H3=${h3Sha ?? '?'} H5=${h5Sha ?? '?'}`,
+      requestId, timings: buildTimings(hops),
+      summary: summarize(hops, null),
+      shas: { h1: h1Sha, h3: h3Sha, h5: h5Sha },
+    }
+  }
+
   const timings = buildTimings(hops)
   if (timings.totalMs !== null && timings.totalMs > timeoutMs) {
     return {
@@ -234,6 +276,7 @@ export function evaluateProbe(hopResult, { timeoutMs = 60_000 } = {}) {
     pass: true, code: PROBE.PASS, stoppedAt: null,
     message: `探针 5 跳齐、耗时 ${timings.totalMs ?? '?'} ms（H1 → H5）`,
     requestId, timings, summary: summarize(hops, null),
+    shas: { h1: h1Sha, h3: h3Sha, h5: h5Sha },
   }
 }
 
