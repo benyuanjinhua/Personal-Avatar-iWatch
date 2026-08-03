@@ -100,6 +100,14 @@ final class WristAgentPhoneRelay: ObservableObject {
         clientLogUplink.start()
     }
 
+    /// WCSession 的激活/可达变化会唤醒 iPhone 进程；每个唤醒点都恢复 events，
+    /// 避免只在下一次语音上送时才顺便建立 WebSocket。
+    func resumeEvents(trigger: String) {
+        guard isPaired else { return }
+        relayLog("恢复事件通道（\(trigger)）")
+        connectEventsIfNeeded()
+    }
+
     // MARK: - 配对
 
     func pair(code: String, deviceName: String) async {
@@ -212,6 +220,7 @@ final class WristAgentPhoneRelay: ObservableObject {
             notifiedStuckRequestIds.remove(entry.requestId)
             relayStatus = "已上送 \(entry.requestId.prefix(8))…"
             notify(status: RelayStatusUpdate(requestId: entry.requestId, phase: .accepted))
+            connectEventsIfNeeded()
         } catch let error as RelayUploadError where !error.isRetryable {
             // Bridge 稳定 4xx：毒消息，不再重试。
             outbox.remove(requestId: entry.requestId)
@@ -329,8 +338,9 @@ final class WristAgentPhoneRelay: ObservableObject {
             }
         }
         eventsConnected = false
-        eventsTask?.cancel(with: .goingAway, reason: nil)
-        eventsTask = nil
+        task.cancel(with: .goingAway, reason: nil)
+        // 旧连接的迟到失败不得清掉已由唤醒入口建立的新连接。
+        if eventsTask === task { eventsTask = nil }
         guard !Task.isCancelled else { return }
         // 指数退避重连；Mac 恢复后事件流自动续上。
         eventsReconnectAttempt += 1

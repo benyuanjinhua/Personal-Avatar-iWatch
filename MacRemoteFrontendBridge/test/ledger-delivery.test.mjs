@@ -31,4 +31,18 @@ describe('terminal result redelivery ledger', () => {
     assert.equal(ledger.markResultRedelivered('req-retry', { now: 1_100, baseDelayMs: 100 }).attempt, 2)
     assert.equal(ledger.replayable({ now: 99_999, maxDeliveryAttempts: 2 }).length, 0)
   })
+
+  it('exposes due terminal deliveries for an already-connected events client and removes them after ACK', () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'result-sweep-'))
+    const ledger = new TurnLedger({ stateDir })
+    ledger.create({ requestId: 'req-live', deviceId: 'phone', bodySha256: 'sha', sessionId: 's' })
+    ledger.setResult('req-live', { text: 'done' })
+
+    assert.deepEqual(ledger.dueTerminalDeliveries({ now: Date.now() }).map(t => t.request_id), ['req-live'])
+    ledger.markResultRedelivered('req-live', { now: 1_000, baseDelayMs: 100 })
+    assert.equal(ledger.dueTerminalDeliveries({ now: 1_050 }).length, 0)
+    assert.equal(ledger.dueTerminalDeliveries({ now: 1_100 }).length, 1)
+    ledger.acknowledgeResult('req-live')
+    assert.equal(ledger.dueTerminalDeliveries({ now: 99_999 }).length, 0)
+  })
 })

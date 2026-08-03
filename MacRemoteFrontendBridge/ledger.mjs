@@ -200,6 +200,17 @@ export class TurnLedger extends EventEmitter {
     return turn
   }
 
+  dueTerminalDeliveries({ now = Date.now(), terminalTtlMs = 30 * 60 * 1000, maxDeliveryAttempts = 5 } = {}) {
+    return [...this.turns.values()].filter(turn => {
+      if (!TERMINAL.has(turn.state) || turn.delivered_ack) return false
+      if ((turn.delivery_attempts || 0) >= maxDeliveryAttempts) return false
+      const nextDeliveryAt = Date.parse(turn.next_delivery_at)
+      if (Number.isFinite(nextDeliveryAt) && now < nextDeliveryAt) return false
+      const terminalAt = Date.parse(turn.updated_at)
+      return Number.isFinite(terminalAt) && now - terminalAt <= terminalTtlMs
+    })
+  }
+
   markResultRedelivered(requestId, { now = Date.now(), baseDelayMs = 2_000, maxDelayMs = 300_000 } = {}) {
     const turn = this.turns.get(requestId)
     if (!turn || !TERMINAL.has(turn.state) || turn.delivered_ack) return null
@@ -213,12 +224,7 @@ export class TurnLedger extends EventEmitter {
   replayable({ now = Date.now(), terminalTtlMs = 30 * 60 * 1000, maxDeliveryAttempts = 5 } = {}) {
     return [...this.turns.values()].filter(turn => {
       if (!TERMINAL.has(turn.state)) return true
-      if (turn.delivered_ack) return false
-      if ((turn.delivery_attempts || 0) >= maxDeliveryAttempts) return false
-      const nextDeliveryAt = Date.parse(turn.next_delivery_at)
-      if (Number.isFinite(nextDeliveryAt) && now < nextDeliveryAt) return false
-      const terminalAt = Date.parse(turn.updated_at)
-      return Number.isFinite(terminalAt) && now - terminalAt <= terminalTtlMs
+      return this.dueTerminalDeliveries({ now, terminalTtlMs, maxDeliveryAttempts }).includes(turn)
     })
   }
 

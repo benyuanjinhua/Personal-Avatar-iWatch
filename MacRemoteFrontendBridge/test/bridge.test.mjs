@@ -193,6 +193,26 @@ describe('direct-answer path', () => {
     assert.equal(snapshot.turns.some(turn => turn.request_id === id), false)
     afterAck.ws.close()
   })
+
+  it('redelivers an unacknowledged result on the existing events connection without another turn', async () => {
+    const events = ctx.client.events()
+    await waitFor(() => events.received.some(e => e.type === 'snapshot'))
+    const id = rid()
+    await ctx.client.createTurn(id, pcm(300))
+
+    await waitFor(() => events.received.filter(e =>
+      e.type === 'turn.state' && e.turn.request_id === id && e.turn.status === 'completed').length >= 2)
+    const acceptedBeforeAck = ctx.bridge.ledger.get(id).delivery_attempts
+    assert.ok(acceptedBeforeAck >= 1, 'connected sweep must advance the persistent delivery ledger')
+
+    await ctx.client.ackTurn(id)
+    const completedAtAck = events.received.filter(e =>
+      e.type === 'turn.state' && e.turn.request_id === id && e.turn.status === 'completed').length
+    await new Promise(resolve => setTimeout(resolve, 2_200))
+    assert.equal(events.received.filter(e =>
+      e.type === 'turn.state' && e.turn.request_id === id && e.turn.status === 'completed').length, completedAtAck)
+    events.ws.close()
+  })
 })
 
 describe('background path: task projection, permission, cancel', () => {
