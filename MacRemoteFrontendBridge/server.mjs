@@ -777,6 +777,22 @@ export function createBridge(overrides = {}) {
   const wss = new WebSocketServer({ noServer: true })
   const eventClients = new Set() // { ws, deviceId }
   const eventsHeartbeatMs = CONFIG.events_heartbeat_ms ?? 20_000
+  const resultDeliverySweepMs = CONFIG.result_delivery_sweep_ms ?? 1_000
+
+  function sendTerminalDelivery(turn, client, cause) {
+    const event = { type: 'turn.state', turn: ledger.projection(turn) }
+    // ESS-181 契约：不达标就剥音频保文字，永远不静默丢弃投影。
+    client.ws.send(JSON.stringify(prepareDownlinkMessage(event, log)))
+    const delivery = ledger.markResultRedelivered(turn.request_id, {
+      baseDelayMs: CONFIG.result_delivery_backoff_base_ms ?? 2_000,
+      maxDelayMs: CONFIG.result_delivery_backoff_max_ms ?? 300_000,
+    })
+    log({
+      evt: 'result_redelivered', request_id: turn.request_id, device_id: client.deviceId,
+      status: turn.state, attempt: delivery?.attempt, retry_after_ms: delivery?.delay_ms, cause,
+    })
+    return true
+  }
 
   // Real task steps are a text-only event and never enter the audio pipeline.
   watcher.onProgress = progress => {
@@ -828,6 +844,14 @@ export function createBridge(overrides = {}) {
           terminalTtlMs: CONFIG.result_delivery_ttl_ms ?? 30 * 60 * 1000,
           maxDeliveryAttempts: CONFIG.result_delivery_max_attempts ?? 5,
         }).filter(t => t.device_id === deviceId)
+        const snapshot = {
+          type: 'snapshot',
+          turns: replayTurns.map(t => ledger.projection(t)),
+        }
+        // ESS-181 契约：不达标就剥音频保文字，永远不静默丢弃投影。
+        ws.send(JSON.stringify(prepareDownlinkMessage(snapshot, log)))
+        // 快照已经承载本轮终态投递，发送后再推进退避账本。不能在构造快照前
+        // mark，否则 replayable 会因 next_delivery_at 被过滤掉。
         for (const turn of replayTurns) {
           if (['completed', 'failed', 'cancelled'].includes(turn.state)) {
             const delivery = ledger.markResultRedelivered(turn.request_id, {
@@ -837,14 +861,10 @@ export function createBridge(overrides = {}) {
             log({
               evt: 'result_redelivered', request_id: turn.request_id, device_id: deviceId,
               status: turn.state, attempt: delivery?.attempt, retry_after_ms: delivery?.delay_ms,
+              cause: 'connect_snapshot',
             })
           }
         }
-        const snapshot = {
-          type: 'snapshot',
-          turns: replayTurns.map(t => ledger.projection(t)),
-        }
-        ws.send(JSON.stringify(prepareDownlinkMessage(snapshot, log)))
         // interim 不改变账本状态，但非终态回合重连时仍须重放；客户端用
         // request_id + delivery_sequence 去重，已持久入 Watch 队列的不会重复播。
         for (const [requestId, interim] of interimPayloads) {
@@ -878,6 +898,21 @@ export function createBridge(overrides = {}) {
     }
   }, eventsHeartbeatMs)
   eventsHeartbeat.unref?.()
+
+  // 未 ACK 终态不能只等下一次 reconnect/turn_accepted。只要 iPhone events
+  // 通道仍在线，就按账本退避主动补投；ACK 到达后 due 集合立即消失。
+  const resultDeliverySweep = setInterval(() => {
+    const due = ledger.dueTerminalDeliveries({
+      terminalTtlMs: CONFIG.result_delivery_ttl_ms ?? 30 * 60 * 1000,
+      maxDeliveryAttempts: CONFIG.result_delivery_max_attempts ?? 5,
+    })
+    for (const turn of due) {
+      const client = [...eventClients].find(candidate =>
+        candidate.deviceId === turn.device_id && candidate.ws.readyState === candidate.ws.OPEN)
+      if (client) sendTerminalDelivery(turn, client, 'connected_sweep')
+    }
+  }, resultDeliverySweepMs)
+  resultDeliverySweep.unref?.()
 
   // ---- restart recovery (§4.1) -------------------------------------------
 
@@ -937,6 +972,7 @@ export function createBridge(overrides = {}) {
     resultAudio.stopSweeper()
     clearInterval(pendingAudioSweeper)
     clearInterval(eventsHeartbeat)
+    clearInterval(resultDeliverySweep)
     for (const client of eventClients) client.ws.close()
     for (const timer of workTimers.values()) clearTimeout(timer)
     return Promise.all(servers.map(s => new Promise(r => s.close(r))))

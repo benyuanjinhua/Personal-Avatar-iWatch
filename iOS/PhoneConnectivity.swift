@@ -115,6 +115,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
             }
             // 会话刚激活正是此前静默丢弃的时刻，这里必须补投。
             self.flushDownlink(trigger: "activation")
+            self.relay.resumeEvents(trigger: "wc-activation")
         }
     }
 
@@ -125,11 +126,17 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     }
 
     nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
-        Task { @MainActor in self.flushDownlink(trigger: "reachability") }
+        Task { @MainActor in
+            self.flushDownlink(trigger: "reachability")
+            self.relay.resumeEvents(trigger: "wc-reachability")
+        }
     }
 
     nonisolated func sessionWatchStateDidChange(_ session: WCSession) {
-        Task { @MainActor in self.flushDownlink(trigger: "watch-state") }
+        Task { @MainActor in
+            self.flushDownlink(trigger: "watch-state")
+            self.relay.resumeEvents(trigger: "wc-watch-state")
+        }
     }
 
     /// 系统回执：userInfo 队列条目已交付 Watch（或最终失败）。
