@@ -44,13 +44,11 @@ struct WatchContentView: View {
                         welcomeBanner
                     }
 
-                    // ESS-65 / G9：自检期间必须有明确提示（铁律 4），
-                    // 没通过时给出可区分「代码坏了 / 没授权」的文案 + 手动重跑（铁律 5）。
-                    if selfCheck.isRunning {
-                        selfCheckRunningBanner
-                    } else if let attention = selfCheck.pendingAttention {
-                        selfCheckAttentionCard(attention)
-                    }
+                    // ESS-163：装机自检 UI（运行中横幅 / 未通过卡片）从首屏移入
+                    // 设置 → 开发者面板。自检仍在启动时静默跑（G9 门禁不变），
+                    // 首屏按最终用户体验呈现——普通装机用户不该看到 S2/S3 名词、
+                    // 也不该被要求「连蓝牙耳机」。铁律 4/5 的运行时可见性由
+                    // bridge.log + DebugPanelView 承担。
 
                     // ESS-55 主张 2：等待文案随时间推进（阶梯 + 计秒），每秒重算，
                     // 保证任何等待状态 10 秒内至少变化一次，不存在静止转圈。
@@ -90,6 +88,18 @@ struct WatchContentView: View {
                         ConversationTimelineView(journal: journal)
                     } label: {
                         Label("状态时间线", systemImage: "list.bullet.rectangle")
+                    }
+                    .font(.footnote)
+                    .buttonStyle(.bordered)
+                    .tint(.secondary)
+
+                    // ESS-163：所有 debug 信息（自检、build 指纹、重跑入口、
+                    // 蓝牙耳机引导）统一收拢到这里；开发/TF/Release 都可见即可，
+                    // 按渠道隐藏另开单。
+                    NavigationLink {
+                        DebugPanelView(selfCheck: selfCheck)
+                    } label: {
+                        Label("开发者", systemImage: "wrench.and.screwdriver")
                     }
                     .font(.footnote)
                     .buttonStyle(.bordered)
@@ -137,39 +147,6 @@ struct WatchContentView: View {
         .frame(maxWidth: .infinity)
         .padding(8)
         .background(Color.cyan.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    // MARK: - 装机音频自检（ESS-65 / G9）
-
-    private var selfCheckRunningBanner: some View {
-        VStack(spacing: 3) {
-            Label("正在自检音频链路，约 15 秒", systemImage: "waveform.badge.magnifyingglass")
-                .font(.caption2.bold())
-            Text("装机门禁 · 按住语音球可跳过")
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(8)
-        .background(Color.purple.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    private func selfCheckAttentionCard(_ outcome: SelfCheckPolicy.Outcome) -> some View {
-        VStack(spacing: 4) {
-            Text(SelfCheckPolicy.userMessage(outcome: outcome))
-                .font(.caption2)
-                .multilineTextAlignment(.center)
-
-            Button("重新自检") {
-                selfCheck.rerun()
-            }
-            .buttonStyle(.bordered)
-            .tint(.purple)
-            .font(.caption2)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(8)
-        .background(Color.purple.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
     }
 
     // MARK: - 通知授权引导（ESS-55）

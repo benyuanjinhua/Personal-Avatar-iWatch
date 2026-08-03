@@ -33,6 +33,7 @@
 		3720FA2BBC2A5376CB24FD23 /* VoiceOutbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB7ABFE8DE51D05121E27317 /* VoiceOutbox.swift */; };
 		389212E3DA6FAA59F9910D22 /* SelfCheckPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5781515B605FE09873311309 /* SelfCheckPolicy.swift */; };
 		3BED828277BCE6296AFDC424 /* PlaybackRecoveryPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 905294A59B10050708A50FBF /* PlaybackRecoveryPolicy.swift */; };
+		3C5CC29413DC9E075BCE129D /* DebugPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC023A855C86E4F149A86DAB /* DebugPanelView.swift */; };
 		3F6EA24FB3A3B46BD00BC2D0 /* WristAgentApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36A3DD675D9E3E4CDC7C7C5A /* WristAgentApp.swift */; };
 		402E9DC1E4E2E918917E9B58 /* WatchSettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C85D18E0360A2A1EBDF04975 /* WatchSettingsStore.swift */; };
 		41214906A025D5C1E7C4ECA9 /* SecureTokenStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC28E8D4A89C399924568EEB /* SecureTokenStore.swift */; };
@@ -198,6 +199,7 @@
 		DE20A46446B578002D231E7D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		E36424AC38F0A8BB28751248 /* UUIDv7.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UUIDv7.swift; sourceTree = "<group>"; };
 		E92A4F28175D63C6FBD62D7E /* ConversationHistory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationHistory.swift; sourceTree = "<group>"; };
+		EC023A855C86E4F149A86DAB /* DebugPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugPanelView.swift; sourceTree = "<group>"; };
 		F0D0D96E379DBB5414F01FA7 /* PermissionRequestView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionRequestView.swift; sourceTree = "<group>"; };
 		F16E394DC77EF14BAE142B32 /* WatchVoiceTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchVoiceTransport.swift; sourceTree = "<group>"; };
 		F7C56A17FC91DC667B51B7D6 /* EncryptedAudioVault.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EncryptedAudioVault.swift; sourceTree = "<group>"; };
@@ -273,6 +275,7 @@
 				67C6A03628F073DFB7BD92CF /* Assets.xcassets */,
 				98840DEEAC5DA7B6F8FCC628 /* AudioRecorder.swift */,
 				8D4D9B7BAB821EF5BEF00394 /* ConversationTimelineView.swift */,
+				EC023A855C86E4F149A86DAB /* DebugPanelView.swift */,
 				13F51C6DCBABB59C404B307D /* Info.plist */,
 				8F9C01710FDC8C90D754460F /* OpenWristAgentIntent.swift */,
 				F0D0D96E379DBB5414F01FA7 /* PermissionRequestView.swift */,
@@ -508,6 +511,7 @@
 				74339B1DE6A6C27DBE1885DD /* ClientLog.swift in Sources */,
 				54817C157F20C92848363962 /* ConversationHistory.swift in Sources */,
 				2600C4D0F1086887A7E1B04A /* ConversationTimelineView.swift in Sources */,
+				3C5CC29413DC9E075BCE129D /* DebugPanelView.swift in Sources */,
 				34140BE278C262CF0BACEABE /* EncryptedAudioVault.swift in Sources */,
 				C3D8984AB14E3ECEB93542E0 /* OpenWristAgentIntent.swift in Sources */,
 				34523D43C35817094DA2E618 /* PermissionRequestView.swift in Sources */,

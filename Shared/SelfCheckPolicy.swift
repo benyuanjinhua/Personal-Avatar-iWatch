@@ -91,14 +91,70 @@ enum SelfCheckPolicy {
     }
 
     /// 上一次自检的持久化记录（UserDefaults JSON）。
+    /// ESS-163：追加 `failedStep` / `code` / `inconclusiveReason`（均可空），
+    /// Debug 面板据此在冷启动跳过自检时也能还原上次结论；Codable 的可选
+    /// 字段解码天然向后兼容旧 JSON（缺字段解为 nil，走 `outcome == nil` 退路）。
     struct RunRecord: Codable, Equatable {
         /// BuildFingerprint.detail 全串（version/build/built_at）作为 build 身份。
         let fingerprintDetail: String
         let result: String
+        let failedStep: String?
+        let code: String?
+        let inconclusiveReason: String?
 
-        init(fingerprintDetail: String, result: Result) {
+        init(
+            fingerprintDetail: String,
+            result: Result,
+            failedStep: SelfCheckPolicy.Step? = nil,
+            code: String? = nil,
+            inconclusiveReason: SelfCheckPolicy.InconclusiveReason? = nil
+        ) {
             self.fingerprintDetail = fingerprintDetail
             self.result = result.rawValue
+            self.failedStep = failedStep?.rawValue
+            self.code = code
+            self.inconclusiveReason = inconclusiveReason?.rawValue
+        }
+
+        /// 从完整 Outcome 建记录：finish() 落盘走这里，避免各处再拆解。
+        static func from(outcome: Outcome, fingerprintDetail: String) -> RunRecord {
+            switch outcome {
+            case .pass:
+                return RunRecord(fingerprintDetail: fingerprintDetail, result: .pass)
+            case .failed(let step, let code):
+                return RunRecord(
+                    fingerprintDetail: fingerprintDetail, result: .fail,
+                    failedStep: step, code: code
+                )
+            case .inconclusive(let reason):
+                return RunRecord(
+                    fingerprintDetail: fingerprintDetail, result: .inconclusive,
+                    inconclusiveReason: reason
+                )
+            }
+        }
+
+        /// 还原为 Outcome；旧记录（缺失新字段）无法还原时返回 nil，
+        /// UI 侧退回到「无历史结论可展示」的空态。
+        var outcome: Outcome? {
+            switch result {
+            case Result.pass.rawValue:
+                return .pass
+            case Result.fail.rawValue:
+                guard let rawStep = failedStep,
+                      let step = SelfCheckPolicy.Step(rawValue: rawStep) else {
+                    return nil
+                }
+                return .failed(step: step, code: code)
+            case Result.inconclusive.rawValue:
+                guard let rawReason = inconclusiveReason,
+                      let reason = SelfCheckPolicy.InconclusiveReason(rawValue: rawReason) else {
+                    return nil
+                }
+                return .inconclusive(reason)
+            default:
+                return nil
+            }
         }
     }
 
