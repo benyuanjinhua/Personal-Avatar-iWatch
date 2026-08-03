@@ -81,6 +81,8 @@ targets:
 
   # ESS-73：watch 模拟器宿主单测——swift test 编不到 Watch target，
   # 中断残留等运行时行为只能在 watchOS 进程里复现（R-02 运行时证据）。
+  # ESS-156：补 GENERATE_INFOPLIST_FILE 让 xcodebuild test 能真正跑起来
+  # （不补的话 code sign 阶段直接 fail，测试从未执行过）。
   WristAgent Watch Tests:
     type: bundle.unit-test
     platform: watchOS
@@ -93,6 +95,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: $(WRISTAGENT_BUNDLE_ID).watchkitapp.tests
         TARGETED_DEVICE_FAMILY: "4"
         WATCHOS_DEPLOYMENT_TARGET: "10.0"
+        GENERATE_INFOPLIST_FILE: YES
 
 schemes:
   WristAgent:
