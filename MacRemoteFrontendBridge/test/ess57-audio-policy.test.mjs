@@ -52,4 +52,33 @@ describe('ESS-57 audio downlink allowlist', () => {
     assert.equal(event.interim.audio.base64, 'AAAA', 'source event must remain intact')
     assert.equal(logs[0].reason, 'missing_kind')
   })
+
+  // ESS-184：门禁探针 kind=probe 必须走白名单（避免自己拦自己，参见
+  // ESS-181）。causal 判据（request_id 存在）同其他 kind 一致。
+  it('admits probe audio when it carries a causal request_id', () => {
+    const logs = []
+    const causal = {
+      type: 'turn.state',
+      turn: {
+        request_id: 'probe-0000000000000000',
+        path: 'direct',
+        result: { audio: { kind: 'probe', sha256: 'p' }, audio_base64: 'AAAA' },
+      },
+    }
+    assert.equal(allowDownlinkMessage(causal, item => logs.push(item)), true)
+    assert.deepEqual(logs, [])
+
+    const noCausal = {
+      type: 'turn.state',
+      turn: {
+        path: 'direct',
+        result: { audio: { kind: 'probe', sha256: 'p' }, audio_base64: 'AAAA' },
+      },
+    }
+    assert.equal(allowDownlinkMessage(noCausal, item => logs.push(item)), false)
+    assert.deepEqual(logs[0], {
+      evt: 'l1_audio_rejected', reason: 'missing_causal_request',
+      request_id: null, source: 'direct', kind: 'probe',
+    })
+  })
 })
