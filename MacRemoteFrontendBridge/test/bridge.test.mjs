@@ -200,6 +200,13 @@ describe('direct-answer path', () => {
     const id = rid()
     await ctx.client.createTurn(id, pcm(300))
 
+    await waitFor(() => events.received.some(e =>
+      e.type === 'turn.state' && e.turn.request_id === id && e.turn.status === 'completed'))
+    await new Promise(resolve => setTimeout(resolve, 1_200))
+    assert.equal(events.received.filter(e =>
+      e.type === 'turn.state' && e.turn.request_id === id && e.turn.status === 'completed').length, 1,
+    'the one-second sweep must not duplicate the initial terminal delivery before backoff')
+
     await waitFor(() => events.received.filter(e =>
       e.type === 'turn.state' && e.turn.request_id === id && e.turn.status === 'completed').length >= 2)
     const acceptedBeforeAck = ctx.bridge.ledger.get(id).delivery_attempts

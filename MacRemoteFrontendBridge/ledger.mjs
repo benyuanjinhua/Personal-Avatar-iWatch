@@ -78,7 +78,7 @@ export class TurnLedger extends EventEmitter {
       permission: null,           // { id, ...bounded summary } while permission_required
       result: null,               // { text, audio_base64?, truncated? } once terminal
       delivered_ack: null,        // { at, source } once Watch has durably stored the result
-      delivery_attempts: 0,       // terminal snapshot redeliveries (bounded + backed off)
+      delivery_attempts: 0,       // terminal delivery attempts (bounded + backed off)
       next_delivery_at: null,
       error: null,                // stable ERR_* code once failed
       event_count: 0,             // 全量观测计数（Realtime + SSE，ESS-37 取证口径）
@@ -224,7 +224,12 @@ export class TurnLedger extends EventEmitter {
   replayable({ now = Date.now(), terminalTtlMs = 30 * 60 * 1000, maxDeliveryAttempts = 5 } = {}) {
     return [...this.turns.values()].filter(turn => {
       if (!TERMINAL.has(turn.state)) return true
-      return this.dueTerminalDeliveries({ now, terminalTtlMs, maxDeliveryAttempts }).includes(turn)
+      if (turn.delivered_ack) return false
+      if ((turn.delivery_attempts || 0) >= maxDeliveryAttempts) return false
+      const nextDeliveryAt = Date.parse(turn.next_delivery_at)
+      if (Number.isFinite(nextDeliveryAt) && now < nextDeliveryAt) return false
+      const terminalAt = Date.parse(turn.updated_at)
+      return Number.isFinite(terminalAt) && now - terminalAt <= terminalTtlMs
     })
   }
 

@@ -779,18 +779,22 @@ export function createBridge(overrides = {}) {
   const eventsHeartbeatMs = CONFIG.events_heartbeat_ms ?? 20_000
   const resultDeliverySweepMs = CONFIG.result_delivery_sweep_ms ?? 1_000
 
-  function sendTerminalDelivery(turn, client, cause) {
-    const event = { type: 'turn.state', turn: ledger.projection(turn) }
-    // ESS-181 契约：不达标就剥音频保文字，永远不静默丢弃投影。
-    client.ws.send(JSON.stringify(prepareDownlinkMessage(event, log)))
+  function markTerminalDelivery(turn, cause, deviceId) {
     const delivery = ledger.markResultRedelivered(turn.request_id, {
       baseDelayMs: CONFIG.result_delivery_backoff_base_ms ?? 2_000,
       maxDelayMs: CONFIG.result_delivery_backoff_max_ms ?? 300_000,
     })
     log({
-      evt: 'result_redelivered', request_id: turn.request_id, device_id: client.deviceId,
+      evt: 'result_delivery_attempt', request_id: turn.request_id, device_id: deviceId,
       status: turn.state, attempt: delivery?.attempt, retry_after_ms: delivery?.delay_ms, cause,
     })
+  }
+
+  function sendTerminalDelivery(turn, client, cause) {
+    const event = { type: 'turn.state', turn: ledger.projection(turn) }
+    // ESS-181 契约：不达标就剥音频保文字，永远不静默丢弃投影。
+    client.ws.send(JSON.stringify(prepareDownlinkMessage(event, log)))
+    markTerminalDelivery(turn, cause, client.deviceId)
     return true
   }
 
@@ -815,10 +819,16 @@ export function createBridge(overrides = {}) {
 
   ledger.on('turn', projection => {
     const event = { type: 'turn.state', turn: projection }
+    let delivered = false
     for (const client of eventClients) {
       if (client.deviceId === projection.device_id && client.ws.readyState === client.ws.OPEN) {
         client.ws.send(JSON.stringify(prepareDownlinkMessage(event, log)))
+        delivered = true
       }
+    }
+    if (delivered && ['completed', 'failed', 'cancelled'].includes(projection.status)) {
+      const turn = ledger.get(projection.request_id)
+      if (turn) markTerminalDelivery(turn, 'live_turn_state', projection.device_id)
     }
   })
 
@@ -854,15 +864,7 @@ export function createBridge(overrides = {}) {
         // mark，否则 replayable 会因 next_delivery_at 被过滤掉。
         for (const turn of replayTurns) {
           if (['completed', 'failed', 'cancelled'].includes(turn.state)) {
-            const delivery = ledger.markResultRedelivered(turn.request_id, {
-              baseDelayMs: CONFIG.result_delivery_backoff_base_ms ?? 2_000,
-              maxDelayMs: CONFIG.result_delivery_backoff_max_ms ?? 300_000,
-            })
-            log({
-              evt: 'result_redelivered', request_id: turn.request_id, device_id: deviceId,
-              status: turn.state, attempt: delivery?.attempt, retry_after_ms: delivery?.delay_ms,
-              cause: 'connect_snapshot',
-            })
+            markTerminalDelivery(turn, 'connect_snapshot', deviceId)
           }
         }
         // interim 不改变账本状态，但非终态回合重连时仍须重放；客户端用
