@@ -3,12 +3,12 @@ import XCTest
 
 @testable import WristAgent_Watch_App
 
-/// ESS-73 复现测试（watch 模拟器宿主进程运行，R-02 运行时证据）：
-/// 真机取证显示 interruption .began 后 .ended 可能永远不投递（全库 grep
-/// 6 条 began 0 条 ended），旧实现以 .ended 为唯一清除路径，导致后续所有
-/// play() 被无限 defer（playback_deferred reason=interruption_active），
-/// 播放通道直到 App 重启才恢复。修复后：新 play() 视为用户意图直接激活，
-/// 激活结果说话；残留标志在激活成功时就地清除。
+/// ESS-73 / ESS-228 复现测试（watch 模拟器宿主进程运行，R-02 运行时证据）：
+/// 真机取证显示 interruption .began 后 .ended 可能永远不投递（bridge.log 全窗口：
+/// began 209 / ended 0）。旧 ESS-64 实现以 .ended 为唯一清除路径 → 播放通道
+/// 永久锁死；ESS-73 撤除激活闸门；ESS-228 起彻底删除本地缓存标志，共享
+/// 会话状态就是 AVAudioSession.sharedInstance() 本身。断言：残留 .began
+/// 下新 play() 必须直接激活并完整出声。
 @MainActor
 final class SpeechPlayerInterruptionTests: XCTestCase {
 

@@ -244,21 +244,22 @@ final class SelfCheckRunner: ObservableObject {
 
     // MARK: - S5/S6：中断残留与双激活失败（ESS-73 / ESS-64）
 
-    /// S5 中断残留（ESS-73）：合成 .began 且**不投 .ended**，复现真机上
-    /// 「.ended 丢失」的残留状态（全量取证 6 条 began 0 条 ended）。此时发起
-    /// 新播放必须直接激活并起播——不得出现 playback_deferred，残留标志应在
-    /// 激活成功时就地清除（interruption_flag_cleared）。这是对旧 ESS-64
-    /// 「等待 .ended」闸门被撤除后新契约的可执行断言。
+    /// S5 中断残留（ESS-73 → ESS-228）：合成 .began 且**不投 .ended**，
+    /// 复现真机上「.ended 丢失」（bridge.log 全窗口：began 209 / ended 0）。
+    /// 此时发起新播放必须直接激活并起播——不得出现 playback_deferred，
+    /// 也不得依赖任何缓存中断标志（ESS-228 起 SpeechPlayer 不再缓存该状态，
+    /// 共享会话状态就是 AVAudioSession.sharedInstance() 本身）。断言就是：
+    /// 残留 .began 下 play_started 必须到、defer 事件必须为 0。
     private func interruptionGateStep(data: Data) async -> SelfCheckPolicy.Outcome? {
         let step = SelfCheckPolicy.Step.interruptionGate
         beginStep(step)
         let startedAt = Date()
-        // 合成通知会置位进程内所有 SpeechPlayer 实例的中断标记：无论本步
-        // 如何退出（含被用户打断），都补一个 ended 清理残留留痕。
+        // 合成通知只落一次 session_interruption 证据；ESS-228 后不再改动
+        // 任何实例状态，因此不必再补一条 ended 清理残留。
         defer { Self.postSyntheticInterruption(.ended) }
 
         Self.postSyntheticInterruption(.began)
-        // 通知处理经 Task 跳一拍主线程，给标志落位留一个节拍。
+        // 通知回调经 Task 跳一拍主线程，给证据落位留一个节拍。
         try? await Task.sleep(nanoseconds: 150_000_000)
         if interrupted { return .inconclusive(.interrupted) }
 
@@ -267,7 +268,6 @@ final class SelfCheckRunner: ObservableObject {
         let started = await waitFor(timeout: 6) { [signals] in signals.count(of: "play_started") > 0 }
         let callbackTs = signals.firstTimestamp(of: "play_started").map { Int64($0.timeIntervalSince1970 * 1000) }
         let deferredSeen = signals.count(of: "playback_deferred")
-        let flagCleared = signals.count(of: "interruption_flag_cleared")
         WatchLog.info(
             "selfcheck", "selfcheck_observation",
             detail: SelfCheckPolicy.observationDetail(
@@ -279,7 +279,7 @@ final class SelfCheckRunner: ObservableObject {
         )
         player.stop(reason: "selfcheck_s5_complete")
         if interrupted { return .inconclusive(.interrupted) }
-        guard started, deferredSeen == 0, flagCleared > 0 else {
+        guard started, deferredSeen == 0 else {
             return failStep(step, startedAt: startedAt, fallbackCode: "ERR_STALE_INTERRUPTION_BLOCKS")
         }
         passStep(step, startedAt: startedAt)

@@ -42,10 +42,6 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     /// ESS-154 T2-4：起播挂起兜底（30s 无 play_started 即认作失败终局）。
     /// 一旦 beginPlayback 成功起播（或任何终局路径先到）即取消。
     private var deferredWatchdog: Task<Void, Never>?
-    /// ESS-73：仅作取证留痕，不再闸门任何播放路径——.ended 不保证投递，
-    /// 以它为唯一清除路径曾把播放通道永久锁死。清除时机：.ended 到达、
-    /// 回前台恢复、任一次激活成功（硬件已归还的实证）。
-    private var isSessionInterrupted = false
     /// 异步激活期间又来了新 play()/stop() 时，旧激活回调据此作废。
     private var playbackGeneration = 0
     /// ESS-65 S6 注入缝：「long-form 与 foreground 双激活失败」在真机上无法
@@ -60,6 +56,9 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     override init() {
         super.init()
         // 播放中断（电话/系统占用）是真机欢迎语「响一半没了」的候选根因，必须留痕。
+        // ESS-228：不再缓存 began/ended 状态到实例上——.ended 真机上从不投递
+        // （bridge.log 全窗口：began 209 / ended 0），任何缓存都会被闩死。
+        // 观察者只做两件事：(1) 落一条运行时证据；(2) .began 时停当前播放。
         interruptionObserver = NotificationCenter.default.addObserver(
             forName: AVAudioSession.interruptionNotification, object: nil, queue: .main
         ) { [weak self] notification in
@@ -67,17 +66,14 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             let kind = raw.flatMap(AVAudioSession.InterruptionType.init(rawValue:))
             Task { @MainActor in
                 guard let self, let kind else { return }
-                self.isSessionInterrupted = kind == .began
                 WatchLog.info(
                     "player", "session_interruption", requestId: self.context,
                     detail: "state=\(kind == .began ? "began" : "ended") "
                         + self.activationEvidence()
                 )
-                // ESS-73：.began 只负责停当前播放并留痕——系统此刻已暂停
-                // 硬件，把这一段判「未播完」走 retainForReplay，UI 立即离开
-                // 「播放中」、结果卡片给出重播入口。不再挂起等 .ended 恢复：
-                // 该通知不保证投递（中断方不归还会话/App 曾挂起都会丢），
-                // 等待会把播放通道永久锁死（真机取证：6 条 began 0 条 ended）。
+                // .began 停当前播放并按未播完收尾（UI 立即离开「播放中」、
+                // 结果卡片给出重播入口）。不等 .ended：该通知不保证投递，
+                // 等待会把播放通道永久锁死（ESS-73 → ESS-228 一脉相承）。
                 guard kind == .began else { return }
                 self.haltPlaybackForInterruption()
             }
@@ -157,22 +153,12 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     private func requestActivationAndPlayback(_ player: AVAudioPlayer, bytes: Int, generation: Int) {
-        // ESS-73：新播放请求视为用户意图，直接激活，激活结果即唯一门禁
-        // （见 AudioSessionPolicy.nextPlaybackActivationAction）。中断期间
-        // 到来的 .began 会经 haltPlaybackForInterruption 收掉本次播放并使
-        // generation 失效，无需在此处预判中断状态。
+        // ESS-73/228：新播放请求视为用户意图，直接激活，激活结果即唯一门禁。
+        // 中断期间到来的 .began 会经 haltPlaybackForInterruption 收掉本次
+        // 播放并使 generation 失效，无需在此处预判中断状态。
         activateSession(context: context) { [weak self] activated in
             guard let self, self.playbackGeneration == generation, self.audioPlayer === player else { return }
             if activated {
-                if self.isSessionInterrupted {
-                    // 激活成功即证明硬件已归还，残留的中断标志是 .ended
-                    // 丢失所致，就地清除。
-                    self.isSessionInterrupted = false
-                    WatchLog.info(
-                        "player", "interruption_flag_cleared", requestId: self.context,
-                        detail: "reason=activation_succeeded " + self.activationEvidence()
-                    )
-                }
                 self.beginPlayback(player, bytes: bytes)
             } else {
                 WatchLog.error(
@@ -240,8 +226,8 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             Task { @MainActor in
                 guard let self else { return }
                 let callbackAt = Date()
-                // ESS-73：不再依据 isSessionInterrupted 拦截激活结果——激活
-                // 成功即硬件可用（标志由调用方清除）；失败自然回落/收尾。
+                // ESS-73/228：不再依据缓存中断标志拦截激活结果——激活成功
+                // 即硬件可用；失败自然回落/收尾。
                 // ESS-61 F2：activated=false 且 error=nil 也是失败（真机取证
                 // 88 秒静默），一律回落前台会话，不许在未激活的会话上 play()。
                 if AudioSessionPolicy.playbackActivationSucceeded(activated: activated, hasError: error != nil) {
@@ -334,16 +320,9 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     /// 回前台钩子（ESS-58）：后台音频路径正常时声音一直在响，无事发生；
     /// App 曾被挂起截断（播放标记在、播放器已停）则原位续播，续不动才
     /// 判未播完——播放不允许静默消失。
+    /// ESS-228：不再有缓存中断标志需要清——.ended 不保证投递、前台恢复
+    /// 由下一次激活结果说话。
     func recoverAfterForeground() {
-        // ESS-73：回前台即清残留中断标志——.ended 不保证投递，Apple 口径
-        // 是前台恢复时重新激活探测；硬件是否真的可用交给下一次激活结果。
-        if isSessionInterrupted {
-            isSessionInterrupted = false
-            WatchLog.info(
-                "player", "interruption_flag_cleared", requestId: context,
-                detail: "reason=foreground_recovery " + activationEvidence()
-            )
-        }
         guard let audioPlayer else { return }
         let action = PlaybackRecoveryPolicy.onForeground(
             hasActivePlayback: isPlaying,
@@ -445,8 +424,12 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         return outputs.isEmpty ? "none" : outputs
     }
 
+    /// ESS-228：会话状态实时查询——不再缓存本地布尔量（.ended 不保证投递，
+    /// 缓存标志会永久闩死）。共享状态就是 AVAudioSession.sharedInstance()，
+    /// 需要时按当前值取样。
     private func activationEvidence() -> String {
-        "scene_phase=\(Self.scenePhaseDescription()) interruption=\(isSessionInterrupted ? "active" : "inactive")"
+        let session = AVAudioSession.sharedInstance()
+        return "scene_phase=\(Self.scenePhaseDescription()) other_audio=\(session.isOtherAudioPlaying ? "yes" : "no")"
     }
 
     private static func scenePhaseDescription() -> String {
