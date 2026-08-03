@@ -28,6 +28,9 @@ struct VoiceTurnRecord: Codable, Equatable, Identifiable {
     /// ESS-55 未读机制：结果首次被查看/播放的时间；nil = 未读。
     /// 结果在用户未查看前不丢失，下次打开仍以未读态呈现。
     var resultViewedAt: Date?
+    /// ESS-180：failed 事件的 Bridge 稳定错误码（`ERR_*`）；成功回合恒为 nil。
+    /// UI 拿它查 `ErrorCueCatalog` 决定拟人化文案与语音提示。
+    var errorCode: String?
 
     var id: String { requestId }
     var currentState: VoiceTurnState { events.last?.state ?? .recorded }
@@ -84,10 +87,16 @@ final class VoiceTurnJournal: ObservableObject {
     /// Watch 本地产生的状态（发送阶段 / 用户取消）。
     @discardableResult
     func recordLocal(_ state: VoiceTurnState, requestId: String, detail: String? = nil, at: Date = Date()) -> Bool {
-        append(state: state, requestId: requestId, detail: detail, at: at, failureStage: nil)
+        append(state: state, requestId: requestId, detail: detail, at: at, failureStage: nil, errorCode: nil)
     }
 
     /// 入账 iPhone 转发来的状态事件；校验失败或不允许的转移（乱序/重复/终态之后）会被丢弃。
+    ///
+    /// ESS-180 / ESS-204：**必须在 append(...) 调用 onStateApplied 之前**把
+    /// permission / result / errorCode 挂到回合上。旧路径先 append（内部
+    /// fires onStateApplied） → 再写字段，PushToTalkController 的 failed
+    /// 回调分支读到 nil errorCode 只能展示 generic 卡片，presenter 又按
+    /// requestId 去重，永远无法纠正。
     @discardableResult
     func apply(_ envelope: VoiceStatusEnvelope) -> Bool {
         guard envelope.validate() == nil else { return false }
@@ -95,21 +104,41 @@ final class VoiceTurnJournal: ObservableObject {
         if !turns.contains(where: { $0.requestId == envelope.requestId }) {
             begin(requestId: envelope.requestId, at: envelope.occurredAt)
         }
-        let applied = append(
-            state: envelope.state,
-            requestId: envelope.requestId,
-            detail: envelope.detail,
-            at: envelope.occurredAt,
-            failureStage: envelope.failureStage
-        )
-        guard applied, let index = turns.firstIndex(where: { $0.requestId == envelope.requestId }) else {
-            return applied
+        guard let index = turns.firstIndex(where: { $0.requestId == envelope.requestId }) else {
+            return false
         }
+        // ESS-204：先挂 payload、后 append（append 内部同步触发 onStateApplied
+        // 时字段已就位）。permission/result/errorCode 只在能真正 transition 时
+        // 才生效——append 返回 false 时下面回滚 turns[index] 的临时写。
+        let priorPermission = turns[index].permission
+        let priorResult = turns[index].result
+        let priorErrorCode = turns[index].errorCode
         if let permission = envelope.permission {
             turns[index].permission = permission
         }
         if let result = envelope.result {
             turns[index].result = result
+        }
+        // 一旦落到 failed 就锁定 errorCode，后续同 request_id 的乱序事件不覆盖。
+        if envelope.state == .failed, turns[index].errorCode == nil,
+           let code = envelope.errorCode, !code.isEmpty {
+            turns[index].errorCode = code
+        }
+        let applied = append(
+            state: envelope.state,
+            requestId: envelope.requestId,
+            detail: envelope.detail,
+            at: envelope.occurredAt,
+            failureStage: envelope.failureStage,
+            errorCode: nil  // 已在上面写入；append 只做状态机推进 + 触发回调
+        )
+        guard applied else {
+            // 转移被拒（终态之后 / 重复 / 乱序）：回滚 payload 写入，回合状态
+            // 与信封应用前一致，onStateApplied 未触发。
+            turns[index].permission = priorPermission
+            turns[index].result = priorResult
+            turns[index].errorCode = priorErrorCode
+            return false
         }
         save()
         // 纯文本降级（ESS-48）：结果没有配套语音（speech_sha256 为空），不会有
@@ -197,12 +226,16 @@ final class VoiceTurnJournal: ObservableObject {
         try? fileManager.removeItem(at: fileURL)
     }
 
+    /// ESS-204：`errorCode` 参数保留但已废弃——`apply(_:)` 在调用 append 前
+    /// 直接写 `turns[index].errorCode`，确保 onStateApplied 触发时字段已就位。
+    /// 保留参数只为不破坏 `recordLocal` 等其它调用点的签名（都传 nil）。
     private func append(
         state: VoiceTurnState,
         requestId: String,
         detail: String?,
         at: Date,
-        failureStage: VoiceFailureStage?
+        failureStage: VoiceFailureStage?,
+        errorCode: String?
     ) -> Bool {
         guard let index = turns.firstIndex(where: { $0.requestId == requestId }) else { return false }
         let current = turns[index].currentState
@@ -210,6 +243,9 @@ final class VoiceTurnJournal: ObservableObject {
         turns[index].events.append(VoiceTurnEvent(state: state, at: at, detail: detail))
         if state == .failed {
             turns[index].failureStage = failureStage ?? .inferred(from: current)
+        }
+        if let errorCode, !errorCode.isEmpty, turns[index].errorCode == nil {
+            turns[index].errorCode = errorCode
         }
         save()
         onStateApplied?(requestId, state)

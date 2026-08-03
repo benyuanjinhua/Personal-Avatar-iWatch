@@ -159,6 +159,10 @@ extension BridgeTurnProjection {
 
     /// 面向用户的补充说明：失败时给稳定错误码，其余透传子状态。
     /// 「没听清」类失败（ESS-41 B2）翻译成可执行的中文提示，不裸露错误码。
+    ///
+    /// ESS-180：拟人化文案与语音提示的最终决策已下沉到 Watch 侧
+    /// `ErrorCueCatalog`；detailText 仍作为日志/回看视图的兜底文案，
+    /// 但不再是错误码的唯一载体——errorCode 与 detailText 现在并行。
     var detailText: String? {
         guard status == "failed" else { return detail }
         switch error {
@@ -167,6 +171,14 @@ extension BridgeTurnProjection {
         default:
             return error ?? detail
         }
+    }
+
+    /// ESS-180：Bridge 稳定短码（`ERR_*`）。仅在 failed 态携带，
+    /// Watch `ErrorCueCatalog` 按 code → (文字, 语音, 触觉) 查表；未知/缺失
+    /// 走通用兜底。
+    var errorCode: String? {
+        guard status == "failed", let code = error, !code.isEmpty else { return nil }
+        return code
     }
 
     /// completed 投影 → Watch 结果载荷。speechSha256/speechDurationMs 来自
@@ -203,7 +215,8 @@ extension BridgeTurnProjection {
             detail: detailText,
             failureStage: state == .failed ? .execution : nil,
             permission: permissionPayload,
-            result: resultPayload
+            result: resultPayload,
+            errorCode: errorCode
         )
     }
 }
