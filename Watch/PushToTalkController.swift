@@ -220,6 +220,9 @@ final class PushToTalkController: ObservableObject {
     }
 
     /// 结果语音落盘后的定向自动播放（ESS-41 B3）。
+    /// ESS-182：dedup token 用 `speechFileName`（`<requestId>-<sha>.m4a`），
+    /// 保证同一 request_id 的 interim / final 两段各自独立去重——旧实现按裸
+    /// request_id 去重会让 final 被 interim 顶掉、静默丢弃。
     private func autoPlayResult(requestId: String) {
         guard state == .idle else {
             Self.logger.info("auto-play deferred: recording in progress (request_id=\(requestId, privacy: .public))")
@@ -230,12 +233,19 @@ final class PushToTalkController: ObservableObject {
             enqueueAutoPlay(requestId, reason: "player_busy")
             return
         }
-        guard playbackLedger.claim(requestId: requestId) else {
-            Self.logger.info("auto-play suppressed: already claimed (request_id=\(requestId, privacy: .public))")
-            return
-        }
         guard let turn = journal.turn(withId: requestId) else {
             Self.logger.error("auto-play failed: turn not found (request_id=\(requestId, privacy: .public))")
+            return
+        }
+        guard let fileName = turn.speechFileName else {
+            WatchLog.error(
+                "player", "auto_play_missing_speech", requestId: requestId,
+                code: "ERR_NO_SPEECH_FILE"
+            )
+            return
+        }
+        guard playbackLedger.claim(token: fileName) else {
+            Self.logger.info("auto-play suppressed: already claimed (request_id=\(requestId, privacy: .public) file=\(fileName, privacy: .public))")
             return
         }
         onAutoPlayStarted?()
