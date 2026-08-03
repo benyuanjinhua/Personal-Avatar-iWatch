@@ -83,6 +83,35 @@ struct VoiceTurnResponse: Codable {
     }
 }
 
+struct VoiceTurnProjection: Codable {
+    struct Result: Codable {
+        struct Audio: Codable {
+            let sha256: String
+            let durationMs: Int?
+
+            enum CodingKeys: String, CodingKey {
+                case sha256
+                case durationMs = "duration_ms"
+            }
+        }
+
+        let text: String?
+        let truncated: Bool?
+        let audio: Audio?
+    }
+
+    let requestId: String
+    let status: String
+    let detail: String?
+    let result: Result?
+    let error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case requestId = "request_id"
+        case status, detail, result, error
+    }
+}
+
 struct BridgeErrorBody: Codable {
     let error: String
 }
@@ -163,16 +192,19 @@ final class RelayClient {
 
     /// 一次性配对码（Mac 端展示）换取设备凭据。
     static func pair(
-        baseURL: URL, pairingCode: String, deviceName: String, session: URLSession = .shared
+        baseURL: URL, pairingCode: String, deviceName: String, deviceId: String? = nil,
+        session: URLSession = .shared
     ) async throws -> RelayDeviceCredentials {
         var request = URLRequest(url: baseURL.appendingPathComponent("/v1/pair"))
         request.httpMethod = "POST"
         request.timeoutInterval = 30
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
+        var body: [String: String] = [
             "pairing_code": pairingCode,
             "device_name": deviceName,
-        ])
+        ]
+        if let deviceId { body["device_id"] = deviceId }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response): (Data, URLResponse)
         do {
             (data, response) = try await session.data(for: request)
@@ -207,6 +239,24 @@ final class RelayClient {
         }
         guard let http = response as? HTTPURLResponse else { throw RelayUploadError.badResponse }
         return (data, http.statusCode)
+    }
+
+    func fetchTurn(requestId: String) async throws -> VoiceTurnProjection {
+        let path = "/v1/voice/turns/\(requestId)"
+        let request = RelaySignedRequestBuilder(baseURL: baseURL, credentials: credentials)
+            .request(method: "GET", path: path, requestId: requestId, body: nil)
+        let (data, response): (Data, URLResponse)
+        do { (data, response) = try await session.data(for: request) }
+        catch { throw RelayUploadError.transport(error) }
+        guard let http = response as? HTTPURLResponse else { throw RelayUploadError.badResponse }
+        guard http.statusCode == 200 else {
+            let code = (try? JSONDecoder().decode(BridgeErrorBody.self, from: data))?.error ?? "ERR_UNKNOWN"
+            throw RelayUploadError.bridge(code: code, httpStatus: http.statusCode)
+        }
+        guard let projection = try? JSONDecoder().decode(VoiceTurnProjection.self, from: data) else {
+            throw RelayUploadError.badResponse
+        }
+        return projection
     }
 
     /// 上送一个 Watch 日志 chunk（ESS-42）：POST /v1/client-logs。

@@ -22,6 +22,7 @@ final class WatchAppServices {
         settings.voiceTransport = pushToTalk.transport
         settings.voiceJournal = pushToTalk.journal
         settings.speechVault = pushToTalk.speechVault
+        pushToTalk.transport.directSpeechVault = pushToTalk.speechVault
         pushToTalk.onAutoPlayStarted = { [welcome] in welcome.interrupt() }
         settings.activate()
         WatchLog.info("lifecycle", "services_bootstrapped", detail: reason)

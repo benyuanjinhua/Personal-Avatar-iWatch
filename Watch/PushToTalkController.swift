@@ -520,6 +520,7 @@ final class PushToTalkController: ObservableObject {
                 self.speechVault?.remove(name: fileName)
                 if self.journal.clearSpeech(requestId: requestId, matching: fileName) {
                     self.sessionKeeper.markDelivered(requestId: requestId)
+                    self.transport.sendResultAck(requestId: requestId)
                 }
             }
             // 播完整段视为已读（ESS-55 未读机制）：熄屏听完也算送达。

@@ -1,6 +1,45 @@
 import Foundation
+import Security
 import WatchConnectivity
 import os
+
+enum WatchTransportMode: String, CaseIterable, Identifiable {
+    case automatic, direct, relay
+    var id: String { rawValue }
+    var title: String {
+        switch self { case .automatic: return "自动"; case .direct: return "直连"; case .relay: return "桥接" }
+    }
+}
+
+private enum WatchRelayCredentialStore {
+    private static let service = "com.benyuan.wristagent.watch-direct-token"
+    private static let account = "jackson-watch"
+
+    static func read() -> RelayDeviceCredentials? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+            kSecAttrAccount as String: account, kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data else { return nil }
+        return try? JSONDecoder().decode(RelayDeviceCredentials.self, from: data)
+    }
+
+    static func save(_ credentials: RelayDeviceCredentials) {
+        guard let data = try? JSONEncoder().encode(credentials) else { return }
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        SecItemDelete(query as CFDictionary)
+        var item = query
+        item[kSecValueData as String] = data
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        SecItemAdd(item as CFDictionary, nil)
+    }
+}
 
 /// Watch → iPhone 语音请求传输（ESS-22 策略）：
 /// - 双端活跃且 isReachable：先 sendMessage 送信封元数据，再 transferFile 送音频；
@@ -34,15 +73,31 @@ final class WatchVoiceTransport: ObservableObject {
     @Published private(set) var progressStatus: RelayStatusUpdate?
     /// Mac 返回的最新结果；音频落在 resultsDirectory/<request_id>.m4a。
     @Published private(set) var lastResult: VoiceRelayResultPayload?
+    @Published var mode: WatchTransportMode {
+        didSet { defaults.set(mode.rawValue, forKey: "wristagent.watch.transport.mode") }
+    }
+    @Published var bridgeHost: String {
+        didSet { defaults.set(bridgeHost, forKey: "wristagent.watch.bridge.host") }
+    }
+    @Published var pairingCode = ""
+    @Published private(set) var directIsPaired = WatchRelayCredentialStore.read() != nil
+    @Published private(set) var directFailureCount = 0
 
     /// 语音回合日志：发送各阶段状态写入其中，UI 时间线由它驱动（ESS-29）。
     private weak var journal: VoiceTurnJournal?
     private let outboxDirectory: URL
     let resultsDirectory: URL
     private let fileManager = FileManager.default
+    private let defaults = UserDefaults.standard
+    weak var directSpeechVault: EncryptedAudioVault?
+    private var directTasks: [String: Task<Void, Never>] = [:]
+    private var directRequestIds: Set<String> = []
 
     init(journal: VoiceTurnJournal? = nil) {
         self.journal = journal
+        let savedMode = UserDefaults.standard.string(forKey: "wristagent.watch.transport.mode")
+        mode = WatchTransportMode(rawValue: savedMode ?? "") ?? .automatic
+        bridgeHost = UserDefaults.standard.string(forKey: "wristagent.watch.bridge.host") ?? ""
         let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         outboxDirectory = base.appendingPathComponent("VoiceOutbox", isDirectory: true)
         resultsDirectory = base.appendingPathComponent("VoiceResults", isDirectory: true)
@@ -141,12 +196,137 @@ final class WatchVoiceTransport: ObservableObject {
             try fileManager.moveItem(at: recording.fileURL, to: audioURL)
             try envelope.jsonData().write(to: sidecarURL(for: envelope.requestId), options: .atomic)
             refreshPendingCount()
-            submit(envelope: envelope, audioURL: audioURL)
+            switch mode {
+            case .relay:
+                submit(envelope: envelope, audioURL: audioURL)
+            case .direct, .automatic:
+                submitDirect(envelope: envelope, audioURL: audioURL)
+            }
         } catch {
             phase = .failed("保存录音失败：\(error.localizedDescription)")
             journal?.recordLocal(.failed, requestId: envelope.requestId, detail: "保存录音失败")
             WatchLog.error("transport", "outbox_save_failed", requestId: envelope.requestId, error: error)
         }
+    }
+
+    func pairDirect() {
+        guard let baseURL = directBaseURL, !pairingCode.isEmpty else {
+            phase = .failed("请填写 Bridge 地址和配对码")
+            return
+        }
+        Task {
+            do {
+                let credentials = try await RelayClient.pair(
+                    baseURL: baseURL, pairingCode: pairingCode, deviceName: "jackson-watch",
+                    deviceId: "jackson-watch"
+                )
+                WatchRelayCredentialStore.save(credentials)
+                directIsPaired = true
+                pairingCode = ""
+                WatchLog.info("transport", "direct_pair_ok", detail: "device_id=\(credentials.deviceId)")
+            } catch {
+                phase = .failed("直连配对失败")
+                WatchLog.error("transport", "direct_pair_failed", error: error)
+            }
+        }
+    }
+
+    private var directBaseURL: URL? {
+        let value = bridgeHost.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        return URL(string: value.contains("://") ? value : "https://\(value):8443")
+    }
+
+    private func submitDirect(envelope: VoiceRequestEnvelope, audioURL: URL) {
+        guard let baseURL = directBaseURL, let credentials = WatchRelayCredentialStore.read() else {
+            if mode == .automatic { submit(envelope: envelope, audioURL: audioURL) }
+            else { phase = .failed("请先配置并配对 Bridge") }
+            return
+        }
+        phase = .sending
+        directTasks[envelope.requestId]?.cancel()
+        directTasks[envelope.requestId] = Task { [weak self] in
+            guard let self else { return }
+            let client = RelayClient(baseURL: baseURL, credentials: credentials)
+            do {
+                let audioData = try Data(contentsOf: audioURL)
+                _ = try await client.upload(envelope: envelope, audioData: audioData)
+                directRequestIds.insert(envelope.requestId)
+                directFailureCount = 0
+                phase = .delivered
+                journal?.recordLocal(.accepted, requestId: envelope.requestId, detail: "Watch 已直连 Bridge")
+                WatchLog.info("transport", "direct_upload_ok", requestId: envelope.requestId)
+                try? fileManager.removeItem(at: audioURL)
+                try? fileManager.removeItem(at: sidecarURL(for: envelope.requestId))
+                refreshPendingCount()
+                await pollDirectTurn(requestId: envelope.requestId, client: client)
+            } catch {
+                await directFailed(envelope: envelope, audioURL: audioURL, error: error)
+            }
+        }
+    }
+
+    private func directFailed(envelope: VoiceRequestEnvelope, audioURL: URL, error: Error) async {
+        directFailureCount += 1
+        WatchLog.error("transport", "direct_upload_failed", requestId: envelope.requestId,
+                       detail: "failures=\(directFailureCount)", error: error)
+        if mode == .automatic && directFailureCount >= 2 {
+            WatchLog.info("transport", "direct_fallback_relay", requestId: envelope.requestId)
+            submit(envelope: envelope, audioURL: audioURL)
+        } else {
+            phase = .failed("直连失败，请重试")
+            journal?.recordLocal(.failed, requestId: envelope.requestId, detail: "Bridge 直连失败")
+        }
+    }
+
+    private func pollDirectTurn(requestId: String, client: RelayClient) async {
+        while !Task.isCancelled {
+            do {
+                let projection = try await client.fetchTurn(requestId: requestId)
+                if apply(projection, requestId: requestId) {
+                    if projection.status == "completed", let audio = projection.result?.audio {
+                        let (data, status) = try await client.fetchResultAudio(requestId: requestId)
+                        guard status == 200, RelayWire.sha256Hex(data) == audio.sha256.lowercased() else {
+                            throw RelayUploadError.badResponse
+                        }
+                        let name = "\(requestId).m4a"
+                        try directSpeechVault?.store(data, name: name)
+                        _ = journal?.attachSpeech(requestId: requestId, fileName: name)
+                        WatchLog.info("transport", "direct_audio_stored", requestId: requestId,
+                                      detail: "bytes=\(data.count)")
+                    }
+                    directTasks[requestId] = nil
+                    return
+                }
+            } catch {
+                WatchLog.error("transport", "direct_poll_failed", requestId: requestId, error: error)
+            }
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+        }
+    }
+
+    @discardableResult
+    private func apply(_ projection: VoiceTurnProjection, requestId: String) -> Bool {
+        let state: VoiceTurnState
+        switch projection.status {
+        case "accepted": state = .accepted
+        case "processing": state = projection.detail == "background_accepted" ? .backgroundAccepted : .realtimeProcessing
+        case "permission_required": state = .permissionRequired
+        case "completed": state = .completed
+        case "failed": state = .failed
+        case "cancelled": state = .cancelled
+        default: return false
+        }
+        let result = projection.result.map {
+            VoiceResultPayload(summary: $0.text ?? "", isTruncated: $0.truncated ?? false,
+                               speechSha256: $0.audio?.sha256, speechDurationMs: $0.audio?.durationMs)
+        }
+        let envelope = VoiceStatusEnvelope.status(
+            requestId: requestId, state: state, detail: projection.detail ?? projection.error,
+            failureStage: state == .failed ? .execution : nil, result: result
+        )
+        _ = journal?.apply(envelope)
+        return state.isTerminal
     }
 
     /// 激活完成 / 重新可达后调用：把 outbox 中没有在途传输的文件重新提交（request_id 复用）。
@@ -210,6 +390,21 @@ final class WatchVoiceTransport: ObservableObject {
     }
 
     func sendResultAck(requestId: String) {
+        if directRequestIds.contains(requestId),
+           let baseURL = directBaseURL,
+           let credentials = WatchRelayCredentialStore.read() {
+            Task {
+                do {
+                    try await RelayClient(baseURL: baseURL, credentials: credentials)
+                        .acknowledgeResult(requestId: requestId)
+                    directRequestIds.remove(requestId)
+                    WatchLog.info("transport", "direct_result_ack_ok", requestId: requestId)
+                } catch {
+                    WatchLog.error("transport", "direct_result_ack_failed", requestId: requestId, error: error)
+                }
+            }
+            return
+        }
         guard let data = try? ResultDeliveryAck(requestId: requestId).jsonData() else { return }
         deliver(payload: [ResultDeliveryAckMessage.envelopeKey: data])
         WatchLog.info("transport", "result_ack_enqueued", requestId: requestId)

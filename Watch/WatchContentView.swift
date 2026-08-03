@@ -38,6 +38,8 @@ struct WatchContentView: View {
                         }
                     }
 
+                    transportControls
+
                     VoiceOrbView(mode: orbMode, size: 70)
                         .padding(.top, 4)
                         .gesture(
@@ -133,6 +135,29 @@ struct WatchContentView: View {
         .sheet(item: $pushToTalk.subtitleSession) { session in
             SubtitlePlaybackView(session: session, player: pushToTalk.player)
         }
+    }
+
+    private var transportControls: some View {
+        VStack(spacing: 5) {
+            Picker("通路", selection: $transport.mode) {
+                ForEach(WatchTransportMode.allCases) { mode in Text(mode.title).tag(mode) }
+            }
+            .pickerStyle(.navigationLink)
+            .disabled(activeTurn?.isActive == true || isRecording)
+
+            if transport.mode != .relay {
+                TextField("Bridge IP 或 URL", text: $transport.bridgeHost)
+                    .textInputAutocapitalization(.never)
+                    .disabled(activeTurn?.isActive == true || isRecording)
+                if !transport.directIsPaired {
+                    SecureField("配对码", text: $transport.pairingCode)
+                    Button("配对 Watch") { transport.pairDirect() }
+                        .buttonStyle(.bordered)
+                        .disabled(activeTurn?.isActive == true || isRecording)
+                }
+            }
+        }
+        .font(.caption2)
     }
 
     // MARK: - 欢迎语（ESS-40）
