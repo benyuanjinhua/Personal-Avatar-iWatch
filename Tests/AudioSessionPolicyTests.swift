@@ -5,6 +5,22 @@ import XCTest
 /// A) long_form 播放后录音 -50，配置必须先复位路由策略、失败有回落；
 /// B) activate 回调 activated=false 却被当成功，88 秒音频静默。
 final class AudioSessionPolicyTests: XCTestCase {
+    // MARK: ESS-220 输出路由选择
+
+    func testBuiltInSpeakerSkipsLongFormPolicy() {
+        XCTAssertEqual(
+            AudioSessionPolicy.playbackRoutePolicy(hasBuiltInSpeakerOutput: true),
+            .foreground
+        )
+    }
+
+    func testExternalAudioOutputKeepsLongFormPolicy() {
+        XCTAssertEqual(
+            AudioSessionPolicy.playbackRoutePolicy(hasBuiltInSpeakerOutput: false),
+            .longForm
+        )
+    }
+
     // MARK: ESS-64/ESS-73 播放激活状态机
 
     func testFreshPlaybackAlwaysAttemptsActivation() {

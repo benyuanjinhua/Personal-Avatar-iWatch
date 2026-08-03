@@ -377,7 +377,17 @@ final class SelfCheckRunner: ObservableObject {
                 // 分两段捕错：让 detail 能区分「category 失败」和「activate
                 // 失败」——真机上后者是主要故障模式（561145203）。
                 do {
-                    try session.setCategory(.playback, mode: .default, policy: .longFormAudio)
+                    let hasBuiltInSpeaker = session.currentRoute.outputs.contains {
+                        $0.portType == .builtInSpeaker
+                    }
+                    switch AudioSessionPolicy.playbackRoutePolicy(
+                        hasBuiltInSpeakerOutput: hasBuiltInSpeaker
+                    ) {
+                    case .foreground:
+                        try session.setCategory(.playback, mode: .default)
+                    case .longForm:
+                        try session.setCategory(.playback, mode: .default, policy: .longFormAudio)
+                    }
                 } catch {
                     lastFailingStage = "set_category"
                     let nsError = error as NSError

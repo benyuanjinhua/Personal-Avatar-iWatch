@@ -9,6 +9,19 @@ import Foundation
 /// 连续 6 次）。同一次取证还发现 activate() 回调 error=nil 但
 /// activated=false 被当成功，88 秒音频一声没出（play_returned_false）。
 enum AudioSessionPolicy {
+    /// watchOS 的内建扬声器不支持 `.longFormAudio` 激活。真机上该组合会稳定
+    /// 返回 561145203（resourceNotAvailable），并且紧随其后的同会话回退也
+    /// 会失败。扬声器因此直接使用默认 route policy；蓝牙等外部输出仍保留
+    /// long-form，以维持锁屏/后台播放合同。
+    enum PlaybackRoutePolicy: Equatable {
+        case longForm
+        case foreground
+    }
+
+    static func playbackRoutePolicy(hasBuiltInSpeakerOutput: Bool) -> PlaybackRoutePolicy {
+        hasBuiltInSpeakerOutput ? .foreground : .longForm
+    }
+
     /// 播放激活状态机的下一步。所有路径最终只能到 `play` 或
     /// `retainForReplay`。
     /// ESS-73：中断标志不再是新播放请求的闸门——`.ended` 通知不保证投递

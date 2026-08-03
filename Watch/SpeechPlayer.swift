@@ -208,6 +208,18 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     /// 前台同步激活，行为等同 ESS-41 B3，不失声但锁屏会被挂起。
     private func activateSession(context: String?, completion: @escaping @MainActor (Bool) -> Void) {
         let session = AVAudioSession.sharedInstance()
+        let hasBuiltInSpeaker = session.currentRoute.outputs.contains { $0.portType == .builtInSpeaker }
+        // ESS-220：扬声器路由下 `.longFormAudio` 在真机 20/20 次激活失败。
+        // 自检强制失败注入仍保留完整两级链，以继续覆盖 exhausted 终局。
+        if AudioSessionPolicy.playbackRoutePolicy(hasBuiltInSpeakerOutput: hasBuiltInSpeaker) == .foreground,
+           !selfCheckForcedActivationFailures.contains("long_form") {
+            WatchLog.info(
+                "player", "session_route_policy_selected", requestId: context,
+                detail: "route=speaker policy=foreground reason=long_form_unsupported"
+            )
+            completion(activateForegroundFallback(context: context))
+            return
+        }
         let requestedAt = Date()
         WatchLog.info(
             "player", "session_activation_requested", requestId: context,
