@@ -157,8 +157,13 @@ final class PushToTalkController: ObservableObject {
         // 超时 / 解码错误）走 PlaybackEndgamePolicy 决策——播触觉、发横幅
         // （横幅无视 T1 的 short_task/app_active，见 ResultNotifier 里的说明）。
         // 成功终局（.success）不追加任何动作，T1 已在结果入账时判过。
-        player.onPlaybackEndgame = { [weak self] requestId, endgame in
-            self?.handlePlaybackEndgame(requestId: requestId, endgame: endgame)
+        player.onPlaybackEndgame = { [weak self] requestId, bytes, endgame in
+            self?.handlePlaybackEndgame(requestId: requestId, bytes: bytes, endgame: endgame)
+        }
+        // ESS-180：错误语音（错误提示 fallback）不参与 result ACK 链路，只需要
+        // 传 endgame 给 handler，其中 ACK gate 会因 bytes 小或不匹配 result 而跳过。
+        errorSpeech.onPlaybackEndgame = { [weak self] requestId, bytes, endgame in
+            self?.handlePlaybackEndgame(requestId: requestId, bytes: bytes, endgame: endgame)
         }
 
         sessionKeeper.bind(
@@ -200,16 +205,30 @@ final class PushToTalkController: ObservableObject {
     ///   去重（本地 Set），跨终局仍会震（比如 halted 后用户重播又 exhausted）。
     /// - 横幅委托 ResultNotifier.notifyPlaybackFailureIfEligible，那里管
     ///   授权/幂等/T1 覆写。这里只出「要不要发」的意图。
-    private func handlePlaybackEndgame(requestId: String?, endgame: PlaybackEndgame) {
-        // ESS-171: 播放成功即触发一次 ACK 回执——不依赖 Watch 首次收到 result
-        // 时的 ACK（interim → background result 切换会漏 ACK，导致 Bridge 侧
-        // result_redelivered 循环）。sendResultAck 幂等，Bridge 侧 dedup 处理。
+    /// ESS-233: interim/fallback 音频固定 16837 bytes。真回复音频通常 > 100KB。
+    /// 用 20_000 作为启发式阈值——低于此不触发 ACK，避免把 interim playback
+    /// 当作 result 终态触发器，进而被 Bridge 拒 ERR_MISSING_FIELD。
+    /// 长期方案是把 `SpeechPlaybackContext.source`（result_direct/result_background/welcome）
+    /// 透传到回调，做语义级判断。
+    private static let resultAckMinBytes = 20_000
+
+    private func handlePlaybackEndgame(requestId: String?, bytes: Int, endgame: PlaybackEndgame) {
+        // ESS-171 + ESS-233: 播放成功且是真回复（非 interim/fallback）才触发 ACK。
+        // interim（16.8KB fallback）尚未使 turn 达终态，ACK 会被 Bridge 拒
+        // ERR_MISSING_FIELD 并导致 iPhone 无限重试。
         if endgame == .success, let requestId {
-            transport.sendResultAck(requestId: requestId)
-            WatchLog.info(
-                "player", "result_ack_on_playback_success", requestId: requestId,
-                detail: "endgame=success"
-            )
+            if bytes >= Self.resultAckMinBytes {
+                transport.sendResultAck(requestId: requestId)
+                WatchLog.info(
+                    "player", "result_ack_on_playback_success", requestId: requestId,
+                    detail: "endgame=success bytes=\(bytes)"
+                )
+            } else {
+                WatchLog.info(
+                    "player", "result_ack_skipped_interim", requestId: requestId,
+                    detail: "endgame=success bytes=\(bytes) threshold=\(Self.resultAckMinBytes)"
+                )
+            }
         }
         guard let outcome = PlaybackEndgamePolicy.outcome(for: endgame) else { return }
         WatchLog.info(

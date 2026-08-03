@@ -38,7 +38,11 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     /// finishPlayback（含 30s 挂起超时兜底）时按具体终局回调；决策与
     /// 是否发触觉/横幅在 PlaybackEndgamePolicy + PushToTalkController。
     /// 欢迎语与自检不设此回调 → 零开销、行为完全不变。
-    var onPlaybackEndgame: ((_ requestId: String?, _ endgame: PlaybackEndgame) -> Void)?
+    /// ESS-233: `bytes` 参数用于让上层区分 interim/fallback（16.8KB 固定大小）
+    /// 与真实回复音频（通常 > 100KB）——PushToTalkController 据此决定是否触发
+    /// result ACK（interim 未终态，ACK 会被 Bridge 拒 ERR_MISSING_FIELD 并造成
+    /// iPhone 无限重试）。0 = 未知（player_init 失败等边缘路径）。
+    var onPlaybackEndgame: ((_ requestId: String?, _ bytes: Int, _ endgame: PlaybackEndgame) -> Void)?
     /// ESS-154 T2-4：起播挂起兜底（30s 无 play_started 即认作失败终局）。
     /// 一旦 beginPlayback 成功起播（或任何终局路径先到）即取消。
     private var deferredWatchdog: Task<Void, Never>?
@@ -132,7 +136,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             onFinish?(false)
             // player_init_failed 属于 T2「起播前失败」，同 exhausted 语义（用户
             // 什么也听不到、音频未被消费）；走 T2 追加告知。
-            onPlaybackEndgame?(context, .exhausted)
+            onPlaybackEndgame?(context, data.count, .exhausted)
             return false
         }
         player.delegate = self
@@ -420,6 +424,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private func finishPlayback(endgame: PlaybackEndgame) {
         cancelDeferredWatchdog()
         let requestId = context
+        let bytes = currentAudioBytes  // ESS-233: 在 reset 前捕获，传给 endgame 回调
         audioPlayer = nil
         currentAudioBytes = 0
         isPlaying = false
@@ -430,7 +435,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         // 决策仍走 PlaybackRecoveryPolicy.finishOutcome）；T2 决策通过独立
         // 回调追加，二者互不干扰、welcome/自检不设 T2 回调即零开销。
         callback?(endgame == .success)
-        onPlaybackEndgame?(requestId, endgame)
+        onPlaybackEndgame?(requestId, bytes, endgame)
     }
 
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
@@ -454,11 +459,13 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             // SelfCheck 依赖不吊死上层，见 SelfCheck.swift:34）。仅补 T2 告知回调，
             // 让用户能感知「语音没能播出」——原状态下解码失败零反馈。
             self.cancelDeferredWatchdog()
+            let bytes = self.currentAudioBytes  // ESS-233: 捕获 bytes 传给 endgame 回调
             self.isPlaying = false
             self.audioPlayer = nil
+            self.currentAudioBytes = 0
             self.onFinish = nil
             self.context = nil
-            self.onPlaybackEndgame?(requestId, .exhausted)
+            self.onPlaybackEndgame?(requestId, bytes, .exhausted)
         }
     }
 
