@@ -36,3 +36,18 @@ export function allowDownlinkMessage(message, log) {
   }
   return true
 }
+
+// 音频不满足契约时只剥离音频，保留同一事件里的文字作为用户可见降级。
+// 返回原对象表示无需降级；返回副本避免污染账本和重放缓存。
+export function prepareDownlinkMessage(message, log) {
+  if (allowDownlinkMessage(message, log)) return message
+  const safe = structuredClone(message)
+  if (safe.interim?.audio) delete safe.interim.audio
+  const turns = safe.turn ? [safe.turn] : (safe.turns ?? [])
+  for (const turn of turns) {
+    if (!turn?.result) continue
+    delete turn.result.audio
+    delete turn.result.audio_base64
+  }
+  return safe
+}

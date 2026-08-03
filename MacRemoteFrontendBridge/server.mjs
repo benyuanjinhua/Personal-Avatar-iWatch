@@ -32,7 +32,7 @@ import { TaskWatcher } from './taskwatch.mjs'
 import { AudioPipeline } from './audio.mjs'
 import { ResultAudioStore } from './result-audio.mjs'
 import { QwenRealtimeSessionSupervisor } from './supervisor.mjs'
-import { allowDownlinkMessage, rejectAudio } from './audio-policy.mjs'
+import { prepareDownlinkMessage } from './audio-policy.mjs'
 
 const BASE = dirname(fileURLToPath(import.meta.url))
 
@@ -135,14 +135,14 @@ export function createBridge(overrides = {}) {
     const interim = { kind: 'interim', request_id: requestId, delivery_sequence: 1, ...payload }
     if (interim.audio) interim.audio.kind = 'interim'
     interimPayloads.set(requestId, interim)
-    const message = JSON.stringify({
+    const event = {
       type: 'turn.interim',
       interim,
-    })
+    }
     for (const client of eventClients) {
       const turn = ledger.get(requestId)
       if (turn && client.deviceId === turn.device_id && client.ws.readyState === client.ws.OPEN) {
-        if (allowDownlinkMessage({ type: 'turn.interim', interim }, log)) client.ws.send(message)
+        client.ws.send(JSON.stringify(prepareDownlinkMessage(event, log)))
       }
     }
   }
@@ -362,9 +362,8 @@ export function createBridge(overrides = {}) {
         // 受理回执只允许固定文案 + 预生成资产，保证内容与用户请求有确定因果。
         const interimText = '收到，正在处理，请稍后'
         let interimAudio = null
-        if (result.audio24k?.length) {
-          rejectAudio({ kind: null, requestId, source: 'realtime_interim', causal: true, log })
-        }
+        // Realtime 自由生成的音频不是产品下行资产，直接忽略；只有下面固定文案
+        // 的预生成音频进入出口门禁，避免把“未发送内容”误记为下行拒绝。
         if (!interimAudio && fallbackInterimAudio) {
           interimAudio = {
             kind: 'interim',
@@ -782,8 +781,8 @@ export function createBridge(overrides = {}) {
 
   function sendTerminalDelivery(turn, client, cause) {
     const event = { type: 'turn.state', turn: ledger.projection(turn) }
-    if (!allowDownlinkMessage(event, log)) return false
-    client.ws.send(JSON.stringify(event))
+    // ESS-181 契约：不达标就剥音频保文字，永远不静默丢弃投影。
+    client.ws.send(JSON.stringify(prepareDownlinkMessage(event, log)))
     const delivery = ledger.markResultRedelivered(turn.request_id, {
       baseDelayMs: CONFIG.result_delivery_backoff_base_ms ?? 2_000,
       maxDelayMs: CONFIG.result_delivery_backoff_max_ms ?? 300_000,
@@ -816,10 +815,9 @@ export function createBridge(overrides = {}) {
 
   ledger.on('turn', projection => {
     const event = { type: 'turn.state', turn: projection }
-    const message = JSON.stringify(event)
     for (const client of eventClients) {
       if (client.deviceId === projection.device_id && client.ws.readyState === client.ws.OPEN) {
-        if (allowDownlinkMessage(event, log)) client.ws.send(message)
+        client.ws.send(JSON.stringify(prepareDownlinkMessage(event, log)))
       }
     }
   })
@@ -850,7 +848,8 @@ export function createBridge(overrides = {}) {
           type: 'snapshot',
           turns: replayTurns.map(t => ledger.projection(t)),
         }
-        if (allowDownlinkMessage(snapshot, log)) ws.send(JSON.stringify(snapshot))
+        // ESS-181 契约：不达标就剥音频保文字，永远不静默丢弃投影。
+        ws.send(JSON.stringify(prepareDownlinkMessage(snapshot, log)))
         // 快照已经承载本轮终态投递，发送后再推进退避账本。不能在构造快照前
         // mark，否则 replayable 会因 next_delivery_at 被过滤掉。
         for (const turn of replayTurns) {
@@ -872,7 +871,7 @@ export function createBridge(overrides = {}) {
           const turn = ledger.get(requestId)
           if (turn?.device_id === deviceId && !['completed', 'failed', 'cancelled'].includes(turn.state)) {
             const event = { type: 'turn.interim', interim }
-            if (allowDownlinkMessage(event, log)) ws.send(JSON.stringify(event))
+            ws.send(JSON.stringify(prepareDownlinkMessage(event, log)))
           }
         }
         ws.on('close', () => eventClients.delete(client))
