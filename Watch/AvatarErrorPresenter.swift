@@ -36,6 +36,14 @@ final class AvatarErrorPresenter: ObservableObject {
         return now >= active.dismissAt
     }
 
+    /// ESS-205：当前卡片是否允许被用户手动 dismiss（now ≥ dismissAt）。
+    /// UI 用它决定「知道了」按钮的禁用态；presenter.dismiss(now:) 里也再校验
+    /// 一次——两层门禁，UI 篡改也拦得住。
+    func canManuallyDismiss(now: Date) -> Bool {
+        guard let active else { return false }
+        return now >= active.dismissAt
+    }
+
     /// 至少停留 5 秒（白梦林验收条 1：不能一闪而过）；实际停留可更长
     /// 由用户手动点击或新的失败覆盖。
     static let minimumDisplaySeconds: TimeInterval = 5
@@ -93,7 +101,12 @@ final class AvatarErrorPresenter: ObservableObject {
     }
 
     /// 用户点「知道了」或系统到点自动收起。
-    func dismiss() {
+    ///
+    /// ESS-205：手动 dismiss 也必须过 5s 门槛——旧路径 UI 按钮直接 nil 出去，
+    /// 绕过了「最少停留 5s」的产品验收。now < dismissAt 时无声忽略（UI 层
+    /// 按钮也应该同步禁用，但即便 UI 篡改也拦得住）。
+    func dismiss(now: Date = Date()) {
+        guard canManuallyDismiss(now: now) else { return }
         active = nil
     }
 

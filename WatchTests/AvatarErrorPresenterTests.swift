@@ -134,7 +134,32 @@ final class AvatarErrorPresenterTests: XCTestCase {
                        "3s 还没到 5s 门槛")
         XCTAssertTrue(presenter.shouldAutoDismiss(now: start.addingTimeInterval(5)),
                       "白梦林验收条：卡片至少停留 5s")
-        presenter.dismiss()
+        presenter.dismiss(now: start.addingTimeInterval(5))
+        XCTAssertNil(presenter.active)
+    }
+
+    /// ESS-205 复审缺陷回归：手动点「知道了」不能绕过 5s 门槛。
+    /// 老路径 dismiss() 直接 nil active，只有自动收起走 shouldAutoDismiss 门禁；
+    /// 新路径 dismiss(now:) 在 now < dismissAt 时无声忽略。
+    func testManualDismissBefore5sIsIgnored() {
+        let presenter = presenter()
+        let start = Date(timeIntervalSince1970: 2_000_000)
+        _ = presenter.present(
+            code: "ERR_VOICE_BUSY", requestId: "req_manual", now: start,
+            clipLoader: { _ in nil }, playAudio: { _, _ in false }, playHaptic: haptic
+        )
+        // 上屏 1 秒时用户就点了「知道了」：presenter 应拒收。
+        presenter.dismiss(now: start.addingTimeInterval(1))
+        XCTAssertNotNil(presenter.active, "5s 门槛内手动 dismiss 必须无效")
+        XCTAssertFalse(presenter.canManuallyDismiss(now: start.addingTimeInterval(1)))
+
+        // 4.99s 仍在门槛内。
+        presenter.dismiss(now: start.addingTimeInterval(4.99))
+        XCTAssertNotNil(presenter.active)
+
+        // 5.0s 到点后手动可关。
+        XCTAssertTrue(presenter.canManuallyDismiss(now: start.addingTimeInterval(5)))
+        presenter.dismiss(now: start.addingTimeInterval(5))
         XCTAssertNil(presenter.active)
     }
 
