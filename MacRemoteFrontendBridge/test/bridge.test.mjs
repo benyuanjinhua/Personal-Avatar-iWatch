@@ -200,10 +200,17 @@ describe('direct-answer path', () => {
     const id = rid()
     await ctx.client.createTurn(id, pcm(300))
 
+    await waitFor(() => events.received.some(e =>
+      e.type === 'turn.state' && e.turn.request_id === id && e.turn.status === 'completed'))
+    await new Promise(resolve => setTimeout(resolve, 1_200))
+    assert.equal(events.received.filter(e =>
+      e.type === 'turn.state' && e.turn.request_id === id && e.turn.status === 'completed').length, 1,
+    'initial terminal delivery must start backoff instead of being duplicated by the 1s sweep')
+
     await waitFor(() => events.received.filter(e =>
       e.type === 'turn.state' && e.turn.request_id === id && e.turn.status === 'completed').length >= 2)
-    const acceptedBeforeAck = ctx.bridge.ledger.get(id).delivery_attempts
-    assert.ok(acceptedBeforeAck >= 1, 'connected sweep must advance the persistent delivery ledger')
+    assert.ok(ctx.bridge.ledger.get(id).delivery_attempts >= 2,
+      'unacknowledged result must still be redelivered after backoff')
 
     await ctx.client.ackTurn(id)
     const completedAtAck = events.received.filter(e =>
