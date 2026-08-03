@@ -37,7 +37,7 @@ final class SelfCheckRunner: ObservableObject {
     @Published private(set) var stage: Stage = .idle
 
     private let recorder = AudioRecorder()
-    private let player = SpeechPlayer()
+    private let player = SpeechPlayer(instanceTag: "selfcheck")
     private let defaults: UserDefaults
     private let signals = SignalCounter()
     private var interrupted = false
