@@ -46,13 +46,13 @@ final class PushToTalkController: ObservableObject {
 
     let journal: VoiceTurnJournal
     let speechVault: EncryptedAudioVault?
-    let player = SpeechPlayer()
+    let player = SpeechPlayer(instanceTag: "ptt")
     /// ESS-180：错误语音专用播放器，与结果语音 `player` 隔离。
     /// 失败到达时结果语音（如果之前有）不能被覆盖，反过来结果语音在播时
     /// 收到失败也不能压过来；两个播放器各自持有各自的 AVAudioPlayer，会话
     /// 抢占由 SpeechPlayer 内部的 generation 兜住，比"用同一个 player.play"
     /// 更能保住彼此的完整性。
-    let errorSpeech = SpeechPlayer()
+    let errorSpeech = SpeechPlayer(instanceTag: "error_speech")
     let transport: WatchVoiceTransport
     /// ESS-55 超长任务本地通知（JIT 授权 / 结果通知 / 兜底预约 / 点通知直达）。
     let notifier: ResultNotifier
