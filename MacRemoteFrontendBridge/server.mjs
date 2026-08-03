@@ -778,6 +778,33 @@ export function createBridge(overrides = {}) {
   const wss = new WebSocketServer({ noServer: true })
   const eventClients = new Set() // { ws, deviceId }
   const eventsHeartbeatMs = CONFIG.events_heartbeat_ms ?? 20_000
+  const resultDeliverySweepMs = CONFIG.result_delivery_sweep_ms ?? 1_000
+
+  function deliverReplayableResults() {
+    const replayable = ledger.replayable({
+      terminalTtlMs: CONFIG.result_delivery_ttl_ms ?? 30 * 60 * 1000,
+      maxDeliveryAttempts: CONFIG.result_delivery_max_attempts ?? 5,
+    }).filter(turn => ['completed', 'failed', 'cancelled'].includes(turn.state))
+    for (const turn of replayable) {
+      const recipients = [...eventClients].filter(client =>
+        client.deviceId === turn.device_id && client.ws.readyState === client.ws.OPEN)
+      if (recipients.length === 0) continue
+      const delivery = ledger.markResultRedelivered(turn.request_id, {
+        baseDelayMs: CONFIG.result_delivery_backoff_base_ms ?? 2_000,
+        maxDelayMs: CONFIG.result_delivery_backoff_max_ms ?? 300_000,
+      })
+      if (!delivery) continue
+      const event = { type: 'turn.state', turn: ledger.projection(turn) }
+      if (!allowDownlinkMessage(event, log)) continue
+      const message = JSON.stringify(event)
+      for (const client of recipients) client.ws.send(message)
+      log({
+        evt: 'result_redelivered', request_id: turn.request_id, device_id: turn.device_id,
+        status: turn.state, attempt: delivery.attempt, retry_after_ms: delivery.delay_ms,
+        trigger: 'delivery_sweep',
+      })
+    }
+  }
 
   // Real task steps are a text-only event and never enter the audio pipeline.
   watcher.onProgress = progress => {
@@ -880,6 +907,11 @@ export function createBridge(overrides = {}) {
     }
   }, eventsHeartbeatMs)
   eventsHeartbeat.unref?.()
+  // A terminal result must not wait for the phone to create a fresh WebSocket
+  // (historically that happened only when the next voice turn woke the app).
+  // Retry on the existing connection until the Watch's durable-storage ACK lands.
+  const resultDeliverySweep = setInterval(deliverReplayableResults, resultDeliverySweepMs)
+  resultDeliverySweep.unref?.()
 
   // ---- restart recovery (§4.1) -------------------------------------------
 
@@ -939,6 +971,7 @@ export function createBridge(overrides = {}) {
     resultAudio.stopSweeper()
     clearInterval(pendingAudioSweeper)
     clearInterval(eventsHeartbeat)
+    clearInterval(resultDeliverySweep)
     for (const client of eventClients) client.ws.close()
     for (const timer of workTimers.values()) clearTimeout(timer)
     return Promise.all(servers.map(s => new Promise(r => s.close(r))))

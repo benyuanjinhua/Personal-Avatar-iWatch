@@ -193,6 +193,38 @@ describe('direct-answer path', () => {
     assert.equal(snapshot.turns.some(turn => turn.request_id === id), false)
     afterAck.ws.close()
   })
+
+  it('redelivers an unacknowledged result on the existing WSS without a new turn or reconnect', async () => {
+    const isolated = await launch({
+      scenario: 'direct',
+      overrides: {
+        result_delivery_sweep_ms: 20,
+        result_delivery_backoff_base_ms: 50,
+        result_delivery_backoff_max_ms: 50,
+      },
+    })
+    try {
+      const events = isolated.client.events()
+      await waitFor(() => events.received.some(e => e.type === 'snapshot'))
+      const id = rid()
+      await isolated.client.createTurn(id, pcm(300))
+      await waitFor(async () => (await isolated.client.getTurn(id)).json.status === 'completed')
+      await waitFor(() => events.received.filter(e =>
+        e.type === 'turn.state' && e.turn.request_id === id && e.turn.status === 'completed').length >= 2)
+
+      const beforeAck = events.received.filter(e =>
+        e.type === 'turn.state' && e.turn.request_id === id && e.turn.status === 'completed').length
+      assert.equal((await isolated.client.ackTurn(id)).status, 200)
+      await new Promise(resolve => setTimeout(resolve, 150))
+      const afterAck = events.received.filter(e =>
+        e.type === 'turn.state' && e.turn.request_id === id && e.turn.status === 'completed').length
+      assert.equal(afterAck, beforeAck, 'ACK must stop live-connection redelivery')
+      events.ws.close()
+    } finally {
+      await isolated.bridge.stop()
+      await isolated.mock.stop()
+    }
+  })
 })
 
 describe('background path: task projection, permission, cancel', () => {

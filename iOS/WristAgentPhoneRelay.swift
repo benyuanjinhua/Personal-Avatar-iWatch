@@ -308,7 +308,15 @@ final class WristAgentPhoneRelay: ObservableObject {
         pingTask = Task {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 30_000_000_000)
-                task.sendPing { _ in }
+                guard !Task.isCancelled else { return }
+                task.sendPing { error in
+                    // URLSessionWebSocketTask.receive() can remain suspended on a
+                    // half-open path. Cancelling on a failed ping unblocks receive,
+                    // allowing the normal backoff/reconnect path below to run.
+                    if error != nil {
+                        task.cancel(with: .goingAway, reason: nil)
+                    }
+                }
             }
         }
         while !Task.isCancelled {
