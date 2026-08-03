@@ -189,3 +189,47 @@ struct ResultDeliveryAck: Codable, Equatable {
 enum ResultDeliveryAckMessage {
     static let envelopeKey = "result_delivery_ack"
 }
+
+/// ESS-184 门禁探针的播放成功回执。Watch → iPhone → Bridge。
+/// **与 ResultDeliveryAck 分家的关键**：ResultDeliveryAck 是「音频已安全落盘」的
+/// 交付 ACK（storeSpeech 成功即发），本探针 ACK 是「音频真的从扬声器出来了」的
+/// 播放完成 ACK（SpeechPlayer.onFinish(true) 才发）。这个语义差别正是 ESS-184
+/// H5 的存在理由 —— 用户耳朵和 Bridge 之间那最后一步，缺 H5 就等于门禁没关严。
+struct ProbePlaybackAck: Codable, Equatable {
+    let protocolVersion: String
+    let requestId: String
+    /// 播完的 sha256（Watch 端从入手的音频算出来，与 envelope 中声明的对齐）；
+    /// 上游据此断言 Watch 播的是 Bridge 发的字节，防止「播了但播的是别的」。
+    let sha256: String
+    /// SpeechPlayer.onFinish(true) 的时刻（Watch 时钟，ms epoch）——仅统计用途，
+    /// H5 判定只看是否收到本 ACK，不比对时钟。
+    let playedAtMs: Int64
+    /// 音频实际播放时长（毫秒）；便于诊断截断。可选：早期版本可能没上报。
+    let durationMs: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case requestId = "request_id"
+        case sha256
+        case playedAtMs = "played_at_ms"
+        case durationMs = "duration_ms"
+    }
+
+    init(requestId: String, sha256: String, playedAtMs: Int64, durationMs: Int?) {
+        protocolVersion = VoiceRequestEnvelope.currentProtocolVersion
+        self.requestId = requestId
+        self.sha256 = sha256.lowercased()
+        self.playedAtMs = playedAtMs
+        self.durationMs = durationMs
+    }
+
+    func jsonData() throws -> Data { try RelayEventCoding.encoder.encode(self) }
+    static func decode(from data: Data) -> ProbePlaybackAck? {
+        try? RelayEventCoding.decoder.decode(ProbePlaybackAck.self, from: data)
+    }
+}
+
+enum ProbePlaybackAckMessage {
+    /// WCSession sendMessage / transferUserInfo 键；与 result_delivery_ack 分家。
+    static let envelopeKey = "probe_playback_ack"
+}

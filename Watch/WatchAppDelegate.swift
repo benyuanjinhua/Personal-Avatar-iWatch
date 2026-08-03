@@ -22,6 +22,10 @@ final class WatchAppServices {
         settings.voiceTransport = pushToTalk.transport
         settings.voiceJournal = pushToTalk.journal
         settings.speechVault = pushToTalk.speechVault
+        // ESS-184：探针播放共用生产 SpeechPlayer，避免同时激活两个会话互相抢占。
+        // 生产按住说话/结果播放与探针播放不重叠（装机窗口专用），SpeechPlayer 自身
+        // 的会话让出/中断机制会处理任何真实并发。
+        pushToTalk.transport.probePlayer = pushToTalk.player
         pushToTalk.onAutoPlayStarted = { [welcome] in welcome.interrupt() }
         settings.activate()
         WatchLog.info("lifecycle", "services_bootstrapped", detail: reason)

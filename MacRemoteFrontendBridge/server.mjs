@@ -760,6 +760,106 @@ export function createBridge(overrides = {}) {
         return reply(200, { request_id: m[1], acknowledged: true, acknowledged_at: acked.delivered_ack.at })
       }
 
+      // ESS-184 门禁探针：由已配对 iPhone Relay 上报的播放成功回执，签名与既有
+      // `/ack` 一致（同 device_id、同 request_id 头绑定）。落 `probe_acked` 事件
+      // 供 Scripts/downlink-probe.mjs 判 H5。
+      // **与 result_acked 分家的意义**：result_acked 是「音频安全落盘」的交付
+      // 确认（storeSpeech 成功即发），probe_acked 是「音频真的从扬声器出来」
+      // 的播放完成确认（SpeechPlayer.onFinish(true) 才发）——H5 只看后者。
+      if (pathName === '/v1/probe/ack') {
+        if (req.method !== 'POST') throw new ApiError(ERR.METHOD_NOT_ALLOWED)
+        const authInfo = verify()
+        let body
+        try { body = JSON.parse(rawBody.toString('utf8')) } catch { throw new ApiError(ERR.BAD_JSON) }
+        if (body.protocol_version !== CONFIG.protocol_version) throw new ApiError(ERR.PROTOCOL_VERSION)
+        if (!body.request_id || body.request_id !== authInfo.requestId) {
+          throw new ApiError(ERR.MISSING_FIELD, 'request_id (body must match x-request-id)')
+        }
+        if (typeof body.sha256 !== 'string' || body.sha256.length !== 64) {
+          throw new ApiError(ERR.MISSING_FIELD, 'sha256')
+        }
+        if (!Number.isFinite(body.played_at_ms)) {
+          throw new ApiError(ERR.MISSING_FIELD, 'played_at_ms')
+        }
+        log({
+          evt: 'probe_acked',
+          request_id: body.request_id,
+          device_id: authInfo.deviceId,
+          sha256: String(body.sha256).toLowerCase(),
+          played_at_ms: Number(body.played_at_ms),
+          duration_ms: Number.isFinite(body.duration_ms) ? Number(body.duration_ms) : null,
+        })
+        return reply(200, { request_id: body.request_id, acknowledged: true })
+      }
+
+      // ESS-184 门禁探针注入：合成一个 completed turn，走完 allowDownlinkMessage
+      // + resultAudio.put + WSS 出口的**完全生产路径**，不新造旁路——严格遵循
+      // 母单 §三「严禁为探针开测试专用旁路」。
+      //
+      // 安全边界：只允许 loopback（127.0.0.1）+ 已配对 device_id + `write_actions_enabled`
+      // 之外的独立 flag，避免公网/Tailscale 侧误触。
+      if (pathName === '/v1/probe/inject') {
+        if (req.method !== 'POST') throw new ApiError(ERR.METHOD_NOT_ALLOWED)
+        if (ip !== '127.0.0.1' && ip !== '::1') {
+          throw new ApiError(ERR.SOURCE_NOT_ALLOWED, 'probe inject is loopback-only')
+        }
+        let body
+        try { body = JSON.parse(rawBody.toString('utf8')) } catch { throw new ApiError(ERR.BAD_JSON) }
+        const requestId = body.request_id
+        if (typeof requestId !== 'string' || requestId.length === 0) {
+          throw new ApiError(ERR.MISSING_FIELD, 'request_id')
+        }
+        if (typeof body.audio_base64 !== 'string' || body.audio_base64.length === 0) {
+          throw new ApiError(ERR.MISSING_FIELD, 'audio_base64')
+        }
+        let audioBuf
+        try { audioBuf = Buffer.from(body.audio_base64, 'base64') } catch { throw new ApiError(ERR.AUDIO_INVALID) }
+        if (audioBuf.length === 0) throw new ApiError(ERR.AUDIO_INVALID)
+        if (audioBuf.length > CONFIG.max_result_audio_bytes) throw new ApiError(ERR.AUDIO_TOO_LARGE)
+        const sha = sha256hex(audioBuf)
+        if (typeof body.sha256 === 'string' && body.sha256.toLowerCase() !== sha) {
+          throw new ApiError(ERR.AUDIO_HASH_MISMATCH)
+        }
+        // device_id 允许显式指定（多手表调试场景），否则用 CONFIG.device_id（
+        // 单机装机的默认设备）。probe 只发给这个 device_id 的 WSS 客户端。
+        const deviceId = typeof body.device_id === 'string' && body.device_id.length > 0
+          ? body.device_id : CONFIG.device_id
+        if (typeof deviceId !== 'string' || deviceId.length === 0) {
+          throw new ApiError(ERR.MISSING_FIELD, 'device_id (no default configured)')
+        }
+        const existing = ledger.get(requestId)
+        if (existing) throw new ApiError(ERR.IDEMPOTENCY_CONFLICT, 'request_id already used')
+        const meta = {
+          kind: 'probe',
+          sha256: sha,
+          codec: 'm4a',
+          duration_ms: Number.isFinite(body.duration_ms) ? Number(body.duration_ms) : 0,
+          size_bytes: audioBuf.length,
+        }
+        // ledger 生命周期：create → resultAudio.put → setResult(state=completed)。
+        // ledger.on('turn', ...) 会以 kind=probe 走 allowDownlinkMessage 白名单
+        // （ESS-184 已开），随后 WSS 出口发到 iPhone Relay。
+        ledger.create({
+          requestId, deviceId, bodySha256: sha,
+          sessionId: supervisor.sessionId,
+        })
+        resultAudio.put(requestId, audioBuf)
+        log({
+          evt: 'l1_audio_ready', request_id: requestId, task_id: null,
+          source: 'probe', response_id: null,
+          codec: meta.codec, duration_ms: meta.duration_ms,
+          size_bytes: meta.size_bytes, sha256: meta.sha256,
+        })
+        ledger.update(requestId, { path: 'direct' })
+        ledger.setResult(requestId, {
+          text: typeof body.text === 'string' ? body.text : '你好Jackson，我是你的数字分身',
+          audioBase64: audioBuf.toString('base64'),
+          audio: meta,
+          extra: { source: 'probe' },
+        }, 'completed')
+        return reply(202, { request_id: requestId, sha256: sha, device_id: deviceId })
+      }
+
       throw new ApiError(ERR.NOT_FOUND)
     } catch (e) {
       if (e instanceof ApiError) {

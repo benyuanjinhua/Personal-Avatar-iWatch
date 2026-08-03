@@ -18,6 +18,12 @@ protocol WatchFeedbackChannel: AnyObject {
     /// 返回 false 表示未能持久化——调用方不得记为已交付，必须允许后续快照重试。
     @discardableResult
     func transferSpeech(fileURL: URL, envelope: VoiceStatusEnvelope) -> Bool
+    /// ESS-184 门禁探针：与 transferSpeech 走同一底层通道（transferFile），但用
+    /// **不同的 metadata 键（voice_probe_envelope）**，让 Watch 从 didReceive
+    /// 就路由到探针分支，不进 storeSpeech —— 不写 vault、不改 journal、不消耗
+    /// ledger。返回语义与 transferSpeech 同：true 已持久入队，false 未能入队。
+    @discardableResult
+    func transferProbe(fileURL: URL, envelope: VoiceStatusEnvelope) -> Bool
 }
 
 /// WristAgentPhoneRelay（ESS-28）：iPhone Companion Relay 编排器。
@@ -403,6 +409,15 @@ final class WristAgentPhoneRelay: ObservableObject {
     }
 
     private func process(projection: BridgeTurnProjection) {
+        // ESS-184 门禁探针：kind=probe 走独立分支——不给用户可见的状态文本、
+        // 不进 UI 时间线、不发文本 result、不消耗 ledger。目的是把探针的一切
+        // 副作用限定在「Watch 播一次、Bridge 收一次 ACK」两件事上，保证符合
+        // ESS-65 §铁律 1 「不污染生产数据」。母单 ESS-207 §一 的完整 traceback：
+        // 走 result 通道会把探针 turn 塞进 journal / ConversationHistory。
+        if projection.result?.audio?.kind == .probe {
+            deliverProbeAudio(projection: projection)
+            return
+        }
         guard let envelope = projection.statusEnvelope() else { return }
         // 旧版 caption 通道照旧（iPhone 前台状态行）。
         if let phase = VoiceRelayPhase(rawValue: envelope.state.rawValue) {
@@ -420,6 +435,122 @@ final class WristAgentPhoneRelay: ObservableObject {
         ))
         relayStatus = "已回传结果 \(projection.requestId.prefix(8))…"
         deliverResultAudio(projection: projection)
+    }
+
+    // MARK: - ESS-184 门禁探针下行
+
+    /// 探针语音下行：Bridge 的 completed 投影里 result.audio.kind=probe 时走这条。
+    /// 与 deliverResultAudio 分家的意义在于：不进 deliveredResultAudio 去重表，
+    /// 不消耗 activeAudioDownloads，不 notifyResult 也不改 journal —— 只做一件事：
+    /// 把 audio_base64 或按 sha 下载后的字节，用 kind=probe 信封走 transferProbe。
+    private func deliverProbeAudio(projection: BridgeTurnProjection) {
+        guard let result = projection.result, let meta = result.audio else { return }
+        if let base64 = result.audioBase64, let data = Data(base64Encoded: base64) {
+            let sha = RelayWire.sha256Hex(data)
+            if meta.sha256.lowercased() != sha {
+                relayLog("探针内联字节与元数据 sha 不一致，转下载 \(projection.requestId.prefix(8))…")
+            } else {
+                stageAndTransferProbe(projection: projection, data: data, sha: sha)
+                return
+            }
+        }
+        Task { [weak self] in
+            await self?.downloadAndTransferProbe(projection: projection, meta: meta)
+        }
+    }
+
+    private func stageAndTransferProbe(projection: BridgeTurnProjection, data: Data, sha: String) {
+        let url = resultAudioDirectory.appendingPathComponent("\(projection.requestId)-probe.m4a")
+        guard (try? data.write(to: url, options: .atomic)) != nil else {
+            relayLog("探针语音落盘失败 \(projection.requestId.prefix(8))…")
+            return
+        }
+        // 信封的 audio_kind 必须是 .probe（Watch 端据此路由并拒绝其它 kind）；
+        // speechSha256 用真实字节算，与 storeSpeech 侧的校验对齐。
+        let payload = VoiceResultPayload(
+            summary: projection.result?.text ?? projection.result?.speechText ?? "probe",
+            isTruncated: false,
+            speechSha256: sha,
+            speechDurationMs: projection.result?.audio?.durationMs
+        )
+        let envelope = VoiceStatusEnvelope.status(
+            requestId: projection.requestId,
+            state: .completed,
+            detail: projection.detailText,
+            result: payload,
+            audioKind: .probe
+        )
+        Self.downlinkLogger.log("l2_relay_audio_ready request_id=\(projection.requestId, privacy: .public) bytes=\(data.count) sha256=\(sha, privacy: .public) source=probe kind=probe")
+        _ = watchChannel?.transferProbe(fileURL: url, envelope: envelope)
+    }
+
+    private func downloadAndTransferProbe(
+        projection: BridgeTurnProjection, meta: BridgeResultAudioMeta
+    ) async {
+        guard let client = makeClient() else { return }
+        if let size = meta.sizeBytes, size > Self.maxResultAudioBytes {
+            relayLog("探针语音超出本地上限（\(size)B），忽略")
+            return
+        }
+        var assembled = Data()
+        for attempt in 0..<3 {
+            do {
+                let (data, status) = try await client.fetchResultAudio(
+                    requestId: projection.requestId,
+                    rangeStart: assembled.isEmpty ? nil : assembled.count
+                )
+                switch status {
+                case 206: assembled.append(data)
+                case 200: assembled = data
+                case 404: return
+                case 416: assembled = Data()
+                default: throw RelayUploadError.bridge(code: "ERR_AUDIO_FETCH", httpStatus: status)
+                }
+                if RelayWire.sha256Hex(assembled) == meta.sha256.lowercased() {
+                    stageAndTransferProbe(
+                        projection: projection, data: assembled, sha: meta.sha256.lowercased()
+                    )
+                    return
+                }
+                if let size = meta.sizeBytes, assembled.count >= size {
+                    assembled = Data()
+                }
+            } catch {
+                let delay = RetryBackoff.outboxDefault.delay(forAttempt: attempt + 1)
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+        }
+        relayLog("探针语音下载未完成 \(projection.requestId.prefix(8))…")
+    }
+
+    /// Watch → iPhone 的 ProbePlaybackAck 转发到 Bridge：POST /v1/probe/ack。
+    /// 与 acknowledgeResult 分家 —— 后者只带 request_id；本请求把 sha/played_at
+    /// /duration 一并传上去，便于 Bridge 侧对账「Watch 播的到底是哪段字节」。
+    /// 进程存活期间无限退避重试；若进程被杀，Bridge 侧 timeout 判 H5 缺失即可
+    /// 触发下一次装机跑探针（探针本身是幂等的 —— 同 request_id 再跑不产生副作用）。
+    private var probeAckTasks: [String: Task<Void, Never>] = [:]
+
+    func acknowledgeProbe(ack: ProbePlaybackAck) {
+        guard probeAckTasks[ack.requestId] == nil else { return }
+        probeAckTasks[ack.requestId] = Task { [weak self] in
+            var attempt = 0
+            while !Task.isCancelled {
+                guard let self else { return }
+                if let client = self.makeClient() {
+                    do {
+                        try await client.acknowledgeProbe(ack: ack)
+                        self.relayStatus = "手表已回执探针 \(ack.requestId.prefix(8))…"
+                        self.probeAckTasks[ack.requestId] = nil
+                        return
+                    } catch {
+                        self.relayLog("探针回执暂未送达 Bridge，重试中")
+                    }
+                }
+                attempt += 1
+                let delay = RetryBackoff.outboxDefault.delay(forAttempt: attempt)
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+        }
     }
 
     // MARK: - 结果语音下行（ESS-38）

@@ -144,6 +144,28 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             }
             return
         }
+        // ESS-184 门禁探针：与 speech 走同一个 transferFile 通道，但 metadata 键
+        // 不同（voice_probe_envelope），Watch 从 didReceive 就路由到探针分支，
+        // 不进 storeSpeech —— 不写 vault、不改 journal、不消耗 ledger，避免任何
+        // 「污染生产数据」的落盘副作用（ESS-65 §铁律 1）。
+        if let probeEnvelope = file.metadata?[VoiceProbeMessage.envelopeKey] as? Data {
+            guard let audioData = try? Data(contentsOf: file.fileURL) else {
+                WatchLog.error(
+                    "wcsession", "file_received_unreadable", detail: "kind=probe",
+                    code: "ERR_FILE_READ"
+                )
+                return
+            }
+            let requestId = (try? VoiceStatusEnvelope.decode(from: probeEnvelope))?.requestId
+            WatchLog.info(
+                "wcsession", "file_received", requestId: requestId,
+                detail: "kind=probe bytes=\(audioData.count)"
+            )
+            Task { @MainActor in
+                self.voiceTransport?.playProbe(envelopeData: probeEnvelope, audioData: audioData)
+            }
+            return
+        }
         guard let envelopeData = file.metadata?[VoiceSpeechMessage.envelopeKey] as? Data else {
             WatchLog.error(
                 "wcsession", "file_received_unknown", detail: "bytes=\(size)", code: "ERR_UNKNOWN_FILE"
@@ -154,7 +176,13 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             WatchLog.error("wcsession", "file_received_unreadable", detail: "kind=speech", code: "ERR_FILE_READ")
             return
         }
-        WatchLog.info("wcsession", "file_received", detail: "kind=speech bytes=\(audioData.count)")
+        // 携带 request_id（若可解出）便于 ESS-184 探针的 H2 观测直接绑到探针 rid；
+        // envelope 解码失败不阻断落盘路径，只是这条 file_received 变成孤儿。
+        let receivedRequestId = (try? VoiceStatusEnvelope.decode(from: envelopeData))?.requestId
+        WatchLog.info(
+            "wcsession", "file_received", requestId: receivedRequestId,
+            detail: "kind=speech bytes=\(audioData.count)"
+        )
         Task { @MainActor in self.storeSpeech(envelopeData: envelopeData, audioData: audioData) }
     }
 

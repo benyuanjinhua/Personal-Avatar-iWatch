@@ -4,6 +4,10 @@ enum AudioDownlinkKind: String, Codable, Equatable, CaseIterable {
     case welcome
     case interim
     case result
+    /// ESS-184 门禁探针：Bridge 独立注入的固定语音，走真实下行通道到手表播放并回执。
+    /// 与生产 `.result` 分家 —— 不进 `VoiceTurnJournal`、不写 `EncryptedAudioVault`、
+    /// 不消耗 `ResultPlaybackLedger`，避免污染用户对话历史（ESS-65 §铁律 1）。
+    case probe
     /// 仅用于 fail-closed 解码和落拒绝日志，永不属于播放白名单。
     case unknown
 }
@@ -155,6 +159,16 @@ struct VoiceStatusEnvelope: Codable, Equatable {
         if state == .permissionRequired && permission == nil { return "permission_required 缺少权限载荷" }
         return nil
     }
+}
+
+/// 结果语音 transferFile 的元数据键（探针专用），值为携带 audioKind=.probe 的
+/// VoiceStatusEnvelope JSON。ESS-184：与 `voice_speech_envelope` 分家的目的是
+/// **让 Watch 端在 `didReceive` 就能路由到探针分支**——不进 storeSpeech、不消耗
+/// journal/ledger，直接播放并回执。若共用 speech key，storeSpeech 里再判 kind
+/// 已经晚了：现有代码链会先把音频写进 EncryptedAudioVault，探针必须避免任何
+/// 落盘副作用（ESS-65 §铁律 1「不污染生产数据」）。
+enum VoiceProbeMessage {
+    static let envelopeKey = "voice_probe_envelope"
 }
 
 /// Watch → iPhone 的权限决定。Watch 不保存任何可签名凭据，

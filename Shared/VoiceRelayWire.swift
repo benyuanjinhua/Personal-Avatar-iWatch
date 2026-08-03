@@ -243,6 +243,24 @@ final class RelayClient {
         }
     }
 
+    /// ESS-184 探针播放成功回执：POST /v1/probe/ack。载荷是 ProbePlaybackAck，
+    /// 与 acknowledgeResult 的最小载荷分家 —— 探针要把 sha/played_at/duration
+    /// 一起上报，让 bridge.log 里的 probe_acked 记录能对账 Watch 播的是哪段字节。
+    func acknowledgeProbe(ack: ProbePlaybackAck) async throws {
+        let path = "/v1/probe/ack"
+        let body = try ack.jsonData()
+        let request = RelaySignedRequestBuilder(baseURL: baseURL, credentials: credentials)
+            .request(method: "POST", path: path, requestId: ack.requestId, body: body)
+        let (data, response): (Data, URLResponse)
+        do { (data, response) = try await session.data(for: request) }
+        catch { throw RelayUploadError.transport(error) }
+        guard let http = response as? HTTPURLResponse else { throw RelayUploadError.badResponse }
+        guard http.statusCode == 200 else {
+            let code = (try? JSONDecoder().decode(BridgeErrorBody.self, from: data))?.error ?? "ERR_UNKNOWN"
+            throw RelayUploadError.bridge(code: code, httpStatus: http.statusCode)
+        }
+    }
+
     /// 上送一个 turn；重试时以同一 request_id 重新调用（新 nonce/签名），Bridge 幂等去重。
     func upload(envelope: VoiceRequestEnvelope, audioData: Data) async throws -> VoiceTurnResponse {
         let body = try JSONEncoder().encode(VoiceTurnUpload(envelope: envelope, audioData: audioData))

@@ -160,6 +160,12 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
             Task { @MainActor in self.relay.acknowledgeResult(requestId: ack.requestId) }
             return
         }
+        // ESS-184 探针播放成功回执 —— 与 ResultDeliveryAck 分家转到探针专用端点。
+        if let probeData = message[ProbePlaybackAckMessage.envelopeKey] as? Data,
+           let ack = ProbePlaybackAck.decode(from: probeData) {
+            Task { @MainActor in self.relay.acknowledgeProbe(ack: ack) }
+            return
+        }
         if let summaryData = message[WatchClientLogMessage.selfCheckSummaryKey] as? Data {
             Task { @MainActor in self.ingestSelfCheckSummary(data: summaryData) }
             return
@@ -180,6 +186,11 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         if let ackData = userInfo[ResultDeliveryAckMessage.envelopeKey] as? Data,
            let ack = ResultDeliveryAck.decode(from: ackData) {
             Task { @MainActor in self.relay.acknowledgeResult(requestId: ack.requestId) }
+            return
+        }
+        if let probeData = userInfo[ProbePlaybackAckMessage.envelopeKey] as? Data,
+           let ack = ProbePlaybackAck.decode(from: probeData) {
+            Task { @MainActor in self.relay.acknowledgeProbe(ack: ack) }
             return
         }
         if let summaryData = userInfo[WatchClientLogMessage.selfCheckSummaryKey] as? Data {
@@ -299,6 +310,49 @@ extension PhoneConnectivity: WatchFeedbackChannel {
     ///
     /// ESS-21 B1：音频先复制进下行队列自持有的目录再投递——调用方的临时文件
     /// 随时可能被清理，且会话未激活时本条必须留在队列里等重投，不能像原先那样直接 return。
+    /// ESS-184 探针 transferFile：与 transferSpeech 走同一 WatchDownlinkOutbox 队列，
+    /// 但用 **VoiceProbeMessage.envelopeKey** 作为 metadata 键，Watch 端从 `didReceive`
+    /// 就路由到探针分支，不进 storeSpeech / journal / vault。
+    @discardableResult
+    func transferProbe(fileURL: URL, envelope: VoiceStatusEnvelope) -> Bool {
+        guard envelope.audioKind == .probe else {
+            Self.downlinkLogger.error(
+                "transferProbe 拿到的信封 audio_kind 不是 probe request_id=\(envelope.requestId, privacy: .public)"
+            )
+            return false
+        }
+        guard let data = try? envelope.jsonData() else { return false }
+        guard let downlink else {
+            Self.downlinkLogger.error(
+                "下行队列不可用，探针无法保证送达 request_id=\(envelope.requestId, privacy: .public)"
+            )
+            return false
+        }
+        guard let audio = try? Data(contentsOf: fileURL) else {
+            Self.downlinkLogger.error(
+                "探针语音读取失败 request_id=\(envelope.requestId, privacy: .public)"
+            )
+            return false
+        }
+        do {
+            _ = try downlink.enqueueSpeech(
+                requestId: envelope.requestId,
+                messageKey: VoiceProbeMessage.envelopeKey,
+                envelope: data,
+                audio: audio,
+                fileName: fileURL.lastPathComponent
+            )
+        } catch {
+            Self.downlinkLogger.error(
+                "探针入队失败 request_id=\(envelope.requestId, privacy: .public) error=\(String(describing: error), privacy: .public)"
+            )
+            return false
+        }
+        refreshDownlinkCount()
+        flushDownlink(trigger: "probe-enqueue")
+        return true
+    }
+
     @discardableResult
     func transferSpeech(fileURL: URL, envelope: VoiceStatusEnvelope) -> Bool {
         guard let data = try? envelope.jsonData() else { return false }

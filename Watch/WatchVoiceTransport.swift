@@ -215,6 +215,99 @@ final class WatchVoiceTransport: ObservableObject {
         WatchLog.info("transport", "result_ack_enqueued", requestId: requestId)
     }
 
+    /// ESS-184 门禁探针的 SpeechPlayer 引用：由 WristAgentWatchApp 在启动时注入。
+    /// 与生产 SpeechPlayer 不同实例——探针播放必须与业务播放隔离，避免抢占用户
+    /// 结果语音的会话。真机上二者共用同一 AVAudioSession，但会话激活/让出走
+    /// SpeechPlayer 内部的既有机制；本类型只做入口调度。
+    weak var probePlayer: SpeechPlayer?
+
+    /// ESS-184 门禁探针的播放入口。不进 storeSpeech、不走 journal / ledger /
+    /// EncryptedAudioVault，也**不改任何生产状态**——只做：sha 校验 → SpeechPlayer.play →
+    /// onFinish(true) 时发 probe_playback_ack。任一步失败都留稳定错误码，绝不静默。
+    ///
+    /// 事件命名与母单 ESS-184 §H3 契约对齐：
+    /// - `wcsession/file_received` (kind=probe)：H2 提前在 WatchSettingsStore 落；
+    /// - `turn/speech_stored` (kind=probe)：本函数在校验通过后落，Bridge 侧 parser 直接复用；
+    /// - `player/play_started` + `player/play_finished`：由 SpeechPlayer 自身落；
+    /// - `transport/probe_ack_enqueued`：本函数发 ACK 时落，用于对账 H5。
+    @MainActor
+    func playProbe(envelopeData: Data, audioData: Data) {
+        guard
+            let envelope = try? VoiceStatusEnvelope.decode(from: envelopeData),
+            envelope.validate() == nil
+        else {
+            WatchLog.error("turn", "probe_envelope_invalid", code: "ERR_DECODE")
+            return
+        }
+        guard envelope.audioKind == .probe else {
+            // 非 probe 走错了通道 —— 明确拒绝，别把它悄悄按 speech 处理。
+            WatchLog.error(
+                "audio", "l1_audio_rejected", requestId: envelope.requestId,
+                detail: "reason=probe_channel_wrong_kind kind=\(envelope.audioKind?.rawValue ?? "missing") source=watch_probe",
+                code: "ERR_AUDIO_KIND_REJECTED"
+            )
+            return
+        }
+        let actualSha = VoiceDigest.sha256Hex(of: audioData)
+        if let expected = envelope.result?.speechSha256?.lowercased(),
+           actualSha != expected {
+            WatchLog.error(
+                "turn", "speech_sha_mismatch", requestId: envelope.requestId,
+                detail: "kind=probe bytes=\(audioData.count)", code: "ERR_SHA_MISMATCH"
+            )
+            return
+        }
+        WatchLog.info(
+            "turn", "speech_stored", requestId: envelope.requestId,
+            detail: "kind=probe bytes=\(audioData.count)"
+        )
+        WatchLogShipper.shared.ship(reason: "probe_stored")
+
+        guard let player = probePlayer else {
+            WatchLog.error(
+                "player", "probe_player_missing", requestId: envelope.requestId,
+                code: "ERR_PROBE_PLAYER_MISSING"
+            )
+            return
+        }
+        let requestId = envelope.requestId
+        let sha = actualSha
+        let context = requestId
+        // 使用 duration 兜底：envelope 里可能带 speechDurationMs；SpeechPlayer 自身
+        // 也会在 onFinish 后收敛；durationMs 只作诊断字段随 ACK 上报。
+        let declaredDuration = envelope.result?.speechDurationMs
+        _ = player.play(data: audioData, context: context) { [weak self] finished in
+            guard let self else { return }
+            // 探针只在**完整播完**时上报 ACK；截断或激活失败不发 ACK，由 Bridge
+            // 侧 timeout 判 stopped_at=H4/H5 —— H5 缺失就是缺失，不许善意补齐。
+            guard finished else {
+                WatchLog.error(
+                    "player", "probe_play_incomplete", requestId: requestId,
+                    detail: "kind=probe sha=\(sha)", code: "ERR_PROBE_INCOMPLETE"
+                )
+                return
+            }
+            let playedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+            let ack = ProbePlaybackAck(
+                requestId: requestId, sha256: sha,
+                playedAtMs: playedAtMs, durationMs: declaredDuration
+            )
+            guard let data = try? ack.jsonData() else {
+                WatchLog.error(
+                    "transport", "probe_ack_encode_failed", requestId: requestId,
+                    code: "ERR_ENCODE"
+                )
+                return
+            }
+            self.deliver(payload: [ProbePlaybackAckMessage.envelopeKey: data])
+            WatchLog.info(
+                "transport", "probe_ack_enqueued", requestId: requestId,
+                detail: "kind=probe sha=\(sha) played_at_ms=\(playedAtMs)"
+            )
+            WatchLogShipper.shared.ship(reason: "probe_acked")
+        }
+    }
+
     func handleReachabilityChange(isReachable: Bool) {
         WatchLog.info("wcsession", "reachability_changed", detail: "reachable=\(isReachable) pending=\(pendingCount)")
         if isReachable {
