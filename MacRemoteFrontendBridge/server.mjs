@@ -659,6 +659,133 @@ export function createBridge(overrides = {}) {
     return { status: 200, body: { chunk_id: chunkId, accepted: Math.min(lines.length, MAX_LOG_LINES_PER_CHUNK) } }
   }
 
+  // ---- ESS-184/207 下行链路探针注入 + 回执 -------------------------------
+  //
+  // /v1/probe/inject（loopback-only，不校 HMAC）：把一段预生成的短音频以
+  //   kind=probe 直接落到账本 completed，走真实 WSS 出口 → iPhone Relay →
+  //   Watch。语义上等价于用户说了一句话且立刻得到语音回执，但不经过
+  //   qwen-audio-realtime，也不会往用户对话历史里塞真 turn。
+  //
+  // /v1/probe/ack（需 HMAC，iPhone Relay 转发 Watch 的 probe_playback_ack）：
+  //   只落日志 evt=probe_acked，供 downlink-probe.mjs 判定 H5；顺手把探针
+  //   turn 标 acknowledged 以停掉持久重投 sweep。
+
+  function pickProbeDevice() {
+    const devices = auth.state?.devices ?? {}
+    for (const [deviceId] of Object.entries(devices)) return deviceId
+    return null
+  }
+
+  function handleProbeInject(rawBody) {
+    let body
+    try { body = JSON.parse(rawBody.toString('utf8')) } catch { throw new ApiError(ERR.BAD_JSON) }
+    const requestId = body.request_id
+    const audioBase64 = body.audio_base64
+    const sha = typeof body.sha256 === 'string' ? body.sha256.toLowerCase() : null
+    if (!requestId || typeof audioBase64 !== 'string' || !sha) {
+      throw new ApiError(ERR.MISSING_FIELD, 'request_id, audio_base64, sha256')
+    }
+    let audioBuf
+    try { audioBuf = Buffer.from(audioBase64, 'base64') } catch { throw new ApiError(ERR.AUDIO_INVALID) }
+    if (audioBuf.length === 0) throw new ApiError(ERR.AUDIO_INVALID)
+    if (audioBuf.length > CONFIG.max_audio_bytes) throw new ApiError(ERR.AUDIO_TOO_LARGE)
+    if (sha256hex(audioBuf) !== sha) throw new ApiError(ERR.AUDIO_HASH_MISMATCH)
+
+    const deviceId = pickProbeDevice()
+    if (!deviceId) throw new ApiError(ERR.DEVICE_UNKNOWN, 'no paired device')
+
+    // 幂等：同 request_id 已在账本，且是 probe，直接重发终态（H1 事件再落一次）；
+    // 不是 probe（比如生产 request_id 撞车）→ 拒绝，宁缺毋滥。
+    const existing = ledger.get(requestId)
+    if (existing) {
+      const isProbe = existing.result?.audio?.kind === 'probe'
+      if (!isProbe) throw new ApiError(ERR.IDEMPOTENCY_CONFLICT, 'request_id belongs to a non-probe turn')
+    } else {
+      ledger.create({
+        requestId,
+        deviceId,
+        bodySha256: sha256hex(rawBody),
+        sessionId: supervisor.sessionId,
+      })
+    }
+
+    resultAudio.put(requestId, audioBuf)
+    const meta = {
+      kind: 'probe',
+      sha256: sha,
+      codec: 'm4a',
+      duration_ms: Number.isFinite(body.duration_ms) ? body.duration_ms : null,
+      size_bytes: audioBuf.length,
+    }
+    // H1 事件：与生产 direct 结果同事件名 `l1_audio_ready`；`kind: meta.kind`
+    // 必须落上，`downlink-probe.mjs` 的 H1 分类严格要求 `entry.kind === 'probe'`
+    // 才认。毕玄 2026-08-03 22:04Z 复审接受 —— 之前只写 `probe: true` 属于事件
+    // 契约缺口，真实 CLI 会稳定停在 ERR_PROBE_STOPPED_AT_H1。
+    log({
+      evt: 'l1_audio_ready', request_id: requestId, task_id: null,
+      source: 'direct', response_id: null, codec: 'm4a',
+      duration_ms: meta.duration_ms, size_bytes: meta.size_bytes,
+      sha256: meta.sha256, kind: meta.kind, probe: true,
+    })
+
+    // path=direct + setResult(completed) → ledger emit → allowDownlinkMessage
+    // 因为 PR #59 已把 'probe' 加入 AUDIO_KINDS，本条不会被拒；随后经 WSS
+    // 抵达 iPhone Relay，Relay 认 kind=probe 走 transferProbe → Watch。
+    ledger.update(requestId, { path: 'direct' })
+    ledger.setResult(requestId, {
+      text: typeof body.text === 'string' ? body.text : null,
+      audioBase64,
+      audio: meta,
+      extra: { source: 'probe' },
+    }, 'completed')
+
+    return { status: 202, body: { request_id: requestId, device_id: deviceId, size_bytes: audioBuf.length, sha256: sha } }
+  }
+
+  function handleProbeAck(rawBody, authInfo) {
+    let body
+    try { body = JSON.parse(rawBody.toString('utf8')) } catch { throw new ApiError(ERR.BAD_JSON) }
+    const requestId = typeof body.request_id === 'string' ? body.request_id : null
+    if (!requestId) throw new ApiError(ERR.MISSING_FIELD, 'request_id')
+
+    // 毕玄 2026-08-03 15:33Z 复审 §2：`/v1/probe/ack` 之前只验 HMAC 就落
+    // `evt=probe_acked`，任一已配对客户端可对任意 rid 发假 ACK 骗过 H5——
+    // 五跳「假 PASS」直接绕过门禁。强校验四条不过就拒收、不落事件：
+    // (a) turn 必须存在；
+    // (b) 必须是探针 turn（kind=probe）；
+    // (c) ACK 的 device_id 必须等于该 probe turn 的目标设备；
+    // (d) ACK 的 sha 必须等于 H1 注入音频 sha（bit-perfect 到手播）。
+    const turn = ledger.get(requestId)
+    if (!turn) throw new ApiError(ERR.NOT_FOUND, 'unknown request_id')
+    if (turn.result?.audio?.kind !== 'probe') {
+      throw new ApiError(ERR.NOT_FOUND, 'not a probe turn')
+    }
+    if (turn.device_id !== authInfo.deviceId) {
+      // 用 NOT_FOUND 复用生产 get-turn 的跨设备语义（不暴露 turn 存在与否）。
+      throw new ApiError(ERR.NOT_FOUND, 'device mismatch')
+    }
+    const ackSha = typeof body.sha256 === 'string' ? body.sha256.toLowerCase() : null
+    const injectSha = turn.result?.audio?.sha256?.toLowerCase() ?? null
+    if (!ackSha || !injectSha || ackSha !== injectSha) {
+      throw new ApiError(ERR.AUDIO_HASH_MISMATCH, 'ack sha does not match injected audio')
+    }
+
+    // H5 事件——只在四条强校验都过之后才落，避免历史事件被伪造。
+    log({
+      evt: 'probe_acked',
+      request_id: requestId,
+      device_id: authInfo.deviceId,
+      played_ok: Boolean(body.played_ok),
+      played_at_ms: Number.isFinite(body.played_at_ms) ? body.played_at_ms : null,
+      duration_ms: Number.isFinite(body.duration_ms) ? body.duration_ms : null,
+      sha256: ackSha,
+      error_code: typeof body.error_code === 'string' ? body.error_code.slice(0, 80) : null,
+    })
+
+    ledger.acknowledgeResult(requestId, { source: 'probe' })
+    return { status: 200, body: { request_id: requestId, acknowledged: true } }
+  }
+
   // ---- HTTP plumbing ------------------------------------------------------
 
   function readBody(req) {
@@ -712,6 +839,25 @@ export function createBridge(overrides = {}) {
       if (pathName === '/v1/client-logs') {
         if (req.method !== 'POST') throw new ApiError(ERR.METHOD_NOT_ALLOWED)
         const r = handleClientLogs(rawBody, verify())
+        return reply(r.status, r.body)
+      }
+
+      // ESS-184/207 探针注入：loopback-only（不校 HMAC——本机唯一进入路径
+      // 是本机用户 curl/脚本；生产 tailscale/公网 sourceAllowed 就把非 CGNAT
+      // 拦在门外，probe 白名单探针只用于门禁自检，不外放）。
+      if (pathName === '/v1/probe/inject') {
+        if (req.method !== 'POST') throw new ApiError(ERR.METHOD_NOT_ALLOWED)
+        if (ip !== '127.0.0.1' && ip !== '::1') throw new ApiError(ERR.SOURCE_NOT_ALLOWED)
+        const r = handleProbeInject(rawBody)
+        return reply(r.status, r.body)
+      }
+
+      // ESS-184/207 探针回执：iPhone Relay 转发 Watch 侧 probe_playback_ack。
+      // 走 HMAC 与其余北向端点一致——auth 的 device_id 就是 log evt=probe_acked
+      // 的 device_id，跨端可对账。
+      if (pathName === '/v1/probe/ack') {
+        if (req.method !== 'POST') throw new ApiError(ERR.METHOD_NOT_ALLOWED)
+        const r = handleProbeAck(rawBody, verify())
         return reply(r.status, r.body)
       }
 
