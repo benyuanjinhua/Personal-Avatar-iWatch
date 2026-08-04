@@ -71,7 +71,7 @@ Bridge 每 20 秒发送 WebSocket ping，失活连接会被终止并由 iPhone �
 `result_acked`。
 
 结果结构（completed）：`result.text`（任务/直答文本）、`result.speech_text`（Qwen Audio
-Realtime 播报转写，后台路径）、`result.audio_base64`（≤ `max_result_audio_bytes` 时内联）、
+Realtime 播报转写，后台路径）、`result.audio_base64`（≤ `max_result_audio_bytes` 时内联；默认 512 KiB）、
 `result.audio = {sha256, codec, duration_ms, size_bytes}`（语音文件元数据，内联被裁时仍在，
 客户端凭它走 `/audio` 端点下载）。
 
