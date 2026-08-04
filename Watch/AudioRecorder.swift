@@ -145,6 +145,9 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         isRecording = false
         releaseSession(reason: "finish")
 
+        let assetMs = currentURL.flatMap { Self.audioAssetDurationMs(url: $0) }
+        let durationMs = Self.sanitizeDurationMs(rawMs: assetMs ?? wallClockMs)
+
         guard let url = currentURL else {
             WatchLog.error(
                 "recorder", "record_empty",
@@ -174,9 +177,6 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         }
         currentURL = nil
         recorder = nil
-
-        let assetMs = Self.audioAssetDurationMs(url: url)
-        let durationMs = Self.sanitizeDurationMs(rawMs: assetMs ?? wallClockMs)
 
         // ESS-225 AC #5：字节数与时长严重不自洽时告警。asset 路径接管后，
         // 正常路径不再触发；仅在 asset 也读不出且 wall-clock 又与字节数
