@@ -36,6 +36,7 @@ import { prepareDownlinkMessage } from './audio-policy.mjs'
 import { VoiceStreamDownlink } from './voice-stream-downlink.mjs'
 import { VoiceStreamUplink } from './voice-stream-uplink.mjs'
 import { PendingAnnouncementStreams } from './pending-announcement-streams.mjs'
+import { RealtimeMediaSession } from './realtime-media-session.mjs'
 
 const BASE = dirname(fileURLToPath(import.meta.url))
 
@@ -1060,6 +1061,7 @@ export function createBridge(overrides = {}) {
 
   const wss = new WebSocketServer({ noServer: true })
   const eventClients = new Set() // { ws, deviceId }
+  const mediaClients = new Set()
   const eventsHeartbeatMs = CONFIG.events_heartbeat_ms ?? 20_000
   const resultDeliverySweepMs = CONFIG.result_delivery_sweep_ms ?? 1_000
 
@@ -1180,8 +1182,75 @@ export function createBridge(overrides = {}) {
     }
     try {
       if (!sourceAllowed(ip)) return refuse(403, 'ERR_SOURCE_NOT_ALLOWED')
-      if (pathName !== '/v1/voice/events') return refuse(404, 'ERR_NOT_FOUND')
-      const { deviceId } = auth.verify({ headers: req.headers, method: 'GET', pathName, rawBody: Buffer.alloc(0) })
+      const isMedia = pathName === '/v1/voice/realtime'
+      if (pathName !== '/v1/voice/events' && !isMedia) return refuse(404, 'ERR_NOT_FOUND')
+      if (isMedia && CONFIG.realtime_media_v1 !== true) return refuse(404, 'ERR_NOT_FOUND')
+      const { deviceId, requestId } = auth.verify({ headers: req.headers, method: 'GET', pathName, rawBody: Buffer.alloc(0) })
+      if (isMedia) {
+        const url = new URL(req.url, 'https://x')
+        const queryRequestId = url.searchParams.get('request_id')
+        const sessionId = url.searchParams.get('session_id')
+        if (!queryRequestId || queryRequestId !== requestId || !sessionId || sessionId.length > 128) {
+          return refuse(400, 'ERR_STREAM_OWNERSHIP')
+        }
+        return wss.handleUpgrade(req, socket, head, ws => {
+          const client = { ws, deviceId, requestId, sessionId, media: null, opened: false }
+          mediaClients.add(client)
+          const maxBuffered = CONFIG.realtime_media_max_buffered_bytes ?? 256 * 1024
+          const sendDownstream = event => {
+            if (ws.readyState !== ws.OPEN) throw Object.assign(new Error('client disconnected'), { code: 'ERR_STREAM_CLOSED' })
+            if (ws.bufferedAmount > maxBuffered) throw Object.assign(new Error('client backpressure limit exceeded'), { code: 'ERR_STREAM_BACKPRESSURE' })
+            ws.send(JSON.stringify(event))
+          }
+          const fail = error => {
+            const code = error?.code ?? 'ERR_STREAM_PROTOCOL'
+            log({ evt: 'realtime_media_error', request_id: requestId, device_id: deviceId, code })
+            if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'error', code, request_id: requestId, session_id: sessionId }))
+            ws.close(1008, String(code).slice(0, 123))
+          }
+          let chain = Promise.resolve()
+          ws.on('message', raw => {
+            chain = chain.then(async () => {
+              let message
+              try { message = JSON.parse(raw.toString()) } catch { throw Object.assign(new Error('invalid JSON'), { code: 'ERR_BAD_JSON' }) }
+              if (!client.opened) {
+                if (message.type !== 'start' || message.protocol_version !== CONFIG.protocol_version
+                  || message.request_id !== requestId || message.session_id !== sessionId) {
+                  throw Object.assign(new Error('invalid media start'), { code: 'ERR_STREAM_OWNERSHIP' })
+                }
+                client.media = new RealtimeMediaSession({
+                  requestId, sessionId,
+                  sendUpstream: event => supervisor.sendMediaEvent(requestId, event),
+                  sendDownstream,
+                  maxFrameBytes: CONFIG.realtime_media_max_frame_bytes ?? 64 * 1024,
+                  log: item => log({ evt: 'realtime_media', device_id: deviceId, ...item }),
+                })
+                await supervisor.openMediaSession({ label: requestId, onEvent: event => client.media?.handleAgentEvent(event) })
+                client.opened = true
+                sendDownstream({ type: 'ready', request_id: requestId, session_id: sessionId })
+                return
+              }
+              if (message.request_id && message.request_id !== requestId) throw Object.assign(new Error('request ownership mismatch'), { code: 'ERR_STREAM_OWNERSHIP' })
+              if (message.session_id && message.session_id !== sessionId) throw Object.assign(new Error('session ownership mismatch'), { code: 'ERR_STREAM_OWNERSHIP' })
+              if (message.type === 'audio.append') client.media.appendInput(message)
+              else if (message.type === 'audio.commit') client.media.endInput()
+              else if (message.type === 'playback.started') client.media.playbackStarted(message.response_id)
+              else if (message.type === 'playback.ended') client.media.playbackEnded(message.response_id)
+              else if (message.type === 'barge_in') client.media.bargeIn()
+              else if (message.type === 'close') ws.close(1000, 'completed')
+              else throw Object.assign(new Error('unknown media event'), { code: 'ERR_STREAM_PROTOCOL' })
+            }).catch(fail)
+          })
+          const cleanup = () => {
+            mediaClients.delete(client)
+            client.media?.close('cancelled')
+            supervisor.closeMediaSession(requestId, { cancel: client.opened })
+            log({ evt: 'realtime_media_disconnected', request_id: requestId, device_id: deviceId })
+          }
+          ws.once('close', cleanup)
+          ws.once('error', cleanup)
+        })
+      }
       wss.handleUpgrade(req, socket, head, ws => {
         const client = { ws, deviceId, alive: true }
         eventClients.add(client)
@@ -1330,6 +1399,7 @@ export function createBridge(overrides = {}) {
     clearInterval(eventsHeartbeat)
     clearInterval(resultDeliverySweep)
     for (const client of eventClients) client.ws.close()
+    for (const client of mediaClients) client.ws.close()
     for (const timer of workTimers.values()) clearTimeout(timer)
     // ESS-234：清 in-flight 兜底计时器 + 释放 salvage PCM 引用
     for (const timer of realtimeFallbackTimers.values()) clearTimeout(timer)

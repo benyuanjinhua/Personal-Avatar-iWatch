@@ -23,6 +23,7 @@ export class MockGateway extends EventEmitter {
     this.holder = preHolder ? { descriptor: preHolder, ws: null } : null
     this.connects = []          // { descriptor, takeover }
     this.playbackReceipts = []  // { type, responseId }
+    this.mediaEvents = []
     this.droppedFrames = 0
     this.voiceClients = new Set()
     this.announceSeq = 0
@@ -152,10 +153,16 @@ export class MockGateway extends EventEmitter {
         return
       }
       if (msg.type === 'playback.started' || msg.type === 'playback.ended') {
+        this.mediaEvents.push(msg)
         this.playbackReceipts.push({ type: msg.type, responseId: msg.responseId })
         return
       }
+      if (msg.type === 'audio.commit' || msg.type === 'response.cancel') {
+        this.mediaEvents.push(msg)
+        return
+      }
       if (msg.type === 'audio.append') {
+        this.mediaEvents.push(msg)
         if (this.holder?.ws !== ws) {
           this.droppedFrames += 1 // 真实网关行为：非 owner 的帧静默丢弃
           return

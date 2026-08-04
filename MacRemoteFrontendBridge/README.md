@@ -1,5 +1,21 @@
 # Remote Frontend Bridge（ESS-26 · P1 完整实现，ESS-30 入库，ESS-36 双向链路修复）
 
+## Realtime media WSS（ESS-322）
+
+设置 `realtime_media_v1=true` 后启用 `WSS /v1/voice/realtime`。Upgrade 使用与
+events socket 相同的来源白名单和 HMAC 请求头；`x-request-id` 必须等于查询参数
+`request_id`，并要求 `session_id`。第一条消息必须是：
+
+```json
+{"type":"start","protocol_version":1,"request_id":"req_...","session_id":"session_..."}
+```
+
+收到 `ready` 后，客户端按序发送 PCM16LE/16kHz `audio.append` 帧并以
+`audio.commit` 结束。Agent 的 `audio.delta`、字幕、中断和完成事件即时以 PCM
+事件下发。Bridge 不伪造播放回执；客户端须发送含 `response_id` 的
+`playback.started` / `playback.ended`。`barge_in` 会取消当前响应并清空播放。
+序号/归属错误、帧大小超限、下行背压或断线均会关闭并清理隔离的媒体会话。
+
 ESS-36 修复说明（真机 0 事件超时的根因与对策）：qwen-audio-agent 对**非语音
 所有权持有者**的 `audio.append` 是**静默丢弃**——所有权是注入的前置条件。
 supervisor 现在：① 连接遇 busy 且持有者是另一个 watch-bridge 实例（上一进程
