@@ -17,20 +17,35 @@ final class RetryRecordingStore {
     private let audioURL: URL
     private let metaURL: URL
     private let fileManager = FileManager.default
+    private let onStorageFailure: ((String) -> Void)?
 
-    init(directory: URL) {
+    init(directory: URL, onStorageFailure: ((String) -> Void)? = nil) {
+        self.onStorageFailure = onStorageFailure
         try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         audioURL = directory.appendingPathComponent("last-recording.m4a")
         metaURL = directory.appendingPathComponent("last-recording.json")
     }
 
-    /// 保存/改绑最近一条录音（覆盖旧的，只留一条）。
+    /// 保存/改绑最近一条录音（覆盖旧的，只留一条）。写盘失败时重试 3 次（每次 100ms），
+    /// 全部失败则清理缓存避免脏状态。
     func save(requestId: String, data: Data, durationMs: Int) {
-        guard
-            (try? data.write(to: audioURL, options: .atomic)) != nil,
-            let metaData = try? JSONEncoder().encode(Meta(requestId: requestId, durationMs: durationMs)),
-            (try? metaData.write(to: metaURL, options: .atomic)) != nil
+        do {
+            try PersistHelper.writeAtomically(data, to: audioURL)
+        } catch {
+            onStorageFailure?("RetryRecordingStore audio write: \(error.localizedDescription)")
+            clearAll()
+            return
+        }
+        guard let metaData = try? JSONEncoder().encode(Meta(requestId: requestId, durationMs: durationMs))
         else {
+            onStorageFailure?("RetryRecordingStore meta encode failed")
+            clearAll()
+            return
+        }
+        do {
+            try PersistHelper.writeAtomically(metaData, to: metaURL)
+        } catch {
+            onStorageFailure?("RetryRecordingStore meta write: \(error.localizedDescription)")
             clearAll()
             return
         }

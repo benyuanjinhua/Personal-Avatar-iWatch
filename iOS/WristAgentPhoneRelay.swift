@@ -96,7 +96,11 @@ final class WristAgentPhoneRelay: ObservableObject {
 
         outbox = try? VoiceOutbox(
             directory: base.appendingPathComponent("VoiceRelayOutbox", isDirectory: true),
-            keyProvider: KeychainOutboxKeyProvider()
+            keyProvider: KeychainOutboxKeyProvider(),
+            onStorageFailure: { detail in
+                Logger(subsystem: "beer.workspace.wristagent", category: "outbox")
+                    .error("VoiceOutbox persist failed: \(detail, privacy: .public)")
+            }
         )
         credentials = RelayCredentialsStore.read()
         isPaired = credentials != nil

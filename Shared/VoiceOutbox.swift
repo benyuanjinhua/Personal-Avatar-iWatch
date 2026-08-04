@@ -88,6 +88,7 @@ final class VoiceOutbox {
     private let now: () -> Date
     private let random: (ClosedRange<Double>) -> Double
     private let fileManager = FileManager.default
+    private let onStorageFailure: ((String) -> Void)?
 
     init(
         directory: URL,
@@ -95,7 +96,8 @@ final class VoiceOutbox {
         backoff: RetryBackoff = .outboxDefault,
         retention: TimeInterval = 24 * 3600,
         now: @escaping () -> Date = Date.init,
-        random: @escaping (ClosedRange<Double>) -> Double = { Double.random(in: $0) }
+        random: @escaping (ClosedRange<Double>) -> Double = { Double.random(in: $0) },
+        onStorageFailure: ((String) -> Void)? = nil
     ) throws {
         self.directory = directory
         self.indexURL = directory.appendingPathComponent("index.json")
@@ -104,6 +106,7 @@ final class VoiceOutbox {
         self.retention = retention
         self.now = now
         self.random = random
+        self.onStorageFailure = onStorageFailure
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         if
             let data = try? Data(contentsOf: indexURL),
@@ -260,7 +263,11 @@ final class VoiceOutbox {
     }
 
     private func persistIndex() {
-        guard let data = try? JSONEncoder().encode(entries) else { return }
-        try? data.write(to: indexURL, options: .atomic)
+        do {
+            let data = try JSONEncoder().encode(entries)
+            try PersistHelper.writeAtomically(data, to: indexURL)
+        } catch {
+            onStorageFailure?("VoiceOutbox persistIndex: \(error.localizedDescription)")
+        }
     }
 }
