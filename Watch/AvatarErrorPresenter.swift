@@ -97,6 +97,20 @@ final class AvatarErrorPresenter: ObservableObject {
         if let requestId, !requestId.isEmpty {
             presentedRequestIds.insert(requestId)
         }
+
+        // ESS-257 R-02.1：每次上卡片都留一条 WatchLog 运行时事件——
+        // 把「D2 恢复族 → 是否允许重试」这条决策显式落到日志里，方便
+        // 复审在 bridge.log 上按 event=error_card_presented 直接读到
+        // 「E-28 的卡片文案与无重试按钮同时成立」这一事实。
+        WatchLog.info(
+            "avatar_error",
+            "error_card_presented",
+            requestId: requestId,
+            detail: "error_code=\(entry.code)"
+                + " family=\(entry.recoveryFamily.rawValue)"
+                + " retry_button_shown=\(entry.recoveryFamily.allowsCachedRetry)"
+                + " audio_attempted=\(audioAttempted)"
+        )
         return true
     }
 
