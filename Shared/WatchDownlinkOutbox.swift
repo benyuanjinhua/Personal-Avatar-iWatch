@@ -515,7 +515,7 @@ final class WatchDownlinkOutbox {
     private func persistIndex() throws {
         do {
             let data = try JSONEncoder().encode(items)
-            try data.write(to: indexURL, options: .atomic)
+            try PersistHelper.writeAtomically(data, to: indexURL)
         } catch {
             throw WatchDownlinkError.storageFailure(error.localizedDescription)
         }

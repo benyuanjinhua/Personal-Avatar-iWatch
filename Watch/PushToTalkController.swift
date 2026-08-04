@@ -79,10 +79,20 @@ final class PushToTalkController: ObservableObject {
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        journal = VoiceTurnJournal(directory: base.appendingPathComponent("VoiceTurns", isDirectory: true))
+        journal = VoiceTurnJournal(
+            directory: base.appendingPathComponent("VoiceTurns", isDirectory: true),
+            onStorageFailure: { detail in
+                WatchLog.error("journal", "persist_failed", detail: detail)
+            }
+        )
         speechVault = try? EncryptedAudioVault(directory: base.appendingPathComponent("SpeechVault", isDirectory: true))
         transport = WatchVoiceTransport(journal: journal)
-        retryStore = RetryRecordingStore(directory: base.appendingPathComponent("RetryCache", isDirectory: true))
+        retryStore = RetryRecordingStore(
+            directory: base.appendingPathComponent("RetryCache", isDirectory: true),
+            onStorageFailure: { detail in
+                WatchLog.error("retry_store", "persist_failed", detail: detail)
+            }
+        )
         playbackLedger = ResultPlaybackLedger(
             directory: base.appendingPathComponent("PlaybackLedger", isDirectory: true)
         )

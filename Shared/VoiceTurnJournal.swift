@@ -81,9 +81,11 @@ final class VoiceTurnJournal: ObservableObject {
     private let fileURL: URL
     private let maximumCount: Int
     private let fileManager = FileManager.default
+    private let onStorageFailure: ((String) -> Void)?
 
-    init(directory: URL, maximumCount: Int = 20) {
+    init(directory: URL, maximumCount: Int = 20, onStorageFailure: ((String) -> Void)? = nil) {
         self.maximumCount = maximumCount
+        self.onStorageFailure = onStorageFailure
         fileURL = directory.appendingPathComponent("voice-turns.json")
         try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         if
@@ -309,7 +311,11 @@ final class VoiceTurnJournal: ObservableObject {
     }
 
     private func save() {
-        guard let data = try? VoiceProtocolJSON.encoder.encode(turns) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+        do {
+            let data = try VoiceProtocolJSON.encoder.encode(turns)
+            try PersistHelper.writeAtomically(data, to: fileURL)
+        } catch {
+            onStorageFailure?("VoiceTurnJournal save: \(error.localizedDescription)")
+        }
     }
 }
