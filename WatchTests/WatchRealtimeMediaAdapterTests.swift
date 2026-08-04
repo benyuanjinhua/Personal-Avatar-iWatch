@@ -141,6 +141,46 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         XCTAssertEqual(counter.invocations.first?.0.requestId, requestId)
     }
 
+    func testAdapterStampsRealBridgeResponseIdOnReceipts() {
+        // ESS-330: two responses arrive within the same session; playback
+        // receipts must echo the actual response_id observed on delta, not
+        // the fabricated session id.
+        let requestId = "44444444-4444-4444-4444-4444444444a0"
+        let sessionId = "55555555-5555-5555-5555-55555555a000"
+        let (adapter, _, player, transport, _) = makeAdapter(sessionIds: [sessionId])
+        let handle = adapter.beginTurn(requestId: requestId)
+
+        let chunkA = VoiceStreamChunk(
+            requestId: handle.requestId, streamId: handle.sessionId,
+            direction: .downlink, sequence: 0, capturedAtMs: 1,
+            codec: "pcm_s16le", sampleRate: 24_000,
+            payload: Data(repeating: 0x11, count: 48)
+        )
+        adapter.ingestDownlink(chunkA, responseId: "resp-alpha")
+        player.onPlaybackEvent?(.started(requestId: handle.requestId, sessionId: handle.sessionId))
+        player.onPlaybackEvent?(.ended(
+            requestId: handle.requestId, sessionId: handle.sessionId, bytesPlayed: 48
+        ))
+
+        // Second response — barge-in and different response_id.
+        let chunkB = VoiceStreamChunk(
+            requestId: handle.requestId, streamId: handle.sessionId,
+            direction: .downlink, sequence: 0, capturedAtMs: 2,
+            codec: "pcm_s16le", sampleRate: 24_000,
+            payload: Data(repeating: 0x22, count: 48)
+        )
+        adapter.ingestDownlink(chunkB, responseId: "resp-beta")
+        player.onPlaybackEvent?(.started(requestId: handle.requestId, sessionId: handle.sessionId))
+        player.onPlaybackEvent?(.ended(
+            requestId: handle.requestId, sessionId: handle.sessionId, bytesPlayed: 48
+        ))
+
+        XCTAssertEqual(transport.playbackStartEvents.map(\.1), ["resp-alpha", "resp-beta"])
+        XCTAssertEqual(transport.playbackEndEvents.map(\.1), ["resp-alpha", "resp-beta"])
+        XCTAssertNotEqual(transport.playbackStartEvents.first?.1, handle.sessionId,
+                          "session_id must not be used as response_id")
+    }
+
     func testPlaybackReceiptsAreForwardedToTransport() {
         let requestId = "44444444-4444-4444-4444-444444444440"
         let (adapter, _, player, transport, _) = makeAdapter(sessionIds: [

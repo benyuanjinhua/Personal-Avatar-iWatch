@@ -285,8 +285,14 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             detail: "kind=\(envelope.kind.rawValue) session=\(envelope.sessionId)"
         )
         switch envelope.kind {
+        case .ready:
+            // ESS-329: Bridge handshake ack. Just proves the socket accepted
+            // `start`; nothing to do at the adapter layer.
+            break
         case .audioDelta:
-            if let chunk = envelope.audio { adapter.ingestDownlink(chunk) }
+            if let chunk = envelope.audio {
+                adapter.ingestDownlink(chunk, responseId: envelope.responseId)
+            }
         case .audioDone:
             adapter.markDownlinkComplete()
         case .playbackClear, .responseInterrupted:

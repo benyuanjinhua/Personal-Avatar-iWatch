@@ -59,29 +59,34 @@ final class PhoneRealtimeWebSocketTransport: PhoneRealtimeSession.Transport {
                 guard let self, !self.isClosed else { return }
                 switch result {
                 case .success(let message):
+                    let outcome: RealtimeBridgeWireCodec.DecodeOutcome
                     switch message {
-                    case .data(let data):
-                        if let envelope = RealtimeBridgeWireCodec.decode(data) {
-                            handler(.success(envelope))
-                        } else {
-                            handler(.failure(NSError(
-                                domain: "PhoneRealtimeWebSocketTransport", code: 3,
-                                userInfo: [NSLocalizedDescriptionKey: "invalid downlink frame"]
-                            )))
-                        }
-                    case .string(let text):
-                        if let envelope = RealtimeBridgeWireCodec.decode(text) {
-                            handler(.success(envelope))
-                        } else {
-                            handler(.failure(NSError(
-                                domain: "PhoneRealtimeWebSocketTransport", code: 4,
-                                userInfo: [NSLocalizedDescriptionKey: "invalid downlink frame"]
-                            )))
-                        }
+                    case .data(let data): outcome = RealtimeBridgeWireCodec.decodeOutcome(data)
+                    case .string(let text): outcome = RealtimeBridgeWireCodec.decodeOutcome(text)
                     @unknown default:
                         handler(.failure(NSError(
                             domain: "PhoneRealtimeWebSocketTransport", code: 5,
                             userInfo: [NSLocalizedDescriptionKey: "unknown message kind"]
+                        )))
+                        return
+                    }
+                    switch outcome {
+                    case .envelope(let envelope):
+                        handler(.success(envelope))
+                    case .unrecognised(let type):
+                        // ESS-329: Bridge PR #113 emits `ready` after `start`
+                        // (and may add more heartbeats over time). Well-formed
+                        // frames the codec has no route for MUST NOT kill the
+                        // socket — log and keep receiving so the next
+                        // `audio.delta` still arrives.
+                        Self.logger.info(
+                            "realtime downlink unrecognised type=\(type, privacy: .public)"
+                        )
+                        self.receive(handler: handler)
+                    case .malformed:
+                        handler(.failure(NSError(
+                            domain: "PhoneRealtimeWebSocketTransport", code: 3,
+                            userInfo: [NSLocalizedDescriptionKey: "invalid downlink frame"]
                         )))
                     }
                 case .failure(let error):

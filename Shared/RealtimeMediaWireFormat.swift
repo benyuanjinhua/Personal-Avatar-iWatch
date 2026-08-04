@@ -127,6 +127,9 @@ struct RealtimePlaybackReceipt: Codable, Sendable, Equatable {
 /// carries `request_id/session_id/sequence` for isolation and rejection of
 /// late frames from prior sessions.
 enum RealtimeDownlinkKind: String, Codable, Sendable {
+    /// Bridge handshake ack; Watch/iPhone treat it as a benign no-op that
+    /// simply proves the socket accepted the `start` frame.
+    case ready = "ready"
     case audioDelta = "audio.delta"
     case transcriptDelta = "transcript.delta"
     case transcriptFinal = "transcript.final"
@@ -145,6 +148,11 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
     let audio: VoiceStreamChunk?
     let transcript: String?
     let reason: String?
+    /// ESS-330: real Agent response_id carried on `audio.delta` / `audio.done`.
+    /// Bridge PR #113 emits this per delta and expects it back on playback
+    /// receipts so multi-response sessions are disambiguated. Absent for
+    /// event kinds that have no notion of an Agent response.
+    let responseId: String?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
@@ -155,13 +163,25 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         case audio
         case transcript
         case reason
+        case responseId = "response_id"
     }
 
-    static func audioDelta(_ chunk: VoiceStreamChunk) -> Self {
+    /// Bridge PR #113 handshake ack. Carries no payload. Adapter treats this
+    /// as "socket is live" and does nothing further.
+    static func ready(requestId: String, sessionId: String) -> Self {
+        RealtimeDownlinkEnvelope(
+            protocolVersion: RealtimeWireVersion.downlink,
+            kind: .ready, requestId: requestId, sessionId: sessionId,
+            sequence: nil, audio: nil, transcript: nil, reason: nil, responseId: nil
+        )
+    }
+
+    static func audioDelta(_ chunk: VoiceStreamChunk, responseId: String? = nil) -> Self {
         RealtimeDownlinkEnvelope(
             protocolVersion: RealtimeWireVersion.downlink,
             kind: .audioDelta, requestId: chunk.requestId, sessionId: chunk.streamId,
-            sequence: chunk.sequence, audio: chunk, transcript: nil, reason: nil
+            sequence: chunk.sequence, audio: chunk, transcript: nil, reason: nil,
+            responseId: responseId
         )
     }
 
@@ -169,7 +189,7 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         RealtimeDownlinkEnvelope(
             protocolVersion: RealtimeWireVersion.downlink,
             kind: .transcriptDelta, requestId: requestId, sessionId: sessionId,
-            sequence: nil, audio: nil, transcript: text, reason: nil
+            sequence: nil, audio: nil, transcript: text, reason: nil, responseId: nil
         )
     }
 
@@ -177,15 +197,16 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         RealtimeDownlinkEnvelope(
             protocolVersion: RealtimeWireVersion.downlink,
             kind: .transcriptFinal, requestId: requestId, sessionId: sessionId,
-            sequence: nil, audio: nil, transcript: text, reason: nil
+            sequence: nil, audio: nil, transcript: text, reason: nil, responseId: nil
         )
     }
 
-    static func audioDone(requestId: String, sessionId: String) -> Self {
+    static func audioDone(requestId: String, sessionId: String, responseId: String? = nil) -> Self {
         RealtimeDownlinkEnvelope(
             protocolVersion: RealtimeWireVersion.downlink,
             kind: .audioDone, requestId: requestId, sessionId: sessionId,
-            sequence: nil, audio: nil, transcript: nil, reason: nil
+            sequence: nil, audio: nil, transcript: nil, reason: nil,
+            responseId: responseId
         )
     }
 
@@ -193,7 +214,7 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         RealtimeDownlinkEnvelope(
             protocolVersion: RealtimeWireVersion.downlink,
             kind: .playbackClear, requestId: requestId, sessionId: sessionId,
-            sequence: nil, audio: nil, transcript: nil, reason: nil
+            sequence: nil, audio: nil, transcript: nil, reason: nil, responseId: nil
         )
     }
 
@@ -201,7 +222,7 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         RealtimeDownlinkEnvelope(
             protocolVersion: RealtimeWireVersion.downlink,
             kind: .responseInterrupted, requestId: requestId, sessionId: sessionId,
-            sequence: nil, audio: nil, transcript: nil, reason: reason
+            sequence: nil, audio: nil, transcript: nil, reason: reason, responseId: nil
         )
     }
 
@@ -209,7 +230,7 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         RealtimeDownlinkEnvelope(
             protocolVersion: RealtimeWireVersion.downlink,
             kind: .bridgeFallback, requestId: requestId, sessionId: sessionId,
-            sequence: nil, audio: nil, transcript: nil, reason: reason
+            sequence: nil, audio: nil, transcript: nil, reason: reason, responseId: nil
         )
     }
 }

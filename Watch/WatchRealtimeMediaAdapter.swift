@@ -70,6 +70,12 @@ final class WatchRealtimeMediaAdapter {
     private let logger: (String) -> Void
     private(set) var didTriggerCompleteFileFallback = false
     private(set) var currentTurn: RealtimeMediaSession.TurnHandle?
+    /// ESS-330: latest `response_id` observed on `audio.delta` for the current
+    /// turn. Bridge PR #113 (`realtime-media-session.mjs:67-70`) tags every
+    /// delta with the real Agent response_id and expects playback receipts
+    /// (`playback.started/ended`) to echo the same value so multi-response
+    /// sessions stay disambiguated. Cleared when the turn ends.
+    private(set) var currentResponseId: String?
 
     init(
         session: RealtimeMediaSession = RealtimeMediaSession(),
@@ -97,13 +103,22 @@ final class WatchRealtimeMediaAdapter {
             case .started(let requestId, let sessionId):
                 if let handle = self.currentTurn,
                    handle.requestId == requestId, handle.sessionId == sessionId {
-                    self.transport.sendPlaybackStarted(handle: handle, responseId: sessionId)
+                    // ESS-330: stamp the real Bridge response_id if we saw
+                    // one on an audio.delta; else fall through to sessionId
+                    // as a legacy hint (Bridge treats unknown ids as
+                    // "unmapped", still better than absent).
+                    self.transport.sendPlaybackStarted(
+                        handle: handle,
+                        responseId: self.currentResponseId ?? sessionId
+                    )
                 }
             case .ended(let requestId, let sessionId, let bytesPlayed):
                 if let handle = self.currentTurn,
                    handle.requestId == requestId, handle.sessionId == sessionId {
                     self.transport.sendPlaybackEnded(
-                        handle: handle, responseId: sessionId, bytesPlayed: bytesPlayed
+                        handle: handle,
+                        responseId: self.currentResponseId ?? sessionId,
+                        bytesPlayed: bytesPlayed
                     )
                 }
                 self.session.markDownlinkFinished()
@@ -121,6 +136,7 @@ final class WatchRealtimeMediaAdapter {
     /// cannot start.
     func beginTurn(requestId: String) -> RealtimeMediaSession.TurnHandle {
         didTriggerCompleteFileFallback = false
+        currentResponseId = nil
         let handle = session.beginTurn(requestId: requestId)
         currentTurn = handle
         do {
@@ -155,7 +171,21 @@ final class WatchRealtimeMediaAdapter {
 
     /// Feed a downlink chunk received from the iPhone. Called by
     /// `PhoneConnectivity` after WSS parses the `audio.delta` off the wire.
-    func ingestDownlink(_ chunk: VoiceStreamChunk) {
+    ///
+    /// `responseId` (ESS-330) is the real Bridge `response_id` extracted from
+    /// the flat `audio.delta` frame. When the current turn's response_id
+    /// changes (multi-response session), the coordinator's playback buffer
+    /// is barged in so late frames from the prior response cannot bleed into
+    /// the new one, matching Bridge's per-response boundary.
+    func ingestDownlink(_ chunk: VoiceStreamChunk, responseId: String? = nil) {
+        if let newResponseId = responseId,
+           let previous = currentResponseId,
+           newResponseId != previous {
+            // Response boundary within the same session — clear the buffer so
+            // the new response's audio plays cleanly.
+            session.bargeInDownlink()
+        }
+        if let newResponseId = responseId { currentResponseId = newResponseId }
         session.receiveDownlink(chunk)
     }
 
@@ -207,6 +237,7 @@ final class WatchRealtimeMediaAdapter {
         case .turnFinished(let handle, let reason):
             if handle == currentTurn {
                 currentTurn = nil
+                currentResponseId = nil
             }
             logger("turn_finished request=\(handle.requestId) reason=\(reason)")
         }

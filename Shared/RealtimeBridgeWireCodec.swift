@@ -127,65 +127,116 @@ enum RealtimeBridgeWireCodec {
 
     // MARK: - Downlink (Bridge → iPhone)
 
+    /// Decode outcome. The transport uses this to distinguish "we parsed a
+    /// frame we know how to route" from "the peer sent a well-formed frame
+    /// of a type we don't recognise" from "the bytes were malformed". The
+    /// unknown-type case is important because Bridge PR #113 introduces
+    /// `ready` (ESS-329) and future revisions may add more heartbeats /
+    /// server-side hints — swallowing them into `.failure` kills the socket
+    /// (ESS-329 real-world regression).
+    enum DecodeOutcome {
+        case envelope(RealtimeDownlinkEnvelope)
+        /// Well-formed JSON with a `type` field the codec does not recognise.
+        /// Transport logs and keeps receiving; coordinator does nothing.
+        case unrecognised(type: String)
+        /// Bytes were not decodable as the flat Bridge shape.
+        case malformed
+    }
+
     /// Decode a flat Bridge-shape JSON string into the tagged-union envelope
-    /// the Watch coordinator consumes.
+    /// the Watch coordinator consumes. Convenience overload for backwards
+    /// compatibility — callers that need to distinguish unrecognised types
+    /// from malformed frames should use `decodeOutcome(_:)` directly.
     static func decode(_ text: String) -> RealtimeDownlinkEnvelope? {
         guard let data = text.data(using: .utf8) else { return nil }
         return decode(data)
     }
 
     static func decode(_ data: Data) -> RealtimeDownlinkEnvelope? {
+        if case .envelope(let envelope) = decodeOutcome(data) { return envelope }
+        return nil
+    }
+
+    static func decodeOutcome(_ text: String) -> DecodeOutcome {
+        guard let data = text.data(using: .utf8) else { return .malformed }
+        return decodeOutcome(data)
+    }
+
+    static func decodeOutcome(_ data: Data) -> DecodeOutcome {
         guard let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
+            return .malformed
         }
         guard let type = raw["type"] as? String,
               let requestId = raw["request_id"] as? String,
-              let sessionId = raw["session_id"] as? String else { return nil }
+              let sessionId = raw["session_id"] as? String else {
+            return .malformed
+        }
         switch type {
+        case "ready":
+            return .envelope(.ready(requestId: requestId, sessionId: sessionId))
         case "audio.delta":
             guard
                 let sequence = raw["sequence"] as? Int,
                 let base64 = raw["audio"] as? String,
                 let audioBytes = Data(base64Encoded: base64)
-            else { return nil }
+            else { return .malformed }
             let codec = (raw["codec"] as? String) ?? RealtimeMediaFormat.downlinkPCM16.codec
             let sampleRate = (raw["sample_rate"] as? Int) ?? RealtimeMediaFormat.downlinkPCM16.sampleRate
             let capturedAt = (raw["captured_at_ms"] as? Int64)
                 ?? Int64((raw["captured_at_ms"] as? Int) ?? 0)
             let endOfStream = (raw["end_of_stream"] as? Bool) ?? false
+            let responseId = raw["response_id"] as? String
             let chunk = VoiceStreamChunk(
                 requestId: requestId, streamId: sessionId, direction: .downlink,
                 sequence: sequence, capturedAtMs: capturedAt > 0 ? capturedAt : 1,
                 codec: codec, sampleRate: sampleRate,
                 payload: audioBytes, endOfStream: endOfStream
             )
-            return .audioDelta(chunk)
+            // ESS-330: preserve Bridge's real response_id on the envelope so
+            // the adapter can stamp playback receipts with it.
+            return .envelope(RealtimeDownlinkEnvelope(
+                protocolVersion: RealtimeWireVersion.downlink,
+                kind: .audioDelta,
+                requestId: requestId, sessionId: sessionId,
+                sequence: sequence,
+                audio: chunk,
+                transcript: nil,
+                reason: nil,
+                responseId: responseId
+            ))
         case "transcript.delta":
-            return .transcriptDelta(
+            return .envelope(.transcriptDelta(
                 requestId: requestId, sessionId: sessionId,
                 text: (raw["text"] as? String) ?? ""
-            )
+            ))
         case "transcript.final":
-            return .transcriptFinal(
+            return .envelope(.transcriptFinal(
                 requestId: requestId, sessionId: sessionId,
                 text: (raw["text"] as? String) ?? ""
-            )
+            ))
         case "audio.done":
-            return .audioDone(requestId: requestId, sessionId: sessionId)
+            let responseId = raw["response_id"] as? String
+            return .envelope(RealtimeDownlinkEnvelope(
+                protocolVersion: RealtimeWireVersion.downlink,
+                kind: .audioDone,
+                requestId: requestId, sessionId: sessionId,
+                sequence: nil, audio: nil, transcript: nil, reason: nil,
+                responseId: responseId
+            ))
         case "playback.clear":
-            return .playbackClear(requestId: requestId, sessionId: sessionId)
+            return .envelope(.playbackClear(requestId: requestId, sessionId: sessionId))
         case "response.interrupted":
-            return .responseInterrupted(
+            return .envelope(.responseInterrupted(
                 requestId: requestId, sessionId: sessionId,
                 reason: (raw["reason"] as? String) ?? "unspecified"
-            )
+            ))
         case "stream.fallback":
-            return .bridgeFallback(
+            return .envelope(.bridgeFallback(
                 requestId: requestId, sessionId: sessionId,
                 reason: (raw["reason"] as? String) ?? "unspecified"
-            )
+            ))
         default:
-            return nil
+            return .unrecognised(type: type)
         }
     }
 }

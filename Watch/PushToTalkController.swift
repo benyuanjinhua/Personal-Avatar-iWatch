@@ -75,6 +75,12 @@ final class PushToTalkController: ObservableObject {
     /// streaming gate is on. Wiring lives in `ensureRealtimeAdapter()`.
     private(set) var realtimeAdapter: WatchRealtimeMediaAdapter?
     private var pendingRealtimeRecording: [String: AudioRecorder.Recording] = [:]
+    /// ESS-331: fast-channel failures can arrive while the m4a is still being
+    /// recorded (i.e. before `finishRecording()`). When that happens we keep
+    /// the fallback intent here and honour it in `submit(recording:)` — the
+    /// adapter's single-shot flag already prevents re-entry, so this map
+    /// tracks the "already promised, still owed" outstanding fallbacks.
+    private var pendingFallbackReason: [String: RealtimeUplinkStream.FallbackReason] = [:]
     /// A release can arrive while AVAudioRecorder is still being prepared. Keep
     /// it pending and finish only after record() has actually succeeded.
     private var releaseRequestedWhileStarting = false
@@ -474,12 +480,23 @@ final class PushToTalkController: ObservableObject {
         )
         retryStore.save(requestId: envelope.requestId, data: recording.data, durationMs: recording.durationMs)
 
-        if let adapter = realtimeAdapter, adapter.currentTurn?.requestId == requestId.uuidString.lowercased() {
+        let requestIdStr = requestId.uuidString.lowercased()
+        // ESS-331: if the fast channel died while recording was still in
+        // flight, the adapter has already tripped its single-shot flag. Now
+        // that the m4a exists, honour the deferred fallback with the real
+        // recording body — this is the one and only allowed integer full-file
+        // upload for this turn.
+        if let deferredReason = pendingFallbackReason.removeValue(forKey: requestIdStr) {
+            submitFullFileFallback(
+                recording: recording, requestId: requestIdStr, reason: deferredReason
+            )
+        } else if let adapter = realtimeAdapter,
+                  adapter.currentTurn?.requestId == requestIdStr {
             // ESS-321: streaming path is live. Retain the m4a so a fast-channel
             // failure can invoke the single-shot fallback with the real body;
             // commit the uplink and skip the direct full-file submission —
             // the Bridge will assemble the answer from PCM frames.
-            retainRealtimeRecording(recording, forRequestId: requestId.uuidString.lowercased())
+            retainRealtimeRecording(recording, forRequestId: requestIdStr)
             adapter.commit()
             WatchLog.info(
                 "realtime", "uplink_committed",
@@ -521,7 +538,7 @@ final class PushToTalkController: ObservableObject {
             player: playbackEngine,
             transport: transport,
             fullFileFallback: { [weak self] handle, reason in
-                Task { @MainActor in self?.performFullFileFallback(handle: handle, reason: reason) }
+                self?.performFullFileFallback(handle: handle, reason: reason)
             },
             logger: { message in
                 WatchLog.info("realtime", "adapter", detail: message)
@@ -531,23 +548,37 @@ final class PushToTalkController: ObservableObject {
         return adapter
     }
 
-    /// Called by the adapter when the fast channel dies. Uses the recording
-    /// the PTT flow just produced (kept in `pendingRealtimeRecording`) to
-    /// invoke the existing reliable full-file relay path exactly once — the
-    /// adapter's single-shot flag already gates re-entry.
+    /// Called by the adapter when the fast channel dies. If the recording
+    /// has already been finalised, upload it via the reliable path
+    /// immediately; otherwise (ESS-331: failure fired mid-record) record the
+    /// intent so `submit(recording:)` can honour it once the m4a exists.
+    /// The adapter's single-shot flag guarantees this is called at most once
+    /// per turn, so this map holds at most one deferred fallback per turn.
     private func performFullFileFallback(
         handle: RealtimeMediaSession.TurnHandle,
         reason: RealtimeUplinkStream.FallbackReason
     ) {
-        guard let recording = pendingRealtimeRecording.removeValue(forKey: handle.requestId) else {
-            WatchLog.error(
-                "realtime", "fallback_no_recording",
+        if let recording = pendingRealtimeRecording.removeValue(forKey: handle.requestId) {
+            submitFullFileFallback(recording: recording, requestId: handle.requestId, reason: reason)
+        } else {
+            pendingFallbackReason[handle.requestId] = reason
+            WatchLog.info(
+                "realtime", "fallback_deferred_until_recording_finish",
                 requestId: handle.requestId,
-                detail: "reason=\(reason)", code: "ERR_FALLBACK_NO_M4A"
+                detail: "reason=\(reason)"
             )
-            return
         }
-        let uuid = UUID(uuidString: handle.requestId) ?? UUIDv7.generate()
+    }
+
+    /// Actual m4a upload via the existing reliable relay path. Called both
+    /// on immediate fallback (adapter fires after recording finishes) and on
+    /// deferred fallback (adapter fired mid-record, `submit` picks it up).
+    private func submitFullFileFallback(
+        recording: AudioRecorder.Recording,
+        requestId: String,
+        reason: RealtimeUplinkStream.FallbackReason
+    ) {
+        let uuid = UUID(uuidString: requestId) ?? UUIDv7.generate()
         let envelope = VoiceRequestEnvelope.voiceRequest(
             requestId: uuid,
             audio: VoiceAudioDescriptor(
@@ -566,7 +597,7 @@ final class PushToTalkController: ObservableObject {
         transport.send(envelope: envelope, recording: recording)
         WatchLog.info(
             "realtime", "fallback_full_file_submitted",
-            requestId: handle.requestId,
+            requestId: requestId,
             detail: "reason=\(reason) duration_ms=\(recording.durationMs) bytes=\(recording.data.count)"
         )
     }
@@ -576,6 +607,12 @@ final class PushToTalkController: ObservableObject {
     /// submitted normally or the adapter consumes it.
     func retainRealtimeRecording(_ recording: AudioRecorder.Recording, forRequestId requestId: String) {
         pendingRealtimeRecording[requestId] = recording
+    }
+
+    /// Snapshot for tests: outstanding deferred fallback reasons keyed by
+    /// request id. Production paths do not read this.
+    var deferredFallbackReasons: [String: RealtimeUplinkStream.FallbackReason] {
+        pendingFallbackReason
     }
 
     /// 一键重试（ESS-55）：用缓存的录音换新 request_id 重发，不需要重新说话。
