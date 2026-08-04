@@ -217,6 +217,23 @@ final class PushToTalkController: ObservableObject {
     /// 透传到回调，做语义级判断。
     private static let resultAckMinBytes = 20_000
 
+    /// 播放终局映射到结果卡错误码。错误提示音使用 `error-<request_id>` 作为
+    /// context；它自己的播放失败只留结构化日志，不能再次弹错误卡并递归播报。
+    /// `.halted` 是可恢复的系统中断，继续由「未播完 · 重播」承担，不升级为错误。
+    static func avatarErrorCode(requestId: String, endgame: PlaybackEndgame) -> String? {
+        guard !requestId.hasPrefix("error-") else { return nil }
+        switch endgame {
+        case .exhausted, .resumeFailed:
+            return "ERR_PLAYBACK_ACTIVATION"
+        case .deferredTimeout:
+            return "ERR_PLAYBACK_DEFERRED_TIMEOUT"
+        case .playRejected:
+            return "ERR_PLAY_RETURNED_FALSE"
+        case .success, .halted:
+            return nil
+        }
+    }
+
     private func handlePlaybackEndgame(requestId: String?, bytes: Int, endgame: PlaybackEndgame) {
         // ESS-171 + ESS-233: 播放成功且是真回复（非 interim/fallback）才触发 ACK。
         // interim（16.8KB fallback）尚未使 turn 达终态，ACK 会被 Bridge 拒
@@ -242,14 +259,7 @@ final class PushToTalkController: ObservableObject {
         )
         var presentedError = false
         if let requestId {
-            let code: String?
-            switch endgame {
-            case .exhausted: code = "ERR_PLAYBACK_ACTIVATION"
-            case .deferredTimeout: code = "ERR_PLAYBACK_DEFERRED_TIMEOUT"
-            case .playRejected: code = "ERR_PLAY_RETURNED_FALSE"
-            default: code = nil
-            }
-            if let code {
+            if let code = Self.avatarErrorCode(requestId: requestId, endgame: endgame) {
                 presentTranscriptOnly(requestId: requestId)
                 presentAvatarError(code: code, requestId: requestId)
                 presentedError = true
