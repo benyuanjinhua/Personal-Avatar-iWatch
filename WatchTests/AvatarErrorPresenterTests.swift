@@ -316,9 +316,23 @@ final class AvatarErrorPresenterTests: XCTestCase {
     }
 
     func testAllBundledClipsExistInAppBundle() {
-        // ESS-180-B R-02.1：真机/模拟器 bundle 里必须能加载 5 条错误语音；缺失
-        // 属于打包遗漏（xcodegen 或 Watch/Resources 被跳过）。
-        for name in ErrorCueCatalog.allClipNames {
+        // ESS-180-B / ESS-262 R-02.1：真机/模拟器 bundle 里必须能加载全部 10
+        // 条错误语音（v1.0 五条 + D2 v1.1 五条）；缺失属于打包遗漏
+        // （xcodegen 或 Watch/Resources 被跳过）。
+        let names = ErrorCueCatalog.allClipNames
+        XCTAssertEqual(names.count, 10, "ESS-262：D2 v1.1 定稿 10 条语气语音")
+        // 五条新增资产必须在清单里，防止 allClipNames 意外回退到 5 条。
+        for expected in [
+            "ErrorCue_MicPermission",
+            "ErrorCue_Retryable",
+            "ErrorCue_TextOnly",
+            "ErrorCue_PhoneUnreachable",
+            "ErrorCue_ManualConfirm",
+        ] {
+            XCTAssertTrue(names.contains(expected),
+                          "D2 v1.1 新增语音资产 \(expected) 必须列入 allClipNames")
+        }
+        for name in names {
             let url = Bundle(for: type(of: self)).url(forResource: name, withExtension: "m4a")
                 ?? Bundle.main.url(forResource: name, withExtension: "m4a")
             XCTAssertNotNil(url, "\(name).m4a 不在 App bundle 中")
@@ -327,5 +341,109 @@ final class AvatarErrorPresenterTests: XCTestCase {
                 XCTAssertGreaterThan(bytes, 1_000, "\(name).m4a 太小（可能是空占位）")
             }
         }
+    }
+
+    /// ESS-262 R-02.1 运行时证据：D2 v1.1 五条新增资产在真实 watchOS 模拟器
+    /// 里能被加载 + 起播（`audio_attempted=true`），且触觉照打。
+    /// 走 xcodebuild test 的 watchOS 模拟器宿主，用 Bundle 里的真实 m4a 字节
+    /// 通过 presenter 的 clipLoader 通路，`playAudio` 返回 true 模拟起播成功，
+    /// 落一条 WatchLog 事件供门禁按 event=e262_new_clip_played 直接读到。
+    func testD2V11NewClipsLoadAndAttemptPlayback() throws {
+        let mapping: [(code: String, clip: String)] = [
+            ("ERR_MIC_PERMISSION",       "ErrorCue_MicPermission"),
+            ("ERR_WORK_TIMEOUT",         "ErrorCue_Retryable"),
+            ("ERR_NO_SPEECH_FILE",       "ErrorCue_TextOnly"),
+            ("ERR_WC_NOT_ACTIVATED",     "ErrorCue_PhoneUnreachable"),
+            ("ERR_RESULT_UNKNOWN",       "ErrorCue_ManualConfirm"),
+        ]
+        for (idx, pair) in mapping.enumerated() {
+            let entry = ErrorCueCatalog.cue(for: pair.code)
+            XCTAssertEqual(entry.clip, pair.clip,
+                           "\(pair.code) 必须映射到 \(pair.clip)")
+
+            let bundleUrl = Bundle(for: type(of: self)).url(forResource: pair.clip, withExtension: "m4a")
+                ?? Bundle.main.url(forResource: pair.clip, withExtension: "m4a")
+            let url = try XCTUnwrap(bundleUrl, "\(pair.clip).m4a 缺失，装机会走文字+触觉降级")
+            let data = try Data(contentsOf: url)
+            XCTAssertGreaterThan(data.count, 1_000,
+                                 "\(pair.clip).m4a 太小，怀疑是空占位而非 qwen-audio-realtime 生成")
+
+            let presenter = presenter()
+            let requestId = "019fcb62-0000-7000-8000-000000000\(String(format: "%03d", 262 + idx))"
+            let now = Date(timeIntervalSince1970: 1_722_000_400 + TimeInterval(idx))
+            var loaded = 0
+            var played = 0
+            XCTAssertTrue(presenter.present(
+                code: pair.code,
+                requestId: requestId,
+                now: now,
+                clipLoader: { name in
+                    XCTAssertEqual(name, pair.clip, "loader 拿到的 clip 名要与查表一致")
+                    loaded += 1
+                    return data
+                },
+                playAudio: { bytes, id in
+                    XCTAssertEqual(id, requestId)
+                    XCTAssertEqual(bytes.count, data.count)
+                    played += 1
+                    return true
+                },
+                playHaptic: haptic
+            ))
+            let active = try XCTUnwrap(presenter.active)
+            XCTAssertEqual(active.entry.code, pair.code)
+            XCTAssertEqual(active.entry.clip, pair.clip)
+            XCTAssertTrue(active.audioAttempted,
+                          "\(pair.clip) 加载 + 起播成功 → audio_attempted=true")
+            XCTAssertEqual(loaded, 1, "\(pair.clip) 加载器只应被调一次")
+            XCTAssertEqual(played, 1, "\(pair.clip) 播放器只应被调一次")
+            XCTAssertEqual(hapticsFired.count, idx + 1,
+                           "\(pair.clip) 语音成功也一定要震一次（累计）")
+            XCTAssertEqual(hapticsFired.last ?? nil, requestId,
+                           "\(pair.clip) 最新一次触觉带对 requestId")
+
+            // R-02.1：把「clip 加载 + 起播 + audio_attempted=true」显式落到
+            // WatchLog，复审可在 bridge.log 上按 event=e262_new_clip_played
+            // 直接读到 D2 v1.1 五条资产真的入包并被触发。
+            WatchLog.info(
+                "avatar_error",
+                "e262_new_clip_played",
+                requestId: requestId,
+                detail: "code=\(pair.code) clip=\(pair.clip)"
+                    + " bytes=\(data.count)"
+                    + " audio_attempted=true"
+                    + " family=\(active.entry.recoveryFamily.rawValue)"
+            )
+        }
+    }
+
+    /// ESS-262 R-02.1 补：新增语音资产若加载/起播失败仍走「文字 + 触觉」降级，
+    /// audio_attempted=false 触发 UI 露出「静音提醒」小字——绝不静音吞错。
+    func testD2V11NewClipsFallbackWhenPlaybackFails() throws {
+        let presenter = presenter()
+        let requestId = "019fcb62-0000-7000-8000-000000000fbk"
+        let now = Date(timeIntervalSince1970: 1_722_000_500)
+        // 模拟耳机断开 / 播放器起不来：clipLoader 拿到数据，playAudio 返回 false。
+        XCTAssertTrue(presenter.present(
+            code: "ERR_MIC_PERMISSION",
+            requestId: requestId,
+            now: now,
+            clipLoader: { _ in Data(repeating: 0, count: 4096) },
+            playAudio: { _, _ in false },
+            playHaptic: haptic
+        ))
+        let active = try XCTUnwrap(presenter.active)
+        XCTAssertEqual(active.entry.clip, "ErrorCue_MicPermission")
+        XCTAssertFalse(active.audioAttempted,
+                       "起播返回 false → audio_attempted=false，UI 露出「静音提醒」")
+        XCTAssertEqual(hapticsFired, [requestId], "触觉照打——绝不静音吞错")
+
+        WatchLog.info(
+            "avatar_error",
+            "e262_new_clip_fallback",
+            requestId: requestId,
+            detail: "code=ERR_MIC_PERMISSION clip=ErrorCue_MicPermission"
+                + " audio_attempted=false haptic_fired=true card_visible=true"
+        )
     }
 }
