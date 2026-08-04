@@ -59,29 +59,28 @@ final class PhoneRealtimeWebSocketTransport: PhoneRealtimeSession.Transport {
                 guard let self, !self.isClosed else { return }
                 switch result {
                 case .success(let message):
+                    let outcome: RealtimeBridgeWireCodec.DecodeResult
                     switch message {
-                    case .data(let data):
-                        if let envelope = RealtimeBridgeWireCodec.decode(data) {
-                            handler(.success(envelope))
-                        } else {
-                            handler(.failure(NSError(
-                                domain: "PhoneRealtimeWebSocketTransport", code: 3,
-                                userInfo: [NSLocalizedDescriptionKey: "invalid downlink frame"]
-                            )))
-                        }
-                    case .string(let text):
-                        if let envelope = RealtimeBridgeWireCodec.decode(text) {
-                            handler(.success(envelope))
-                        } else {
-                            handler(.failure(NSError(
-                                domain: "PhoneRealtimeWebSocketTransport", code: 4,
-                                userInfo: [NSLocalizedDescriptionKey: "invalid downlink frame"]
-                            )))
-                        }
+                    case .data(let data): outcome = RealtimeBridgeWireCodec.classify(data)
+                    case .string(let text): outcome = RealtimeBridgeWireCodec.classify(text)
                     @unknown default:
                         handler(.failure(NSError(
                             domain: "PhoneRealtimeWebSocketTransport", code: 5,
                             userInfo: [NSLocalizedDescriptionKey: "unknown message kind"]
+                        )))
+                        return
+                    }
+                    switch outcome {
+                    case .envelope(let envelope):
+                        handler(.success(envelope))
+                    case .ignore:
+                        // Bridge handshake frame (e.g. `ready`) — keep the
+                        // receive loop alive without waking the coordinator.
+                        self.receive(handler: handler)
+                    case .invalid:
+                        handler(.failure(NSError(
+                            domain: "PhoneRealtimeWebSocketTransport", code: 3,
+                            userInfo: [NSLocalizedDescriptionKey: "invalid downlink frame"]
                         )))
                     }
                 case .failure(let error):

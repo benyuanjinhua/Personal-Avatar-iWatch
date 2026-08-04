@@ -197,6 +197,96 @@ final class RealtimeBridgeWireCodecTests: XCTestCase {
         ]
         let data = try! JSONSerialization.data(withJSONObject: bridgeMessage)
         XCTAssertNil(RealtimeBridgeWireCodec.decode(data))
+        XCTAssertEqual(RealtimeBridgeWireCodec.classify(data), .invalid)
+    }
+
+    // MARK: - Handshake / ignorable frames (ESS-329)
+
+    func testReadyHandshakeClassifiesAsIgnore() throws {
+        // Bridge PR #113 emits this the moment `start` succeeds; the client
+        // must absorb it silently, not treat it as an invalid downlink.
+        let bridgeMessage: [String: Any] = [
+            "type": "ready",
+            "request_id": requestId,
+            "session_id": sessionId
+        ]
+        let data = try JSONSerialization.data(withJSONObject: bridgeMessage)
+        XCTAssertEqual(RealtimeBridgeWireCodec.classify(data), .ignore)
+        // `decode` still returns nil (there is no business envelope), but the
+        // transport must not confuse `.ignore` with `.invalid`.
+        XCTAssertNil(RealtimeBridgeWireCodec.decode(data))
+    }
+
+    func testUnknownDownlinkTypeClassifiesAsInvalid() throws {
+        let bridgeMessage: [String: Any] = [
+            "type": "brand.new.event",
+            "request_id": requestId,
+            "session_id": sessionId
+        ]
+        let data = try JSONSerialization.data(withJSONObject: bridgeMessage)
+        XCTAssertEqual(RealtimeBridgeWireCodec.classify(data), .invalid)
+    }
+
+    func testMissingIdentifiersClassifiesAsInvalid() throws {
+        let bridgeMessage: [String: Any] = [
+            "type": "ready",
+            "request_id": requestId
+            // session_id intentionally omitted
+        ]
+        let data = try JSONSerialization.data(withJSONObject: bridgeMessage)
+        XCTAssertEqual(RealtimeBridgeWireCodec.classify(data), .invalid)
+    }
+
+    /// End-to-end protocol contract for the sequence Bridge PR #113 actually
+    /// runs: uplink `start` is encoded flat, downlink `ready` is absorbed
+    /// silently, uplink `audio.append` still encodes normally, and downlink
+    /// `audio.delta` decodes into a business envelope. Covers the exact order
+    /// ESS-329 asked for.
+    func testProtocolSequenceStartReadyAudioAppendAudioDelta() throws {
+        // 1. Uplink: start
+        let start = RealtimeStreamStart(
+            requestId: requestId, sessionId: sessionId,
+            format: .uplinkPCM16, capturedAtMs: 1_800_000_000_000
+        )
+        let startWire = try XCTUnwrap(RealtimeBridgeWireCodec.encode(RealtimeBridgeWireCodec.UplinkFlatFrame.start(start)))
+        XCTAssertTrue(startWire.contains("\"type\":\"start\""))
+
+        // 2. Downlink: ready — must classify as `.ignore`, never `.invalid`.
+        let readyPayload: [String: Any] = [
+            "type": "ready",
+            "request_id": requestId,
+            "session_id": sessionId
+        ]
+        let readyData = try JSONSerialization.data(withJSONObject: readyPayload)
+        XCTAssertEqual(RealtimeBridgeWireCodec.classify(readyData), .ignore)
+
+        // 3. Uplink: audio.append still encodes normally after `ready`.
+        let chunk = VoiceStreamChunk(
+            requestId: requestId, streamId: sessionId, direction: .uplink,
+            sequence: 0, capturedAtMs: 1_800_000_000_001,
+            codec: "pcm_s16le", sampleRate: 16_000,
+            payload: Data([0xAA, 0xBB])
+        )
+        let appendWire = try XCTUnwrap(RealtimeBridgeWireCodec.encode(RealtimeBridgeWireCodec.UplinkFlatFrame.audioAppend(chunk)))
+        XCTAssertTrue(appendWire.contains("\"type\":\"audio.append\""))
+
+        // 4. Downlink: audio.delta must classify as a business envelope.
+        let deltaBytes = Data(repeating: 0xCD, count: 32)
+        let deltaPayload: [String: Any] = [
+            "type": "audio.delta",
+            "request_id": requestId,
+            "session_id": sessionId,
+            "sequence": 0,
+            "sample_rate": 24_000,
+            "codec": "pcm_s16le",
+            "audio": deltaBytes.base64EncodedString()
+        ]
+        let deltaData = try JSONSerialization.data(withJSONObject: deltaPayload)
+        guard case .envelope(let envelope) = RealtimeBridgeWireCodec.classify(deltaData) else {
+            return XCTFail("audio.delta must classify as envelope")
+        }
+        XCTAssertEqual(envelope.kind, .audioDelta)
+        XCTAssertEqual(envelope.audio?.payload, deltaBytes)
     }
 
     // MARK: - Round-trip via coordinator

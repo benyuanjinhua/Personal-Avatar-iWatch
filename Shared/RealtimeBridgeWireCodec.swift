@@ -127,20 +127,60 @@ enum RealtimeBridgeWireCodec {
 
     // MARK: - Downlink (Bridge → iPhone)
 
+    /// Outcome of decoding a Bridge downlink frame.
+    ///
+    ///  * `.envelope` — a business event the coordinator must see.
+    ///  * `.ignore`   — a recognized non-business frame the transport must
+    ///                  absorb silently and keep the receive loop alive.
+    ///                  Bridge PR #113 emits `{type:"ready"}` immediately after
+    ///                  a successful `start`; it is a handshake ack, not
+    ///                  something the Watch layer needs to see.
+    ///  * `.invalid`  — genuinely unparseable / unknown; caller should fail.
+    enum DecodeResult: Equatable {
+        case envelope(RealtimeDownlinkEnvelope)
+        case ignore
+        case invalid
+    }
+
+    /// Non-business frame types that Bridge PR #113 emits alongside real
+    /// events. Whitelisted so an unknown type still surfaces as `.invalid`
+    /// rather than being silently swallowed.
+    private static let ignoredDownlinkTypes: Set<String> = ["ready"]
+
+    static func classify(_ text: String) -> DecodeResult {
+        guard let data = text.data(using: .utf8) else { return .invalid }
+        return classify(data)
+    }
+
+    static func classify(_ data: Data) -> DecodeResult {
+        guard let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = raw["type"] as? String,
+              let requestId = raw["request_id"] as? String,
+              let sessionId = raw["session_id"] as? String else { return .invalid }
+        if ignoredDownlinkTypes.contains(type) { return .ignore }
+        if let envelope = decodeBusiness(type: type, requestId: requestId, sessionId: sessionId, raw: raw) {
+            return .envelope(envelope)
+        }
+        return .invalid
+    }
+
     /// Decode a flat Bridge-shape JSON string into the tagged-union envelope
-    /// the Watch coordinator consumes.
+    /// the Watch coordinator consumes. Returns `nil` for both `.ignore` and
+    /// `.invalid`; prefer `classify` when the caller needs to distinguish
+    /// handshake frames from bad frames.
     static func decode(_ text: String) -> RealtimeDownlinkEnvelope? {
         guard let data = text.data(using: .utf8) else { return nil }
         return decode(data)
     }
 
     static func decode(_ data: Data) -> RealtimeDownlinkEnvelope? {
-        guard let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-        guard let type = raw["type"] as? String,
-              let requestId = raw["request_id"] as? String,
-              let sessionId = raw["session_id"] as? String else { return nil }
+        if case .envelope(let envelope) = classify(data) { return envelope }
+        return nil
+    }
+
+    private static func decodeBusiness(
+        type: String, requestId: String, sessionId: String, raw: [String: Any]
+    ) -> RealtimeDownlinkEnvelope? {
         switch type {
         case "audio.delta":
             guard
