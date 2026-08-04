@@ -397,6 +397,94 @@ final class WatchVoiceTransport: ObservableObject {
         }
     }
 
+    // MARK: - ESS-321 real-time media hop
+
+    /// Watch → iPhone real-time envelope (start/append/commit/fallback). Uses
+    /// `sendMessage` as the reachable-only fast path; on failure, notifies the
+    /// adapter so the coordinator can trigger the single full-file fallback.
+    func sendRealtimeUplink(_ envelope: RealtimeUplinkEnvelope, onFailure: (@MainActor () -> Void)? = nil) {
+        guard let data = try? JSONEncoder().encode(envelope) else {
+            onFailure?()
+            return
+        }
+        let payload = [RealtimeMediaMessage.uplinkEnvelopeKey: data]
+        let session = WCSession.default
+        guard session.activationState == .activated, session.isReachable else {
+            WatchLog.info(
+                "transport", "realtime_uplink_unreachable",
+                requestId: envelope.append?.requestId ?? envelope.start?.requestId
+                    ?? envelope.commit?.requestId ?? envelope.fallback?.requestId ?? "",
+                detail: "kind=\(envelope.kind.rawValue)"
+            )
+            onFailure?()
+            return
+        }
+        session.sendMessage(payload, replyHandler: nil) { [weak self] error in
+            Task { @MainActor in
+                WatchLog.error(
+                    "transport", "realtime_uplink_failed",
+                    requestId: envelope.append?.requestId ?? envelope.start?.requestId
+                        ?? envelope.commit?.requestId ?? envelope.fallback?.requestId ?? "",
+                    detail: "kind=\(envelope.kind.rawValue)", error: error
+                )
+                _ = self
+                onFailure?()
+            }
+        }
+    }
+}
+
+/// ESS-321 conformance to the adapter's Transport contract. Kept in an
+/// extension so `WatchVoiceTransport`'s core file stays focused on the
+/// existing full-file / relay flow.
+extension WatchVoiceTransport: WatchRealtimeMediaAdapter.Transport {
+    func sendStreamStart(_ start: RealtimeStreamStart) {
+        sendRealtimeUplink(.start(start)) { [weak self] in
+            self?.notifyRealtimeUplinkFailed(requestId: start.requestId)
+        }
+    }
+
+    func sendAudioAppend(_ chunk: VoiceStreamChunk) {
+        sendRealtimeUplink(.append(chunk)) { [weak self] in
+            self?.notifyRealtimeUplinkFailed(requestId: chunk.requestId)
+        }
+    }
+
+    func sendAudioCommit(_ commit: RealtimeStreamCommit) {
+        sendRealtimeUplink(.commit(commit)) { [weak self] in
+            self?.notifyRealtimeUplinkFailed(requestId: commit.requestId)
+        }
+    }
+
+    func fallbackToCompleteFile(handle: RealtimeMediaSession.TurnHandle,
+                                reason: RealtimeUplinkStream.FallbackReason) {
+        // ESS-321: the coordinator has committed to fallback exactly once per
+        // turn. Emit a wire signal so the iPhone drops any in-flight WSS
+        // buffers for this request, and leave the full-file relay flow to
+        // handle delivery — the recorded m4a already sits in the outbox.
+        WatchLog.info(
+            "transport", "realtime_complete_file_fallback",
+            requestId: handle.requestId, detail: "reason=\(reason)"
+        )
+        let descriptor = RealtimeUplinkFallbackDescriptor(
+            requestId: handle.requestId, sessionId: handle.sessionId, reason: "\(reason)"
+        )
+        sendRealtimeUplink(.fallback(descriptor))
+    }
+
+    private func notifyRealtimeUplinkFailed(requestId: String) {
+        // The adapter forwards this into `RealtimeMediaSession.markUplinkTransportFailed`,
+        // which flips the single-shot fallback flag.
+        NotificationCenter.default.post(
+            name: WatchVoiceTransport.realtimeUplinkFailedNotification,
+            object: nil, userInfo: ["request_id": requestId]
+        )
+    }
+
+    static let realtimeUplinkFailedNotification = Notification.Name(
+        "wristagent.realtime.uplink.failed"
+    )
+
     func handleReachabilityChange(isReachable: Bool) {
         WatchLog.info("wcsession", "reachability_changed", detail: "reachable=\(isReachable) pending=\(pendingCount)")
         if isReachable {

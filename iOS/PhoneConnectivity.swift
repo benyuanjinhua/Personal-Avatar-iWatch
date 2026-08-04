@@ -15,6 +15,19 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     @Published private(set) var pendingDownlinkCount = 0
     /// ESS-28：加密 outbox + Tailscale 上送 + 结果回传编排器。
     let relay: WristAgentPhoneRelay
+    /// ESS-321 real-time media session (Watch ↔ iPhone ↔ Bridge). Lazily
+    /// constructed on the first uplink envelope so households that never
+    /// enable streaming (VoiceStreamingGate.defaultEnabled == false) do not
+    /// pay for the WSS setup.
+    private lazy var realtimeSession: PhoneRealtimeSession = {
+        let session = PhoneRealtimeSession(transportFactory: { [weak self] in
+            self?.makeRealtimeTransport()
+        })
+        session.onDownlink = { [weak self] envelope in
+            self?.forwardRealtimeDownlink(envelope)
+        }
+        return session
+    }()
     private var pendingConfiguration: AgentConfiguration?
     private let historyStorageKey = "wristagent.phone.conversation.history"
     private let voiceInbox: VoiceRequestInbox?
@@ -171,6 +184,10 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
             Task { @MainActor in self.ingestSelfCheckSummary(data: summaryData) }
             return
         }
+        if let realtimeUplink = message[RealtimeMediaMessage.uplinkEnvelopeKey] as? Data {
+            Task { @MainActor in self.handleRealtimeUplink(data: realtimeUplink) }
+            return
+        }
         guard
             let envelopeData = message[VoiceMessage.envelopeKey] as? Data,
             let envelope = try? VoiceRequestEnvelope.decode(from: envelopeData)
@@ -185,6 +202,52 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
               VoiceStreamValidator().validate(chunk) == nil,
               chunk.direction == .uplink else { return }
         Task { @MainActor in self.relay.forwardStreamChunk(chunk) }
+    }
+
+    /// ESS-321 real-time uplink dispatch. Called from `didReceiveMessage`
+    /// when the payload carries a `RealtimeUplinkEnvelope`.
+    @MainActor
+    private func handleRealtimeUplink(data: Data) {
+        guard let envelope = try? JSONDecoder().decode(RealtimeUplinkEnvelope.self, from: data),
+              envelope.protocolVersion == RealtimeWireVersion.uplink else { return }
+        realtimeSession.forward(envelope)
+    }
+
+    /// Bridge → iPhone → Watch: enqueue a decoded downlink envelope onto the
+    /// existing WatchDownlinkOutbox so it flows through the same durable
+    /// queue that carries status envelopes.
+    @MainActor
+    private func forwardRealtimeDownlink(_ envelope: RealtimeDownlinkEnvelope) {
+        guard let data = try? JSONEncoder().encode(envelope) else { return }
+        enqueueDownlink(
+            requestId: envelope.requestId,
+            kind: .relayStatus,
+            key: RealtimeMediaMessage.downlinkEnvelopeKey,
+            data: data
+        )
+    }
+
+    /// URLSessionWebSocketTask factory bound to the relay's credentials and
+    /// bridge URL. Returns `nil` if the phone is not paired yet (the watch
+    /// side will treat that as a transport failure and fall back to the
+    /// existing full-file relay flow).
+    @MainActor
+    private func makeRealtimeTransport() -> PhoneRealtimeSession.Transport? {
+        guard let credentials = RelayCredentialsStore.read(),
+              var components = URLComponents(string: relay.bridgeURLString) else { return nil }
+        components.scheme = "wss"
+        components.path = "/v1/voice/realtime"
+        guard let url = components.url else { return nil }
+        let builder = RelaySignedRequestBuilder(
+            baseURL: url.deletingLastPathComponent(), credentials: credentials
+        )
+        var request = builder.request(
+            method: "GET", path: "/v1/voice/realtime",
+            requestId: UUID().uuidString.lowercased(), body: nil
+        )
+        request.url = url
+        let task = URLSession.shared.webSocketTask(with: request)
+        return PhoneRealtimeWebSocketTransport(task: task)
     }
 
     nonisolated func session(
