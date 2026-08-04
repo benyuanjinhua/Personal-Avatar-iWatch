@@ -16,8 +16,10 @@ struct WatchContentView: View {
     /// ESS-280（R1 生效）：设置页承载流式开关与自检；首屏不消费本对象，
     /// 但需要传给 `WatchSettingsView`（TabView 第 2 页）。
     @ObservedObject private var debugSettings: WatchDebugSettings
-    /// ESS-280 方案 C（PM Jackson Bai 2026-08-04 拍板）：两屏结构 ——
-    /// 0 = 主界面、1 = 设置。冷启动落 tag 0，符合手表侧「主界面即入口」。
+    /// ESS-280 方案 A（PM Jackson Bai 2026-08-04 拍板；R-04.6 后一条覆盖前一条）：
+    /// 三屏结构 —— 0 = 主界面、1 = 状态时间线（原挂在主屏 NavigationLink 下的
+    /// `ConversationTimelineView` 抬升为独立屏）、2 = 设置。冷启动落 tag 0。
+    /// 白梦林原话「右滑第 3 屏设置」字面成立即靠这里的 tag 2。
     @State private var selectedTab: Int = 0
 
     init(
@@ -38,18 +40,23 @@ struct WatchContentView: View {
     }
 
     var body: some View {
-        // ESS-280 方案 C：`TabView(.page)` 两屏 —— 0=主界面、1=设置。
-        // 用 SwiftUI 惯用 `.tabViewStyle(.page)` 让 watchOS 支持横滑分屏。
-        // 每个 tab 各自包一层 NavigationStack 以保留标题与 push 语义（例如
-        // 主屏的「状态时间线」入口 / 设置屏的自检重跑）。
+        // ESS-280 方案 A：`TabView(.page)` 三屏 —— 0=主界面、1=状态时间线、
+        // 2=设置。用 SwiftUI 惯用 `.tabViewStyle(.page)` 让 watchOS 支持横滑
+        // 分屏。每个 tab 各自包一层 NavigationStack 以保留标题与 push 语义
+        // （时间线内更早回合的详情、设置屏内的自检重跑）。
         TabView(selection: $selectedTab) {
             mainScreen
                 .tag(0)
 
             NavigationStack {
-                WatchSettingsView(selfCheck: selfCheck, debugSettings: debugSettings)
+                ConversationTimelineView(journal: journal)
             }
             .tag(1)
+
+            NavigationStack {
+                WatchSettingsView(selfCheck: selfCheck, debugSettings: debugSettings)
+            }
+            .tag(2)
         }
         .tabViewStyle(.page)
         // 字幕式播放视图（ESS-48）：播放开始/纯文本结果到达时由控制器置入会话。
@@ -96,7 +103,7 @@ struct WatchContentView: View {
                     }
 
                     // ESS-163：装机自检的过程/结果不再默认铺在首屏；
-                    // ESS-280 R1 生效后统一收进设置页（TabView 第 2 屏）。
+                    // ESS-280 R1 生效后统一收进设置页（TabView 第 3 屏）。
                     // 日志证据（selfcheck_*）不变，ESS-65 铁律 3/5 通过设置页
                     // 内的重跑按钮与业务入口独立保留。
 
@@ -153,17 +160,9 @@ struct WatchContentView: View {
                         turnContent(turn)
                     }
 
-                    NavigationLink {
-                        ConversationTimelineView(journal: journal)
-                    } label: {
-                        Label("状态时间线", systemImage: "list.bullet.rectangle")
-                    }
-                    .font(.footnote)
-                    .buttonStyle(.bordered)
-                    .tint(.secondary)
-
-                    // ESS-280 R1 生效：设置入口下沉到 TabView 第 2 屏（右滑到达），
-                    // 不再在主界面放开发者入口，也不再走 ESS-163 的长按隐藏手势。
+                    // ESS-280 方案 A（R1 生效）：状态时间线抬升为 TabView 第 2 屏
+                    // （右滑一次到达），主界面不再放跳转按钮；设置在第 3 屏
+                    // （右滑到底），显式可见，不再走 ESS-163 的长按隐藏手势。
 
                     if let remote = transport.remoteStatus,
                        remote.requestId != activeTurn?.requestId {
