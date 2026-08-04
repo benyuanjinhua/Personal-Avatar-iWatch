@@ -124,6 +124,57 @@ final class SelfCheckPolicyTests: XCTestCase {
         XCTAssertEqual(SelfCheckPolicy.Outcome.inconclusive(.interrupted).result, .inconclusive)
     }
 
+    // MARK: - ESS-163 RunRecord ↔ Outcome 双向还原
+    // Debug 面板在冷启动同 build 已跑过（`selfcheck_skipped`）时靠 RunRecord
+    // 还原「最近一次结果」；这几条用例锁住磁盘 → outcome 的兼容契约。
+
+    func testRunRecordRoundTripPass() {
+        let record = SelfCheckPolicy.RunRecord.from(
+            outcome: .pass, fingerprintDetail: fingerprint
+        )
+        XCTAssertEqual(record.outcome, .pass)
+    }
+
+    func testRunRecordRoundTripFailPreservesStepAndCode() {
+        let record = SelfCheckPolicy.RunRecord.from(
+            outcome: .failed(step: .playThenRecord, code: "NSOSStatusErrorDomain#-50"),
+            fingerprintDetail: fingerprint
+        )
+        XCTAssertEqual(
+            record.outcome,
+            .failed(step: .playThenRecord, code: "NSOSStatusErrorDomain#-50")
+        )
+    }
+
+    func testRunRecordRoundTripInconclusivePreservesReason() {
+        let record = SelfCheckPolicy.RunRecord.from(
+            outcome: .inconclusive(.micPermissionMissing),
+            fingerprintDetail: fingerprint
+        )
+        XCTAssertEqual(record.outcome, .inconclusive(.micPermissionMissing))
+    }
+
+    /// 旧记录（仅有 fingerprintDetail+result）解码后 outcome 为 nil，
+    /// UI 走「尚未运行」空态而不是崩溃或误报默认值。
+    func testLegacyRunRecordWithoutStepDecodesButYieldsNilOutcome() throws {
+        let legacyJSON = #"{"fingerprintDetail":"\#(fingerprint)","result":"fail"}"#.data(using: .utf8)!
+        let record = try JSONDecoder().decode(SelfCheckPolicy.RunRecord.self, from: legacyJSON)
+        XCTAssertEqual(record.result, "fail")
+        XCTAssertNil(record.outcome)
+    }
+
+    /// 新记录持久化后再解回，字段全对齐。
+    func testRunRecordCodableRoundTrip() throws {
+        let source = SelfCheckPolicy.RunRecord.from(
+            outcome: .failed(step: .dualActivationFailure, code: "ERR_DUAL_FAILURE_LEAK"),
+            fingerprintDetail: fingerprint
+        )
+        let data = try JSONEncoder().encode(source)
+        let decoded = try JSONDecoder().decode(SelfCheckPolicy.RunRecord.self, from: data)
+        XCTAssertEqual(decoded, source)
+        XCTAssertEqual(decoded.outcome, .failed(step: .dualActivationFailure, code: "ERR_DUAL_FAILURE_LEAK"))
+    }
+
     func testUserMessageDistinguishesPermissionFromDefect() {
         let permission = SelfCheckPolicy.userMessage(outcome: .inconclusive(.micPermissionMissing))
         XCTAssertTrue(permission.contains("麦克风权限"))
