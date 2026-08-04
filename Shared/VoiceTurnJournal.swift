@@ -28,7 +28,8 @@ struct VoiceTurnRecord: Codable, Equatable, Identifiable {
     /// Watch 收到并校验、加密落盘结果语音的本地时间。用于计算端侧音频 TTFT；
     /// optional 保持对旧版 voice-turns.json 的向后兼容。
     var speechAttachedAt: Date? = nil
-    /// Watch 首次收到包含可展示文本的结果信封时间（interim 或 final）。
+    /// Watch 首次收到包含可展示文本的结果信封的本地时间（interim 或 final）。
+    /// 必须与 createdAt 同属 Watch 时钟域，不能使用 Bridge 生成的 occurredAt。
     var firstResultAt: Date? = nil
     /// ESS-55 未读机制：结果首次被查看/播放的时间；nil = 未读。
     /// 结果在用户未查看前不丢失，下次打开仍以未读态呈现。
@@ -144,7 +145,7 @@ final class VoiceTurnJournal: ObservableObject {
         if let result = envelope.result {
             turns[index].result = result
             if turns[index].firstResultAt == nil {
-                turns[index].firstResultAt = envelope.occurredAt
+                turns[index].firstResultAt = Date()
             }
         }
         // 一旦落到 failed 就锁定 errorCode，后续同 request_id 的乱序事件不覆盖。

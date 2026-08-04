@@ -202,6 +202,27 @@ final class VoiceTurnJournalTests: XCTestCase {
         XCTAssertEqual(finished.events.count, 9)
     }
 
+    func testFirstResultMilestoneUsesWatchClockInsteadOfBridgeOccurredAt() {
+        let journal = VoiceTurnJournal(directory: directory)
+        let id = newRequestId()
+        journal.begin(requestId: id)
+        let bridgeOccurredAt = Date(timeIntervalSince1970: 1_000)
+        let beforeApply = Date()
+
+        XCTAssertTrue(journal.apply(.status(
+            requestId: id,
+            state: .completed,
+            occurredAt: bridgeOccurredAt,
+            result: VoiceResultPayload(summary: "done", isTruncated: false, speechSha256: nil, speechDurationMs: nil)
+        )))
+
+        let afterApply = Date()
+        let firstResultAt = try! XCTUnwrap(journal.turn(withId: id)?.firstResultAt)
+        XCTAssertGreaterThanOrEqual(firstResultAt, beforeApply)
+        XCTAssertLessThanOrEqual(firstResultAt, afterApply)
+        XCTAssertNotEqual(firstResultAt, bridgeOccurredAt, "Bridge occurred_at must not enter Watch TTFT arithmetic")
+    }
+
     func testOutOfOrderAndDuplicateEventsDropped() {
         let journal = VoiceTurnJournal(directory: directory)
         let id = newRequestId()
