@@ -144,6 +144,24 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             }
             return
         }
+        // ESS-184/207：kind=probe 走独立文件通道；Watch 端严格按 metadata key
+        // 分流，避免探针误入 storeSpeech（vault + journal）。probe 分支需要
+        // request_id 观测（H2 严格匹配 request_id 不再依赖邻近推断）。
+        if let envelopeData = file.metadata?[VoiceProbeMessage.envelopeKey] as? Data {
+            guard let audioData = try? Data(contentsOf: file.fileURL) else {
+                WatchLog.error(
+                    "wcsession", "file_received_unreadable", detail: "kind=probe", code: "ERR_FILE_READ"
+                )
+                return
+            }
+            let envelope = try? VoiceStatusEnvelope.decode(from: envelopeData)
+            WatchLog.info(
+                "wcsession", "file_received", requestId: envelope?.requestId,
+                detail: "kind=probe bytes=\(audioData.count)"
+            )
+            Task { @MainActor in self.playProbe(envelopeData: envelopeData, audioData: audioData) }
+            return
+        }
         guard let envelopeData = file.metadata?[VoiceSpeechMessage.envelopeKey] as? Data else {
             WatchLog.error(
                 "wcsession", "file_received_unknown", detail: "bytes=\(size)", code: "ERR_UNKNOWN_FILE"
@@ -156,6 +174,28 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         }
         WatchLog.info("wcsession", "file_received", detail: "kind=speech bytes=\(audioData.count)")
         Task { @MainActor in self.storeSpeech(envelopeData: envelopeData, audioData: audioData) }
+    }
+
+    /// ESS-184/207 探针接收：sha 校验 → 转发给 transport 起播 → 播完发 probe_ack。
+    /// 绝不触碰 journal / vault / ledger；本函数是 Watch 侧「探针分身」的入口。
+    @MainActor
+    private func playProbe(envelopeData: Data, audioData: Data) {
+        guard
+            let envelope = try? VoiceStatusEnvelope.decode(from: envelopeData),
+            envelope.validate() == nil
+        else {
+            WatchLog.error("probe", "envelope_invalid", code: "ERR_DECODE")
+            return
+        }
+        guard envelope.audioKind == .probe else {
+            WatchLog.error(
+                "probe", "wrong_kind", requestId: envelope.requestId,
+                detail: "kind=\(envelope.audioKind?.rawValue ?? "missing")",
+                code: "ERR_AUDIO_KIND_MISMATCH"
+            )
+            return
+        }
+        voiceTransport?.playProbe(envelope: envelope, audioData: audioData)
     }
 
     private nonisolated func forwardRelayPayloads(in userInfo: [String: Any]) {

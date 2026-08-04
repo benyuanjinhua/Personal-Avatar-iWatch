@@ -53,6 +53,9 @@ final class WatchVoiceTransport: ObservableObject {
     private let outboxDirectory: URL
     let resultsDirectory: URL
     private let fileManager = FileManager.default
+    /// ESS-184/207 探针专用播放器；与 PushToTalkController 里的结果/错误
+    /// player 完全隔离，避免探针挤占用户结果播放的会话/上下文。
+    private let probePlayer = SpeechPlayer()
 
     init(journal: VoiceTurnJournal? = nil) {
         self.journal = journal
@@ -269,6 +272,90 @@ final class WatchVoiceTransport: ObservableObject {
         }
     }
 
+    // MARK: - ESS-184/207 下行链路探针
+
+    /// 探针语音入口：sha 校验 → 起播 → 播完组装 ProbeAck 走 sendMessage +
+    /// transferUserInfo 双通道回执。绝不入 journal/vault/ledger——探针 turn
+    /// 与用户结果链路完全隔离，确保「不污染生产数据」（ESS-65 铁律 1）。
+    func playProbe(envelope: VoiceStatusEnvelope, audioData: Data) {
+        let requestId = envelope.requestId
+        let expectedSha = envelope.result?.speechSha256?.lowercased()
+        let actualSha = VoiceDigest.sha256Hex(of: audioData)
+        if let expected = expectedSha, expected != actualSha {
+            WatchLog.error(
+                "probe", "sha_mismatch", requestId: requestId,
+                detail: "bytes=\(audioData.count) expected=\(expected) actual=\(actualSha)",
+                code: "ERR_PROBE_SHA_MISMATCH"
+            )
+            // sha 不匹配：不播，也不发 played_ok=true 的 ack；发一个失败 ack
+            // 让 Bridge H5 收到明确的失败信号（否则 CLI 会停在 H3 而非报 sha 问题）。
+            sendProbeAck(ProbeAckEnvelope(
+                requestId: requestId, playedOk: false,
+                playedAtMs: Self.milliseconds(Date()),
+                durationMs: envelope.result?.speechDurationMs,
+                sha256: actualSha,
+                errorCode: "ERR_PROBE_SHA_MISMATCH"
+            ))
+            return
+        }
+        // H3 落盘事件复用既有 `turn/speech_stored`（parser 无需改事件名）；
+        // detail 里除了 kind/bytes 还带 sha256——ESS-207 复审 §2 修复：
+        // downlink-probe.mjs 会做 H1↔H3↔H5 三处 sha 相等断言，缺 sha 时
+        // 该断言退化成向前兼容窗（跳过），带上让 CLI 能真正把关。
+        // 探针不真的落盘（EncryptedAudioVault 是结果链路的东西），日志只是
+        // 让 parser 的 H3 匹配到。
+        WatchLog.info(
+            "turn", "speech_stored", requestId: requestId,
+            detail: "kind=probe bytes=\(audioData.count) sha256=\(actualSha)"
+        )
+        WatchLogShipper.shared.ship(reason: "probe_received")
+        let startedAtMs = Self.milliseconds(Date())
+        _ = probePlayer.play(data: audioData, context: requestId) { [weak self] finished in
+            guard let self else { return }
+            let ack = ProbeAckEnvelope(
+                requestId: requestId,
+                playedOk: finished,
+                playedAtMs: startedAtMs,
+                durationMs: envelope.result?.speechDurationMs,
+                sha256: actualSha,
+                errorCode: finished ? nil : "ERR_PROBE_PLAYBACK_TRUNCATED"
+            )
+            self.sendProbeAck(ack)
+            WatchLogShipper.shared.ship(reason: "probe_ack")
+        }
+    }
+
+    /// probe_ack 走 sendMessage + transferUserInfo 双通道：即时到不了时
+    /// 系统托管队列兜底，iPhone 端靠 postProbeAck 的 in-flight 去重挡重复。
+    private func sendProbeAck(_ ack: ProbeAckEnvelope) {
+        guard let data = try? ack.jsonData() else { return }
+        let session = WCSession.default
+        guard session.activationState == .activated else {
+            WatchLog.error(
+                "probe", "ack_session_not_activated",
+                requestId: ack.requestId, code: "ERR_WC_NOT_ACTIVATED"
+            )
+            return
+        }
+        let payload = [ProbeAckMessage.envelopeKey: data]
+        if session.isReachable {
+            session.sendMessage(payload, replyHandler: nil, errorHandler: { _ in
+                Task { @MainActor in
+                    WCSession.default.transferUserInfo(payload)
+                }
+            })
+        }
+        // 无论 sendMessage 成不成，都进系统托管队列。iPhone 侧 postProbeAck
+        // 的 probeAckTasks[requestId] 会做 in-flight 去重，重复不会翻倍成两条
+        // POST /v1/probe/ack；顶多是同一 evt=probe_acked 在 bridge.log 里出现
+        // 一次（H5 判定用 first-of，不受影响）。
+        session.transferUserInfo(payload)
+        WatchLog.info(
+            "probe", "ack_enqueued", requestId: ack.requestId,
+            detail: "played_ok=\(ack.playedOk) reachable=\(session.isReachable)"
+        )
+    }
+
     func sendResultAck(requestId: String) {
         guard let data = try? ResultDeliveryAck(requestId: requestId).jsonData() else { return }
         deliver(payload: [ResultDeliveryAckMessage.envelopeKey: data])
@@ -327,5 +414,9 @@ final class WatchVoiceTransport: ObservableObject {
 
     private func refreshPendingCount() {
         pendingCount = outboxRequestIds().count
+    }
+
+    private static func milliseconds(_ date: Date) -> Int64 {
+        Int64(date.timeIntervalSince1970 * 1_000)
     }
 }
