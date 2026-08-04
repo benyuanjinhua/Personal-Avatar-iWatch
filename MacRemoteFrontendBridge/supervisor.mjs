@@ -104,6 +104,7 @@ export class QwenRealtimeSessionSupervisor {
     this.suspectZombie = false    // 上一连接因 ping 超时被判僵尸
     this.announcements = new Map() // responseId → 聚合中的 announcement 捕获（ESS-38）
     this.playbackStarted = new Set()       // 已回执 playback.started 的 responseId
+    this.mediaSession = null               // ESS-322: northbound frame-by-frame owner
     this.onAnnouncement = null    // (capture) => void — 后台播报聚合完成的交付回调
     this.onPermissionRequested = null // (task) => void — 本会话权限请求（D1/ESS-34）
     this.onTurnAudioDelta = null // ({requestId,event}) => void — L1 debug downlink
@@ -374,6 +375,17 @@ export class QwenRealtimeSessionSupervisor {
   // ---- 服务端事件 ---------------------------------------------------------
 
   handleServerEvent(event) {
+    // ESS-322 media mode owns the realtime response stream. Forward raw deltas
+    // immediately and, critically, do not synthesize playback receipts here;
+    // only the northbound player's explicit receipts are relayed upstream.
+    if (this.mediaSession && [
+      'audio.delta', 'audio.done', 'response.started', 'response.interrupted',
+      'transcript.delta', 'transcript.final', 'transcript.discard', 'playback.clear',
+    ].includes(event.type)) {
+      this.mediaSession.onEvent(event)
+      this.record({ event: `media.${event.type}`, label: this.mediaSession.label, ...summarize(event) })
+      return
+    }
     // D1 主路径（ESS-34 第三轮）：网关只把 sessionId 等于本连接会话的任务的
     // 权限事件下发到本 WS（realtime-gateway 源码 `task.sessionId !== sessionId
     // → return`）——事件到达本连接即为会话级归属证明，与宿主 task 挂对挂错
@@ -542,6 +554,38 @@ export class QwenRealtimeSessionSupervisor {
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(obj))
   }
 
+  async openMediaSession({ label, onEvent }) {
+    if (!label || typeof onEvent !== 'function') throw new Error('media session label and listener are required')
+    if (this.mediaSession || this.currentTurn) {
+      throw Object.assign(new Error('realtime media owner is busy'), { code: 'ERR_VOICE_BUSY' })
+    }
+    await this.ensureLiveSession()
+    if (this.mediaSession || this.currentTurn) {
+      throw Object.assign(new Error('realtime media owner is busy'), { code: 'ERR_VOICE_BUSY' })
+    }
+    if (!this.voiceReady) throw Object.assign(new Error('voice not ready'), { code: 'ERR_VOICE_BUSY' })
+    this.mediaSession = { label, onEvent }
+    this.touchIdle()
+  }
+
+  sendMediaEvent(label, event) {
+    if (!this.mediaSession || this.mediaSession.label !== label) {
+      throw Object.assign(new Error('media session is not active'), { code: 'ERR_STREAM_CLOSED' })
+    }
+    if (this.ws?.readyState !== WebSocket.OPEN || !this.voiceReady) {
+      throw Object.assign(new Error('realtime upstream unavailable'), { code: 'ERR_UPSTREAM_UNAVAILABLE' })
+    }
+    this.touchIdle()
+    this.ws.send(JSON.stringify(event))
+  }
+
+  closeMediaSession(label, { cancel = false } = {}) {
+    if (!this.mediaSession || this.mediaSession.label !== label) return false
+    if (cancel) this.wsSend({ type: 'response.cancel' })
+    this.mediaSession = null
+    return true
+  }
+
   // F2 watchdog（ESS-30）：turn 超时意味着 Realtime 会话已停摆——连接层仍然
   // 存活（ping/pong 正常），仅靠僵尸检测发现不了，必须强制回收重建 WS，
   // 否则停摆状态不自愈、后续 turn 连续失败。旧连接可能仍占有语音所有权，
@@ -573,6 +617,9 @@ export class QwenRealtimeSessionSupervisor {
   // 次；其余失败（超时、所有权被真实用户抢占、cancel）不重放，保持原语义。
   injectTurn(pcm16k, { label = '', onStart, shouldRun } = {}) {
     const run = async () => {
+      if (this.mediaSession) {
+        throw Object.assign(new Error('realtime media owner is busy'), { code: 'ERR_VOICE_BUSY' })
+      }
       if (shouldRun && !shouldRun()) {
         throw Object.assign(new Error('turn skipped before injection'), { skipped: true })
       }

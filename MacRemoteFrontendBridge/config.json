@@ -45,5 +45,8 @@
 
   "audiopipe_path": "./audiopipe",
   "allow_test_pcm": false,
-  "voice_streaming_v2": false
+  "voice_streaming_v2": false,
+  "realtime_media_v1": false,
+  "realtime_media_max_frame_bytes": 65536,
+  "realtime_media_max_buffered_bytes": 262144
 }
