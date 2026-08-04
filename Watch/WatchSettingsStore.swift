@@ -225,6 +225,14 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             "turn", "state_event", requestId: envelope.requestId,
             detail: "state=\(envelope.state.rawValue) applied=\(applied)\(failure)\(detailText)"
         )
+        if applied, envelope.state == .completed,
+           let turn = voiceJournal?.turn(withId: envelope.requestId),
+           let textTTFTMs = VoiceTurnLatency.measure(turn).textTTFTMs {
+            WatchLog.info(
+                "latency", "text_ttft", requestId: envelope.requestId,
+                detail: "ttft_ms=\(textTTFTMs) clock=watch_turn"
+            )
+        }
         if envelope.state.isTerminal {
             WatchLogShipper.shared.ship(reason: "turn_terminal")
         }
@@ -276,6 +284,7 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         WatchLog.info(
             "turn", "speech_stored", requestId: envelope.requestId, detail: "bytes=\(audioData.count)"
         )
+        let hadAudioMilestone = voiceJournal?.turn(withId: envelope.requestId)?.speechAttachedAt != nil
         guard voiceJournal?.attachSpeech(requestId: envelope.requestId, fileName: fileName) == true else {
             speechVault?.remove(name: fileName)
             WatchLog.error(
@@ -283,6 +292,14 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
                 detail: "file=\(fileName)", code: "ERR_TURN_NOT_FOUND"
             )
             return
+        }
+        if !hadAudioMilestone,
+           let turn = voiceJournal?.turn(withId: envelope.requestId),
+           let audioTTFTMs = VoiceTurnLatency.measure(turn).audioTTFTMs {
+            WatchLog.info(
+                "latency", "audio_ttft", requestId: envelope.requestId,
+                detail: "ttft_ms=\(audioTTFTMs) bytes=\(audioData.count) clock=watch_turn"
+            )
         }
         // interim 语音（ESS-46，非终态信封）落盘不算交付：ACK 只对终态结果发，
         // 否则 Bridge 会在回合转终态后接受这个早发的 ACK，final 丢失时不再重投（ESS-47）。

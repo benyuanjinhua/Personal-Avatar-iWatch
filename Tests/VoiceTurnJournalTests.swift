@@ -1,6 +1,39 @@
 import XCTest
 @testable import WristAgentCore
 
+final class VoiceTurnLatencyTests: XCTestCase {
+    func testMeasuresTextAndAudioTTFTFromWatchRecordingCompletion() {
+        let start = Date(timeIntervalSince1970: 1_000)
+        let turn = VoiceTurnRecord(
+            requestId: UUID().uuidString,
+            createdAt: start,
+            events: [
+                VoiceTurnEvent(state: .recorded, at: start),
+                VoiceTurnEvent(state: .completed, at: start.addingTimeInterval(1.234))
+            ],
+            speechFileName: "result.m4a",
+            speechAttachedAt: start.addingTimeInterval(1.75),
+            firstResultAt: start.addingTimeInterval(1.234)
+        )
+
+        let metric = VoiceTurnLatency.measure(turn)
+        XCTAssertEqual(metric.textTTFTMs, 1_234)
+        XCTAssertEqual(metric.audioTTFTMs, 1_750)
+    }
+
+    func testMissingMilestonesRemainAbsentAndNegativeSkewIsClamped() {
+        let start = Date(timeIntervalSince1970: 2_000)
+        var turn = VoiceTurnRecord(
+            requestId: UUID().uuidString,
+            createdAt: start,
+            events: [VoiceTurnEvent(state: .recorded, at: start)]
+        )
+        XCTAssertEqual(VoiceTurnLatency.measure(turn), VoiceTurnLatency(textTTFTMs: nil, audioTTFTMs: nil))
+        turn.speechAttachedAt = start.addingTimeInterval(-1)
+        XCTAssertEqual(VoiceTurnLatency.measure(turn).audioTTFTMs, 0)
+    }
+}
+
 final class VoiceStatusEnvelopeTests: XCTestCase {
     func testAudioDownlinkPolicyRejectsMissingAndUnknownWireKinds() throws {
         XCTAssertFalse(AudioDownlinkPolicy.allows(nil, expected: [.interim, .result]))
@@ -167,6 +200,27 @@ final class VoiceTurnJournalTests: XCTestCase {
         XCTAssertEqual(finished.permissionApproved, true)
         XCTAssertEqual(finished.result?.summary, "已修改")
         XCTAssertEqual(finished.events.count, 9)
+    }
+
+    func testFirstResultMilestoneUsesWatchClockInsteadOfBridgeOccurredAt() {
+        let journal = VoiceTurnJournal(directory: directory)
+        let id = newRequestId()
+        journal.begin(requestId: id)
+        let bridgeOccurredAt = Date(timeIntervalSince1970: 1_000)
+        let beforeApply = Date()
+
+        XCTAssertTrue(journal.apply(.status(
+            requestId: id,
+            state: .completed,
+            occurredAt: bridgeOccurredAt,
+            result: VoiceResultPayload(summary: "done", isTruncated: false, speechSha256: nil, speechDurationMs: nil)
+        )))
+
+        let afterApply = Date()
+        let firstResultAt = try! XCTUnwrap(journal.turn(withId: id)?.firstResultAt)
+        XCTAssertGreaterThanOrEqual(firstResultAt, beforeApply)
+        XCTAssertLessThanOrEqual(firstResultAt, afterApply)
+        XCTAssertNotEqual(firstResultAt, bridgeOccurredAt, "Bridge occurred_at must not enter Watch TTFT arithmetic")
     }
 
     func testOutOfOrderAndDuplicateEventsDropped() {
