@@ -50,10 +50,11 @@ final class SpeechPlayerReleaseTests: XCTestCase {
         WatchLog.setObserver { module, event, detail, errorCode in
             sink.append(CapturedEvent(module: module, event: event, detail: detail, errorCode: errorCode))
         }
-        // 交错测试可能在上一个用例里留下 owner 令牌（另一个实例已 deinit，
-        // ObjectIdentifier 悬空但仍可与新实例比较）——每个用例开头清一次，
-        // 与真机冷启动一致。
-        SpeechPlayer.sharedSessionOwner = nil
+        // 不再在此处清 sharedSessionOwner：all tests in this class call
+        // waitForHostWelcomeToFinish() before creating their own players,
+        // and the host welcome's releaseAudioSession will naturally clear the
+        // owner when it finishes.  Clearing prematurely orphans the welcome's
+        // active session and causes crashes in subsequent tests (ESS-277).
     }
 
     override func tearDown() {
@@ -83,6 +84,7 @@ final class SpeechPlayerReleaseTests: XCTestCase {
     /// skipped_reason=not_current_owner` 而不是 `session_released`。修复前
     /// 这一分支也会直接 `setActive(false)`，可能连带拆掉别的 player 会话。
     func testExhaustedEndgameSkipsReleaseWhenNotOwner() async throws {
+        try await waitForHostWelcomeToFinish()
         let player = SpeechPlayer(instanceTag: "test-exhausted")
         player.selfCheckForcedActivationFailures = ["long_form", "foreground"]
 
