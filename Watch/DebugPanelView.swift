@@ -14,11 +14,15 @@ import SwiftUI
 /// Bridge 侧 `Scripts/watch-smoke-gate.mjs` 判定逻辑零改动。
 struct DebugPanelView: View {
     @ObservedObject var selfCheck: SelfCheckRunner
+    /// ESS-280：本机 Debug 灰度存储，Toggle 直接绑定。仅在 Watch 本地生效，
+    /// 不会同步给 iPhone —— 避免最终用户被开发者态污染。
+    @ObservedObject var debugSettings: WatchDebugSettings
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 selfCheckSection
+                downlinkStreamingSection
                 buildSection
                 logsHintSection
             }
@@ -89,6 +93,34 @@ struct DebugPanelView: View {
         case .inconclusive(let reason):
             return "结果：inconclusive · \(reason.rawValue)"
         }
+    }
+
+    // MARK: - 流式下行灰度（ESS-280）
+
+    /// 白梦林 2026-08-04 决策（正本 ESS-249）：两轨合成一个包，Debug 面板
+    /// 内提供开关做同机 A/B。默认 OFF（走完整 m4a / transferFile 旧链路），
+    /// 手动 ON 走 ESS-279（PR #100）下行首包即播；关掉即刻按当前分片进度
+    /// 丢弃并回退旧链路，不留 session / 分片缓冲 / 计时器等残留。
+    private var downlinkStreamingSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            sectionHeader("流式下行（Debug）")
+
+            Toggle(isOn: Binding(
+                get: { debugSettings.downlinkStreamingEnabled },
+                set: { debugSettings.setDownlinkStreamingEnabled($0) }
+            )) {
+                Text("启用流式下行")
+                    .font(.caption2)
+            }
+            .tint(.orange)
+
+            Text("默认关；仅本机生效，不同步 iPhone。关掉时在途流式回合会丢弃并回退旧链路。")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(9)
+        .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
     }
 
     // MARK: - 构建指纹

@@ -13,11 +13,19 @@ struct WatchContentView: View {
     @ObservedObject private var notifier: ResultNotifier
     /// ESS-180：屏幕分身错误卡片状态机。
     @ObservedObject private var errorPresenter: AvatarErrorPresenter
+    /// ESS-280：Debug 灰度存储，只用于 Debug 面板内的 Toggle 绑定；
+    /// 首屏不消费本对象。
+    @ObservedObject private var debugSettings: WatchDebugSettings
     /// ESS-163 PD 裁定：首屏零可见开发入口，Debug 面板改用「长按主界面
     /// 标题 2 秒」隐藏手势进入，不加任何可见提示。
     @State private var showDebugPanel = false
 
-    init(pushToTalk: PushToTalkController, welcome: WelcomeGreeter, selfCheck: SelfCheckRunner) {
+    init(
+        pushToTalk: PushToTalkController,
+        welcome: WelcomeGreeter,
+        selfCheck: SelfCheckRunner,
+        debugSettings: WatchDebugSettings
+    ) {
         self.pushToTalk = pushToTalk
         self.welcome = welcome
         self.selfCheck = selfCheck
@@ -26,6 +34,7 @@ struct WatchContentView: View {
         self.player = pushToTalk.player
         self.notifier = pushToTalk.notifier
         self.errorPresenter = pushToTalk.errorPresenter
+        self.debugSettings = debugSettings
     }
 
     var body: some View {
@@ -161,7 +170,7 @@ struct WatchContentView: View {
         // 手表下滑关闭；避免 NavigationLink 在首屏留下可见项。
         .sheet(isPresented: $showDebugPanel) {
             NavigationStack {
-                DebugPanelView(selfCheck: selfCheck)
+                DebugPanelView(selfCheck: selfCheck, debugSettings: debugSettings)
             }
         }
     }

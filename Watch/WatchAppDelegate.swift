@@ -13,6 +13,9 @@ final class WatchAppServices {
     let pushToTalk = PushToTalkController()
     let welcome = WelcomeGreeter()
     let selfCheck = SelfCheckRunner()
+    /// ESS-280 Debug 灰度：只在 Watch 本机生效，与 `settings`（会同步给
+    /// iPhone 的用户配置）严格分开，避免最终用户被开发者态污染。
+    let debugSettings = WatchDebugSettings()
     private var bootstrapped = false
 
     /// 幂等接线 + WCSession 激活；前台启动与后台唤醒共用。
