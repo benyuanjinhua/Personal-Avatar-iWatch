@@ -106,6 +106,8 @@ export class QwenRealtimeSessionSupervisor {
     this.playbackStarted = new Set()       // 已回执 playback.started 的 responseId
     this.onAnnouncement = null    // (capture) => void — 后台播报聚合完成的交付回调
     this.onPermissionRequested = null // (task) => void — 本会话权限请求（D1/ESS-34）
+    this.onTurnAudioDelta = null // ({requestId,event}) => void — L1 debug downlink
+    this.onTurnAudioDone = null // ({requestId,event}) => void — L1 debug downlink EOS
   }
 
   record(entry) {
@@ -402,7 +404,11 @@ export class QwenRealtimeSessionSupervisor {
       // 24kHz PCM base64 → 聚合缓冲；日志不落原始音频
       this.record({ event: 'audio.delta', responseId: event.responseId, bytes: Buffer.from(event.audio || '', 'base64').length, sampleRate: event.sampleRate, announcement: Boolean(capture) })
       if (capture) this.appendAnnouncementAudio(capture, event)
-      else this.currentTurn?.onAudioDelta(event)
+      else {
+        const requestId = this.currentTurn?.label
+        this.currentTurn?.onAudioDelta(event)
+        if (requestId) this.onTurnAudioDelta?.({ requestId, event })
+      }
       return
     }
     if (event.type === 'audio.done') {
@@ -412,6 +418,8 @@ export class QwenRealtimeSessionSupervisor {
       }
       if (this.announcements.has(event.responseId)) {
         this.finishAnnouncement(event.responseId, 'audio.done')
+      } else if (this.currentTurn?.label) {
+        this.onTurnAudioDone?.({ requestId: this.currentTurn.label, event })
       }
     }
     // 播报窗口收尾：还没等到 audio.done 的聚合（纯文本播报等）就此交付
