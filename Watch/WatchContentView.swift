@@ -459,10 +459,14 @@ struct WatchContentView: View {
     /// 任何位置都不允许出现秒数或时:分。10s 档位只在无新事件时触发，
     /// 真实事件到达时 elapsed 归零自动抑制。
     static func processingTitle(for phase: VoiceTurnPhase, elapsed: TimeInterval) -> String {
-        if elapsed >= 60 { return "任务较慢，可继续等待或取消" }
         switch phase {
         case .sending: return "正在送出"
         case .waitingForPhone: return "等待手机连接"
+        case .completed, .failed, .cancelled: return phase.title
+        default: break
+        }
+        if elapsed >= 60 { return "任务较慢，可继续等待或取消" }
+        switch phase {
         case .waitingForMac:
             if elapsed >= 30 { return "分身还在联系 Mac…" }
             if elapsed >= 10 { return "Mac 尚未响应" }
@@ -476,7 +480,7 @@ struct WatchContentView: View {
             if elapsed >= 10 { return background ? "仍在后台运行…" : "仍在思考，请稍候" }
             return background ? "分身正在处理…" : "分身正在思考…"
         case .needsConfirmation: return "需要你的确认"
-        case .completed, .failed, .cancelled: return phase.title
+        default: return phase.title
         }
     }
 
