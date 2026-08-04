@@ -67,6 +67,10 @@ final class PushToTalkController: ObservableObject {
 
     private static let logger = Logger(subsystem: "com.benyuan.wristagent.watch", category: "PlaybackTrigger")
     private let recorder = AudioRecorder()
+    var voiceStreamingEnabled: () -> Bool = { VoiceStreamingGate.defaultEnabled }
+    private var streamRequestId: UUID?
+    private var streamId: UUID?
+    private var streamSequence = 0
     /// A release can arrive while AVAudioRecorder is still being prepared. Keep
     /// it pending and finish only after record() has actually succeeded.
     private var releaseRequestedWhileStarting = false
@@ -365,10 +369,16 @@ final class PushToTalkController: ObservableObject {
         }
         player.stop(reason: "recording_started")
         state = .recording
+        let streaming = voiceStreamingEnabled()
+        streamRequestId = streaming ? UUIDv7.generate() : nil
+        streamId = streaming ? UUID() : nil
+        streamSequence = 0
         WatchHaptics.play(.recordingStarted)
         Task {
             do {
-                try await recorder.start()
+                try await recorder.start(streamHandler: streaming ? { [weak self] payload, end in
+                    self?.emitUplinkChunk(payload: payload, end: end)
+                } : nil)
                 guard state == .recording else {
                     WatchLog.info("recorder", "late_start_cancelled", detail: "state=\(String(describing: state))")
                     recorder.cancel()
@@ -434,6 +444,7 @@ final class PushToTalkController: ObservableObject {
     /// 提交录音：生成信封发送，同时留一份重试缓存（失败重发不用重新说话）。
     private func submit(recording: AudioRecorder.Recording) {
         let envelope = VoiceRequestEnvelope.voiceRequest(
+            requestId: streamRequestId ?? UUIDv7.generate(),
             audio: VoiceAudioDescriptor(
                 codec: "aac",
                 sampleRate: AudioRecorder.sampleRate,
@@ -445,6 +456,20 @@ final class PushToTalkController: ObservableObject {
         retryStore.save(requestId: envelope.requestId, data: recording.data, durationMs: recording.durationMs)
         transport.send(envelope: envelope, recording: recording)
         WatchHaptics.play(.requestSubmitted)
+        streamRequestId = nil
+        streamId = nil
+    }
+
+    private func emitUplinkChunk(payload: Data, end: Bool) {
+        guard let requestId = streamRequestId, let streamId else { return }
+        let chunk = VoiceStreamChunk(
+            requestId: requestId.uuidString.lowercased(), streamId: streamId.uuidString.lowercased(),
+            direction: .uplink, sequence: streamSequence,
+            capturedAtMs: Int64(Date().timeIntervalSince1970 * 1_000), codec: "aac_lc",
+            sampleRate: AudioRecorder.sampleRate, payload: payload, endOfStream: end
+        )
+        streamSequence += 1
+        transport.sendStreamChunk(chunk)
     }
 
     /// 一键重试（ESS-55）：用缓存的录音换新 request_id 重发，不需要重新说话。

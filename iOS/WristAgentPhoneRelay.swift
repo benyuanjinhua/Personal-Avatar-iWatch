@@ -76,6 +76,9 @@ final class WristAgentPhoneRelay: ObservableObject {
     private var resultAckTasks: [String: Task<Void, Never>] = [:]
     /// requestId|delivery_sequence：WSS 重连或服务端重放不重复显示/播放 interim。
     private var deliveredInterims: Set<String> = []
+    /// Absorbing per-turn failure set: a stream failure never retries chunks;
+    /// the already-persisted complete m4a path remains the single fallback.
+    private var failedUplinkStreams: Set<String> = []
 
     private static let bridgeURLKey = "wristagent.relay.bridge_url"
     /// 连续失败到该次数时提醒用户打开 App（后台网络受限时人工兜底）。
@@ -187,6 +190,20 @@ final class WristAgentPhoneRelay: ObservableObject {
         }
         refreshEntries()
         scheduleDrain(after: 0)
+    }
+
+    func forwardStreamChunk(_ chunk: VoiceStreamChunk) {
+        guard chunk.direction == .uplink, !failedUplinkStreams.contains(chunk.requestId),
+              let client = makeClient() else { return }
+        Task { [weak self] in
+            do {
+                try await client.uploadVoiceStreamChunk(chunk)
+                self?.relayLog("上行流片已送达 sequence=\(chunk.sequence)")
+            } catch {
+                guard let self, self.failedUplinkStreams.insert(chunk.requestId).inserted else { return }
+                self.relayLog("上行流失败，保留完整包降级 request_id=\(chunk.requestId)")
+            }
+        }
     }
 
     /// 结果音频 transferFile 完成后删除本地临时文件（成功交付即删，§8）。

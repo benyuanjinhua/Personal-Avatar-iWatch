@@ -180,6 +180,13 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         }
     }
 
+    nonisolated func session(_ session: WCSession, didReceiveMessageData messageData: Data) {
+        guard let chunk = try? JSONDecoder().decode(VoiceStreamChunk.self, from: messageData),
+              VoiceStreamValidator().validate(chunk) == nil,
+              chunk.direction == .uplink else { return }
+        Task { @MainActor in self.relay.forwardStreamChunk(chunk) }
+    }
+
     nonisolated func session(
         _ session: WCSession,
         didReceiveUserInfo userInfo: [String: Any] = [:]

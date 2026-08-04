@@ -116,7 +116,7 @@ struct VoiceStreamValidator {
         guard chunk.capturedAtMs > 0 else { return .invalidTimestamp }
         guard allowedCodecs.contains(chunk.codec) else { return .unsupportedCodec }
         guard allowedSampleRates.contains(chunk.sampleRate) else { return .unsupportedSampleRate }
-        guard !chunk.payload.isEmpty else { return .emptyPayload }
+        guard !chunk.payload.isEmpty || chunk.endOfStream else { return .emptyPayload }
         guard chunk.payload.count <= maxPayloadBytes else { return .payloadTooLarge }
         guard VoiceStreamChunk.sha256(chunk.payload) == chunk.payloadSha256.lowercased() else {
             return .digestMismatch

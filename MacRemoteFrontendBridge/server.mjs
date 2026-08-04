@@ -33,6 +33,8 @@ import { AudioPipeline } from './audio.mjs'
 import { ResultAudioStore } from './result-audio.mjs'
 import { QwenRealtimeSessionSupervisor } from './supervisor.mjs'
 import { prepareDownlinkMessage } from './audio-policy.mjs'
+import { VoiceStreamDownlink } from './voice-stream-downlink.mjs'
+import { VoiceStreamUplink } from './voice-stream-uplink.mjs'
 
 const BASE = dirname(fileURLToPath(import.meta.url))
 
@@ -97,6 +99,18 @@ export function createBridge(overrides = {}) {
   // D1 主路径（ESS-34）：本会话 Realtime WS 上的权限请求即会话级归属证明
   // （网关只下发 sessionId 匹配的任务权限事件），写开关关闭时定向 reject。
   supervisor.onPermissionRequested = task => watcher.denyRealtimePermission(task)
+  let streamDownlink = null
+  const streamUplink = new VoiceStreamUplink({
+    enabled: CONFIG.voice_streaming_v2 === true,
+    maxPayloadBytes: CONFIG.voice_stream_max_payload_bytes ?? 64 * 1024,
+    maxBufferedBytes: CONFIG.voice_stream_max_buffered_bytes ?? 256 * 1024,
+    maxSequenceWindow: CONFIG.voice_stream_max_sequence_window ?? 32,
+    onChunk: ({ requestId, payload, chunk }) => log({
+      evt: 'voice_uplink_chunk_received', request_id: requestId,
+      stream_id: chunk.stream_id, sequence: chunk.sequence, bytes: payload.length,
+    }),
+    log,
+  })
   // ESS-36 可观测性 + ESS-37 取证：supervisor journal（ws.connecting/close
   // code/error frame、probe、stall、rebuild、全部网关事件摘要）全量落 Bridge
   // 结构化日志，request_id 由 journal 的 label 字段携带 —— accepted →
@@ -947,6 +961,18 @@ export function createBridge(overrides = {}) {
         return reply(r.status, r.body)
       }
 
+      if (pathName === '/v1/voice/streams/chunks') {
+        if (req.method !== 'POST') throw new ApiError(ERR.METHOD_NOT_ALLOWED)
+        const authInfo = verify()
+        let chunk
+        try { chunk = JSON.parse(rawBody.toString('utf8')) } catch { throw new ApiError(ERR.BAD_JSON) }
+        if (chunk?.request_id !== authInfo.requestId) {
+          throw new ApiError(ERR.MISSING_FIELD, 'x-request-id must match stream request_id')
+        }
+        const result = streamUplink.ingest(chunk)
+        return reply(202, { request_id: chunk.request_id, ...result })
+      }
+
       if (pathName === '/v1/client-logs') {
         if (req.method !== 'POST') throw new ApiError(ERR.METHOD_NOT_ALLOWED)
         const r = handleClientLogs(rawBody, verify())
@@ -1036,6 +1062,43 @@ export function createBridge(overrides = {}) {
   const eventsHeartbeatMs = CONFIG.events_heartbeat_ms ?? 20_000
   const resultDeliverySweepMs = CONFIG.result_delivery_sweep_ms ?? 1_000
 
+  streamDownlink = new VoiceStreamDownlink({
+    enabled: CONFIG.voice_streaming_v2 === true,
+    maxPayloadBytes: CONFIG.voice_stream_max_payload_bytes ?? 64 * 1024,
+    maxBufferedBytes: CONFIG.voice_stream_max_buffered_bytes ?? 256 * 1024,
+    maxSequenceWindow: CONFIG.voice_stream_max_sequence_window ?? 32,
+    gapTimeoutMs: CONFIG.voice_stream_gap_timeout_ms ?? 1_500,
+    send: (requestId, message) => {
+      const turn = ledger.get(requestId)
+      if (!turn) return false
+      const client = [...eventClients].find(candidate =>
+        candidate.deviceId === turn.device_id && candidate.ws.readyState === candidate.ws.OPEN)
+      if (!client) return false
+      client.ws.send(JSON.stringify(message))
+      return true
+    },
+    log,
+  })
+  supervisor.onTurnAudioDelta = ({ requestId, event }) => {
+    streamDownlink.append({ requestId, responseId: event.responseId, audio: event.audio, sampleRate: event.sampleRate ?? 24_000 })
+  }
+  supervisor.onTurnAudioDone = ({ requestId }) => streamDownlink.finish(requestId)
+  supervisor.onAnnouncementAudioDelta = ({ capture, event }) => {
+    const turn = capture.taskId ? ledger.byTaskId(capture.taskId) : null
+    if (!turn) {
+      log({ evt: 'voice_stream_announcement_unmatched', task_id: capture.taskId, response_id: capture.responseId })
+      return
+    }
+    streamDownlink.append({
+      requestId: turn.request_id, responseId: capture.responseId,
+      audio: event.audio, sampleRate: event.sampleRate ?? 24_000,
+    })
+  }
+  supervisor.onAnnouncementAudioDone = ({ capture }) => {
+    const turn = capture.taskId ? ledger.byTaskId(capture.taskId) : null
+    if (turn) streamDownlink.finish(turn.request_id)
+  }
+
   function sendTerminalDelivery(turn, client, cause) {
     const event = { type: 'turn.state', turn: ledger.projection(turn) }
     // ESS-181 契约：不达标就剥音频保文字，永远不静默丢弃投影。
@@ -1103,6 +1166,14 @@ export function createBridge(overrides = {}) {
         eventClients.add(client)
         log({ evt: 'events_client_connected', device_id: deviceId })
         ws.on('pong', () => { client.alive = true })
+        ws.on('message', raw => {
+          let message
+          try { message = JSON.parse(raw.toString()) } catch { return }
+          if (message.type === 'voice.stream.fallback' && typeof message.request_id === 'string') {
+            const turn = ledger.get(message.request_id)
+            if (turn?.device_id === deviceId) streamDownlink.fallback(message.request_id, 'client_requested')
+          }
+        })
         // Reconnect recovery: replay live turns plus recent terminal results until
         // the Watch explicitly confirms durable storage.
         const replayTurns = ledger.replayable({

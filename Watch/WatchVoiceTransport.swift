@@ -56,6 +56,7 @@ final class WatchVoiceTransport: ObservableObject {
     /// ESS-184/207 探针专用播放器；与 PushToTalkController 里的结果/错误
     /// player 完全隔离，避免探针挤占用户结果播放的会话/上下文。
     private let probePlayer = SpeechPlayer()
+    private var failedUplinkStreams: Set<String> = []
 
     init(journal: VoiceTurnJournal? = nil) {
         self.journal = journal
@@ -370,6 +371,23 @@ final class WatchVoiceTransport: ObservableObject {
         guard let data = try? ResultDeliveryAck(requestId: requestId).jsonData() else { return }
         deliver(payload: [ResultDeliveryAckMessage.envelopeKey: data])
         WatchLog.info("transport", "result_ack_enqueued", requestId: requestId)
+    }
+
+    func sendStreamChunk(_ chunk: VoiceStreamChunk) {
+        guard !failedUplinkStreams.contains(chunk.requestId) else { return }
+        let session = WCSession.default
+        guard session.activationState == .activated, session.isReachable,
+              let data = try? JSONEncoder().encode(chunk) else {
+            failedUplinkStreams.insert(chunk.requestId)
+            WatchLog.info("transport", "uplink_stream_fallback", requestId: chunk.requestId, detail: "reason=unreachable retry=1")
+            return
+        }
+        session.sendMessageData(data, replyHandler: nil) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.failedUplinkStreams.insert(chunk.requestId).inserted else { return }
+                WatchLog.info("transport", "uplink_stream_fallback", requestId: chunk.requestId, detail: "reason=send_failed retry=1")
+            }
+        }
     }
 
     func handleReachabilityChange(isReachable: Bool) {

@@ -44,5 +44,6 @@
   "poll_interval_ms": 3000,
 
   "audiopipe_path": "./audiopipe",
-  "allow_test_pcm": false
+  "allow_test_pcm": false,
+  "voice_streaming_v2": false
 }

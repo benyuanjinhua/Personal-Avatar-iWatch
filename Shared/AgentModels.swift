@@ -88,6 +88,37 @@ struct AgentConfiguration: Codable, Equatable {
     var autoListen: Bool
     var hapticsEnabled: Bool
     var conciseReply: Bool
+    /// Shared uplink/downlink L1 gate. Missing values decode as false so an
+    /// upgrade can never silently enable streaming.
+    var voiceStreamingV2: Bool = false
+
+    enum CodingKeys: String, CodingKey {
+        case mode, endpoint, bearerToken, autoListen, hapticsEnabled, conciseReply, voiceStreamingV2
+    }
+
+    init(
+        mode: ConnectionMode, endpoint: String, bearerToken: String, autoListen: Bool,
+        hapticsEnabled: Bool, conciseReply: Bool, voiceStreamingV2: Bool = false
+    ) {
+        self.mode = mode
+        self.endpoint = endpoint
+        self.bearerToken = bearerToken
+        self.autoListen = autoListen
+        self.hapticsEnabled = hapticsEnabled
+        self.conciseReply = conciseReply
+        self.voiceStreamingV2 = voiceStreamingV2
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        mode = try values.decode(ConnectionMode.self, forKey: .mode)
+        endpoint = try values.decode(String.self, forKey: .endpoint)
+        bearerToken = try values.decode(String.self, forKey: .bearerToken)
+        autoListen = try values.decode(Bool.self, forKey: .autoListen)
+        hapticsEnabled = try values.decode(Bool.self, forKey: .hapticsEnabled)
+        conciseReply = try values.decode(Bool.self, forKey: .conciseReply)
+        voiceStreamingV2 = try values.decodeIfPresent(Bool.self, forKey: .voiceStreamingV2) ?? false
+    }
 
     static let demo = AgentConfiguration(
         mode: .demo,
@@ -95,7 +126,8 @@ struct AgentConfiguration: Codable, Equatable {
         bearerToken: "",
         autoListen: false,
         hapticsEnabled: true,
-        conciseReply: true
+        conciseReply: true,
+        voiceStreamingV2: false
     )
 }
 
