@@ -39,24 +39,43 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         private(set) var startEvents: [RealtimeStreamStart] = []
         private(set) var appendEvents: [VoiceStreamChunk] = []
         private(set) var commitEvents: [RealtimeStreamCommit] = []
+        private(set) var playbackStartEvents: [(RealtimeMediaSession.TurnHandle, String)] = []
+        private(set) var playbackEndEvents: [(RealtimeMediaSession.TurnHandle, String, Int)] = []
         private(set) var fallbackEvents: [(RealtimeMediaSession.TurnHandle,
                                           RealtimeUplinkStream.FallbackReason)] = []
 
         func sendStreamStart(_ start: RealtimeStreamStart) { startEvents.append(start) }
         func sendAudioAppend(_ chunk: VoiceStreamChunk) { appendEvents.append(chunk) }
         func sendAudioCommit(_ commit: RealtimeStreamCommit) { commitEvents.append(commit) }
+        func sendPlaybackStarted(handle: RealtimeMediaSession.TurnHandle, responseId: String) {
+            playbackStartEvents.append((handle, responseId))
+        }
+        func sendPlaybackEnded(handle: RealtimeMediaSession.TurnHandle,
+                               responseId: String, bytesPlayed: Int) {
+            playbackEndEvents.append((handle, responseId, bytesPlayed))
+        }
         func fallbackToCompleteFile(handle: RealtimeMediaSession.TurnHandle,
                                     reason: RealtimeUplinkStream.FallbackReason) {
             fallbackEvents.append((handle, reason))
         }
     }
 
+    private final class FallbackCounter {
+        private(set) var invocations: [(RealtimeMediaSession.TurnHandle,
+                                        RealtimeUplinkStream.FallbackReason)] = []
+        func record(_ handle: RealtimeMediaSession.TurnHandle,
+                    _ reason: RealtimeUplinkStream.FallbackReason) {
+            invocations.append((handle, reason))
+        }
+    }
+
     private func makeAdapter(sessionIds: [String]) -> (
-        WatchRealtimeMediaAdapter, MockRecorder, MockPlayer, MockTransport
+        WatchRealtimeMediaAdapter, MockRecorder, MockPlayer, MockTransport, FallbackCounter
     ) {
         let recorder = MockRecorder()
         let player = MockPlayer()
         let transport = MockTransport()
+        let counter = FallbackCounter()
         var index = 0
         var clock: Int64 = 0
         let session = RealtimeMediaSession(
@@ -72,14 +91,15 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
             }
         )
         let adapter = WatchRealtimeMediaAdapter(
-            session: session, recorder: recorder, player: player, transport: transport
+            session: session, recorder: recorder, player: player, transport: transport,
+            fullFileFallback: { handle, reason in counter.record(handle, reason) }
         )
-        return (adapter, recorder, player, transport)
+        return (adapter, recorder, player, transport, counter)
     }
 
     func testFullTurnRoutesUplinkToTransportAndDownlinkToPlayer() {
         let requestId = "44444444-4444-4444-4444-444444444444"
-        let (adapter, recorder, player, transport) = makeAdapter(sessionIds: [
+        let (adapter, recorder, player, transport, _) = makeAdapter(sessionIds: [
             "55555555-5555-5555-5555-555555555555"
         ])
         let handle = adapter.beginTurn(requestId: requestId)
@@ -105,7 +125,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
 
     func testTransportFailureTriggersOneShotCompleteFileFallback() {
         let requestId = "44444444-4444-4444-4444-444444444444"
-        let (adapter, recorder, _, transport) = makeAdapter(sessionIds: [
+        let (adapter, recorder, _, transport, counter) = makeAdapter(sessionIds: [
             "55555555-5555-5555-5555-555555555555"
         ])
         _ = adapter.beginTurn(requestId: requestId)
@@ -115,10 +135,31 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         recorder.fail(NSError(domain: "test", code: 2))
         XCTAssertEqual(transport.fallbackEvents.count, 1)
         XCTAssertTrue(adapter.didTriggerCompleteFileFallback)
+        // Full-file fallback closure invoked exactly once — proves the
+        // adapter actually executes the reliable path, not just signals it.
+        XCTAssertEqual(counter.invocations.count, 1)
+        XCTAssertEqual(counter.invocations.first?.0.requestId, requestId)
+    }
+
+    func testPlaybackReceiptsAreForwardedToTransport() {
+        let requestId = "44444444-4444-4444-4444-444444444440"
+        let (adapter, _, player, transport, _) = makeAdapter(sessionIds: [
+            "55555555-5555-5555-5555-555555555559"
+        ])
+        let handle = adapter.beginTurn(requestId: requestId)
+        // Simulate the player firing real started/ended receipts.
+        player.onPlaybackEvent?(.started(requestId: handle.requestId, sessionId: handle.sessionId))
+        player.onPlaybackEvent?(.ended(
+            requestId: handle.requestId, sessionId: handle.sessionId, bytesPlayed: 2_048
+        ))
+        XCTAssertEqual(transport.playbackStartEvents.count, 1)
+        XCTAssertEqual(transport.playbackStartEvents.first?.1, handle.sessionId)
+        XCTAssertEqual(transport.playbackEndEvents.count, 1)
+        XCTAssertEqual(transport.playbackEndEvents.first?.2, 2_048)
     }
 
     func testNewTurnBargesInAndPlayerClearsPriorPlayback() {
-        let (adapter, recorder, player, _) = makeAdapter(sessionIds: [
+        let (adapter, recorder, player, _, _) = makeAdapter(sessionIds: [
             "55555555-5555-5555-5555-555555555555",
             "66666666-6666-6666-6666-666666666666"
         ])

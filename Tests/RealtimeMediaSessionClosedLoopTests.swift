@@ -226,6 +226,8 @@ final class RealtimeMediaSessionClosedLoopTests: XCTestCase {
             case .streamStart: XCTAssertEqual(decoded.start?.sessionId, handle.sessionId)
             case .audioAppend: XCTAssertEqual(decoded.append?.streamId, handle.sessionId)
             case .audioCommit: XCTAssertEqual(decoded.commit?.sessionId, handle.sessionId)
+            case .playbackStarted, .playbackEnded:
+                XCTFail("no playback receipt envelope expected on happy path")
             case .fallback: XCTFail("no fallback envelope expected on happy path")
             }
         }

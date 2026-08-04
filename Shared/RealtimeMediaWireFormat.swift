@@ -21,6 +21,8 @@ enum RealtimeUplinkKind: String, Codable, Sendable {
     case streamStart = "stream.start"
     case audioAppend = "audio.append"
     case audioCommit = "audio.commit"
+    case playbackStarted = "playback.started"
+    case playbackEnded = "playback.ended"
     case fallback = "stream.fallback"
 }
 
@@ -30,6 +32,7 @@ struct RealtimeUplinkEnvelope: Codable, Sendable, Equatable {
     let start: RealtimeStreamStart?
     let append: VoiceStreamChunk?
     let commit: RealtimeStreamCommit?
+    let playback: RealtimePlaybackReceipt?
     let fallback: RealtimeUplinkFallbackDescriptor?
 
     enum CodingKeys: String, CodingKey {
@@ -38,34 +41,55 @@ struct RealtimeUplinkEnvelope: Codable, Sendable, Equatable {
         case start
         case append
         case commit
+        case playback
         case fallback
     }
 
     static func start(_ start: RealtimeStreamStart) -> Self {
         RealtimeUplinkEnvelope(
             protocolVersion: RealtimeWireVersion.uplink,
-            kind: .streamStart, start: start, append: nil, commit: nil, fallback: nil
+            kind: .streamStart, start: start, append: nil, commit: nil,
+            playback: nil, fallback: nil
         )
     }
 
     static func append(_ chunk: VoiceStreamChunk) -> Self {
         RealtimeUplinkEnvelope(
             protocolVersion: RealtimeWireVersion.uplink,
-            kind: .audioAppend, start: nil, append: chunk, commit: nil, fallback: nil
+            kind: .audioAppend, start: nil, append: chunk, commit: nil,
+            playback: nil, fallback: nil
         )
     }
 
     static func commit(_ commit: RealtimeStreamCommit) -> Self {
         RealtimeUplinkEnvelope(
             protocolVersion: RealtimeWireVersion.uplink,
-            kind: .audioCommit, start: nil, append: nil, commit: commit, fallback: nil
+            kind: .audioCommit, start: nil, append: nil, commit: commit,
+            playback: nil, fallback: nil
+        )
+    }
+
+    static func playbackStarted(_ receipt: RealtimePlaybackReceipt) -> Self {
+        RealtimeUplinkEnvelope(
+            protocolVersion: RealtimeWireVersion.uplink,
+            kind: .playbackStarted, start: nil, append: nil, commit: nil,
+            playback: receipt, fallback: nil
+        )
+    }
+
+    static func playbackEnded(_ receipt: RealtimePlaybackReceipt) -> Self {
+        RealtimeUplinkEnvelope(
+            protocolVersion: RealtimeWireVersion.uplink,
+            kind: .playbackEnded, start: nil, append: nil, commit: nil,
+            playback: receipt, fallback: nil
         )
     }
 
     static func fallback(_ descriptor: RealtimeUplinkFallbackDescriptor) -> Self {
         RealtimeUplinkEnvelope(
             protocolVersion: RealtimeWireVersion.uplink,
-            kind: .fallback, start: nil, append: nil, commit: nil, fallback: descriptor
+            kind: .fallback, start: nil, append: nil, commit: nil,
+            playback: nil, fallback: descriptor
         )
     }
 }
@@ -79,6 +103,20 @@ struct RealtimeUplinkFallbackDescriptor: Codable, Sendable, Equatable {
         case requestId = "request_id"
         case sessionId = "session_id"
         case reason
+    }
+}
+
+struct RealtimePlaybackReceipt: Codable, Sendable, Equatable {
+    let requestId: String
+    let sessionId: String
+    let responseId: String
+    let bytesPlayed: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case requestId = "request_id"
+        case sessionId = "session_id"
+        case responseId = "response_id"
+        case bytesPlayed = "bytes_played"
     }
 }
 

@@ -71,6 +71,10 @@ final class PushToTalkController: ObservableObject {
     private var streamRequestId: UUID?
     private var streamId: UUID?
     private var streamSequence = 0
+    /// ESS-321 real-time adapter. Lazily created on first press when the
+    /// streaming gate is on. Wiring lives in `ensureRealtimeAdapter()`.
+    private(set) var realtimeAdapter: WatchRealtimeMediaAdapter?
+    private var pendingRealtimeRecording: [String: AudioRecorder.Recording] = [:]
     /// A release can arrive while AVAudioRecorder is still being prepared. Keep
     /// it pending and finish only after record() has actually succeeded.
     private var releaseRequestedWhileStarting = false
@@ -383,6 +387,10 @@ final class PushToTalkController: ObservableObject {
         streamRequestId = streaming ? UUIDv7.generate() : nil
         streamId = streaming ? UUID() : nil
         streamSequence = 0
+        if streaming, let requestId = streamRequestId {
+            let adapter = ensureRealtimeAdapter()
+            _ = adapter.beginTurn(requestId: requestId.uuidString.lowercased())
+        }
         WatchHaptics.play(.recordingStarted)
         Task {
             do {
@@ -453,8 +461,9 @@ final class PushToTalkController: ObservableObject {
 
     /// 提交录音：生成信封发送，同时留一份重试缓存（失败重发不用重新说话）。
     private func submit(recording: AudioRecorder.Recording) {
+        let requestId = streamRequestId ?? UUIDv7.generate()
         let envelope = VoiceRequestEnvelope.voiceRequest(
-            requestId: streamRequestId ?? UUIDv7.generate(),
+            requestId: requestId,
             audio: VoiceAudioDescriptor(
                 codec: "aac",
                 sampleRate: AudioRecorder.sampleRate,
@@ -464,7 +473,22 @@ final class PushToTalkController: ObservableObject {
             )
         )
         retryStore.save(requestId: envelope.requestId, data: recording.data, durationMs: recording.durationMs)
-        transport.send(envelope: envelope, recording: recording)
+
+        if let adapter = realtimeAdapter, adapter.currentTurn?.requestId == requestId.uuidString.lowercased() {
+            // ESS-321: streaming path is live. Retain the m4a so a fast-channel
+            // failure can invoke the single-shot fallback with the real body;
+            // commit the uplink and skip the direct full-file submission —
+            // the Bridge will assemble the answer from PCM frames.
+            retainRealtimeRecording(recording, forRequestId: requestId.uuidString.lowercased())
+            adapter.commit()
+            WatchLog.info(
+                "realtime", "uplink_committed",
+                requestId: envelope.requestId,
+                detail: "duration_ms=\(recording.durationMs) bytes=\(recording.data.count)"
+            )
+        } else {
+            transport.send(envelope: envelope, recording: recording)
+        }
         WatchHaptics.play(.requestSubmitted)
         streamRequestId = nil
         streamId = nil
@@ -480,6 +504,78 @@ final class PushToTalkController: ObservableObject {
         )
         streamSequence += 1
         transport.sendStreamChunk(chunk)
+    }
+
+    // MARK: - ESS-321 real-time adapter wiring
+
+    /// Lazily construct the adapter. Public so the WatchSettingsStore can
+    /// hand incoming `RealtimeDownlinkEnvelope` payloads to it, and so tests
+    /// can substitute recorder / player fakes if needed.
+    @discardableResult
+    func ensureRealtimeAdapter() -> WatchRealtimeMediaAdapter {
+        if let adapter = realtimeAdapter { return adapter }
+        let pcmRecorder = PCMFrameRecorder()
+        let playbackEngine = RealtimePlaybackEngine()
+        let adapter = WatchRealtimeMediaAdapter(
+            recorder: pcmRecorder,
+            player: playbackEngine,
+            transport: transport,
+            fullFileFallback: { [weak self] handle, reason in
+                Task { @MainActor in self?.performFullFileFallback(handle: handle, reason: reason) }
+            },
+            logger: { message in
+                WatchLog.info("realtime", "adapter", detail: message)
+            }
+        )
+        realtimeAdapter = adapter
+        return adapter
+    }
+
+    /// Called by the adapter when the fast channel dies. Uses the recording
+    /// the PTT flow just produced (kept in `pendingRealtimeRecording`) to
+    /// invoke the existing reliable full-file relay path exactly once — the
+    /// adapter's single-shot flag already gates re-entry.
+    private func performFullFileFallback(
+        handle: RealtimeMediaSession.TurnHandle,
+        reason: RealtimeUplinkStream.FallbackReason
+    ) {
+        guard let recording = pendingRealtimeRecording.removeValue(forKey: handle.requestId) else {
+            WatchLog.error(
+                "realtime", "fallback_no_recording",
+                requestId: handle.requestId,
+                detail: "reason=\(reason)", code: "ERR_FALLBACK_NO_M4A"
+            )
+            return
+        }
+        let uuid = UUID(uuidString: handle.requestId) ?? UUIDv7.generate()
+        let envelope = VoiceRequestEnvelope.voiceRequest(
+            requestId: uuid,
+            audio: VoiceAudioDescriptor(
+                codec: "aac",
+                sampleRate: AudioRecorder.sampleRate,
+                channels: AudioRecorder.channels,
+                durationMs: recording.durationMs,
+                sha256: VoiceDigest.sha256Hex(of: recording.data)
+            )
+        )
+        retryStore.save(
+            requestId: envelope.requestId,
+            data: recording.data,
+            durationMs: recording.durationMs
+        )
+        transport.send(envelope: envelope, recording: recording)
+        WatchLog.info(
+            "realtime", "fallback_full_file_submitted",
+            requestId: handle.requestId,
+            detail: "reason=\(reason) duration_ms=\(recording.durationMs) bytes=\(recording.data.count)"
+        )
+    }
+
+    /// Stash the just-finished m4a so a subsequent fast-channel failure can
+    /// still reach the reliable upload path. Cleared once the turn is
+    /// submitted normally or the adapter consumes it.
+    func retainRealtimeRecording(_ recording: AudioRecorder.Recording, forRequestId requestId: String) {
+        pendingRealtimeRecording[requestId] = recording
     }
 
     /// 一键重试（ESS-55）：用缓存的录音换新 request_id 重发，不需要重新说话。

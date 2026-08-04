@@ -456,12 +456,36 @@ extension WatchVoiceTransport: WatchRealtimeMediaAdapter.Transport {
         }
     }
 
+    func sendPlaybackStarted(handle: RealtimeMediaSession.TurnHandle, responseId: String) {
+        WatchLog.info(
+            "transport", "realtime_playback_started",
+            requestId: handle.requestId, detail: "response_id=\(responseId)"
+        )
+        sendRealtimeUplink(.playbackStarted(RealtimePlaybackReceipt(
+            requestId: handle.requestId, sessionId: handle.sessionId,
+            responseId: responseId, bytesPlayed: nil
+        )))
+    }
+
+    func sendPlaybackEnded(handle: RealtimeMediaSession.TurnHandle, responseId: String, bytesPlayed: Int) {
+        WatchLog.info(
+            "transport", "realtime_playback_ended",
+            requestId: handle.requestId,
+            detail: "response_id=\(responseId) bytes_played=\(bytesPlayed)"
+        )
+        sendRealtimeUplink(.playbackEnded(RealtimePlaybackReceipt(
+            requestId: handle.requestId, sessionId: handle.sessionId,
+            responseId: responseId, bytesPlayed: bytesPlayed
+        )))
+    }
+
     func fallbackToCompleteFile(handle: RealtimeMediaSession.TurnHandle,
                                 reason: RealtimeUplinkStream.FallbackReason) {
         // ESS-321: the coordinator has committed to fallback exactly once per
         // turn. Emit a wire signal so the iPhone drops any in-flight WSS
-        // buffers for this request, and leave the full-file relay flow to
-        // handle delivery — the recorded m4a already sits in the outbox.
+        // buffers for this request. The concrete m4a upload is performed by
+        // the adapter's injected FullFileFallback closure (which routes to
+        // this class's `send(envelope:recording:)`), so no double execution.
         WatchLog.info(
             "transport", "realtime_complete_file_fallback",
             requestId: handle.requestId, detail: "reason=\(reason)"

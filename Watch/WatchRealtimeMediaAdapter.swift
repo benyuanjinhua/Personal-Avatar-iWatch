@@ -40,14 +40,33 @@ final class WatchRealtimeMediaAdapter {
         func sendStreamStart(_ start: RealtimeStreamStart)
         func sendAudioAppend(_ chunk: VoiceStreamChunk)
         func sendAudioCommit(_ commit: RealtimeStreamCommit)
+        /// Bridge PR #113 contract: real `playback.started/ended` receipts are
+        /// forwarded up the WSS so the Bridge treats the Watch player as the
+        /// authority — receiving `audio.delta` does not count.
+        func sendPlaybackStarted(handle: RealtimeMediaSession.TurnHandle, responseId: String)
+        func sendPlaybackEnded(handle: RealtimeMediaSession.TurnHandle, responseId: String, bytesPlayed: Int)
+        /// Single-shot full-file fallback. The adapter GUARANTEES this is
+        /// called at most once per turn; implementations must NOT trigger a
+        /// double m4a upload themselves.
         func fallbackToCompleteFile(handle: RealtimeMediaSession.TurnHandle,
                                     reason: RealtimeUplinkStream.FallbackReason)
     }
+
+    /// Real single-shot full-file fallback executor. When the fast channel
+    /// dies the coordinator triggers `.uplinkFallback`; the adapter routes
+    /// that through this closure so the concrete Watch wiring (which knows
+    /// how to grab the m4a from the parallel AudioRecorder and call
+    /// `WatchVoiceTransport.send(envelope:recording:)`) can actually upload
+    /// the recording exactly once. The adapter guarantees single execution
+    /// via its own flag.
+    typealias FullFileFallback = @MainActor (RealtimeMediaSession.TurnHandle,
+                                             RealtimeUplinkStream.FallbackReason) -> Void
 
     let session: RealtimeMediaSession
     private let recorder: Recorder
     private let player: Player
     private let transport: Transport
+    private let fullFileFallback: FullFileFallback
     private let logger: (String) -> Void
     private(set) var didTriggerCompleteFileFallback = false
     private(set) var currentTurn: RealtimeMediaSession.TurnHandle?
@@ -57,12 +76,14 @@ final class WatchRealtimeMediaAdapter {
         recorder: Recorder,
         player: Player,
         transport: Transport,
+        fullFileFallback: @escaping FullFileFallback = { _, _ in },
         logger: @escaping (String) -> Void = { _ in }
     ) {
         self.session = session
         self.recorder = recorder
         self.player = player
         self.transport = transport
+        self.fullFileFallback = fullFileFallback
         self.logger = logger
         wire()
     }
@@ -73,9 +94,20 @@ final class WatchRealtimeMediaAdapter {
         player.onPlaybackEvent = { [weak self] event in
             guard let self else { return }
             switch event {
-            case .ended:
+            case .started(let requestId, let sessionId):
+                if let handle = self.currentTurn,
+                   handle.requestId == requestId, handle.sessionId == sessionId {
+                    self.transport.sendPlaybackStarted(handle: handle, responseId: sessionId)
+                }
+            case .ended(let requestId, let sessionId, let bytesPlayed):
+                if let handle = self.currentTurn,
+                   handle.requestId == requestId, handle.sessionId == sessionId {
+                    self.transport.sendPlaybackEnded(
+                        handle: handle, responseId: sessionId, bytesPlayed: bytesPlayed
+                    )
+                }
                 self.session.markDownlinkFinished()
-            case .bargedIn, .failed, .started:
+            case .bargedIn, .failed:
                 break
             }
             self.logger("playback_event=\(event)")
@@ -152,7 +184,15 @@ final class WatchRealtimeMediaAdapter {
             player.stop(barge: false)
             if !didTriggerCompleteFileFallback {
                 didTriggerCompleteFileFallback = true
+                // Signal the peer (Bridge) that the fast channel is dead so
+                // it releases the WSS resources — the message is a close, not
+                // a new business event (`RealtimeBridgeWireCodec` translates
+                // `.fallback` → `close`).
                 transport.fallbackToCompleteFile(handle: handle, reason: reason)
+                // Actually execute the full-file upload through the existing
+                // reliable path. Called exactly once per turn thanks to the
+                // flag above.
+                fullFileFallback(handle, reason)
                 logger("uplink_fallback reason=\(reason) request=\(handle.requestId)")
             }
         case .playbackReady(let frames):

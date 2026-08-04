@@ -14,6 +14,10 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
     weak var voiceJournal: VoiceTurnJournal?
     /// 结果语音的加密落盘仓（ESS-29）。
     weak var speechVault: EncryptedAudioVault?
+    /// ESS-321 real-time downlink dispatch target. `PushToTalkController` sets
+    /// this when the streaming gate is on so `audio.delta` envelopes arriving
+    /// from iPhone can be routed into the real playback engine.
+    weak var realtimeAdapter: WatchRealtimeMediaAdapter?
     private let defaults = UserDefaults.standard
     private let storageKey = "wristagent.watch.configuration"
 
@@ -120,6 +124,9 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         if let data = message[VoiceResultAudioDegradationMessage.envelopeKey] as? Data {
             Task { @MainActor in self.applyAudioDegradation(data) }
         }
+        if let data = message[RealtimeMediaMessage.downlinkEnvelopeKey] as? Data {
+            Task { @MainActor in self.applyRealtimeDownlink(data) }
+        }
         guard let data = message[VoiceStatusMessage.envelopeKey] as? Data else { return }
         Task { @MainActor in self.applyVoiceStatus(data) }
     }
@@ -131,6 +138,9 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         forwardRelayPayloads(in: userInfo)
         if let data = userInfo[VoiceResultAudioDegradationMessage.envelopeKey] as? Data {
             Task { @MainActor in self.applyAudioDegradation(data) }
+        }
+        if let data = userInfo[RealtimeMediaMessage.downlinkEnvelopeKey] as? Data {
+            Task { @MainActor in self.applyRealtimeDownlink(data) }
         }
         guard let data = userInfo[VoiceStatusMessage.envelopeKey] as? Data else { return }
         Task { @MainActor in self.applyVoiceStatus(data) }
@@ -244,6 +254,49 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         }
         if envelope.state == .completed, envelope.result?.speechSha256 == nil {
             voiceTransport?.sendResultAck(requestId: envelope.requestId)
+        }
+    }
+
+    /// ESS-321: decode a `RealtimeDownlinkEnvelope` arriving from iPhone via
+    /// `WatchDownlinkOutbox` and dispatch to the adapter. Envelopes for
+    /// requests other than the currently-active turn are dropped by the
+    /// adapter's session-isolated buffer.
+    @MainActor
+    private func applyRealtimeDownlink(_ data: Data) {
+        guard let envelope = try? JSONDecoder().decode(RealtimeDownlinkEnvelope.self, from: data),
+              envelope.protocolVersion == RealtimeWireVersion.downlink else {
+            WatchLog.error(
+                "turn", "realtime_downlink_undecodable",
+                detail: "bytes=\(data.count)", code: "ERR_DECODE"
+            )
+            return
+        }
+        guard let adapter = realtimeAdapter else {
+            WatchLog.info(
+                "turn", "realtime_downlink_no_adapter",
+                requestId: envelope.requestId,
+                detail: "kind=\(envelope.kind.rawValue)"
+            )
+            return
+        }
+        WatchLog.info(
+            "turn", "realtime_downlink_dispatch",
+            requestId: envelope.requestId,
+            detail: "kind=\(envelope.kind.rawValue) session=\(envelope.sessionId)"
+        )
+        switch envelope.kind {
+        case .audioDelta:
+            if let chunk = envelope.audio { adapter.ingestDownlink(chunk) }
+        case .audioDone:
+            adapter.markDownlinkComplete()
+        case .playbackClear, .responseInterrupted:
+            adapter.bargeIn()
+        case .bridgeFallback:
+            adapter.markDownlinkBridgeFallback()
+        case .transcriptDelta, .transcriptFinal:
+            // Text-only events are handled by the transcript layer, not the
+            // playback engine — leave them to `applyVoiceStatus` for now.
+            break
         }
     }
 

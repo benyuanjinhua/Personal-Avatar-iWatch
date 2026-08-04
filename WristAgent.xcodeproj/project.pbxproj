@@ -32,6 +32,7 @@
 		2AFB7EE475338CDAB23D6E85 /* VoiceOrbView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CA853AA557CCC08A3446DED /* VoiceOrbView.swift */; };
 		2BE4825B9DE1357E0469CED7 /* SpeechPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7669A09014913EDDEC887BBE /* SpeechPlayer.swift */; };
 		2FF25EEB3BCA3688BCB58468 /* ProcessingCopyThresholdTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FA650F428590FCA9FAA371A /* ProcessingCopyThresholdTests.swift */; };
+		3094CD00C51EF6746AEB7C98 /* RealtimeBridgeWireCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B1609E87036B6E0CEFB8C95 /* RealtimeBridgeWireCodec.swift */; };
 		3213E1FAF48D79262E5EA9FC /* CompanionContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A2CDFE23539DF4DB5ADDAF7 /* CompanionContentView.swift */; };
 		3216F8C5F4A8D25615A5F8E4 /* ResultNotificationPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13475F099EA8ADC39FB4651D /* ResultNotificationPolicy.swift */; };
 		34140BE278C262CF0BACEABE /* EncryptedAudioVault.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7C56A17FC91DC667B51B7D6 /* EncryptedAudioVault.swift */; };
@@ -134,6 +135,7 @@
 		E1EB77C2B2AFD2E3C00EC110 /* VoiceSessionKeeper.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0E2B5FAE82F1D44C2C36616 /* VoiceSessionKeeper.swift */; };
 		E67E11F4044782400305330E /* WatchContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 937C17EC6A16413E34C276A2 /* WatchContentView.swift */; };
 		E817250A3DAFD3D2F889876B /* BridgeTurnProjection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A61F7EAFB8A0CCF3D03F1D2 /* BridgeTurnProjection.swift */; };
+		E9BABA745F521D5A45E84D50 /* RealtimeBridgeWireCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B1609E87036B6E0CEFB8C95 /* RealtimeBridgeWireCodec.swift */; };
 		ECA89E26FFC474C089D1802D /* RealtimeMediaWireFormat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 63B4FAFE429B15682CA5E9F8 /* RealtimeMediaWireFormat.swift */; };
 		ECB4DA3B894FC346061B54D4 /* ErrorCue_TextOnly.m4a in Resources */ = {isa = PBXBuildFile; fileRef = 57F64DE4D4F59AFD226CD234 /* ErrorCue_TextOnly.m4a */; };
 		EFF14C832245DFFF4D10E97F /* VoiceRelayWire.swift in Sources */ = {isa = PBXBuildFile; fileRef = 035DF4EEFBF9F540A0B791F7 /* VoiceRelayWire.swift */; };
@@ -196,6 +198,7 @@
 		13F51C6DCBABB59C404B307D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		16A065FFB735532D201B2183 /* VoiceRequestEnvelope.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRequestEnvelope.swift; sourceTree = "<group>"; };
 		1AB8CD6D695437D845CE87AF /* VoiceRequestInbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRequestInbox.swift; sourceTree = "<group>"; };
+		1B1609E87036B6E0CEFB8C95 /* RealtimeBridgeWireCodec.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeBridgeWireCodec.swift; sourceTree = "<group>"; };
 		1CEDAB5F3CD7B29B993F0FA2 /* RealtimeMediaFormat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeMediaFormat.swift; sourceTree = "<group>"; };
 		1DAF03C2F2C11D4CBC8D9587 /* WatchSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchSettingsView.swift; sourceTree = "<group>"; };
 		234EBF336FF2F9724F289524 /* ClientLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientLog.swift; sourceTree = "<group>"; };
@@ -309,6 +312,7 @@
 				827B4FDF631BEBEFA13118A9 /* PersistHelper.swift */,
 				9F3363DB5FB9EF9FF44F0744 /* PlaybackEndgamePolicy.swift */,
 				905294A59B10050708A50FBF /* PlaybackRecoveryPolicy.swift */,
+				1B1609E87036B6E0CEFB8C95 /* RealtimeBridgeWireCodec.swift */,
 				4C41457A27FD24A41133AFFE /* RealtimeDownlinkPlayback.swift */,
 				1CEDAB5F3CD7B29B993F0FA2 /* RealtimeMediaFormat.swift */,
 				49D1CFEB2C03FAA07DA192C1 /* RealtimeMediaSession.swift */,
@@ -616,6 +620,7 @@
 				D646FBAAC6F5F67130E21FB0 /* PhoneRealtimeWebSocketTransport.swift in Sources */,
 				CEA31973C29CBFC9511A3BAB /* PlaybackEndgamePolicy.swift in Sources */,
 				3BED828277BCE6296AFDC424 /* PlaybackRecoveryPolicy.swift in Sources */,
+				E9BABA745F521D5A45E84D50 /* RealtimeBridgeWireCodec.swift in Sources */,
 				03A62E2D08DF9037D1ED20F3 /* RealtimeDownlinkPlayback.swift in Sources */,
 				7249351A21B20AAC649807D9 /* RealtimeMediaFormat.swift in Sources */,
 				87589EC57C16EFE13A79738E /* RealtimeMediaSession.swift in Sources */,
@@ -669,6 +674,7 @@
 				88162BC2A9F5ADF2F56E6246 /* PlaybackEndgamePolicy.swift in Sources */,
 				7522A68DCE1692BE3EC03F18 /* PlaybackRecoveryPolicy.swift in Sources */,
 				5E9988BFEA3673DAA88C1F70 /* PushToTalkController.swift in Sources */,
+				3094CD00C51EF6746AEB7C98 /* RealtimeBridgeWireCodec.swift in Sources */,
 				C8D3D2E8D0626D66145B3C31 /* RealtimeDownlinkPlayback.swift in Sources */,
 				7787B4B28677EFC96B299E8D /* RealtimeMediaFormat.swift in Sources */,
 				1DEEC7DB7C45672A9EE48707 /* RealtimeMediaSession.swift in Sources */,

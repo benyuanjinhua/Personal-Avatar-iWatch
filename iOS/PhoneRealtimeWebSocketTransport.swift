@@ -2,12 +2,15 @@ import Foundation
 import os
 
 /// ESS-321 production transport for `PhoneRealtimeSession`. Wraps a
-/// `URLSessionWebSocketTask` speaking the bridge's realtime WSS endpoint.
+/// `URLSessionWebSocketTask` speaking the Bridge realtime WSS endpoint owned
+/// by ESS-322 (`server.mjs` in PR #113).
 ///
-/// The bridge contract (owned by ESS-322) accepts one WSS connection per
-/// (device, request_id, session_id) tuple. Uplink frames are sent as JSON
-/// text messages; downlink events arrive as text messages with the same
-/// `RealtimeDownlinkEnvelope` shape defined in `Shared`.
+/// Wire schema: the Bridge accepts **flat** JSON messages tagged by top-level
+/// `type` — see `RealtimeBridgeWireCodec` for the exact shape. This transport
+/// runs Watch → iPhone envelopes through the codec on the way out and Bridge
+/// downlink events through the codec on the way back in. That keeps schema
+/// drift confined to one file and lets `Tests/` verify the exact strings the
+/// Bridge will see without spinning up a socket.
 ///
 /// Deliberately minimal: connection setup, receive loop, and send. No retry
 /// or backoff — the coordinator on the watch treats a failure as a signal
@@ -33,8 +36,7 @@ final class PhoneRealtimeWebSocketTransport: PhoneRealtimeSession.Transport {
             ]))
             return
         }
-        guard let data = try? JSONEncoder().encode(envelope),
-              let text = String(data: data, encoding: .utf8) else {
+        guard let text = RealtimeBridgeWireCodec.encode(envelope) else {
             completion(NSError(domain: "PhoneRealtimeWebSocketTransport", code: 2, userInfo: [
                 NSLocalizedDescriptionKey: "envelope encode failed"
             ]))
@@ -42,6 +44,11 @@ final class PhoneRealtimeWebSocketTransport: PhoneRealtimeSession.Transport {
         }
         task.send(.string(text)) { error in
             Task { @MainActor in completion(error) }
+        }
+        if case .fallback = envelope.kind {
+            // Bridge sees fallback as socket close — no more messages after.
+            isClosed = true
+            task.cancel(with: .goingAway, reason: envelope.fallback?.reason.data(using: .utf8))
         }
     }
 
@@ -54,22 +61,21 @@ final class PhoneRealtimeWebSocketTransport: PhoneRealtimeSession.Transport {
                 case .success(let message):
                     switch message {
                     case .data(let data):
-                        if let envelope = try? JSONDecoder().decode(RealtimeDownlinkEnvelope.self, from: data) {
+                        if let envelope = RealtimeBridgeWireCodec.decode(data) {
                             handler(.success(envelope))
                         } else {
                             handler(.failure(NSError(
                                 domain: "PhoneRealtimeWebSocketTransport", code: 3,
-                                userInfo: [NSLocalizedDescriptionKey: "invalid downlink envelope"]
+                                userInfo: [NSLocalizedDescriptionKey: "invalid downlink frame"]
                             )))
                         }
                     case .string(let text):
-                        if let data = text.data(using: .utf8),
-                           let envelope = try? JSONDecoder().decode(RealtimeDownlinkEnvelope.self, from: data) {
+                        if let envelope = RealtimeBridgeWireCodec.decode(text) {
                             handler(.success(envelope))
                         } else {
                             handler(.failure(NSError(
                                 domain: "PhoneRealtimeWebSocketTransport", code: 4,
-                                userInfo: [NSLocalizedDescriptionKey: "invalid downlink envelope"]
+                                userInfo: [NSLocalizedDescriptionKey: "invalid downlink frame"]
                             )))
                         }
                     @unknown default:

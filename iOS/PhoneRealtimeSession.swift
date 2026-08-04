@@ -39,7 +39,12 @@ final class PhoneRealtimeSession {
         category: "RealtimeSession"
     )
 
-    private let transportFactory: () -> Transport?
+    /// Bridge PR #113 `server.mjs` requires the WSS handshake to carry
+    /// `?request_id=` and `?session_id=` in the URL query AND the request-id
+    /// used for HMAC signing to match `request_id` — otherwise the socket
+    /// closes with `ERR_STREAM_OWNERSHIP`. The factory therefore takes the
+    /// (requestId, sessionId) tuple for the turn it will serve.
+    private let transportFactory: (_ requestId: String, _ sessionId: String) -> Transport?
     private var currentTransport: Transport?
     private(set) var state: State = .idle
     private var pendingDownlink: [RealtimeDownlinkEnvelope] = []
@@ -50,7 +55,7 @@ final class PhoneRealtimeSession {
     /// Emits state transitions so callers can flip UI or log evidence.
     var onStateChange: ((State) -> Void)?
 
-    init(transportFactory: @escaping () -> Transport?) {
+    init(transportFactory: @escaping (_ requestId: String, _ sessionId: String) -> Transport?) {
         self.transportFactory = transportFactory
     }
 
@@ -131,7 +136,7 @@ final class PhoneRealtimeSession {
             break
         }
         currentTransport?.close(reason: "supersede")
-        guard let transport = transportFactory() else {
+        guard let transport = transportFactory(requestId, sessionId) else {
             transition(to: .failed(reason: "no_transport"))
             return
         }

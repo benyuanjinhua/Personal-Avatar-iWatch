@@ -20,8 +20,8 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     /// enable streaming (VoiceStreamingGate.defaultEnabled == false) do not
     /// pay for the WSS setup.
     private lazy var realtimeSession: PhoneRealtimeSession = {
-        let session = PhoneRealtimeSession(transportFactory: { [weak self] in
-            self?.makeRealtimeTransport()
+        let session = PhoneRealtimeSession(transportFactory: { [weak self] requestId, sessionId in
+            self?.makeRealtimeTransport(requestId: requestId, sessionId: sessionId)
         })
         session.onDownlink = { [weak self] envelope in
             self?.forwardRealtimeDownlink(envelope)
@@ -231,19 +231,29 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     /// bridge URL. Returns `nil` if the phone is not paired yet (the watch
     /// side will treat that as a transport failure and fall back to the
     /// existing full-file relay flow).
+    ///
+    /// Bridge PR #113 `server.mjs` requires `?request_id=` + `?session_id=`
+    /// on the WSS handshake AND the signed request-id to equal the URL's
+    /// `request_id`, otherwise the socket closes with `ERR_STREAM_OWNERSHIP`.
+    /// The factory therefore signs with the turn's request id (not a fresh
+    /// UUID) and stamps both ids on the URL query.
     @MainActor
-    private func makeRealtimeTransport() -> PhoneRealtimeSession.Transport? {
+    private func makeRealtimeTransport(requestId: String, sessionId: String) -> PhoneRealtimeSession.Transport? {
         guard let credentials = RelayCredentialsStore.read(),
               var components = URLComponents(string: relay.bridgeURLString) else { return nil }
         components.scheme = "wss"
         components.path = "/v1/voice/realtime"
+        components.queryItems = [
+            URLQueryItem(name: "request_id", value: requestId),
+            URLQueryItem(name: "session_id", value: sessionId)
+        ]
         guard let url = components.url else { return nil }
         let builder = RelaySignedRequestBuilder(
             baseURL: url.deletingLastPathComponent(), credentials: credentials
         )
         var request = builder.request(
             method: "GET", path: "/v1/voice/realtime",
-            requestId: UUID().uuidString.lowercased(), body: nil
+            requestId: requestId, body: nil
         )
         request.url = url
         let task = URLSession.shared.webSocketTask(with: request)
