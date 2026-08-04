@@ -65,6 +65,31 @@ function entrySha(entry) {
   return detailSha(entry)
 }
 
+/// 抓 detail 里 `bytes=<n>` / `size_bytes=<n>` 的十进制正整数；顶层 `size_bytes`
+/// 数值字段兜底（Bridge 侧 l1_audio_ready 直接落）。返回 number 或 null。
+function detailNumber(entry, name) {
+  const detail = entry?.detail
+  if (typeof detail !== 'string') return null
+  const re = new RegExp(`(?:^|\\s)${name}=(\\d+)(?:\\s|$)`)
+  const match = detail.match(re)
+  return match ? Number(match[1]) : null
+}
+function entrySize(entry) {
+  if (Number.isFinite(entry?.size_bytes)) return Number(entry.size_bytes)
+  const fromSize = detailNumber(entry, 'size_bytes')
+  if (fromSize !== null) return fromSize
+  return detailNumber(entry, 'bytes')
+}
+
+/// 抓 detail 里 `<name>=true|false` 的布尔值。三态返回：true/false/null（缺）。
+function detailBool(entry, name) {
+  const detail = entry?.detail
+  if (typeof detail !== 'string') return null
+  const re = new RegExp(`(?:^|\\s)${name}=(true|false)(?:\\s|$)`)
+  const match = detail.match(re)
+  return match ? (match[1] === 'true') : null
+}
+
 /// 把一条 bridge.log 条目映射到探针跳编号（H1..H5），返回 null 表示与探针无关。
 ///
 /// 匹配规则严格从紧，不放行貌似相关但语义不合的事件（例如别的 request_id 的
@@ -109,6 +134,11 @@ function classifyEntry(entry, requestId) {
   if (module === 'player' && event === 'play_started') return 'H4_start'
   if (module === 'player' && event === 'play_finished') return 'H4_finish'
 
+  // 负信号：AVAudioSession activate 返回 activated=false → 显式激活失败。
+  // 不是跳，但要在 evaluateProbe 里挡下（H4_NOT_ACTIVATED），比事后从 play_*
+  // 判定更可靠——真机上 play_started 有时能在未激活的会话下上，产出静音回执。
+  if (module === 'player' && event === 'session_activation_failed') return 'SESSION_ACTIVATION_FAILED'
+
   return null
 }
 
@@ -124,9 +154,11 @@ export const HOP_DESCRIPTIONS = Object.freeze({
 /// 解析 bridge.log，返回该 requestId 的逐跳观测。
 ///
 /// - 只按 Bridge 落盘 ts 排序（服务端时钟，与 watch-build.mjs 同口径）；
-/// - H2 允许「无 request_id 但 detail=kind=speech|probe 且时间落在 H1 之后 / H3 之前」
-///   的邻近推断（Watch 端补齐 request_id 前的过渡兼容，Watch 端补齐后此路径失效）；
-/// - 缺 H1 或 H2 不推断出 H3/H4/H5；缺失就是缺失，不做善意补齐。
+/// - 缺 H1 或 H2 不推断出 H3/H4/H5；缺失就是缺失，不做善意补齐；
+/// - ESS-240：**H2 不再做孤儿 file_received 邻近推断**。任何跳都必须显式携带
+///   request_id（即 probe_id）与 H1 相同才被采纳；缺 probe_id 一律 fail-closed。
+///   历史「Watch 未补 request_id」兜底路径是 PR #59 fail-open 的入口之一（ESS-240），
+///   同一时间窗内任意别人的 file_received 都能被无差别捡走当作本探针的 H2。
 export function parseProbeHops(lines, requestId, { window = null } = {}) {
   if (typeof requestId !== 'string' || requestId.length === 0) {
     throw new Error('parseProbeHops: requestId 必填')
@@ -135,7 +167,7 @@ export function parseProbeHops(lines, requestId, { window = null } = {}) {
 
   const observations = { H1: [], H2: [], H3: [], H4_start: [], H4_finish: [], H5: [] }
   const rejected = []
-  const orphanFileReceived = []
+  const activationFailed = []
 
   for (const entry of entries) {
     const at = parseTimestamp(entry.ts)
@@ -143,16 +175,8 @@ export function parseProbeHops(lines, requestId, { window = null } = {}) {
 
     const hop = classifyEntry(entry, requestId)
     if (hop === 'REJECTED') { rejected.push({ at, reason: entry.reason ?? null, source: entry.source ?? null }); continue }
+    if (hop === 'SESSION_ACTIVATION_FAILED') { activationFailed.push({ at, entry }); continue }
     if (hop) { observations[hop].push({ at, entry }); continue }
-
-    // 孤儿 file_received（无 request_id）：仅当 detail=kind=speech|probe 时保留，
-    // 后续 buildHops 用 H1/H3 的时间窗判是否属于本探针。
-    if (entry.evt === 'watch_client_log' && entry.module === 'wcsession' && entry.event === 'file_received') {
-      const kind = detailKind(entry)
-      if (kind === 'speech' || kind === 'probe' || kind === 'result_audio') {
-        orphanFileReceived.push({ at, entry })
-      }
-    }
   }
 
   const firstOf = list => list.length === 0 ? null : list.reduce((a, b) => (
@@ -168,20 +192,11 @@ export function parseProbeHops(lines, requestId, { window = null } = {}) {
   hops.H4 = startObs && finishObs ? { at: finishObs.at, entry: finishObs.entry, startAt: startObs.at } : null
   hops.H5 = firstOf(observations.H5)
 
-  // H2 兜底：Watch 端未在探针路径上补 request_id 时，用「H1 之后 / H3 之前 + detail
-  // 里 kind 与探针语义一致」的孤儿 file_received 邻近推断（仅一条）。这条兜底显式
-  // 标记 `inferred: true`，PM/门禁看得见是推断而非直证。
-  if (!hops.H2 && orphanFileReceived.length > 0 && hops.H1) {
-    const h1At = hops.H1.at
-    const h3At = hops.H3?.at ?? null
-    const candidate = orphanFileReceived.find(o => o.at && h1At && o.at >= h1At && (!h3At || o.at <= h3At))
-    if (candidate) hops.H2 = { at: candidate.at, entry: candidate.entry, inferred: true }
-  }
-
   return {
     requestId,
     hops,
     rejected: rejected.length > 0 ? rejected[0] : null,
+    activationFailed: activationFailed.length > 0 ? activationFailed[0] : null,
     counts: {
       H1: observations.H1.length,
       H2: observations.H2.length,
@@ -190,7 +205,7 @@ export function parseProbeHops(lines, requestId, { window = null } = {}) {
       H4_finish: observations.H4_finish.length,
       H5: observations.H5.length,
       REJECTED: rejected.length,
-      orphanFileReceived: orphanFileReceived.length,
+      SESSION_ACTIVATION_FAILED: activationFailed.length,
     },
   }
 }
@@ -207,6 +222,13 @@ export const PROBE = {
   BAD_ORDER: 'ERR_PROBE_HOP_OUT_OF_ORDER',
   // ESS-207 复审 §2：H1/H3/H5 三处 sha 不一致 → 播放的可能不是本次注入的字节。
   SHA_MISMATCH: 'ERR_PROBE_SHA_MISMATCH',
+  // ESS-240：跨跳 size_bytes 不一致（H1 声明的字节数与 H2/H3 观测到的不同）→
+  // 途中被截/被换字节。size 与 sha 分开报，方便按维度定位。
+  SIZE_MISMATCH: 'ERR_PROBE_SIZE_MISMATCH',
+  // ESS-240：H4 段观察到 session_activation_failed 或 play_finished successfully=false
+  // ——播放器路径没走通，回执用户听到的可能是静音/半段。
+  H4_NOT_ACTIVATED: 'ERR_PROBE_H4_NOT_ACTIVATED',
+  H4_NOT_FINISHED: 'ERR_PROBE_H4_NOT_FINISHED',
 }
 
 /// 依据逐跳观测出裁决。停在第一个缺跳，附每跳耗时（自 H1 起算）。
@@ -215,7 +237,7 @@ export const PROBE = {
 /// - 有 rejected 记录（同 request_id）→ 直接 FAIL，不再看后续跳；
 /// - timeoutMs 从 H1 起算；跳齐但耗时超阈值判 TIMEOUT。
 export function evaluateProbe(hopResult, { timeoutMs = 60_000 } = {}) {
-  const { hops, rejected, requestId } = hopResult
+  const { hops, rejected, activationFailed, requestId } = hopResult
   if (rejected) {
     return {
       pass: false, code: PROBE.REJECTED, stoppedAt: 'H1',
@@ -245,22 +267,82 @@ export function evaluateProbe(hopResult, { timeoutMs = 60_000 } = {}) {
     previousAt = obs.at ?? previousAt
   }
 
-  // ESS-207 复审 §2：H1（Bridge 出口）、H3（Watch 落盘）、H5（Watch 播完 ACK）
-  // 三处的 sha 必须一致，否则「播的可能不是本次注入的字节」——H5 事件伪造 /
-  // Watch 侧沾了残留 vault 数据都能被这条挡住。任一 sha 缺失（旧日志格式）
-  // 时不强制断言，保留向前兼容窗；两个都有值时必须相等。
+  // ESS-207 复审 §2 / ESS-240 强化：H1（Bridge 出口）、H3（Watch 落盘）、H5
+  // （Watch 播完 ACK）三处的 sha 必须一致。ESS-240 之前是「filter(Boolean) +
+  // set.size>1」判定——H3 缺 sha 时静默跳过，就是 PR #59 fail-open 入口之一。
+  // 现在改为：H1 有 sha 时 H3/H5 也必须有 sha 且值相同，任一缺失/不匹配即
+  // SHA_MISMATCH。H1 自身无 sha 的旧日志格式仍保留兼容窗。
   const h1Sha = entrySha(hops.H1.entry)
   const h3Sha = entrySha(hops.H3.entry)
   const h5Sha = entrySha(hops.H5.entry)
-  const observedShas = [h1Sha, h3Sha, h5Sha].filter(Boolean)
-  const uniqueShas = new Set(observedShas)
-  if (observedShas.length >= 2 && uniqueShas.size > 1) {
+  if (h1Sha) {
+    // H3（Watch 落盘）必须携带 sha 且与 H1 相等——这是「Watch 真的拿到本次注入
+    // 的字节」的直接证据；缺 sha 视同不匹配（fail-closed，ESS-240）。
+    if (h3Sha !== h1Sha) {
+      return {
+        pass: false, code: PROBE.SHA_MISMATCH, stoppedAt: 'H3',
+        message: `H1/H3 sha 不一致：H1=${h1Sha} H3=${h3Sha ?? '缺失'}`
+          + `（H3 ${h3Sha === null ? '缺 sha256 字段' : '不同'}）`,
+        requestId, timings: buildTimings(hops),
+        summary: summarize(hops, null),
+        shas: { h1: h1Sha, h3: h3Sha, h5: h5Sha },
+      }
+    }
+    // H5 sha 弱要求：`probe_acked` 走 sha 双保险；`result_acked`（探针未拆前的
+    // 兼容通道）不带 sha 字段——允许缺失但不允许不匹配。
+    if (h5Sha !== null && h5Sha !== h1Sha) {
+      return {
+        pass: false, code: PROBE.SHA_MISMATCH, stoppedAt: 'H5',
+        message: `H1/H5 sha 不一致：H1=${h1Sha} H5=${h5Sha}——ACK 里的字节不是本次注入的字节`,
+        requestId, timings: buildTimings(hops),
+        summary: summarize(hops, null),
+        shas: { h1: h1Sha, h3: h3Sha, h5: h5Sha },
+      }
+    }
+  }
+
+  // ESS-240 AC2：H1 声明 size_bytes 时，H2 / H3 的 bytes= 必须与 H1 相等。任一
+  // 缺失 / 不匹配即 SIZE_MISMATCH——被截字节、误传别的文件都能被这条挡住。
+  // H1 自身无 size 的老包保留兼容（此时上游没定 baseline，不做断言）。
+  const h1Size = entrySize(hops.H1.entry)
+  const h2Size = entrySize(hops.H2.entry)
+  const h3Size = entrySize(hops.H3.entry)
+  if (Number.isFinite(h1Size)) {
+    for (const [name, obsSize] of [['H2', h2Size], ['H3', h3Size]]) {
+      if (obsSize !== h1Size) {
+        return {
+          pass: false, code: PROBE.SIZE_MISMATCH, stoppedAt: name,
+          message: `探针 5 跳齐但 size_bytes 不一致：H1=${h1Size} H2=${h2Size ?? '缺失'} H3=${h3Size ?? '缺失'}`
+            + `（${name} ${obsSize === null ? '缺 bytes 字段' : '不同'}）`,
+          requestId, timings: buildTimings(hops),
+          summary: summarize(hops, null),
+          sizes: { h1: h1Size, h2: h2Size, h3: h3Size },
+        }
+      }
+    }
+  }
+
+  // ESS-240 AC4a：H4 段任何时刻观察到 session_activation_failed（同 request_id）
+  // → 不给 PASS。真机取证过：activate 回调 activated=false 也可能后续走 fallback
+  // 让 play_started 上，产出静音回执；这里挡住不再看是否 play_finished。
+  if (activationFailed) {
+    const detail = activationFailed.entry?.detail ?? ''
     return {
-      pass: false, code: PROBE.SHA_MISMATCH, stoppedAt: 'H5',
-      message: `探针 5 跳齐但 H1/H3/H5 sha 不一致：H1=${h1Sha ?? '?'} H3=${h3Sha ?? '?'} H5=${h5Sha ?? '?'}`,
-      requestId, timings: buildTimings(hops),
-      summary: summarize(hops, null),
-      shas: { h1: h1Sha, h3: h3Sha, h5: h5Sha },
+      pass: false, code: PROBE.H4_NOT_ACTIVATED, stoppedAt: 'H4',
+      message: `H4 观察到 session_activation_failed（${detail || '无 detail'}）——播放会话未激活`,
+      requestId, timings: buildTimings(hops), summary: summarize(hops, 'H4'),
+    }
+  }
+
+  // ESS-240 AC4b：play_finished successfully=false → 不给 PASS。play_started +
+  // play_finished 都在但 successfully=false 意味着播放被打断，回执用户听到的
+  // 是半段/静音。detail 缺 successfully 字段的旧日志按 true 处理（保留兼容）。
+  const finishOk = detailBool(hops.H4.entry, 'successfully')
+  if (finishOk === false) {
+    return {
+      pass: false, code: PROBE.H4_NOT_FINISHED, stoppedAt: 'H4',
+      message: `H4 play_finished successfully=false——播放未成功收尾`,
+      requestId, timings: buildTimings(hops), summary: summarize(hops, 'H4'),
     }
   }
 

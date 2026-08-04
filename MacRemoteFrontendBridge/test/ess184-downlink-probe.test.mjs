@@ -102,18 +102,21 @@ describe('ESS-184 probe log parser', () => {
     assert.equal(verdict.code, PROBE.SHA_MISMATCH)
   })
 
-  it('stays backward-compatible when Watch H3 log has no sha256 field (skip sha check silently)', () => {
-    // 旧日志格式没有 sha256=… 时，parser 退化为不做 H3 断言，避免升级窗内误报。
+  it('fails-closed when Watch H3 log has no sha256 field (ESS-240: missing != skip)', () => {
+    // ESS-207 时代此测试断言 pass:true——H3 缺 sha 时静默跳过校验。ESS-240 复现
+    // PR #59 fail-open：H1 有 sha 而 H3 缺，正是 PROBE_PASS 伪绿灯的路径之一。
+    // 现在改为 fail-closed：H1 有 sha → H3 必须携带并匹配。
     const lines = [
       j({ ts: ts(0.0), evt: 'l1_audio_ready', request_id: RID, source: 'direct', kind: 'probe', sha256: HAPPY_SHA, size_bytes: 40000 }),
-      j({ ts: ts(0.8), evt: 'watch_client_log', module: 'wcsession', event: 'file_received', request_id: RID, detail: 'kind=probe' }),
+      j({ ts: ts(0.8), evt: 'watch_client_log', module: 'wcsession', event: 'file_received', request_id: RID, detail: 'kind=probe bytes=40000' }),
       j({ ts: ts(1.0), evt: 'watch_client_log', module: 'turn', event: 'speech_stored', request_id: RID, detail: 'bytes=40000' }), // 无 sha
-      j({ ts: ts(1.5), evt: 'watch_client_log', module: 'player', event: 'play_started', request_id: RID }),
-      j({ ts: ts(3.8), evt: 'watch_client_log', module: 'player', event: 'play_finished', request_id: RID }),
+      j({ ts: ts(1.5), evt: 'watch_client_log', module: 'player', event: 'play_started', request_id: RID, detail: 'activated=true' }),
+      j({ ts: ts(3.8), evt: 'watch_client_log', module: 'player', event: 'play_finished', request_id: RID, detail: 'successfully=true' }),
       j({ ts: ts(4.0), evt: 'probe_acked', request_id: RID, played_ok: true, sha256: HAPPY_SHA }),
     ]
     const verdict = evaluateProbe(parseProbeHops(lines, RID))
-    assert.equal(verdict.pass, true, verdict.message)
+    assert.equal(verdict.pass, false, 'H3 缺 sha 已改为 fail-closed')
+    assert.equal(verdict.code, PROBE.SHA_MISMATCH)
   })
 
   it('flags H1 stop when the whitelist rejected the probe (kind not in AUDIO_KINDS)', () => {
@@ -151,9 +154,10 @@ describe('ESS-184 probe log parser', () => {
     assert.equal(verdict.stoppedAt, 'H2')
   })
 
-  it('infers H2 from an orphan file_received (no request_id but kind=speech, within H1..H3 window)', () => {
-    // Watch 端在探针路径上暂未补 request_id 时的过渡兼容：孤儿 file_received（无
-    // request_id 但 detail 里 kind=speech）在 H1 之后 / H3 之前 → 记 inferred。
+  it('rejects orphan H2 without request_id (ESS-240 removed the inference path)', () => {
+    // ESS-207 时代此测试断言 pass:true——用邻近推断把孤儿 file_received 认作 H2。
+    // ESS-240：这条路径正是 fail-open 入口（时间窗内任意别的 probe 的 file_received
+    // 都会被捡走）。改为 fail-closed：H2 必须显式带 request_id（即 probe_id）。
     const lines = [
       j({ ts: ts(0.0), evt: 'l1_audio_ready', request_id: RID, source: 'direct', kind: 'probe' }),
       j({ ts: ts(0.8), evt: 'watch_client_log', module: 'wcsession', event: 'file_received', detail: 'kind=speech bytes=40000' }),
@@ -163,10 +167,10 @@ describe('ESS-184 probe log parser', () => {
       j({ ts: ts(4.0), evt: 'result_acked', request_id: RID }),
     ]
     const verdict = evaluateProbe(parseProbeHops(lines, RID))
-    assert.equal(verdict.pass, true, verdict.message)
+    assert.equal(verdict.pass, false)
+    assert.equal(verdict.code, PROBE.MISSING_H2)
     const h2 = verdict.summary.find(r => r.hop === 'H2')
-    assert.equal(h2.present, true)
-    assert.equal(h2.inferred, true)
+    assert.equal(h2.present, false)
   })
 
   it('stops at H3 when Watch never confirmed the sha match', () => {
@@ -255,6 +259,129 @@ describe('ESS-184 probe log parser', () => {
     assert.equal(hopResult.hops.H2, null)
     const verdict = evaluateProbe(hopResult)
     assert.equal(verdict.code, PROBE.MISSING_H2)
+  })
+})
+
+// ESS-240：门禁 fail-closed 反例——PR #59 合入 main 后复现的 5 条 fail-open
+// 场景。每条对应验收标准里的一条 bullet，且都断言 pass:false + 具名错误码。
+// 自检：任一修复被回滚，这一组必须变红。
+describe('ESS-240 probe gate fail-closed reproductions', () => {
+  it('AC1 rejects H3 with a sha256 that differs from H1 in bit patterns (SHA_MISMATCH)', () => {
+    const wrongSha = 'd'.repeat(64)
+    const lines = [
+      j({ ts: ts(0.0), evt: 'l1_audio_ready', request_id: RID, source: 'direct', kind: 'probe', sha256: HAPPY_SHA, size_bytes: 40000 }),
+      j({ ts: ts(0.8), evt: 'watch_client_log', module: 'wcsession', event: 'file_received', request_id: RID, detail: 'kind=probe bytes=40000' }),
+      j({ ts: ts(1.0), evt: 'watch_client_log', module: 'turn', event: 'speech_stored', request_id: RID, detail: `bytes=40000 sha256=${wrongSha}` }),
+      j({ ts: ts(1.5), evt: 'watch_client_log', module: 'player', event: 'play_started', request_id: RID, detail: 'activated=true' }),
+      j({ ts: ts(3.8), evt: 'watch_client_log', module: 'player', event: 'play_finished', request_id: RID, detail: 'successfully=true' }),
+      j({ ts: ts(4.0), evt: 'probe_acked', request_id: RID, played_ok: true, sha256: HAPPY_SHA }),
+    ]
+    const verdict = evaluateProbe(parseProbeHops(lines, RID))
+    assert.equal(verdict.pass, false)
+    assert.equal(verdict.code, PROBE.SHA_MISMATCH, verdict.message)
+    assert.match(verdict.message, /sha/i)
+  })
+
+  it('AC1-fail-closed rejects H3 that has no sha field at all (missing = mismatch, not silent skip)', () => {
+    // 反例：H3 完全缺 sha 字段。ESS-240 之前会「向前兼容跳过」判 PASS，属于
+    // fail-open；ESS-240 之后 H1 有 sha 而 H3 缺 → SHA_MISMATCH（fail-closed）。
+    const lines = [
+      j({ ts: ts(0.0), evt: 'l1_audio_ready', request_id: RID, source: 'direct', kind: 'probe', sha256: HAPPY_SHA, size_bytes: 40000 }),
+      j({ ts: ts(0.8), evt: 'watch_client_log', module: 'wcsession', event: 'file_received', request_id: RID, detail: 'kind=probe bytes=40000' }),
+      j({ ts: ts(1.0), evt: 'watch_client_log', module: 'turn', event: 'speech_stored', request_id: RID, detail: 'bytes=40000' }),
+      j({ ts: ts(1.5), evt: 'watch_client_log', module: 'player', event: 'play_started', request_id: RID, detail: 'activated=true' }),
+      j({ ts: ts(3.8), evt: 'watch_client_log', module: 'player', event: 'play_finished', request_id: RID, detail: 'successfully=true' }),
+      j({ ts: ts(4.0), evt: 'probe_acked', request_id: RID, played_ok: true, sha256: HAPPY_SHA }),
+    ]
+    const verdict = evaluateProbe(parseProbeHops(lines, RID))
+    assert.equal(verdict.pass, false)
+    assert.equal(verdict.code, PROBE.SHA_MISMATCH, verdict.message)
+  })
+
+  it('AC2 rejects H3 with size_bytes different from H1 (SIZE_MISMATCH)', () => {
+    // H1 size_bytes=40000，H3 detail bytes=99——不同字节数 → SIZE_MISMATCH。
+    const lines = [
+      j({ ts: ts(0.0), evt: 'l1_audio_ready', request_id: RID, source: 'direct', kind: 'probe', sha256: HAPPY_SHA, size_bytes: 40000 }),
+      j({ ts: ts(0.8), evt: 'watch_client_log', module: 'wcsession', event: 'file_received', request_id: RID, detail: 'kind=probe bytes=40000' }),
+      j({ ts: ts(1.0), evt: 'watch_client_log', module: 'turn', event: 'speech_stored', request_id: RID, detail: `bytes=99 sha256=${HAPPY_SHA}` }),
+      j({ ts: ts(1.5), evt: 'watch_client_log', module: 'player', event: 'play_started', request_id: RID, detail: 'activated=true' }),
+      j({ ts: ts(3.8), evt: 'watch_client_log', module: 'player', event: 'play_finished', request_id: RID, detail: 'successfully=true' }),
+      j({ ts: ts(4.0), evt: 'probe_acked', request_id: RID, played_ok: true, sha256: HAPPY_SHA }),
+    ]
+    const verdict = evaluateProbe(parseProbeHops(lines, RID))
+    assert.equal(verdict.pass, false)
+    assert.equal(verdict.code, PROBE.SIZE_MISMATCH, verdict.message)
+    assert.match(verdict.message, /size|bytes|字节/i)
+  })
+
+  it('AC3 rejects orphan H2 that has no probe_id/request_id link to H1 (PROBE_ID_MISMATCH)', () => {
+    // Watch 端探针路径未补 request_id 的过渡兼容曾经用邻近推断接住孤儿
+    // file_received——这条正是 fail-open 的入口：任意时间窗内的孤儿都能被
+    // 认作本 probe 的 H2。ESS-240 把此路径关掉：H2 必须显式携带 request_id
+    // （即 probe_id）与 H1 相同，否则 fail-closed。
+    const lines = [
+      j({ ts: ts(0.0), evt: 'l1_audio_ready', request_id: RID, source: 'direct', kind: 'probe', sha256: HAPPY_SHA, size_bytes: 40000 }),
+      // 孤儿 file_received：detail=kind=probe 但无 request_id
+      j({ ts: ts(0.8), evt: 'watch_client_log', module: 'wcsession', event: 'file_received', detail: 'kind=probe bytes=40000' }),
+      j({ ts: ts(1.0), evt: 'watch_client_log', module: 'turn', event: 'speech_stored', request_id: RID, detail: `bytes=40000 sha256=${HAPPY_SHA}` }),
+      j({ ts: ts(1.5), evt: 'watch_client_log', module: 'player', event: 'play_started', request_id: RID, detail: 'activated=true' }),
+      j({ ts: ts(3.8), evt: 'watch_client_log', module: 'player', event: 'play_finished', request_id: RID, detail: 'successfully=true' }),
+      j({ ts: ts(4.0), evt: 'probe_acked', request_id: RID, played_ok: true, sha256: HAPPY_SHA }),
+    ]
+    const verdict = evaluateProbe(parseProbeHops(lines, RID))
+    assert.equal(verdict.pass, false)
+    assert.equal(verdict.code, PROBE.MISSING_H2,
+      '孤儿 file_received 不再算 H2 —— 缺 probe_id 不做善意补齐')
+  })
+
+  it('AC4a rejects H4 when session_activation_failed was recorded (activated=false)', () => {
+    // 场景：AVAudioSession activate 回调返回 activated=false，Watch 落
+    // `player/session_activation_failed`。play_started 事件仍能上（走 fallback
+    // 或直接跑），门禁必须挡住——不能因为 play_started + play_finished 都在就 PASS。
+    const lines = [
+      j({ ts: ts(0.0), evt: 'l1_audio_ready', request_id: RID, source: 'direct', kind: 'probe', sha256: HAPPY_SHA, size_bytes: 40000 }),
+      j({ ts: ts(0.8), evt: 'watch_client_log', module: 'wcsession', event: 'file_received', request_id: RID, detail: 'kind=probe bytes=40000' }),
+      j({ ts: ts(1.0), evt: 'watch_client_log', module: 'turn', event: 'speech_stored', request_id: RID, detail: `bytes=40000 sha256=${HAPPY_SHA}` }),
+      j({ ts: ts(1.2), evt: 'watch_client_log', module: 'player', event: 'session_activation_failed', request_id: RID, detail: 'policy=long_form activated=false fallback=foreground' }),
+      j({ ts: ts(1.5), evt: 'watch_client_log', module: 'player', event: 'play_started', request_id: RID }),
+      j({ ts: ts(3.8), evt: 'watch_client_log', module: 'player', event: 'play_finished', request_id: RID, detail: 'successfully=true' }),
+      j({ ts: ts(4.0), evt: 'probe_acked', request_id: RID, played_ok: true, sha256: HAPPY_SHA }),
+    ]
+    const verdict = evaluateProbe(parseProbeHops(lines, RID))
+    assert.equal(verdict.pass, false)
+    assert.equal(verdict.code, PROBE.H4_NOT_ACTIVATED, verdict.message)
+  })
+
+  it('AC4b rejects H4 when play_finished carries successfully=false (finished=false)', () => {
+    // 场景：AVAudioPlayer 播放中途被打断，`play_finished successfully=false`。
+    // 门禁必须挡住——回执用户听到的是半段/静音。
+    const lines = [
+      j({ ts: ts(0.0), evt: 'l1_audio_ready', request_id: RID, source: 'direct', kind: 'probe', sha256: HAPPY_SHA, size_bytes: 40000 }),
+      j({ ts: ts(0.8), evt: 'watch_client_log', module: 'wcsession', event: 'file_received', request_id: RID, detail: 'kind=probe bytes=40000' }),
+      j({ ts: ts(1.0), evt: 'watch_client_log', module: 'turn', event: 'speech_stored', request_id: RID, detail: `bytes=40000 sha256=${HAPPY_SHA}` }),
+      j({ ts: ts(1.5), evt: 'watch_client_log', module: 'player', event: 'play_started', request_id: RID, detail: 'activated=true' }),
+      j({ ts: ts(3.8), evt: 'watch_client_log', module: 'player', event: 'play_finished', request_id: RID, detail: 'successfully=false' }),
+      j({ ts: ts(4.0), evt: 'probe_acked', request_id: RID, played_ok: true, sha256: HAPPY_SHA }),
+    ]
+    const verdict = evaluateProbe(parseProbeHops(lines, RID))
+    assert.equal(verdict.pass, false)
+    assert.equal(verdict.code, PROBE.H4_NOT_FINISHED, verdict.message)
+  })
+
+  it('AC5 rejects H3 that is present as an event but missing size_bytes field (missing != skip)', () => {
+    // fail-closed 收口：H3 事件在，H1 已声明 size_bytes，但 H3 detail 没有
+    // bytes= 字段 → 视同 SIZE_MISMATCH，不再「因字段缺失而跳过校验」。
+    const lines = [
+      j({ ts: ts(0.0), evt: 'l1_audio_ready', request_id: RID, source: 'direct', kind: 'probe', sha256: HAPPY_SHA, size_bytes: 40000 }),
+      j({ ts: ts(0.8), evt: 'watch_client_log', module: 'wcsession', event: 'file_received', request_id: RID, detail: 'kind=probe bytes=40000' }),
+      j({ ts: ts(1.0), evt: 'watch_client_log', module: 'turn', event: 'speech_stored', request_id: RID, detail: `sha256=${HAPPY_SHA}` }), // 没有 bytes=
+      j({ ts: ts(1.5), evt: 'watch_client_log', module: 'player', event: 'play_started', request_id: RID, detail: 'activated=true' }),
+      j({ ts: ts(3.8), evt: 'watch_client_log', module: 'player', event: 'play_finished', request_id: RID, detail: 'successfully=true' }),
+      j({ ts: ts(4.0), evt: 'probe_acked', request_id: RID, played_ok: true, sha256: HAPPY_SHA }),
+    ]
+    const verdict = evaluateProbe(parseProbeHops(lines, RID))
+    assert.equal(verdict.pass, false)
+    assert.equal(verdict.code, PROBE.SIZE_MISMATCH, verdict.message)
   })
 })
 
