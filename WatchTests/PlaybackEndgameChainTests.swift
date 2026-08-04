@@ -89,7 +89,7 @@ final class PlaybackEndgameChainTests: XCTestCase {
             directory: FileManager.default.temporaryDirectory
                 .appendingPathComponent("ess154-tests-\(UUID().uuidString)", isDirectory: true)
         ))
-        player.onPlaybackEndgame = { rid, endgame in
+        player.onPlaybackEndgame = { rid, _, endgame in
             receivedEndgame = endgame
             guard let outcome = PlaybackEndgamePolicy.outcome(for: endgame) else { return }
             if let cue = outcome.haptic {
