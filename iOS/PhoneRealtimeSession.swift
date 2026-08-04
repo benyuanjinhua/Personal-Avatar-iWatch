@@ -73,6 +73,9 @@ final class PhoneRealtimeSession {
         case .audioCommit:
             guard let commit = envelope.commit else { return }
             openIfNeeded(requestId: commit.requestId, sessionId: commit.sessionId)
+        case .playbackStarted, .playbackEnded:
+            guard let receipt = envelope.playback else { return }
+            openIfNeeded(requestId: receipt.requestId, sessionId: receipt.sessionId)
         case .fallback:
             guard let descriptor = envelope.fallback else { return }
             transition(to: .failed(reason: descriptor.reason))
