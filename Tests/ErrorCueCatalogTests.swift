@@ -62,17 +62,25 @@ final class ErrorCueCatalogTests: XCTestCase {
 
     func testAllClipNamesDedupesRealtimeStallVariants() {
         let names = ErrorCueCatalog.allClipNames
-        // 5 张片：AudioTooShort / TranscriptDiscarded / VoiceBusy / RealtimeStalled / Generic
+        // ESS-262：10 张片 = v1.0 五条（AudioTooShort / TranscriptDiscarded /
+        // VoiceBusy / RealtimeStalled / Generic）+ D2 v1.1 五条（MicPermission /
+        // Retryable / TextOnly / PhoneUnreachable / ManualConfirm）。
         XCTAssertEqual(Set(names).count, names.count, "文件名去重")
         XCTAssertTrue(names.contains("ErrorCue_Generic"))
         XCTAssertTrue(names.contains("ErrorCue_RealtimeStalled"))
-        XCTAssertEqual(names.count, 5, "白梦林规格 3-5 条，实装 5 条")
+        XCTAssertTrue(names.contains("ErrorCue_MicPermission"))
+        XCTAssertTrue(names.contains("ErrorCue_Retryable"))
+        XCTAssertTrue(names.contains("ErrorCue_TextOnly"))
+        XCTAssertTrue(names.contains("ErrorCue_PhoneUnreachable"))
+        XCTAssertTrue(names.contains("ErrorCue_ManualConfirm"))
+        XCTAssertEqual(names.count, 10, "ESS-262：D2 v1.1 定稿 10 条")
     }
 
     // MARK: - ESS-257 · D2 v1.1 四个 Bridge 终态码的文案与恢复族
 
     /// D2 E-18：Bridge upstream 不可达 + iPhone Relay 传输/回包异常同用一句文案。
     /// 三个 code 用户视角一致：Mac 没人应答，缓存可原样重发（族 B）。
+    /// ESS-262：clip 落 `ErrorCue_Retryable`，与 E-10/E-11/E-26 共用一条语音。
     func testMacUnreachableCodesShareE18CopyAndAllowRetry() {
         for code in ["ERR_UPSTREAM_UNAVAILABLE", "ERR_TRANSPORT", "ERR_BAD_RESPONSE"] {
             let entry = ErrorCueCatalog.cue(for: code)
@@ -81,29 +89,40 @@ final class ErrorCueCatalogTests: XCTestCase {
                            "\(code) → D2 E-18 定型文案")
             XCTAssertEqual(entry.recoveryFamily, .retry, "\(code) 属族 B，缓存录音可重发")
             XCTAssertTrue(entry.recoveryFamily.allowsCachedRetry, "\(code) 必须允许重试按钮")
+            XCTAssertEqual(entry.clip, "ErrorCue_Retryable",
+                           "\(code) 属族 B，共用 ErrorCue_Retryable 语音资产")
         }
     }
 
     /// D2 E-26：Mac 找不到这次任务（`gateway.mjs` / `taskwatch.mjs`）。
+    /// ESS-262：clip 落 `ErrorCue_Retryable`。
     func testTaskNotFoundShowsE26CopyAndAllowsRetry() {
         let entry = ErrorCueCatalog.cue(for: "ERR_TASK_NOT_FOUND")
         XCTAssertEqual(entry.text, "Mac 那边找不到这件事了，点重试我重新交一次。",
                        "D2 E-26 定型文案")
         XCTAssertEqual(entry.recoveryFamily, .retry)
         XCTAssertTrue(entry.recoveryFamily.allowsCachedRetry)
+        XCTAssertEqual(entry.clip, "ErrorCue_Retryable")
     }
 
     /// D2 E-11：Mac 侧任务落 failed 终态。
+    /// ESS-262：`ERR_TASK_FAILED` / `ERR_PROCESSING_FAILED` / `ERR_INTERNAL`
+    /// 共族共资产，clip 落 `ErrorCue_Retryable`。
     func testTaskFailedShowsE11CopyAndAllowsRetry() {
-        let entry = ErrorCueCatalog.cue(for: "ERR_TASK_FAILED")
-        XCTAssertEqual(entry.text, "这件事我没办成，点重试再跑一次，不用重新说。",
-                       "D2 E-11 定型文案")
-        XCTAssertEqual(entry.recoveryFamily, .retry)
-        XCTAssertTrue(entry.recoveryFamily.allowsCachedRetry)
+        for code in ["ERR_TASK_FAILED", "ERR_PROCESSING_FAILED", "ERR_INTERNAL"] {
+            let entry = ErrorCueCatalog.cue(for: code)
+            XCTAssertEqual(entry.text, "这件事我没办成，点重试再跑一次，不用重新说。",
+                           "\(code) → D2 E-11 定型文案")
+            XCTAssertEqual(entry.recoveryFamily, .retry)
+            XCTAssertTrue(entry.recoveryFamily.allowsCachedRetry)
+            XCTAssertEqual(entry.clip, "ErrorCue_Retryable",
+                           "\(code) 与 E-18/E-26 共用 ErrorCue_Retryable 语音资产")
+        }
     }
 
     /// D2 E-28（族 H）：Bridge 明确「不知道做完没有」。这是本 issue 的头号
     /// 铁律——**禁止重试按钮**，避免重复执行已生效的写操作。
+    /// ESS-262：clip 落 `ErrorCue_ManualConfirm`。
     func testResultUnknownShowsE28CopyAndBlocksRetry() {
         let entry = ErrorCueCatalog.cue(for: "ERR_RESULT_UNKNOWN")
         XCTAssertEqual(entry.text,
@@ -112,6 +131,56 @@ final class ErrorCueCatalogTests: XCTestCase {
         XCTAssertEqual(entry.recoveryFamily, .manualConfirm, "族 H")
         XCTAssertFalse(entry.recoveryFamily.allowsCachedRetry,
                        "白梦林铁律：族 H 绝不给重试按钮，重复执行有副作用")
+        XCTAssertEqual(entry.clip, "ErrorCue_ManualConfirm")
+    }
+
+    // MARK: - ESS-262 · D2 v1.1 新增五条语气语音的查表规则
+
+    /// D2 E-04（族 D）：麦克风权限缺失。
+    /// 恢复动作是「怎么开」（去手表设置），重录/重试都会被系统再次拦下。
+    func testMicPermissionShowsE04CopyAndAuthorizeFamily() {
+        let entry = ErrorCueCatalog.cue(for: "ERR_MIC_PERMISSION")
+        XCTAssertTrue(entry.text.contains("麦克风权限"))
+        XCTAssertTrue(entry.text.contains("设置"))
+        XCTAssertEqual(entry.recoveryFamily, .authorize, "族 D")
+        XCTAssertFalse(entry.recoveryFamily.allowsCachedRetry,
+                       "族 D：权限缺失，重录/重试都会被系统再拦")
+        XCTAssertEqual(entry.clip, "ErrorCue_MicPermission")
+    }
+
+    /// D2 E-10（族 B）：Bridge 侧 work timeout 属可重试链路错。
+    func testWorkTimeoutShowsE10CopyAndAllowsRetry() {
+        let entry = ErrorCueCatalog.cue(for: "ERR_WORK_TIMEOUT")
+        XCTAssertEqual(entry.text, "这件事我跑太久也没跑完，点一下重试，不用重新说。",
+                       "D2 E-10 定型文案")
+        XCTAssertEqual(entry.recoveryFamily, .retry)
+        XCTAssertTrue(entry.recoveryFamily.allowsCachedRetry)
+        XCTAssertEqual(entry.clip, "ErrorCue_Retryable",
+                       "E-10 与 E-11/E-18/E-26 共用 ErrorCue_Retryable")
+    }
+
+    /// D2 E-12（族 E）：语音丢了 / 存不下 / 加载不出，但文字答案在。
+    /// 三个 code 共用「看文字」恢复动作与 `ErrorCue_TextOnly` 语音资产。
+    func testTextOnlyCodesShareE12CopyAndTextOnlyFamily() {
+        for code in ["ERR_NO_SPEECH_FILE", "ERR_VAULT_LOAD", "ERR_VAULT_STORE"] {
+            let entry = ErrorCueCatalog.cue(for: code)
+            XCTAssertEqual(entry.text, "答案在，只是语音没留住——文字给你看。",
+                           "\(code) → D2 E-12 定型文案")
+            XCTAssertEqual(entry.recoveryFamily, .textOnly, "\(code) 属族 E")
+            XCTAssertFalse(entry.recoveryFamily.allowsCachedRetry,
+                           "族 E：动作是「看文字」不是重试")
+            XCTAssertEqual(entry.clip, "ErrorCue_TextOnly")
+        }
+    }
+
+    /// D2 E-17（族 B）：手机不可达。缓存录音自动重发，卡片语音强调「连上会重发」。
+    func testPhoneUnreachableShowsE17CopyAndAllowsRetry() {
+        let entry = ErrorCueCatalog.cue(for: "ERR_WC_NOT_ACTIVATED")
+        XCTAssertEqual(entry.text, "手机没连上。录音我存着了，连上会自动重发。",
+                       "D2 E-17 定型文案")
+        XCTAssertEqual(entry.recoveryFamily, .retry, "族 B：缓存重发")
+        XCTAssertTrue(entry.recoveryFamily.allowsCachedRetry)
+        XCTAssertEqual(entry.clip, "ErrorCue_PhoneUnreachable")
     }
 
     /// D2 v1.1 E-99：未知/兜底走族 B（可重试），文案先劝重试、再退到重说，
@@ -176,11 +245,15 @@ final class ErrorCueCatalogTests: XCTestCase {
     }
 
     /// D2.3 禁用词：卡片文案里不允许把错误码原样拼进用户可见文本。
-    /// 覆盖 ESS-257 新增的所有 code。
+    /// 覆盖 ESS-257 & ESS-262 新增的所有 code。
     func testNewCodesNeverExposeRawErrorCodeInText() {
         for code in [
             "ERR_UPSTREAM_UNAVAILABLE", "ERR_TRANSPORT", "ERR_BAD_RESPONSE",
             "ERR_TASK_NOT_FOUND", "ERR_TASK_FAILED", "ERR_RESULT_UNKNOWN",
+            "ERR_MIC_PERMISSION", "ERR_WORK_TIMEOUT",
+            "ERR_NO_SPEECH_FILE", "ERR_VAULT_LOAD", "ERR_VAULT_STORE",
+            "ERR_WC_NOT_ACTIVATED",
+            "ERR_PROCESSING_FAILED", "ERR_INTERNAL",
         ] {
             let entry = ErrorCueCatalog.cue(for: code)
             XCTAssertFalse(entry.text.contains("ERR_"), "\(code) 卡片文案不得含裸码")

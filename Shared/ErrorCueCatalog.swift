@@ -1,6 +1,7 @@
 import Foundation
 
-/// ESS-180 / ESS-257：Bridge 稳定 `ERR_*` → 拟人化错误提示（文字 + 语音片段名 + 触觉 + 恢复族）。
+/// ESS-180 / ESS-257 / ESS-262：Bridge 稳定 `ERR_*` → 拟人化错误提示
+/// （文字 + 语音片段名 + 触觉 + 恢复族）。
 ///
 /// 白梦林拍板：错误必须**语音 + 文字**回给用户，屏幕不再压掉失败终态。
 /// 目录在 Shared 里，是因为 iPhone Relay/单元测试也要按 code 走同一份文案，
@@ -9,11 +10,16 @@ import Foundation
 ///
 /// 灰度约定：`clip` 为 nil 表示无预置语音、只走文字 + 触觉；`ErrorCueCatalog.cue`
 /// 对未知错误码回落到 `.generic`，绝不返回 nil——「静音吞错」是本 issue 的
-/// 头号红线，从 API 形状层杜绝。180-B 起，5 条 m4a 已就位；播放失败仍会
-/// 自动降级到「文字 + 触觉」，卡片露出「静音提醒」小字。
+/// 头号红线，从 API 形状层杜绝。
 ///
 /// ESS-257：新增 `recoveryFamily` 字段（对应 D2.1 恢复族 A/B/C/D/E/F/G/H），
 /// UI 层不得再散写 `if code == ...`——是否显示「重试」按钮由 catalog 说了算。
+///
+/// ESS-262：D2 v1.1 语气语音资产扩到 10 条。E-04（`ErrorCue_MicPermission`）、
+/// E-10/E-11/E-18（`ErrorCue_Retryable`）、E-12（`ErrorCue_TextOnly`）、E-17
+/// （`ErrorCue_PhoneUnreachable`）、E-28（`ErrorCue_ManualConfirm`）五条 m4a
+/// 由 qwen-audio-realtime 生成入包；播放失败仍会自动降级到「文字 + 触觉」，
+/// 卡片露出「静音提醒」小字。
 struct ErrorCueEntry: Equatable {
     /// Bridge 侧稳定错误码，`ERR_*` 前缀；tests 依赖这个字符串完整。
     let code: String
@@ -111,59 +117,100 @@ enum ErrorCueCatalog {
                 clip: "ErrorCue_RealtimeStalled",
                 recoveryFamily: .reRecord
             )
+        // ESS-262 · D2 E-04（族 D）：麦克风权限缺失。SelfCheck/AudioRecorder
+        // 在拿不到 permission 时抛这个 code；重录/重试都会被系统再次拦下，
+        // 唯一恢复动作是引导用户去手表「设置 → 隐私」里开。
+        case "ERR_MIC_PERMISSION":
+            return ErrorCueEntry(
+                code: code,
+                text: "我还没拿到麦克风权限，去手表的「设置 → 隐私」里开一下就能听见你了。",
+                clip: "ErrorCue_MicPermission",
+                recoveryFamily: .authorize
+            )
+        // ESS-262 · D2 E-10（族 B）：Bridge 侧 work timeout。缓存录音可原样
+        // 重发一次，与 E-11 / E-18 共用「重试」语音资产。
+        case "ERR_WORK_TIMEOUT":
+            return ErrorCueEntry(
+                code: code,
+                text: "这件事我跑太久也没跑完，点一下重试，不用重新说。",
+                clip: "ErrorCue_Retryable",
+                recoveryFamily: .retry
+            )
+        // ESS-262 · D2 E-12（族 E）：语音丢了 / 存不下 / 加载不出，但文字答案在。
+        // 用户能看到 Watch 顶部条上的文本回执；语音资产强调「看文字」这一恢复动作。
+        // ERR_NO_SPEECH_FILE：结果语音文件根本不存在（Bridge 没生成或链路丢了）
+        // ERR_VAULT_LOAD / ERR_VAULT_STORE：Watch 本地保管室读/写失败。
+        case "ERR_NO_SPEECH_FILE",
+             "ERR_VAULT_LOAD",
+             "ERR_VAULT_STORE":
+            return ErrorCueEntry(
+                code: code,
+                text: "答案在，只是语音没留住——文字给你看。",
+                clip: "ErrorCue_TextOnly",
+                recoveryFamily: .textOnly
+            )
+        // ESS-262 · D2 E-17（族 B）：手机不可达族。WCSession 未激活或
+        // waiting_for_phone 超时都归入此，用户视角一致：手机没连上，缓存
+        // 录音可自动重发。共享 `ErrorCue_PhoneUnreachable` 语音资产。
+        case "ERR_WC_NOT_ACTIVATED":
+            return ErrorCueEntry(
+                code: code,
+                text: "手机没连上。录音我存着了，连上会自动重发。",
+                clip: "ErrorCue_PhoneUnreachable",
+                recoveryFamily: .retry
+            )
         // ESS-257 · D2 E-18：Mac 不可达族——Bridge 主动上抛的 upstream 不可达 +
         // iPhone Relay 侧的传输/回包异常（ESS-253 已让后两者带码到达 Watch）。
         // 用户视角相同：Mac 那边没人应答，缓存录音可原样重发。
-        //
-        // 语音资产：D2.2 v1.1 归入 `ErrorCue_Retryable`（新增语音清单，尚未落
-        // 包）；在 m4a 就位前 `clip: nil` 走「文字 + 触觉」降级，卡片自带
-        // 「静音提醒」小字，绝不静音吞错——避免装机后 clip 缺失导致语音路径
-        // 悄悄跑到未知资源加载。
+        // ESS-262：语音资产 `ErrorCue_Retryable` 已落包，替换 clip: nil。
         case "ERR_UPSTREAM_UNAVAILABLE",
              "ERR_TRANSPORT",
              "ERR_BAD_RESPONSE":
             return ErrorCueEntry(
                 code: code,
                 text: "Mac 那边没应答。确认助手在运行，点重试不用重新说。",
-                clip: nil,
+                clip: "ErrorCue_Retryable",
                 recoveryFamily: .retry
             )
         // ESS-257 · D2 E-26：Mac 找不到这次任务（gateway/taskwatch 均可能抛）。
         // 缓存录音可重投；文案强调「重新交一次」区别于普通重试。
+        // ESS-262：与 E-11 / E-18 共享 `ErrorCue_Retryable` 语音资产。
         case "ERR_TASK_NOT_FOUND":
             return ErrorCueEntry(
                 code: code,
                 text: "Mac 那边找不到这件事了，点重试我重新交一次。",
-                clip: nil,
+                clip: "ErrorCue_Retryable",
                 recoveryFamily: .retry
             )
         // ESS-257 · D2 E-11：Mac 侧任务落到 failed 终态（脚本/工具报错等）。
         // 缓存录音可原样重发一次，也许上游临时故障。
-        case "ERR_TASK_FAILED":
+        // ERR_PROCESSING_FAILED / ERR_INTERNAL 走同族同资产。
+        // ESS-262：语音资产 `ErrorCue_Retryable` 已落包，替换 clip: nil。
+        case "ERR_TASK_FAILED",
+             "ERR_PROCESSING_FAILED",
+             "ERR_INTERNAL":
             return ErrorCueEntry(
                 code: code,
                 text: "这件事我没办成，点重试再跑一次，不用重新说。",
-                clip: nil,
+                clip: "ErrorCue_Retryable",
                 recoveryFamily: .retry
             )
         // ESS-257 · D2 E-28（族 H）：Bridge 明确「不知道做完没有」
         // （`manual_confirmation_required`）。**禁止重试按钮**——重跑一个可能
         // 已生效的写操作等于重复执行。Bridge 侧 `isAutomaticallyRetryableTerminalError`
         // 已按此语义关掉自动重试；Watch 侧同步关掉用户可见的重试入口。
-        //
-        // 语音资产：D2.2 v1.1 归入 `ErrorCue_ManualConfirm`，同样待落包；在
-        // m4a 就位前走「文字 + 触觉」降级，卡片露出「静音提醒」小字。
+        // ESS-262：语音资产 `ErrorCue_ManualConfirm` 已落包，替换 clip: nil。
         case "ERR_RESULT_UNKNOWN":
             return ErrorCueEntry(
                 code: code,
                 text: "这件事做完没有我不确定，去 Mac 上看一眼——我不敢替你重跑。",
-                clip: nil,
+                clip: "ErrorCue_ManualConfirm",
                 recoveryFamily: .manualConfirm
             )
         default:
-            // 其他 ERR_*（ERR_WORK_TIMEOUT / ERR_PROCESSING_FAILED / …）走通用文案，
-            // 但 code 保留在 entry.code 里以便日志追溯——用户看到的还是「刚才没成功」，
-            // 后台错误码从不裸露到 UI。族按 E-99 走 .retry。
+            // 其他未命名 ERR_* 走通用文案，但 code 保留在 entry.code 里以便日志
+            // 追溯——用户看到的还是「刚才没成功」，后台错误码从不裸露到 UI。
+            // 族按 E-99 走 .retry。
             return ErrorCueEntry(
                 code: code,
                 text: generic.text,
@@ -175,11 +222,10 @@ enum ErrorCueCatalog {
 
     /// 所有目录内独立语音片段的资源名（去重后），用于 Bundle 存在性校验。
     ///
-    /// ESS-257 新增码（UPSTREAM_UNAVAILABLE / TRANSPORT / BAD_RESPONSE /
-    /// TASK_NOT_FOUND / TASK_FAILED / RESULT_UNKNOWN）暂用 `clip: nil` 走
-    /// 「文字 + 触觉」降级通路，不列在这里——`ErrorCue_Retryable` /
-    /// `ErrorCue_ManualConfirm` 两条 m4a 由后续视觉资产单交付；那单落地时
-    /// 把上面的 `clip: nil` 换成真名，并把资源名追加到本清单。
+    /// ESS-262：D2 v1.1 五条新增语音资产 (`ErrorCue_MicPermission` /
+    /// `ErrorCue_Retryable` / `ErrorCue_TextOnly` / `ErrorCue_PhoneUnreachable` /
+    /// `ErrorCue_ManualConfirm`) 已由 qwen-audio-realtime 生成落包，与既有 5 条
+    /// 共 10 条随 App 打包。列表按 D2 v1.1 全量代表 code 遍历一次去重后得到。
     static var allClipNames: [String] {
         var seen: Set<String> = []
         var ordered: [String] = []
@@ -188,6 +234,14 @@ enum ErrorCueCatalog {
             cue(for: "ERR_TRANSCRIPT_DISCARDED"),
             cue(for: "ERR_VOICE_BUSY"),
             cue(for: "ERR_REALTIME_STALLED"),
+            cue(for: "ERR_MIC_PERMISSION"),
+            cue(for: "ERR_WORK_TIMEOUT"),
+            cue(for: "ERR_NO_SPEECH_FILE"),
+            cue(for: "ERR_WC_NOT_ACTIVATED"),
+            cue(for: "ERR_UPSTREAM_UNAVAILABLE"),
+            cue(for: "ERR_TASK_NOT_FOUND"),
+            cue(for: "ERR_TASK_FAILED"),
+            cue(for: "ERR_RESULT_UNKNOWN"),
             generic,
         ] {
             guard let clip = entry.clip, !seen.contains(clip) else { continue }
