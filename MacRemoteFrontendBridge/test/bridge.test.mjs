@@ -172,6 +172,31 @@ describe('direct-answer path', () => {
     assert.equal(conflict.json.error, 'ERR_IDEMPOTENCY_CONFLICT')
   })
 
+  it('delivers an unacknowledged terminal result over HTTP without a WSS client', async () => {
+    const id = rid()
+    await ctx.client.createTurn(id, pcm(300))
+    const done = await waitFor(async () => {
+      const r = await ctx.client.getTurn(id)
+      return r.json.status === 'completed' ? r.json : null
+    })
+
+    const delivered = await ctx.client.deliverTurn(id)
+    assert.equal(delivered.status, 200)
+    assert.equal(delivered.json.type, 'turn.state')
+    assert.deepEqual(delivered.json.turn, done)
+
+    const ledgerPath = join(ctx.stateDir, 'turn-ledger.json')
+    const persisted = JSON.parse(readFileSync(ledgerPath, 'utf8')).turns[id]
+    assert.equal(persisted.delivery_attempts, 1)
+    assert.ok(Number.isFinite(Date.parse(persisted.next_delivery_at)))
+
+    // The HTTP path shares the WSS backoff ledger, so an immediate poll cannot
+    // duplicate the terminal result. ACK removes it permanently from delivery.
+    assert.equal((await ctx.client.deliverTurn(id)).status, 204)
+    assert.equal((await ctx.client.ackTurn(id)).status, 200)
+    assert.equal((await ctx.client.deliverTurn(id)).status, 204)
+  })
+
   it('replays an unacknowledged completed result after reconnect and stops after Watch ACK', async () => {
     const id = rid()
     await ctx.client.createTurn(id, pcm(300))
