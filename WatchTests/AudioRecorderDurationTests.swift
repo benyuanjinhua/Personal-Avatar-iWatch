@@ -103,6 +103,49 @@ final class AudioRecorderDurationTests: XCTestCase {
         )
     }
 
+    // MARK: - ESS-225 AC #5：duration_ms 与 bytes 不自洽的防御门
+
+    /// 真机 (2026-08-03 16:20~16:40) 观测到的三类样本一并喂给 `durationBytesMismatch`：
+    /// - 正常段（43KB / 4318ms，47KB / 5566ms，43KB / 4514ms）—— 必须放行
+    /// - 溢出段（43KB / 51,129,344ms、47KB / 51,707,905ms）—— 必须触发
+    /// - 近零段（24KB / 31ms）—— 必须触发（毕玄 PR #66 复审指出 sanitize 只
+    ///   拦上限，不覆盖此反向异常；本门是 PR #66 上的增量）
+    func testMismatchGateOnRealDeviceSamples() {
+        // 正常样本：不出门
+        XCTAssertNil(AudioRecorder.durationBytesMismatch(durationMs: 4_318, bytes: 42_887))
+        XCTAssertNil(AudioRecorder.durationBytesMismatch(durationMs: 5_566, bytes: 47_872))
+        XCTAssertNil(AudioRecorder.durationBytesMismatch(durationMs: 4_514, bytes: 43_986))
+
+        // 上限异常样本：出门
+        let overflow1 = AudioRecorder.durationBytesMismatch(durationMs: 51_129_344, bytes: 43_296)
+        XCTAssertNotNil(overflow1, "43KB / 51,129,344ms 必须被判为不自洽")
+        XCTAssertTrue(overflow1?.contains("expected_ms≈") == true)
+
+        let overflow2 = AudioRecorder.durationBytesMismatch(durationMs: 51_707_905, bytes: 47_436)
+        XCTAssertNotNil(overflow2, "47KB / 51,707,905ms 必须被判为不自洽")
+
+        // 下限异常样本：ESS-225 待确认项——`duration_ms=31 bytes=24588` 与
+        // 两条溢出同源（均是 currentTime 未定义），本门确保未来同类漂移可见。
+        let nearZero = AudioRecorder.durationBytesMismatch(durationMs: 31, bytes: 24_588)
+        XCTAssertNotNil(nearZero, "24KB / 31ms 必须被判为不自洽（PR #66 sanitize 未覆盖）")
+    }
+
+    /// 微小容器样本（<4KB）走 too_short 判定，不进本门以避免噪声告警。
+    func testMismatchGateSkipsUnderMinimumBytes() {
+        XCTAssertNil(AudioRecorder.durationBytesMismatch(durationMs: 0, bytes: 512))
+        XCTAssertNil(AudioRecorder.durationBytesMismatch(durationMs: 100, bytes: 1_500))
+        XCTAssertNil(AudioRecorder.durationBytesMismatch(durationMs: 999_999, bytes: 100))
+    }
+
+    /// 3× 冗余边界：40KB 的 expected_ms = 10_000，允许区间 [3_333, 30_000]。
+    /// 靠近但仍在门内不告警；越界一步就告警。
+    func testMismatchGateThreeXBoundary() {
+        XCTAssertNil(AudioRecorder.durationBytesMismatch(durationMs: 3_500, bytes: 40_000))
+        XCTAssertNil(AudioRecorder.durationBytesMismatch(durationMs: 29_000, bytes: 40_000))
+        XCTAssertNotNil(AudioRecorder.durationBytesMismatch(durationMs: 3_000, bytes: 40_000))
+        XCTAssertNotNil(AudioRecorder.durationBytesMismatch(durationMs: 31_000, bytes: 40_000))
+    }
+
     private final class EventLog: @unchecked Sendable {
         private let lock = NSLock()
         private var entries: [(module: String, event: String, detail: String?, code: String?)] = []
