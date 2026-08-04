@@ -19,10 +19,13 @@ import SwiftUI
 struct WatchSettingsView: View {
     @ObservedObject var selfCheck: SelfCheckRunner
     @ObservedObject var debugSettings: WatchDebugSettings
+    /// ESS-307：iPhone 下行队列积压计数。
+    @ObservedObject var settings: WatchSettingsStore
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
+                downlinkBacklogSection
                 streamingSection
                 selfCheckSection
                 buildSection
@@ -32,6 +35,29 @@ struct WatchSettingsView: View {
             .padding(.vertical, 4)
         }
         .navigationTitle("设置")
+    }
+
+    // MARK: - 下行队列积压（ESS-307）
+
+    private var downlinkBacklogSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            sectionHeader("下行队列")
+            HStack {
+                Text("当前积压")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("\(settings.downlinkBacklogCount) 条")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(settings.downlinkBacklogCount > 0 ? .orange : .secondary)
+            }
+            Text("iPhone 端尚未送到手表的条目数。积压会在会话恢复后自动投递。")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(9)
+        .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
     }
 
     // MARK: - 流式（Debug）：R1 直呼直取，不再走隐藏手势

@@ -4,6 +4,8 @@ import SwiftUI
 /// 当前回合展开完整时间线，更早的回合折叠成一行可点开。
 struct ConversationTimelineView: View {
     @ObservedObject var journal: VoiceTurnJournal
+    /// ESS-307：iPhone 下行队列积压信息，用于标注「等待送达」状态。
+    @ObservedObject var settings: WatchSettingsStore
 
     var body: some View {
         Group {
@@ -21,6 +23,19 @@ struct ConversationTimelineView: View {
                         }
                     }
 
+                    // ESS-307：积压条目标识 —— 在时间线中标注 iPhone 排队未投递的回合
+                    let backlogIds = Set(settings.downlinkQueuedRequestIds)
+                    if !backlogIds.isEmpty {
+                        let backlogTurns = journal.turns.filter { backlogIds.contains($0.requestId) }
+                        if !backlogTurns.isEmpty {
+                            Section("等待送达（\\(backlogTurns.count) 条）") {
+                                ForEach(backlogTurns) { turn in
+                                    TurnSummaryRow(turn: turn, isPendingDelivery: true)
+                                }
+                            }
+                        }
+                    }
+
                     let others = journal.turns.filter { $0.requestId != journal.activeTurn?.requestId }
                     if !others.isEmpty {
                         Section("更早") {
@@ -29,7 +44,7 @@ struct ConversationTimelineView: View {
                                     List { TurnTimelineSection(turn: turn) }
                                         .navigationTitle("请求详情")
                                 } label: {
-                                    TurnSummaryRow(turn: turn)
+                                    TurnSummaryRow(turn: turn, isPendingDelivery: false)
                                 }
                             }
                         }
@@ -114,13 +129,25 @@ struct TurnTimelineSection: View {
 }
 
 /// 折叠展示的历史回合行：当前投影 + 时间。
+/// `isPendingDelivery` 为 true 时追加「等待送达」标识（ESS-307）。
 struct TurnSummaryRow: View {
     let turn: VoiceTurnRecord
+    var isPendingDelivery: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text(turn.phase.title)
-                .font(.footnote.bold())
+            HStack(spacing: 4) {
+                Text(turn.phase.title)
+                    .font(.footnote.bold())
+                if isPendingDelivery {
+                    Text("等待送达")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.orange)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Color.orange.opacity(0.15), in: RoundedRectangle(cornerRadius: 4))
+                }
+            }
             HStack(spacing: 4) {
                 Image(systemName: turn.currentState.displaySymbol)
                 Text(turn.createdAt, style: .time)

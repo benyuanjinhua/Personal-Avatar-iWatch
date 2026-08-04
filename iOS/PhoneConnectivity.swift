@@ -514,6 +514,28 @@ extension PhoneConnectivity: WatchFeedbackChannel {
     private func refreshDownlinkCount() {
         downlink?.purgeExpired()
         pendingDownlinkCount = downlink?.pendingCount() ?? 0
+        pushDownlinkBacklog()
+    }
+
+    /// ESS-307：将下行队列积压信息推送到 Watch，让用户可见「还有 N 条结果没到」。
+    private func pushDownlinkBacklog() {
+        guard let downlink else { return }
+        let queuedIds = downlink.items
+            .filter { $0.state != .delivered }
+            .map { $0.requestId }
+        let payload = DownlinkBacklogPayload(
+            pendingCount: pendingDownlinkCount,
+            queuedRequestIds: queuedIds,
+            updatedAt: Date()
+        )
+        guard let data = try? payload.jsonData() else { return }
+        do {
+            try WCSession.default.updateApplicationContext([
+                DownlinkBacklogMessage.contextKey: data
+            ])
+        } catch {
+            Self.downlinkLogger.error("下行积压推送失败: \(error.localizedDescription)")
+        }
     }
 
     /// 队列不可用时的降级路径（尽力而为，无回执）。

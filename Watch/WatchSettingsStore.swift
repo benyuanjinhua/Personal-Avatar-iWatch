@@ -8,6 +8,10 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
     /// ESS-41 L3 取证：结果语音「到没到手表、为何被丢」全部走这条日志。
     private static let speechLogger = Logger(subsystem: "com.benyuan.wristagent.watch", category: "SpeechStore")
     @Published private(set) var configuration: AgentConfiguration = .demo
+    /// ESS-307：iPhone 下行队列积压数。Watch 主界面据此显示「还有 N 条结果没送到」。
+    @Published private(set) var downlinkBacklogCount: Int = 0
+    /// ESS-307：当前排队中的 requestId 列表，供时间线与 Gap-6 对齐。
+    @Published private(set) var downlinkQueuedRequestIds: [String] = []
     /// 语音传输回调转发目标（WCSession 只允许一个 delegate）。
     weak var voiceTransport: WatchVoiceTransport?
     /// 状态/权限/结果事件入账目标（ESS-29）。
@@ -36,6 +40,8 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         if let data = WCSession.default.receivedApplicationContext[ConfigurationMessage.key] as? Data {
             apply(data)
         }
+        // ESS-307：冷启动恢复下行积压状态
+        applyDownlinkBacklog(from: WCSession.default.receivedApplicationContext)
     }
 
     private func apply(_ data: Data) {
@@ -98,8 +104,20 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         _ session: WCSession,
         didReceiveApplicationContext applicationContext: [String: Any]
     ) {
-        guard let data = applicationContext[ConfigurationMessage.key] as? Data else { return }
-        Task { @MainActor in self.apply(data) }
+        if let data = applicationContext[ConfigurationMessage.key] as? Data {
+            Task { @MainActor in self.apply(data) }
+        }
+        applyDownlinkBacklog(from: applicationContext)
+    }
+
+    /// ESS-307：接收 iPhone 推送的下行队列积压信息。
+    nonisolated func applyDownlinkBacklog(from applicationContext: [String: Any]) {
+        guard let data = applicationContext[DownlinkBacklogMessage.contextKey] as? Data,
+              let payload = try? DownlinkBacklogPayload.decode(from: data) else { return }
+        Task { @MainActor in
+            self.downlinkBacklogCount = payload.pendingCount
+            self.downlinkQueuedRequestIds = payload.queuedRequestIds
+        }
     }
 
     nonisolated func session(

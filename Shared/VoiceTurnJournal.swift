@@ -44,6 +44,9 @@ struct VoiceTurnRecord: Codable, Equatable, Identifiable {
     var playbackInterruptedAt: Date? = nil
     /// completed 之后独立到达的结果语音降级码；不改变 turn 终态。
     var resultAudioErrorCode: String? = nil
+    /// ESS-307 / Gap-6：下行投递状态。nil = 未知，true = 已送达 Watch，false = 仍在 iPhone 队列。
+    /// 由 Gap-6 折叠逻辑写入，供时间线「待手动重播」标识消费。
+    var downlinkDelivered: Bool? = nil
 
     var id: String { requestId }
     var currentState: VoiceTurnState { events.last?.state ?? .recorded }

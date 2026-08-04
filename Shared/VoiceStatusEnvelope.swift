@@ -334,3 +334,27 @@ enum VoiceSpeechMessage {
 enum VoiceProbeMessage {
     static let envelopeKey = "voice_probe_envelope"
 }
+
+// MARK: - ESS-307 下行队列积压可见性
+
+/// iPhone → Watch 的下行队列积压载荷：告知 Watch 当前有多少条结果还在排队。
+/// 通过 `updateApplicationContext` 传递，只保留最新值。
+struct DownlinkBacklogPayload: Codable, Equatable {
+    let pendingCount: Int
+    /// 当前排队中的 requestId 列表，供 Watch 时间线标注「等待送达」。
+    let queuedRequestIds: [String]
+    let updatedAt: Date
+
+    func jsonData() throws -> Data {
+        try VoiceProtocolJSON.encoder.encode(self)
+    }
+
+    static func decode(from data: Data) throws -> Self {
+        try VoiceProtocolJSON.decoder.decode(Self.self, from: data)
+    }
+}
+
+/// 与 `DownlinkBacklogPayload` 配对的 WCSession applicationContext 键。
+enum DownlinkBacklogMessage {
+    static let contextKey = "downlink_backlog"
+}
