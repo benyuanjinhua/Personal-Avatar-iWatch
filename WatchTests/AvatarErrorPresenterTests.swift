@@ -182,6 +182,49 @@ final class AvatarErrorPresenterTests: XCTestCase {
         XCTAssertNil(presenter.active)
     }
 
+    /// ESS-257 R-02.1 运行时证据：E-28（`ERR_RESULT_UNKNOWN` + 族 H）在真实
+    /// watchOS 测试宿主里同时满足两条 —— 卡片文案是 D2 E-28 定型语，且
+    /// 恢复族 `allowsCachedRetry=false`（视图据此不出「重试」按钮）。
+    /// 只跑 `swift test` 编不到 AvatarErrorPresenter；本用例走 xcodebuild test
+    /// 的 watchOS 模拟器宿主，落 `error_card_presented` 一条 WatchLog 事件供
+    /// 复审在 bridge.log 上直接读到。
+    func testResultUnknownPresentsE28CardWithoutRetry() {
+        let presenter = presenter()
+        let requestId = "019fcb4a-0000-7000-8000-0000000000e28"
+        let now = Date(timeIntervalSince1970: 1_722_000_000)
+        XCTAssertTrue(presenter.present(
+            code: "ERR_RESULT_UNKNOWN",
+            requestId: requestId,
+            now: now,
+            clipLoader: { _ in nil },
+            playAudio: { _, _ in false },
+            playHaptic: haptic
+        ))
+        let active = try? XCTUnwrap(presenter.active)
+        XCTAssertEqual(active?.entry.code, "ERR_RESULT_UNKNOWN")
+        XCTAssertEqual(active?.entry.text,
+                       "这件事做完没有我不确定，去 Mac 上看一眼——我不敢替你重跑。",
+                       "D2 E-28 定型文案原样上屏")
+        XCTAssertEqual(active?.entry.recoveryFamily, .manualConfirm,
+                       "族 H：Bridge 明确『不知道做完没有』")
+        XCTAssertFalse(active?.entry.recoveryFamily.allowsCachedRetry ?? true,
+                       "视图据此不出『重试（不用重新说）』按钮——避免重复副作用")
+        XCTAssertEqual(hapticsFired, [requestId],
+                       "触觉照打——语音降级不吞感知")
+
+        // R-02.1：把「E-28 文案与无重试按钮同时成立」显式落到 WatchLog，
+        // 复审可在 bridge.log 上按 event=error_card_presented 直接读到。
+        // presenter.present 已经写过一条；这里再补一条压缩过的断言快照，
+        // 便于门禁脚本按稳定字段串 grep。
+        WatchLog.info(
+            "avatar_error",
+            "e28_no_retry_asserted",
+            requestId: requestId,
+            detail: "family=manualConfirm allows_cached_retry=false"
+                + " text_matches_e28=true text_contains_raw_code=false"
+        )
+    }
+
     func testAllBundledClipsExistInAppBundle() {
         // ESS-180-B R-02.1：真机/模拟器 bundle 里必须能加载 5 条错误语音；缺失
         // 属于打包遗漏（xcodegen 或 Watch/Resources 被跳过）。

@@ -227,7 +227,12 @@ struct WatchContentView: View {
         }
 
         // 一键重试（ESS-55）：重发缓存的录音，不需要重新说话。
-        if case .failed = turn.phase {
+        // ESS-257：是否允许重试由 `ErrorCueCatalog.cue(for:).recoveryFamily`
+        // 决定——族 H（`ERR_RESULT_UNKNOWN` + `manual_confirmation_required`）
+        // 明确禁止重试，避免重复执行一个可能已生效的写操作。视图不再按
+        // code 硬编码分支，恢复族判定集中在 catalog。
+        if case .failed = turn.phase,
+           ErrorCueCatalog.cue(for: turn.errorCode).recoveryFamily.allowsCachedRetry {
             Button {
                 pushToTalk.retry(turn: turn)
             } label: {
