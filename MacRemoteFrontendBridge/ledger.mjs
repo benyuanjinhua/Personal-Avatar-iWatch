@@ -95,7 +95,10 @@ export class TurnLedger extends EventEmitter {
 
   // Idempotent create. Returns { turn, replay } — replay=true means the
   // request_id already exists and the caller must NOT start a second execution.
-  create({ requestId, deviceId, bodySha256, sessionId, watchCreatedAt = null }) {
+  create({
+    requestId, deviceId, bodySha256, sessionId, watchCreatedAt = null,
+    parentRequestId = null, contextSummary = null,
+  }) {
     const existing = this.turns.get(requestId)
     if (existing) {
       if (existing.body_sha256 !== bodySha256) return { turn: existing, conflict: true }
@@ -108,6 +111,9 @@ export class TurnLedger extends EventEmitter {
       device_id: deviceId,
       body_sha256: bodySha256,
       session_id: sessionId,
+      // ESS-320：再次对话只关联上一轮，不引入服务端会话 ID 或整条链。
+      parent_request_id: parentRequestId,
+      context_summary: contextSummary,
       task_id: null,
       codex_session_id: null,
       path: 'unknown',            // direct | background
@@ -247,6 +253,8 @@ export class TurnLedger extends EventEmitter {
     return {
       request_id: turn.request_id,
       device_id: turn.device_id,
+      parent_request_id: turn.parent_request_id ?? null,
+      context_summary: turn.context_summary ?? null,
       status: turn.state,
       detail: turn.state === 'failed' ? clientFailureDetail(turn.error) : turn.detail,
       path: turn.path,

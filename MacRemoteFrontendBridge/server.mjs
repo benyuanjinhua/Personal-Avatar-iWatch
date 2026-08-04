@@ -589,6 +589,13 @@ export function createBridge(overrides = {}) {
     if (!meta || !meta.codec || !Number.isFinite(meta.duration_ms) || !meta.sha256 || typeof body.audio_base64 !== 'string') {
       throw new ApiError(ERR.MISSING_FIELD, 'audio{codec,duration_ms,sha256}, audio_base64')
     }
+    // ESS-320：字段可缺省或为 null（兼容旧客户端）；出现时必须保持字符串原值。
+    // 这里只关联上一轮，不派生或引入服务端会话 ID。
+    for (const field of ['parent_request_id', 'context_summary']) {
+      if (body[field] !== undefined && body[field] !== null && typeof body[field] !== 'string') {
+        throw new ApiError(ERR.MISSING_FIELD, `${field} must be a string or null`)
+      }
+    }
 
     const bodySha = sha256hex(rawBody)
 
@@ -616,6 +623,8 @@ export function createBridge(overrides = {}) {
       bodySha256: bodySha,
       sessionId: supervisor.sessionId,
       watchCreatedAt: body.created_at,
+      parentRequestId: body.parent_request_id ?? null,
+      contextSummary: body.context_summary ?? null,
     })
     log({ evt: 'turn_accepted', request_id: requestId, device_id: authInfo.deviceId, audio_bytes: audioBuf.length })
     // Snapshot the `accepted` receipt before processing starts mutating state;

@@ -220,6 +220,38 @@ describe('direct-answer path', () => {
       e.type === 'turn.state' && e.turn.request_id === id && e.turn.status === 'completed').length, completedAtAck)
     events.ws.close()
   })
+
+  it('preserves optional follow-up context and remains compatible with legacy turns', async () => {
+    const parentId = rid()
+    const followUpId = rid()
+    const summary = '用户：北京天气？\n助手：晴，25℃。'
+    const followUp = await ctx.client.createTurn(followUpId, pcm(500), {
+      parentRequestId: parentId,
+      contextSummary: summary,
+    })
+    assert.equal(followUp.status, 202)
+    assert.equal(followUp.json.parent_request_id, parentId)
+    assert.equal(followUp.json.context_summary, summary)
+
+    const persisted = await ctx.client.getTurn(followUpId)
+    assert.equal(persisted.json.parent_request_id, parentId)
+    assert.equal(persisted.json.context_summary, summary)
+
+    const legacyId = rid()
+    const legacy = await ctx.client.createTurn(legacyId, pcm(500))
+    assert.equal(legacy.status, 202)
+    assert.equal(legacy.json.parent_request_id, null)
+    assert.equal(legacy.json.context_summary, null)
+
+    // Both accepted requests run asynchronously; let the shared fixture drain
+    // before its after-hook shuts the mock gateway down.
+    for (const id of [followUpId, legacyId]) {
+      await waitFor(async () => {
+        const response = await ctx.client.getTurn(id)
+        return ['completed', 'failed', 'cancelled'].includes(response.json.status)
+      })
+    }
+  })
 })
 
 describe('background path: task projection, permission, cancel', () => {
