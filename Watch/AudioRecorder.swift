@@ -129,6 +129,21 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         }
         currentURL = nil
         recorder = nil
+
+        // ESS-225 AC #5：字节数与时长严重不自洽时告警。PR #66 的单调时钟
+        // 消灭了「44KB 报 14.2 小时」的溢出，但同源反向异常
+        // 「24KB 报 31ms」（真机 16:22:31 样本）逃出 sanitizeDurationMs 的 60s
+        // 上限门——DispatchTime 差值虽单调，仍可能因 finish() 相对 record start
+        // 时钟戳漂移（如中断恢复后 uptime 语义变化、或首次录音戳未落）返回
+        // 与文件字节数不匹配的量级。加一道后置门，未来同类漂移可自动可见。
+        if let mismatchDetail = Self.durationBytesMismatch(durationMs: durationMs, bytes: data.count) {
+            WatchLog.error(
+                "recorder", "duration_bytes_inconsistent",
+                detail: mismatchDetail,
+                code: "ERR_DURATION_INCONSISTENT"
+            )
+        }
+
         WatchLog.info("recorder", "record_finished", detail: "duration_ms=\(durationMs) bytes=\(data.count)")
         return Recording(fileURL: url, data: data, durationMs: max(1, durationMs))
     }
@@ -167,6 +182,26 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
             return maxMs
         }
         return max(0, rawMs)
+    }
+
+    /// ESS-225 AC #5 防御门：字节数与时长不自洽时返回 detail，调用点落
+    /// `duration_bytes_inconsistent` 事件。AAC 32kbps ≈ 4000B/s；expected_ms
+    /// = bytes * 1000 / 4000；允许 3× 冗余覆盖 AAC 起始/结束帧与容器开销。
+    ///
+    /// 真机窗口 (2026-08-03 16:20~16:40) 校准：
+    /// - 正常样本 `duration_ms=4318 bytes=42887` → expected≈10721 → 门内（3573~32163）
+    /// - 异常样本 `duration_ms=51129344 bytes=43296` → expected≈10824 → 门外（触发）
+    /// - 异常样本 `duration_ms=31 bytes=24588`     → expected≈6147  → 门外（触发）
+    ///
+    /// <4KB 的样本走 too_short 阈值判定，本门不参与以避免噪声。
+    static func durationBytesMismatch(durationMs: Int, bytes: Int) -> String? {
+        guard bytes >= 4_000, durationMs >= 0 else { return nil }
+        let bytesPerSecond = 4_000 // AVEncoderBitRateKey 32_000 bps
+        let expectedMs = bytes * 1_000 / bytesPerSecond
+        let lowerBound = expectedMs / 3
+        let upperBound = expectedMs * 3
+        guard durationMs < lowerBound || durationMs > upperBound else { return nil }
+        return "duration_ms=\(durationMs) bytes=\(bytes) expected_ms≈\(expectedMs)"
     }
 
     /// ESS-72：录音结束必须把共享会话交还出去。录音把会话激活成
