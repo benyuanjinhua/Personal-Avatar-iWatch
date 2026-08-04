@@ -44,6 +44,30 @@ final class BridgeTurnProjectionErrorCodeTests: XCTestCase {
         XCTAssertEqual(envelope.state, .failed)
     }
 
+    func testD2BridgeTerminalCodesNeverBecomeRawUserDetail() throws {
+        let expected = [
+            "ERR_UPSTREAM_UNAVAILABLE": "Mac 那边没应答。确认助手在运行，点重试不用重新说。",
+            "ERR_TASK_NOT_FOUND": "Mac 那边找不到这件事了，点重试我重新交一次。",
+            "ERR_TASK_FAILED": "这件事我没办成，点重试再跑一次，不用重新说。",
+            "ERR_RESULT_UNKNOWN": "这件事做完没有我不确定，去 Mac 上看一眼——我不敢替你重跑。",
+        ]
+        for (code, detail) in expected {
+            let envelope = try XCTUnwrap(projection(status: "failed", error: code).statusEnvelope())
+            XCTAssertEqual(envelope.detail, detail)
+            XCTAssertFalse(envelope.detail?.contains("ERR_") ?? false)
+        }
+    }
+
+    func testUnknownFailureUsesReadableFallback() throws {
+        let envelope = try XCTUnwrap(projection(status: "failed", error: "ERR_FUTURE_CODE").statusEnvelope())
+        XCTAssertEqual(envelope.detail, "刚才这件事没成，点重试再来一次；还不行就再说一遍。")
+    }
+
+    func testUpstreamUnavailableProjectsMacFailureStage() throws {
+        let envelope = try XCTUnwrap(projection(status: "failed", error: "ERR_UPSTREAM_UNAVAILABLE").statusEnvelope())
+        XCTAssertEqual(envelope.failureStage, .macUnreachable)
+    }
+
     func testEnvelopeRoundTripsErrorCode() throws {
         let original = VoiceStatusEnvelope.status(
             requestId: requestId, state: .failed,

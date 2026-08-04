@@ -3,7 +3,51 @@ import assert from 'node:assert/strict'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { TurnLedger } from '../ledger.mjs'
+import {
+  BRIDGE_TASK_TERMINAL_ERRORS,
+  TurnLedger,
+  isAutomaticallyRetryableTerminalError,
+} from '../ledger.mjs'
+
+describe('ESS-255 D2 terminal error projection', () => {
+  const cases = [
+    ['ERR_UPSTREAM_UNAVAILABLE', 'Mac 那边没应答。确认助手在运行，点重试不用重新说。'],
+    ['ERR_TASK_NOT_FOUND', 'Mac 那边找不到这件事了，点重试我重新交一次。'],
+    ['ERR_TASK_FAILED', '这件事我没办成，点重试再跑一次，不用重新说。'],
+    ['ERR_RESULT_UNKNOWN', '这件事做完没有我不确定，去 Mac 上看一眼——我不敢替你重跑。'],
+  ]
+
+  for (const [errorCode, expectedDetail] of cases) {
+    it(`projects ${errorCode} with client-safe detail`, () => {
+      const stateDir = mkdtempSync(join(tmpdir(), 'terminal-error-'))
+      const ledger = new TurnLedger({ stateDir })
+      ledger.create({ requestId: errorCode, deviceId: 'phone', bodySha256: 'sha', sessionId: 's' })
+      ledger.fail(errorCode, errorCode, `unsafe upstream detail ${errorCode}`)
+
+      const projection = ledger.projection(errorCode)
+      assert.equal(projection.error, errorCode)
+      assert.equal(projection.detail, expectedDetail)
+      assert.equal(projection.detail.includes('ERR_'), false)
+    })
+  }
+
+  it('enumerates the real terminal set and keeps unknown-result non-retryable', () => {
+    assert.deepEqual([...BRIDGE_TASK_TERMINAL_ERRORS], cases.map(([code]) => code))
+    assert.equal(isAutomaticallyRetryableTerminalError('ERR_RESULT_UNKNOWN'), false)
+    assert.equal(isAutomaticallyRetryableTerminalError('ERR_TASK_FAILED'), true)
+    assert.equal(isAutomaticallyRetryableTerminalError('ERR_NOT_ENUMERATED'), false)
+  })
+
+  it('never exposes unknown error codes or raw failed detail', () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'terminal-error-fallback-'))
+    const ledger = new TurnLedger({ stateDir })
+    ledger.create({ requestId: 'unknown', deviceId: 'phone', bodySha256: 'sha', sessionId: 's' })
+    ledger.fail('unknown', 'ERR_PRIVATE_INTERNAL', 'secret upstream status')
+    const projection = ledger.projection('unknown')
+    assert.equal(projection.detail, '刚才这件事没成，点重试再来一次；还不行就再说一遍。')
+    assert.equal(projection.detail.includes('ERR_'), false)
+  })
+})
 
 describe('terminal result redelivery ledger', () => {
   it('projects request-correlated stage timestamps, TTFT, and end-to-end latency', () => {

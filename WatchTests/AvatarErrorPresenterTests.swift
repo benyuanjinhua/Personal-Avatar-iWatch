@@ -93,6 +93,25 @@ final class AvatarErrorPresenterTests: XCTestCase {
                        "白梦林铁律：任何失败都要说话，未知 code 走通用兜底")
     }
 
+    /// ESS-255 / D2 E-28 + E-99：在真实 watchOS 测试宿主中解码 Bridge 终态，
+    /// 锁定历史/回看 detail 不含裸码，并产出 R-02 可复核运行时事件。
+    func testBridgeTerminalDetailIsReadableAtWatchRuntime() throws {
+        let requestId = "019fcb4a-0000-7000-8000-000000000255"
+        let json = """
+        {"type":"turn.state","turn":{"request_id":"\(requestId)","status":"failed","error":"ERR_RESULT_UNKNOWN","detail":"manual_confirmation_required"}}
+        """
+        let turn = try XCTUnwrap(BridgeEventMessage.decode(from: Data(json.utf8))?.turn)
+        let envelope = try XCTUnwrap(turn.statusEnvelope())
+        let detail = try XCTUnwrap(envelope.detail)
+        XCTAssertFalse(detail.contains("ERR_"))
+        XCTAssertTrue(detail.contains("我不敢替你重跑"))
+        WatchLog.info(
+            "turn", "terminal_detail_projected",
+            requestId: requestId,
+            detail: "error_code=ERR_RESULT_UNKNOWN detail_has_raw_code=false auto_retry=false"
+        )
+    }
+
     func testDuplicateRequestIdIsDedupedNotDoubled() {
         let presenter = presenter()
         XCTAssertTrue(presenter.present(

@@ -17,6 +17,30 @@ export const NORTH_STATES = new Set([
 ])
 const TERMINAL = new Set(['completed', 'failed', 'cancelled'])
 
+// ESS-255 / D2 v1.1: Bridge 真实产生的后台终态码。北向 detail 是用户可见字段，
+// 不能透传上游 statusReason 或 ERR_*；稳定码继续保留在 error 字段供客户端查表。
+export const BRIDGE_TASK_TERMINAL_ERRORS = new Set([
+  'ERR_UPSTREAM_UNAVAILABLE',
+  'ERR_TASK_NOT_FOUND',
+  'ERR_TASK_FAILED',
+  'ERR_RESULT_UNKNOWN',
+])
+
+const CLIENT_FAILURE_DETAILS = new Map([
+  ['ERR_UPSTREAM_UNAVAILABLE', 'Mac 那边没应答。确认助手在运行，点重试不用重新说。'],
+  ['ERR_TASK_NOT_FOUND', 'Mac 那边找不到这件事了，点重试我重新交一次。'],
+  ['ERR_TASK_FAILED', '这件事我没办成，点重试再跑一次，不用重新说。'],
+  ['ERR_RESULT_UNKNOWN', '这件事做完没有我不确定，去 Mac 上看一眼——我不敢替你重跑。'],
+])
+
+export function isAutomaticallyRetryableTerminalError(errorCode) {
+  return BRIDGE_TASK_TERMINAL_ERRORS.has(errorCode) && errorCode !== 'ERR_RESULT_UNKNOWN'
+}
+
+export function clientFailureDetail(errorCode) {
+  return CLIENT_FAILURE_DETAILS.get(errorCode) ?? '刚才这件事没成，点重试再来一次；还不行就再说一遍。'
+}
+
 export class TurnLedger extends EventEmitter {
   constructor({ stateDir, maxResultChars = 4000, maxResultAudioBytes = 2 * 1024 * 1024, log = () => {} }) {
     super()
@@ -224,7 +248,7 @@ export class TurnLedger extends EventEmitter {
       request_id: turn.request_id,
       device_id: turn.device_id,
       status: turn.state,
-      detail: turn.detail,
+      detail: turn.state === 'failed' ? clientFailureDetail(turn.error) : turn.detail,
       path: turn.path,
       task_id: turn.task_id,
       permission: turn.permission,

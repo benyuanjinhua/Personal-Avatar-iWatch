@@ -157,8 +157,8 @@ extension BridgeTurnProjection {
         }
     }
 
-    /// 面向用户的补充说明：失败时给稳定错误码，其余透传子状态。
-    /// 「没听清」类失败（ESS-41 B2）翻译成可执行的中文提示，不裸露错误码。
+    /// 面向用户的补充说明。失败 detail 可能来自旧 Bridge 或本地缓存，必须在
+    /// 客户端边界再次去裸码；稳定码只经 errorCode 进入 Watch 查表。
     ///
     /// ESS-180：拟人化文案与语音提示的最终决策已下沉到 Watch 侧
     /// `ErrorCueCatalog`；detailText 仍作为日志/回看视图的兜底文案，
@@ -168,8 +168,17 @@ extension BridgeTurnProjection {
         switch error {
         case "ERR_AUDIO_TOO_SHORT", "ERR_TRANSCRIPT_DISCARDED":
             return "没听清，请重说"
+        case "ERR_UPSTREAM_UNAVAILABLE":
+            return "Mac 那边没应答。确认助手在运行，点重试不用重新说。"
+        case "ERR_TASK_NOT_FOUND":
+            return "Mac 那边找不到这件事了，点重试我重新交一次。"
+        case "ERR_TASK_FAILED":
+            return "这件事我没办成，点重试再跑一次，不用重新说。"
+        case "ERR_RESULT_UNKNOWN":
+            return "这件事做完没有我不确定，去 Mac 上看一眼——我不敢替你重跑。"
         default:
-            return error ?? detail
+            if let detail, !detail.hasPrefix("ERR_"), !detail.contains("_") { return detail }
+            return "刚才这件事没成，点重试再来一次；还不行就再说一遍。"
         }
     }
 
@@ -213,10 +222,17 @@ extension BridgeTurnProjection {
             state: state,
             occurredAt: date,
             detail: detailText,
-            failureStage: state == .failed ? .execution : nil,
+            failureStage: state == .failed ? failureStage : nil,
             permission: permissionPayload,
             result: resultPayload,
             errorCode: errorCode
         )
+    }
+
+    private var failureStage: VoiceFailureStage {
+        switch error {
+        case "ERR_UPSTREAM_UNAVAILABLE": return .macUnreachable
+        default: return .execution
+        }
     }
 }
