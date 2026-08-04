@@ -117,6 +117,9 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         didReceiveMessage message: [String: Any]
     ) {
         forwardRelayPayloads(in: message)
+        if let data = message[VoiceResultAudioDegradationMessage.envelopeKey] as? Data {
+            Task { @MainActor in self.applyAudioDegradation(data) }
+        }
         guard let data = message[VoiceStatusMessage.envelopeKey] as? Data else { return }
         Task { @MainActor in self.applyVoiceStatus(data) }
     }
@@ -126,6 +129,9 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         didReceiveUserInfo userInfo: [String: Any] = [:]
     ) {
         forwardRelayPayloads(in: userInfo)
+        if let data = userInfo[VoiceResultAudioDegradationMessage.envelopeKey] as? Data {
+            Task { @MainActor in self.applyAudioDegradation(data) }
+        }
         guard let data = userInfo[VoiceStatusMessage.envelopeKey] as? Data else { return }
         Task { @MainActor in self.applyVoiceStatus(data) }
     }
@@ -241,6 +247,22 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         }
     }
 
+    @MainActor
+    func applyAudioDegradation(_ data: Data) {
+        guard let envelope = try? VoiceResultAudioDegradationEnvelope.decode(from: data),
+              envelope.validate() == nil else {
+            WatchLog.error("turn", "audio_degradation_invalid", code: "ERR_DECODE")
+            return
+        }
+        let applied = voiceJournal?.recordAudioDegradation(
+            requestId: envelope.requestId, errorCode: envelope.errorCode
+        ) ?? false
+        WatchLog.info(
+            "turn", "result_audio_degraded", requestId: envelope.requestId,
+            detail: "code=\(envelope.errorCode) applied=\(applied) text_available=true"
+        )
+    }
+
     /// 结果语音入库：sha256 校验通过才加密落盘；校验失败整体丢弃（数据不可信）。
     /// ESS-41 L3 取证：每个丢弃分支必须留 request_id + 原因，禁止静默 return。
     @MainActor
@@ -278,6 +300,9 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         guard let vault = speechVault, (try? vault.store(audioData, name: fileName)) != nil else {
             WatchLog.error(
                 "turn", "speech_vault_store_failed", requestId: envelope.requestId, code: "ERR_VAULT_STORE"
+            )
+            _ = voiceJournal?.recordAudioDegradation(
+                requestId: envelope.requestId, errorCode: "ERR_VAULT_STORE"
             )
             return
         }

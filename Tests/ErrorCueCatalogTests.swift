@@ -33,6 +33,16 @@ final class ErrorCueCatalogTests: XCTestCase {
         }
     }
 
+    func testResultAudioFailuresMapToD2E12E13E14() {
+        XCTAssertEqual(
+            ErrorCueCatalog.cue(for: "ERR_NO_SPEECH_FILE").text,
+            "答案在，只是语音没留住——文字给你看。"
+        )
+        XCTAssertTrue(ErrorCueCatalog.cue(for: "ERR_PLAYBACK_ACTIVATION").text.contains("扬声器"))
+        XCTAssertTrue(ErrorCueCatalog.cue(for: "ERR_PLAY_RETURNED_FALSE").text.contains("点重播"))
+        XCTAssertNil(ErrorCueCatalog.cue(for: "ERR_PLAYBACK_DEFERRED_TIMEOUT").clip)
+    }
+
     func testUnknownCodeFallsBackToGenericButPreservesCode() {
         let entry = ErrorCueCatalog.cue(for: "ERR_SOMETHING_NEW")
         XCTAssertEqual(entry.code, "ERR_SOMETHING_NEW", "code 保留供日志追溯")

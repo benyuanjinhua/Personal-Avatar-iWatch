@@ -269,6 +269,52 @@ enum VoiceStatusMessage {
     static let envelopeKey = "voice_status_envelope"
 }
 
+/// iPhone → Watch 的结果语音降级事件。结果文本已经完成入账时，音频链路的
+/// 后续失败不能再伪装成第二个 turn 终态（completed 会被状态机吸收），因此
+/// 使用独立事件表达“文字已到、语音未到”。
+struct VoiceResultAudioDegradationEnvelope: Codable, Equatable {
+    static let currentProtocolVersion = "1.0"
+    static let eventType = "result_audio_degraded"
+
+    let protocolVersion: String
+    let requestId: String
+    let type: String
+    let errorCode: String
+    let occurredAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case requestId = "request_id"
+        case type
+        case errorCode = "error_code"
+        case occurredAt = "occurred_at"
+    }
+
+    static func event(
+        requestId: String, errorCode: String = "ERR_NO_SPEECH_FILE", occurredAt: Date = Date()
+    ) -> Self {
+        Self(
+            protocolVersion: currentProtocolVersion, requestId: requestId,
+            type: eventType, errorCode: errorCode, occurredAt: occurredAt
+        )
+    }
+
+    func validate() -> String? {
+        guard protocolVersion == Self.currentProtocolVersion else { return "不支持的协议版本" }
+        guard type == Self.eventType else { return "不支持的事件类型" }
+        guard UUID(uuidString: requestId) != nil else { return "request_id 不是合法 UUID" }
+        guard errorCode.hasPrefix("ERR_") else { return "error_code 非法" }
+        return nil
+    }
+
+    func jsonData() throws -> Data { try VoiceProtocolJSON.encoder.encode(self) }
+    static func decode(from data: Data) throws -> Self { try VoiceProtocolJSON.decoder.decode(Self.self, from: data) }
+}
+
+enum VoiceResultAudioDegradationMessage {
+    static let envelopeKey = "voice_result_audio_degradation"
+}
+
 enum PermissionDecisionMessage {
     static let envelopeKey = "permission_decision_envelope"
 }

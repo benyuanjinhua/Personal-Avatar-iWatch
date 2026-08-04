@@ -446,4 +446,37 @@ final class AvatarErrorPresenterTests: XCTestCase {
                 + " audio_attempted=false haptic_fired=true card_visible=true"
         )
     }
+
+    /// ESS-254 R-02：在 watchOS 测试进程中走真实接收入口，产出
+    /// `result_audio_degraded` WatchLog，并验证 completed 不被改写成 failed。
+    func testResultAudioDegradationRuntimeEventKeepsTextAndProjectsE12() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ess254-runtime-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let journal = VoiceTurnJournal(directory: directory)
+        let requestId = "018f4c6e-0000-7000-8000-000000000254"
+        journal.begin(requestId: requestId)
+        let result = VoiceResultPayload(
+            summary: "文字答案仍然可读", isTruncated: false,
+            speechSha256: "abc", speechDurationMs: 1_000
+        )
+        XCTAssertTrue(journal.apply(.status(requestId: requestId, state: .completed, result: result)))
+
+        var projectedCode: String?
+        journal.onResultAudioDegraded = { _, code in projectedCode = code }
+        let store = WatchSettingsStore()
+        store.voiceJournal = journal
+        let event = VoiceResultAudioDegradationEnvelope.event(
+            requestId: requestId, occurredAt: Date(timeIntervalSince1970: 1_770_000_000)
+        )
+        store.applyAudioDegradation(try event.jsonData())
+
+        XCTAssertEqual(projectedCode, "ERR_NO_SPEECH_FILE")
+        XCTAssertEqual(journal.turn(withId: requestId)?.currentState, .completed)
+        XCTAssertEqual(journal.turn(withId: requestId)?.result?.summary, "文字答案仍然可读")
+        XCTAssertEqual(
+            ErrorCueCatalog.cue(for: projectedCode).text,
+            "答案在，只是语音没留住——文字给你看。"
+        )
+    }
 }

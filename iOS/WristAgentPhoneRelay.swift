@@ -13,6 +13,7 @@ protocol WatchFeedbackChannel: AnyObject {
     func notifyWatch(result: VoiceRelayResultPayload)
     /// 状态/权限/结果信封 → Watch VoiceTurnJournal（ESS-29 时间线 UI 的入账单位）。
     func notifyWatch(voiceStatus: VoiceStatusEnvelope)
+    func notifyWatch(resultAudioDegradation: VoiceResultAudioDegradationEnvelope)
     /// 结果语音 transferFile；metadata 带含 speechSha256 的信封，Watch 校验后入加密仓。
     /// 返回 true 表示本条已**持久入队**（或同载荷已在队列/保留期内送达过，属幂等重复）；
     /// 返回 false 表示未能持久化——调用方不得记为已交付，必须允许后续快照重试。
@@ -488,7 +489,10 @@ final class WristAgentPhoneRelay: ObservableObject {
     private func audioDeliveryKey(_ requestId: String, _ sha: String) -> String { "\(requestId)|\(sha)" }
 
     private func deliverResultAudio(projection: BridgeTurnProjection) {
-        guard let result = projection.result else { return }
+        guard let result = projection.result else {
+            notifyAudioDegradation(requestId: projection.requestId, sourceCode: "ERR_NO_SPEECH_FILE")
+            return
+        }
         // inline base64 优先（≤ Bridge 上限时随投影内联下发）。
         if let base64 = result.audioBase64, let data = Data(base64Encoded: base64) {
             let sha = RelayWire.sha256Hex(data)
@@ -501,7 +505,10 @@ final class WristAgentPhoneRelay: ObservableObject {
             }
         }
         // 无内联（超限被裁）：凭元数据经 HTTPS 有界下载，支持断点续传。
-        guard let meta = result.audio else { return } // 纯文本降级：无音频可交付
+        guard let meta = result.audio else {
+            notifyAudioDegradation(requestId: projection.requestId, sourceCode: "ERR_NO_SPEECH_FILE")
+            return
+        }
         let key = audioDeliveryKey(projection.requestId, meta.sha256.lowercased())
         guard !deliveredResultAudio.contains(key), !activeAudioDownloads.contains(key) else { return }
         activeAudioDownloads.insert(key)
@@ -515,13 +522,20 @@ final class WristAgentPhoneRelay: ObservableObject {
         let key = audioDeliveryKey(projection.requestId, sha)
         guard !deliveredResultAudio.contains(key) else { return }
         let url = resultAudioDirectory.appendingPathComponent("\(projection.requestId).m4a")
-        guard (try? data.write(to: url, options: .atomic)) != nil else { return }
+        guard (try? data.write(to: url, options: .atomic)) != nil else {
+            notifyAudioDegradation(requestId: projection.requestId, sourceCode: "ERR_VAULT_STORE")
+            return
+        }
         // transferFile 的信封以实际字节的 sha 为准（Watch 端以此校验入库）。
-        guard let envelope = speechEnvelope(projection: projection, sha: sha) else { return }
+        guard let envelope = speechEnvelope(projection: projection, sha: sha) else {
+            notifyAudioDegradation(requestId: projection.requestId, sourceCode: "ERR_NO_SPEECH_FILE")
+            return
+        }
         Self.downlinkLogger.log("l2_relay_audio_ready request_id=\(projection.requestId, privacy: .public) bytes=\(data.count) sha256=\(sha, privacy: .public) source=\(projection.path ?? "unknown", privacy: .public)")
         guard watchChannel?.transferSpeech(fileURL: url, envelope: envelope) == true else {
             // 编码/读文件/落盘任一环失败：不写内存去重，下一次快照重放还能重试这条语音。
             relayLog("结果语音入队失败，等待快照重试 \(projection.requestId.prefix(8))…")
+            notifyAudioDegradation(requestId: projection.requestId, sourceCode: "ERR_AUDIO_FETCH")
             return
         }
         deliveredResultAudio.insert(key)
@@ -623,6 +637,7 @@ final class WristAgentPhoneRelay: ObservableObject {
         guard let client = makeClient() else { return }
         if let size = meta.sizeBytes, size > Self.maxResultAudioBytes {
             relayLog("结果语音超出本地上限（\(size)B），保留文本降级")
+            notifyAudioDegradation(requestId: projection.requestId, sourceCode: "ERR_NO_SPEECH_FILE")
             return
         }
         let partialURL = resultAudioDirectory
@@ -648,7 +663,8 @@ final class WristAgentPhoneRelay: ObservableObject {
                     Self.downlinkLogger.error(
                         "result audio fetch failed request_id=\(projection.requestId, privacy: .public) state=failed reason=not-found attempt=\(attempt + 1)"
                     )
-                    return // 音频已过保留期/不存在：文本降级
+                    notifyAudioDegradation(requestId: projection.requestId, sourceCode: "ERR_NO_SPEECH_FILE")
+                    return
                 case 416: assembled = Data() // 断点越界：从头再来
                 default: throw RelayUploadError.bridge(code: "ERR_AUDIO_FETCH", httpStatus: status)
                 }
@@ -677,6 +693,14 @@ final class WristAgentPhoneRelay: ObservableObject {
             "result audio fetch deferred request_id=\(projection.requestId, privacy: .public) state=queued bytes_staged=\(assembled.count) reason=retry-exhausted"
         )
         relayLog("结果语音下载未完成，已保留断点；文本结果已先行送达")
+        notifyAudioDegradation(requestId: projection.requestId, sourceCode: "ERR_AUDIO_FETCH")
+    }
+
+    private func notifyAudioDegradation(requestId: String, sourceCode: String) {
+        Self.downlinkLogger.error(
+            "result audio degraded request_id=\(requestId, privacy: .public) source_code=\(sourceCode, privacy: .public) projected_code=ERR_NO_SPEECH_FILE"
+        )
+        watchChannel?.notifyWatch(resultAudioDegradation: .event(requestId: requestId))
     }
 
     private func relayLog(_ message: String) {
