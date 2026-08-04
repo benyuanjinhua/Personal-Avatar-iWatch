@@ -13,11 +13,21 @@ struct WatchContentView: View {
     @ObservedObject private var notifier: ResultNotifier
     /// ESS-180：屏幕分身错误卡片状态机。
     @ObservedObject private var errorPresenter: AvatarErrorPresenter
-    /// ESS-163 PD 裁定：首屏零可见开发入口，Debug 面板改用「长按主界面
-    /// 标题 2 秒」隐藏手势进入，不加任何可见提示。
-    @State private var showDebugPanel = false
+    /// ESS-280（R1 生效）：设置页承载流式开关与自检；首屏不消费本对象，
+    /// 但需要传给 `WatchSettingsView`（TabView 第 2 页）。
+    @ObservedObject private var debugSettings: WatchDebugSettings
+    /// ESS-280 方案 A（PM Jackson Bai 2026-08-04 拍板；R-04.6 后一条覆盖前一条）：
+    /// 三屏结构 —— 0 = 主界面、1 = 状态时间线（原挂在主屏 NavigationLink 下的
+    /// `ConversationTimelineView` 抬升为独立屏）、2 = 设置。冷启动落 tag 0。
+    /// 白梦林原话「右滑第 3 屏设置」字面成立即靠这里的 tag 2。
+    @State private var selectedTab: Int = 0
 
-    init(pushToTalk: PushToTalkController, welcome: WelcomeGreeter, selfCheck: SelfCheckRunner) {
+    init(
+        pushToTalk: PushToTalkController,
+        welcome: WelcomeGreeter,
+        selfCheck: SelfCheckRunner,
+        debugSettings: WatchDebugSettings
+    ) {
         self.pushToTalk = pushToTalk
         self.welcome = welcome
         self.selfCheck = selfCheck
@@ -26,9 +36,42 @@ struct WatchContentView: View {
         self.player = pushToTalk.player
         self.notifier = pushToTalk.notifier
         self.errorPresenter = pushToTalk.errorPresenter
+        self.debugSettings = debugSettings
     }
 
     var body: some View {
+        // ESS-280 方案 A：`TabView(.page)` 三屏 —— 0=主界面、1=状态时间线、
+        // 2=设置。用 SwiftUI 惯用 `.tabViewStyle(.page)` 让 watchOS 支持横滑
+        // 分屏。每个 tab 各自包一层 NavigationStack 以保留标题与 push 语义
+        // （时间线内更早回合的详情、设置屏内的自检重跑）。
+        TabView(selection: $selectedTab) {
+            mainScreen
+                .tag(0)
+
+            NavigationStack {
+                ConversationTimelineView(journal: journal)
+            }
+            .tag(1)
+
+            NavigationStack {
+                WatchSettingsView(selfCheck: selfCheck, debugSettings: debugSettings)
+            }
+            .tag(2)
+        }
+        .tabViewStyle(.page)
+        // 字幕式播放视图（ESS-48）：播放开始/纯文本结果到达时由控制器置入会话。
+        // ESS-259 B-STOP：正在播放本回合语音时轻点字幕区打断，只清播放不改状态、
+        // 不重新入队、不算失败——参见 `PushToTalkController.stopPlaybackByUser`。
+        .sheet(item: $pushToTalk.subtitleSession) { session in
+            SubtitlePlaybackView(session: session, player: pushToTalk.player) {
+                pushToTalk.stopPlaybackByUser(requestId: session.requestId)
+            }
+        }
+    }
+
+    // MARK: - 屏 0：主界面
+
+    private var mainScreen: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 10) {
@@ -59,9 +102,10 @@ struct WatchContentView: View {
                         welcomeBanner
                     }
 
-                    // ESS-163：装机自检的过程/结果不再默认铺在首屏，
-                    // 收进「开发者面板」入口。日志证据（selfcheck_*）不变，
-                    // ESS-65 铁律 3/5 通过面板内的重跑按钮与业务入口独立保留。
+                    // ESS-163：装机自检的过程/结果不再默认铺在首屏；
+                    // ESS-280 R1 生效后统一收进设置页（TabView 第 3 屏）。
+                    // 日志证据（selfcheck_*）不变，ESS-65 铁律 3/5 通过设置页
+                    // 内的重跑按钮与业务入口独立保留。
 
                     // ESS-180：主界面禁止「已等待 N 秒」——处理中只允许语义化
                     // 阶段词（正在思考…/正在查询…），30/60 秒切换文案而非数秒。
@@ -69,17 +113,13 @@ struct WatchContentView: View {
                     TimelineView(.periodic(from: .now, by: 5)) { context in
                         let status = statusCopy(now: context.date)
                         VStack(spacing: 10) {
-                            // ESS-163：主界面标题就是这个 status.title——长按 2 秒
-                            // 唤起 Debug 面板；不加可见提示。手势不消费 tap，
-                            // 语音球的 DragGesture 与欢迎语打断均不受影响。
+                            // ESS-280 R1 生效：删除 ESS-163 的「长按标题 2s 进 Debug 面板」
+                            // 隐藏手势 —— 与 D3「不许隐藏交互」冲突。设置入口改由
+                            // TabView 右滑第 2 屏承担，显式可见。
                             Text(status.title)
                                 .font(.footnote.bold())
                                 .multilineTextAlignment(.center)
                                 .lineLimit(2)
-                                .contentShape(Rectangle())
-                                .onLongPressGesture(minimumDuration: 2.0) {
-                                    showDebugPanel = true
-                                }
 
                             Text(status.subtitle)
                                 .font(.caption2)
@@ -120,19 +160,9 @@ struct WatchContentView: View {
                         turnContent(turn)
                     }
 
-                    NavigationLink {
-                        ConversationTimelineView(journal: journal)
-                    } label: {
-                        Label("状态时间线", systemImage: "list.bullet.rectangle")
-                    }
-                    .font(.footnote)
-                    .buttonStyle(.bordered)
-                    .tint(.secondary)
-
-                    // ESS-163 PD 裁定：Debug 面板入口迁出首屏，改为长按主界面
-                    // 标题 2 秒隐藏手势唤起（见上面 status.title 的
-                    // onLongPressGesture）。此处不再放任何可见 NavigationLink /
-                    // Button，避免最终用户看到开发者入口。
+                    // ESS-280 方案 A（R1 生效）：状态时间线抬升为 TabView 第 2 屏
+                    // （右滑一次到达），主界面不再放跳转按钮；设置在第 3 屏
+                    // （右滑到底），显式可见，不再走 ESS-163 的长按隐藏手势。
 
                     if let remote = transport.remoteStatus,
                        remote.requestId != activeTurn?.requestId {
@@ -149,21 +179,6 @@ struct WatchContentView: View {
         // 按 request_id 定向触发，ESS-41 B3）：不再依赖本视图挂载或该回合仍是
         // activeTurn——旧的 onChange 触发在「语音后到 + 回合已切换/已判失败」时
         // 会静默漏播。
-        // 字幕式播放视图（ESS-48）：播放开始/纯文本结果到达时由控制器置入会话。
-        // ESS-259 B-STOP：正在播放本回合语音时轻点字幕区打断，只清播放不改状态、
-        // 不重新入队、不算失败——参见 `PushToTalkController.stopPlaybackByUser`。
-        .sheet(item: $pushToTalk.subtitleSession) { session in
-            SubtitlePlaybackView(session: session, player: pushToTalk.player) {
-                pushToTalk.stopPlaybackByUser(requestId: session.requestId)
-            }
-        }
-        // ESS-163：Debug 面板作为覆盖 sheet 呈现——不占用首屏导航栈，
-        // 手表下滑关闭；避免 NavigationLink 在首屏留下可见项。
-        .sheet(isPresented: $showDebugPanel) {
-            NavigationStack {
-                DebugPanelView(selfCheck: selfCheck)
-            }
-        }
     }
 
     // MARK: - 欢迎语（ESS-40）
