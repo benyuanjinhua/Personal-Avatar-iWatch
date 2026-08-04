@@ -108,6 +108,8 @@ export class QwenRealtimeSessionSupervisor {
     this.onPermissionRequested = null // (task) => void — 本会话权限请求（D1/ESS-34）
     this.onTurnAudioDelta = null // ({requestId,event}) => void — L1 debug downlink
     this.onTurnAudioDone = null // ({requestId,event}) => void — L1 debug downlink EOS
+    this.onAnnouncementAudioDelta = null // ({capture,event}) => void — taskId-bound L1 debug downlink
+    this.onAnnouncementAudioDone = null // ({capture,event}) => void — taskId-bound L1 debug downlink EOS
   }
 
   record(entry) {
@@ -403,7 +405,10 @@ export class QwenRealtimeSessionSupervisor {
       }
       // 24kHz PCM base64 → 聚合缓冲；日志不落原始音频
       this.record({ event: 'audio.delta', responseId: event.responseId, bytes: Buffer.from(event.audio || '', 'base64').length, sampleRate: event.sampleRate, announcement: Boolean(capture) })
-      if (capture) this.appendAnnouncementAudio(capture, event)
+      if (capture) {
+        this.appendAnnouncementAudio(capture, event)
+        this.onAnnouncementAudioDelta?.({ capture, event })
+      }
       else {
         const requestId = this.currentTurn?.label
         this.currentTurn?.onAudioDelta(event)
@@ -417,6 +422,8 @@ export class QwenRealtimeSessionSupervisor {
         this.wsSend({ type: 'playback.ended', responseId: event.responseId })
       }
       if (this.announcements.has(event.responseId)) {
+        const capture = this.announcements.get(event.responseId)
+        this.onAnnouncementAudioDone?.({ capture, event })
         this.finishAnnouncement(event.responseId, 'audio.done')
       } else if (this.currentTurn?.label) {
         this.onTurnAudioDone?.({ requestId: this.currentTurn.label, event })

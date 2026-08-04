@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { VoiceStreamDownlink } from '../voice-stream-downlink.mjs'
+import { QwenRealtimeSessionSupervisor } from '../supervisor.mjs'
 
 const requestId = 'req_test'
 const delta = n => Buffer.from(`delta-${n}`)
@@ -67,5 +68,57 @@ describe('VoiceStreamDownlink', () => {
     assert.equal(stream.fallback(requestId).retry, 1)
     assert.equal(stream.fallback(requestId).status, 'already_fell_back')
     assert.equal(logs.length, 1)
+  })
+
+  it('arms a bounded gap timer and falls back exactly once on timeout', () => {
+    let callback = null
+    let cleared = 0
+    const { stream, logs } = harness({
+      gapTimeoutMs: 25,
+      setTimer: fn => { callback = fn; return { timer: true } },
+      clearTimer: () => { cleared += 1 },
+    })
+    assert.equal(stream.append({ requestId, sequence: 1, audio: delta(1) }).status, 'accepted')
+    assert.equal(typeof callback, 'function')
+    callback()
+    assert.equal(logs.filter(l => l.reason === 'gap_timed_out').length, 1)
+    assert.equal(stream.gapTimedOut(requestId).status, 'already_fell_back')
+    assert.equal(cleared, 0, 'fired timer clears its own handle before fallback')
+  })
+
+  it('cancels the gap timer when the missing chunk arrives', () => {
+    let cleared = 0
+    const { stream, messages } = harness({
+      setTimer: () => ({ timer: true }),
+      clearTimer: () => { cleared += 1 },
+    })
+    stream.append({ requestId, sequence: 1, audio: delta(1) })
+    assert.equal(stream.append({ requestId, sequence: 0, audio: delta(0) }).sent, 2)
+    assert.equal(cleared, 1)
+    assert.deepEqual(messages.map(m => m.chunk.sequence), [0, 1])
+  })
+})
+
+describe('Realtime audio.delta ownership routing', () => {
+  it('routes direct turn deltas and EOS with the current request_id', () => {
+    const supervisor = new QwenRealtimeSessionSupervisor({ log: () => {} })
+    const seen = []
+    supervisor.currentTurn = { label: 'req_direct', onAudioDelta: () => {}, onEvent: () => {} }
+    supervisor.onTurnAudioDelta = item => seen.push(['delta', item.requestId])
+    supervisor.onTurnAudioDone = item => seen.push(['done', item.requestId])
+    supervisor.handleServerEvent({ type: 'audio.delta', responseId: 'resp_direct', audio: delta(0).toString('base64'), sampleRate: 24_000 })
+    supervisor.handleServerEvent({ type: 'audio.done', responseId: 'resp_direct' })
+    assert.deepEqual(seen, [['delta', 'req_direct'], ['done', 'req_direct']])
+  })
+
+  it('routes announcement deltas only through their task capture', () => {
+    const supervisor = new QwenRealtimeSessionSupervisor({ log: () => {}, announcementIdleMs: 60_000 })
+    const seen = []
+    supervisor.onAnnouncementAudioDelta = ({ capture }) => seen.push(['delta', capture.taskId])
+    supervisor.onAnnouncementAudioDone = ({ capture }) => seen.push(['done', capture.taskId])
+    supervisor.handleServerEvent({ type: 'response.started', origin: 'announcement', responseId: 'resp_ann', taskId: 'task_42' })
+    supervisor.handleServerEvent({ type: 'audio.delta', responseId: 'resp_ann', audio: delta(0).toString('base64'), sampleRate: 24_000 })
+    supervisor.handleServerEvent({ type: 'audio.done', responseId: 'resp_ann' })
+    assert.deepEqual(seen, [['delta', 'task_42'], ['done', 'task_42']])
   })
 })

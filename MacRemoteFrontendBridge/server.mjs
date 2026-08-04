@@ -1043,6 +1043,7 @@ export function createBridge(overrides = {}) {
     maxPayloadBytes: CONFIG.voice_stream_max_payload_bytes ?? 64 * 1024,
     maxBufferedBytes: CONFIG.voice_stream_max_buffered_bytes ?? 256 * 1024,
     maxSequenceWindow: CONFIG.voice_stream_max_sequence_window ?? 32,
+    gapTimeoutMs: CONFIG.voice_stream_gap_timeout_ms ?? 1_500,
     send: (requestId, message) => {
       const turn = ledger.get(requestId)
       if (!turn) return false
@@ -1058,6 +1059,21 @@ export function createBridge(overrides = {}) {
     streamDownlink.append({ requestId, responseId: event.responseId, audio: event.audio, sampleRate: event.sampleRate ?? 24_000 })
   }
   supervisor.onTurnAudioDone = ({ requestId }) => streamDownlink.finish(requestId)
+  supervisor.onAnnouncementAudioDelta = ({ capture, event }) => {
+    const turn = capture.taskId ? ledger.byTaskId(capture.taskId) : null
+    if (!turn) {
+      log({ evt: 'voice_stream_announcement_unmatched', task_id: capture.taskId, response_id: capture.responseId })
+      return
+    }
+    streamDownlink.append({
+      requestId: turn.request_id, responseId: capture.responseId,
+      audio: event.audio, sampleRate: event.sampleRate ?? 24_000,
+    })
+  }
+  supervisor.onAnnouncementAudioDone = ({ capture }) => {
+    const turn = capture.taskId ? ledger.byTaskId(capture.taskId) : null
+    if (turn) streamDownlink.finish(turn.request_id)
+  }
 
   function sendTerminalDelivery(turn, client, cause) {
     const event = { type: 'turn.state', turn: ledger.projection(turn) }

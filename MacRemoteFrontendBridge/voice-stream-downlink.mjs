@@ -12,17 +12,23 @@ export class VoiceStreamDownlink {
     maxPayloadBytes = 64 * 1024,
     maxBufferedBytes = 256 * 1024,
     maxSequenceWindow = 32,
+    gapTimeoutMs = 1_500,
     send,
     log = () => {},
     now = () => Date.now(),
+    setTimer = setTimeout,
+    clearTimer = clearTimeout,
   } = {}) {
     this.enabled = enabled === true
     this.maxPayloadBytes = maxPayloadBytes
     this.maxBufferedBytes = maxBufferedBytes
     this.maxSequenceWindow = maxSequenceWindow
+    this.gapTimeoutMs = gapTimeoutMs
     this.send = send ?? (() => false)
     this.log = log
     this.now = now
+    this.setTimer = setTimer
+    this.clearTimer = clearTimer
     this.streams = new Map()
   }
 
@@ -39,6 +45,7 @@ export class VoiceStreamDownlink {
       stream = {
         requestId, responseId, streamId: randomUUID(), nextSequence: 0,
         pending: new Map(), bufferedBytes: 0, fellBack: false, startedAtMs: this.now(),
+        gapTimer: null,
       }
       this.streams.set(requestId, stream)
     }
@@ -62,6 +69,7 @@ export class VoiceStreamDownlink {
       stream.nextSequence += 1
       sent += 1
     }
+    this.refreshGapTimer(stream)
     return { status: sent ? 'sent' : 'accepted', sent }
   }
 
@@ -71,6 +79,7 @@ export class VoiceStreamDownlink {
     if (!stream) return { status: 'missing' }
     if (stream.fellBack) return { status: 'already_fell_back' }
     if (stream.pending.size) return this.fallback(requestId, 'stream_ended_with_gap')
+    this.cancelGapTimer(stream)
     // L1 validator rejects empty payloads, including EOS. A single PCM16
     // silence sample closes the stream without inventing a second wire shape.
     const sent = this.emit(stream, Buffer.alloc(2), 24_000, true)
@@ -82,8 +91,25 @@ export class VoiceStreamDownlink {
 
   gapTimedOut(requestId) {
     const stream = this.streams.get(requestId)
+    if (stream?.fellBack) return { status: 'already_fell_back' }
     if (!stream || !stream.pending.size) return { status: 'accepted' }
     return this.fallback(requestId, 'gap_timed_out')
+  }
+
+  refreshGapTimer(stream) {
+    this.cancelGapTimer(stream)
+    if (!stream.pending.size || stream.fellBack) return
+    stream.gapTimer = this.setTimer(() => {
+      stream.gapTimer = null
+      this.gapTimedOut(stream.requestId)
+    }, this.gapTimeoutMs)
+    stream.gapTimer?.unref?.()
+  }
+
+  cancelGapTimer(stream) {
+    if (!stream?.gapTimer) return
+    this.clearTimer(stream.gapTimer)
+    stream.gapTimer = null
   }
 
   fallback(requestId, reason = 'client_requested') {
@@ -94,6 +120,7 @@ export class VoiceStreamDownlink {
       this.streams.set(requestId, stream)
     }
     if (stream.fellBack) return { status: 'already_fell_back' }
+    this.cancelGapTimer(stream)
     stream.fellBack = true
     stream.pending.clear()
     stream.bufferedBytes = 0
