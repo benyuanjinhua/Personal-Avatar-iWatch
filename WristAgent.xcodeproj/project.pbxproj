@@ -92,6 +92,7 @@
 		D51204118681270691727D4C /* SpeechPlayerInterruptionEvidenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FDE52A8C1B2854E4646A286 /* SpeechPlayerInterruptionEvidenceTests.swift */; };
 		D9B1A7DECC44E46204E0FFF3 /* UUIDv7.swift in Sources */ = {isa = PBXBuildFile; fileRef = E36424AC38F0A8BB28751248 /* UUIDv7.swift */; };
 		DADA85367CAACD55C3514A81 /* CompanionSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0DFA30C0EEFD46DDC835A5B6 /* CompanionSettings.swift */; };
+		DBE963FE2EC46A5678CC5122 /* AudioRecorderDurationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 24DF76CA9FD4F1F5347735D9 /* AudioRecorderDurationTests.swift */; };
 		E0C092AAB8EB860FC6D5A0B7 /* AgentModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB1D464D47EC34B55A8C8411 /* AgentModels.swift */; };
 		E1EB77C2B2AFD2E3C00EC110 /* VoiceSessionKeeper.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0E2B5FAE82F1D44C2C36616 /* VoiceSessionKeeper.swift */; };
 		E67E11F4044782400305330E /* WatchContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 937C17EC6A16413E34C276A2 /* WatchContentView.swift */; };
@@ -151,6 +152,7 @@
 		16A065FFB735532D201B2183 /* VoiceRequestEnvelope.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRequestEnvelope.swift; sourceTree = "<group>"; };
 		1AB8CD6D695437D845CE87AF /* VoiceRequestInbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRequestInbox.swift; sourceTree = "<group>"; };
 		234EBF336FF2F9724F289524 /* ClientLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientLog.swift; sourceTree = "<group>"; };
+		24DF76CA9FD4F1F5347735D9 /* AudioRecorderDurationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRecorderDurationTests.swift; sourceTree = "<group>"; };
 		2B644F4BEAE260E21C555E9E /* RuntimeSessionPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RuntimeSessionPolicy.swift; sourceTree = "<group>"; };
 		2E4C7D8E5213EE0C04CA8BEC /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		2E88D71F4696224E69D652E8 /* WristAgent Watch App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "WristAgent Watch App.app"; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -324,6 +326,7 @@
 		E0960019F13FD9B843014358 /* WatchTests */ = {
 			isa = PBXGroup;
 			children = (
+				24DF76CA9FD4F1F5347735D9 /* AudioRecorderDurationTests.swift */,
 				0DAD45847A8F17F8D430ACB9 /* AudioRecorderHandoverTests.swift */,
 				CA9DA8A923948AE9124C19F9 /* AvatarErrorPresenterTests.swift */,
 				5CAC488B088EEC6542FF5CAB /* PlaybackEndgameChainTests.swift */,
@@ -575,6 +578,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				DBE963FE2EC46A5678CC5122 /* AudioRecorderDurationTests.swift in Sources */,
 				95171100A79B4FD51C92AF73 /* AudioRecorderHandoverTests.swift in Sources */,
 				BD58016CCCEA3B35C68B307A /* AvatarErrorPresenterTests.swift in Sources */,
 				5DE908AEFD1FB51FD79565BA /* PlaybackEndgameChainTests.swift in Sources */,
