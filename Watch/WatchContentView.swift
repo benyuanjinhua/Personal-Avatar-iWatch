@@ -449,34 +449,45 @@ struct WatchContentView: View {
         let lastEventAt = turn.events.last?.at ?? turn.createdAt
         let elapsed = now.timeIntervalSince(lastEventAt)
         return MainStatusCopy(
-            title: processingTitle(for: turn.phase, elapsed: elapsed),
-            subtitle: processingSubtitle(for: turn.phase, elapsed: elapsed)
+            title: Self.processingTitle(for: turn.phase, elapsed: elapsed),
+            subtitle: Self.processingSubtitle(for: turn.phase, elapsed: elapsed)
         )
     }
 
-    /// ESS-180 语义化阶段词：0-30s 走短文案，30s+ 换语义提示，60s+ 追加
-    /// 「较慢，可继续等待或取消」。任何位置都不允许出现秒数或时:分。
-    private func processingTitle(for phase: VoiceTurnPhase, elapsed: TimeInterval) -> String {
+    /// ESS-180 / D4 Gap-3 语义化阶段词：0-10s 走短文案，10s+ 换「暂无进展」
+    /// 提示，30s+ 换语义说明，60s+ 追加「较慢，可继续等待或取消」。
+    /// 任何位置都不允许出现秒数或时:分。10s 档位只在无新事件时触发，
+    /// 真实事件到达时 elapsed 归零自动抑制。
+    static func processingTitle(for phase: VoiceTurnPhase, elapsed: TimeInterval) -> String {
         if elapsed >= 60 { return "任务较慢，可继续等待或取消" }
         switch phase {
         case .sending: return "正在送出"
         case .waitingForPhone: return "等待手机连接"
-        case .waitingForMac: return elapsed >= 30 ? "分身还在联系 Mac…" : "已到手机，等待 Mac"
-        case .delivered: return elapsed >= 30 ? "分身正在准备执行…" : "Mac 已受理"
+        case .waitingForMac:
+            if elapsed >= 30 { return "分身还在联系 Mac…" }
+            if elapsed >= 10 { return "Mac 尚未响应" }
+            return "已到手机，等待 Mac"
+        case .delivered:
+            if elapsed >= 30 { return "分身正在准备执行…" }
+            if elapsed >= 10 { return "仍在等待 Mac 处理" }
+            return "Mac 已受理"
         case .processing(let background):
             if elapsed >= 30 { return background ? "分身还在跑…" : "分身还在想…" }
+            if elapsed >= 10 { return background ? "仍在后台运行…" : "仍在思考，请稍候" }
             return background ? "分身正在处理…" : "分身正在思考…"
         case .needsConfirmation: return "需要你的确认"
         case .completed, .failed, .cancelled: return phase.title
         }
     }
 
-    private func processingSubtitle(for phase: VoiceTurnPhase, elapsed: TimeInterval) -> String {
+    static func processingSubtitle(for phase: VoiceTurnPhase, elapsed: TimeInterval) -> String {
         switch phase {
         case .waitingForPhone: return "手机连上后自动送出"
         case .needsConfirmation: return "未确认前不会执行"
         default:
             if elapsed >= 60 { return "分身仍在运行，可以先放下手腕" }
+            if elapsed >= 30 { return "仍在等待，可继续使用手表" }
+            if elapsed >= 10 { return "暂无新进展，可放下手腕等待" }
             return "结果好了会震动提醒"
         }
     }
