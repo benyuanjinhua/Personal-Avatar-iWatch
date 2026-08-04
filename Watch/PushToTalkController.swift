@@ -499,6 +499,25 @@ final class PushToTalkController: ObservableObject {
         journal.recordLocal(.cancelled, requestId: turn.requestId, detail: "你取消了本次请求")
     }
 
+    /// ESS-259 B-STOP：用户在字幕视图轻点打断本回合结果语音。
+    /// - `player.stop(reason:)` 只清进程内状态、不派发 onFinish/onPlaybackEndgame，
+    ///   因此不会走 `PlaybackEndgamePolicy`——不播 `.failure` 触觉、不发失败横幅、
+    ///   不改状态机（回合仍是 `.completed`）。
+    /// - 不重新入队（区别于 B-PTT：按住说话打断在 pressBegan 里 enqueueAutoPlay）；
+    ///   语音留在加密仓，用户可点结果卡片「播放语音」重播。
+    /// - `journal.recordPlaybackInterrupted` 落打断时间戳，供②历史时间线追加
+    ///   「已打断」一行；同一次播放里连点两下幂等。
+    /// - 单独落 `playback_user_interrupted` 结构化事件作为 R-02.1 运行时证据。
+    func stopPlaybackByUser(requestId: String) {
+        guard player.currentContext == requestId else { return }
+        WatchLog.info(
+            "player", "playback_user_interrupted", requestId: requestId,
+            detail: "source=subtitle_tap"
+        )
+        player.stop(reason: "user_interrupt")
+        journal.recordPlaybackInterrupted(requestId: requestId)
+    }
+
     /// 播放结果语音：从加密仓解密到内存播放，播完即删（交付后删除）。
     func playResult(for turn: VoiceTurnRecord) {
         let requestId = turn.requestId
