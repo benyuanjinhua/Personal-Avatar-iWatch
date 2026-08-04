@@ -94,19 +94,28 @@ final class WatchRealtimeMediaAdapter {
         player.onPlaybackEvent = { [weak self] event in
             guard let self else { return }
             switch event {
-            case .started(let requestId, let sessionId):
+            case .started(let requestId, let sessionId, let responseId):
+                // ESS-330: forward the Agent-supplied response_id, NOT the
+                // session UUID. Bridge PR #113 keys the real response
+                // playback state by response_id; using session_id here made
+                // multi-response sessions unroutable.
                 if let handle = self.currentTurn,
                    handle.requestId == requestId, handle.sessionId == sessionId {
-                    self.transport.sendPlaybackStarted(handle: handle, responseId: sessionId)
+                    self.transport.sendPlaybackStarted(handle: handle, responseId: responseId)
                 }
-            case .ended(let requestId, let sessionId, let bytesPlayed):
+            case .ended(let requestId, let sessionId, let responseId, let bytesPlayed):
                 if let handle = self.currentTurn,
                    handle.requestId == requestId, handle.sessionId == sessionId {
                     self.transport.sendPlaybackEnded(
-                        handle: handle, responseId: sessionId, bytesPlayed: bytesPlayed
+                        handle: handle, responseId: responseId, bytesPlayed: bytesPlayed
                     )
                 }
-                self.session.markDownlinkFinished()
+                // ESS-330: the terminal `audio.done` path routes through
+                // `markDownlinkComplete`, which calls `finishTurn` — that
+                // already ends the downlink session. When `.ended` fires at a
+                // mid-session response boundary (barge-in produced a new
+                // response on the same session), the downlink MUST stay open
+                // so subsequent audio.delta chunks are still accepted.
             case .bargedIn, .failed:
                 break
             }

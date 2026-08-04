@@ -13,7 +13,7 @@ import Foundation
 ///   Uplink  : { "type": "playback.ended",   "request_id": "...", "session_id": "...", "response_id": "...", "bytes_played": N }
 ///   Uplink  : { "type": "close",          "request_id": "...", "session_id": "...", "reason": "..." }
 ///
-///   Downlink: { "type": "audio.delta",    "request_id": "...", "session_id": "...", "sequence": N, "sample_rate": 24000, "codec": "pcm_s16le", "audio": "<base64>" }
+///   Downlink: { "type": "audio.delta",    "request_id": "...", "session_id": "...", "response_id": "...", "sequence": N, "sample_rate": 24000, "codec": "pcm_s16le", "audio": "<base64>" }
 ///   Downlink: { "type": "transcript.delta"/"transcript.final", "request_id": "...", "session_id": "...", "text": "..." }
 ///   Downlink: { "type": "audio.done",     "request_id": "...", "session_id": "..." }
 ///   Downlink: { "type": "playback.clear", "request_id": "...", "session_id": "..." }
@@ -153,11 +153,15 @@ enum RealtimeBridgeWireCodec {
             let capturedAt = (raw["captured_at_ms"] as? Int64)
                 ?? Int64((raw["captured_at_ms"] as? Int) ?? 0)
             let endOfStream = (raw["end_of_stream"] as? Bool) ?? false
+            // ESS-330: preserve Bridge PR #113's `response_id` so playback
+            // receipts can identify the originating response, not the session.
+            let responseId = raw["response_id"] as? String
             let chunk = VoiceStreamChunk(
                 requestId: requestId, streamId: sessionId, direction: .downlink,
                 sequence: sequence, capturedAtMs: capturedAt > 0 ? capturedAt : 1,
                 codec: codec, sampleRate: sampleRate,
-                payload: audioBytes, endOfStream: endOfStream
+                payload: audioBytes, endOfStream: endOfStream,
+                responseId: responseId
             )
             return .audioDelta(chunk)
         case "transcript.delta":

@@ -122,6 +122,7 @@ final class RealtimeBridgeWireCodecTests: XCTestCase {
             "type": "audio.delta",
             "request_id": requestId,
             "session_id": sessionId,
+            "response_id": "resp-42",
             "sequence": 3,
             "sample_rate": 24_000,
             "codec": "pcm_s16le",
@@ -134,6 +135,28 @@ final class RealtimeBridgeWireCodecTests: XCTestCase {
         XCTAssertEqual(envelope.sessionId, sessionId)
         XCTAssertEqual(envelope.sequence, 3)
         XCTAssertEqual(envelope.audio?.payload, audioBytes)
+        // ESS-330: the Bridge's `response_id` must survive the flat→envelope
+        // hop. Without this the playback receipt would fall back to
+        // `session_id` and multi-response sessions become unroutable.
+        XCTAssertEqual(envelope.audio?.responseId, "resp-42")
+    }
+
+    func testAudioDeltaWithoutResponseIdDecodesToNil() throws {
+        // Backwards-compat guard: a Bridge that omits response_id (older
+        // server, error case) must not fail the whole decode.
+        let audioBytes = Data(repeating: 0x0C, count: 32)
+        let bridgeMessage: [String: Any] = [
+            "type": "audio.delta",
+            "request_id": requestId,
+            "session_id": sessionId,
+            "sequence": 0,
+            "sample_rate": 24_000,
+            "codec": "pcm_s16le",
+            "audio": audioBytes.base64EncodedString()
+        ]
+        let data = try JSONSerialization.data(withJSONObject: bridgeMessage)
+        let envelope = try XCTUnwrap(RealtimeBridgeWireCodec.decode(data))
+        XCTAssertNil(envelope.audio?.responseId)
     }
 
     func testAudioDoneAndClearAndInterruptDecode() throws {

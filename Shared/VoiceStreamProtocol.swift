@@ -35,6 +35,14 @@ struct VoiceStreamChunk: Codable, Equatable {
     let payload: Data
     let payloadSha256: String
     let endOfStream: Bool
+    /// ESS-330: Bridge tags each downlink `audio.delta` with the real Agent
+    /// `response_id`. Multiple responses can share a single session (barge-in
+    /// mid-turn), so the response_id — NOT the session_id — is what routes a
+    /// `playback.started/ended` receipt back to its originating response.
+    /// Optional because uplink chunks and legacy relay uploads have no
+    /// response context; downlink audio.delta chunks decoded via
+    /// `RealtimeBridgeWireCodec` must carry it.
+    let responseId: String?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
@@ -47,6 +55,7 @@ struct VoiceStreamChunk: Codable, Equatable {
         case payload
         case payloadSha256 = "payload_sha256"
         case endOfStream = "end_of_stream"
+        case responseId = "response_id"
     }
 
     init(
@@ -60,7 +69,8 @@ struct VoiceStreamChunk: Codable, Equatable {
         sampleRate: Int,
         payload: Data,
         payloadSha256: String? = nil,
-        endOfStream: Bool = false
+        endOfStream: Bool = false,
+        responseId: String? = nil
     ) {
         self.protocolVersion = protocolVersion
         self.requestId = requestId
@@ -73,6 +83,7 @@ struct VoiceStreamChunk: Codable, Equatable {
         self.payload = payload
         self.payloadSha256 = payloadSha256 ?? Self.sha256(payload)
         self.endOfStream = endOfStream
+        self.responseId = responseId
     }
 
     static func sha256(_ data: Data) -> String {

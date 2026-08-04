@@ -147,15 +147,151 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
             "55555555-5555-5555-5555-555555555559"
         ])
         let handle = adapter.beginTurn(requestId: requestId)
-        // Simulate the player firing real started/ended receipts.
-        player.onPlaybackEvent?(.started(requestId: handle.requestId, sessionId: handle.sessionId))
+        // ESS-330: player fires receipts tagged with the Agent response_id
+        // (NOT the session UUID). The adapter must forward that verbatim to
+        // the transport — reusing sessionId would collapse multi-response
+        // sessions on the Bridge side.
+        let responseId = "resp-alpha"
+        player.onPlaybackEvent?(.started(
+            requestId: handle.requestId, sessionId: handle.sessionId, responseId: responseId
+        ))
         player.onPlaybackEvent?(.ended(
-            requestId: handle.requestId, sessionId: handle.sessionId, bytesPlayed: 2_048
+            requestId: handle.requestId, sessionId: handle.sessionId,
+            responseId: responseId, bytesPlayed: 2_048
         ))
         XCTAssertEqual(transport.playbackStartEvents.count, 1)
-        XCTAssertEqual(transport.playbackStartEvents.first?.1, handle.sessionId)
+        XCTAssertEqual(transport.playbackStartEvents.first?.1, responseId)
+        XCTAssertNotEqual(transport.playbackStartEvents.first?.1, handle.sessionId)
         XCTAssertEqual(transport.playbackEndEvents.count, 1)
+        XCTAssertEqual(transport.playbackEndEvents.first?.1, responseId)
         XCTAssertEqual(transport.playbackEndEvents.first?.2, 2_048)
+    }
+
+    /// ESS-330 acceptance: two responses sharing a single session must each
+    /// return their own response_id in playback.started/ended receipts. This
+    /// exercises the full path from the Bridge wire codec through the
+    /// coordinator, the playback engine, and the adapter's transport seam.
+    func testTwoResponsesShareSessionAndProduceIndependentReceipts() throws {
+        let requestId = "44444444-4444-4444-4444-444444444443"
+        let sessionId = "55555555-5555-5555-5555-555555555556"
+        let recorder = MockRecorder()
+        let engine = RecordingPlayer()
+        let transport = MockTransport()
+        var clock: Int64 = 0
+        let session = RealtimeMediaSession(
+            configuration: RealtimeMediaSession.Configuration(
+                uplinkFrameBytes: 64,
+                maxInFlightUplinkBytes: 8 * 1024,
+                maxDownlinkBufferBytes: 8 * 1024
+            ),
+            now: { clock += 10; return clock },
+            sessionIdFactory: { sessionId }
+        )
+        let realAdapter = WatchRealtimeMediaAdapter(
+            session: session, recorder: recorder, player: engine, transport: transport
+        )
+        let handle = realAdapter.beginTurn(requestId: requestId)
+
+        // Round-trip the Bridge shape so the codec's response_id extraction is
+        // actually exercised, not a hand-built chunk.
+        let deltaAlpha = try makeAudioDelta(
+            requestId: handle.requestId, sessionId: handle.sessionId,
+            responseId: "resp-alpha", sequence: 0, bytes: 256
+        )
+        let deltaBeta = try makeAudioDelta(
+            requestId: handle.requestId, sessionId: handle.sessionId,
+            responseId: "resp-beta", sequence: 1, bytes: 512
+        )
+        realAdapter.ingestDownlink(deltaAlpha)
+        realAdapter.ingestDownlink(deltaBeta)
+
+        // Response boundary at seq=1 must close resp-alpha and open resp-beta.
+        XCTAssertEqual(transport.playbackStartEvents.map(\.1), ["resp-alpha", "resp-beta"])
+        XCTAssertEqual(transport.playbackEndEvents.count, 1)
+        XCTAssertEqual(transport.playbackEndEvents.first?.1, "resp-alpha")
+        XCTAssertEqual(transport.playbackEndEvents.first?.2, 256)
+
+        // Bridge signals `audio.done` — the trailing `.ended` closes resp-beta
+        // with the bytes played for that response only.
+        realAdapter.markDownlinkComplete()
+        XCTAssertEqual(transport.playbackEndEvents.count, 2)
+        XCTAssertEqual(transport.playbackEndEvents.last?.1, "resp-beta")
+        XCTAssertEqual(transport.playbackEndEvents.last?.2, 512)
+
+        // Neither receipt used the session UUID as response_id.
+        XCTAssertFalse(transport.playbackStartEvents.contains(where: { $0.1 == handle.sessionId }))
+        XCTAssertFalse(transport.playbackEndEvents.contains(where: { $0.1 == handle.sessionId }))
+    }
+
+    private func makeAudioDelta(
+        requestId: String, sessionId: String, responseId: String,
+        sequence: Int, bytes: Int
+    ) throws -> VoiceStreamChunk {
+        let audio = Data(repeating: UInt8(sequence % 255), count: bytes)
+        let json: [String: Any] = [
+            "type": "audio.delta",
+            "request_id": requestId,
+            "session_id": sessionId,
+            "response_id": responseId,
+            "sequence": sequence,
+            "sample_rate": 24_000,
+            "codec": "pcm_s16le",
+            "audio": audio.base64EncodedString()
+        ]
+        let data = try JSONSerialization.data(withJSONObject: json)
+        let envelope = try XCTUnwrap(RealtimeBridgeWireCodec.decode(data))
+        return try XCTUnwrap(envelope.audio)
+    }
+
+    /// Test double that stands in for `RealtimePlaybackEngine` and executes
+    /// the same response-boundary logic without touching AVAudioEngine —
+    /// WatchTests build without the audio session on the simulator.
+    @MainActor
+    private final class RecordingPlayer: WatchRealtimeMediaAdapter.Player {
+        var onPlaybackEvent: ((RealtimePlaybackEngine.PlaybackEvent) -> Void)?
+        private var turn: RealtimeMediaSession.TurnHandle?
+        private var currentResponseId: String?
+        private var bytesPlayedForCurrentResponse = 0
+
+        func prepare(for turn: RealtimeMediaSession.TurnHandle) throws {
+            self.turn = turn
+            currentResponseId = nil
+            bytesPlayedForCurrentResponse = 0
+        }
+        func enqueue(chunks: [VoiceStreamChunk]) {
+            guard let turn else { return }
+            for chunk in chunks {
+                let rid = chunk.responseId ?? turn.sessionId
+                if let prior = currentResponseId, prior != rid {
+                    onPlaybackEvent?(.ended(
+                        requestId: turn.requestId, sessionId: turn.sessionId,
+                        responseId: prior, bytesPlayed: bytesPlayedForCurrentResponse
+                    ))
+                    bytesPlayedForCurrentResponse = 0
+                }
+                if currentResponseId != rid {
+                    onPlaybackEvent?(.started(
+                        requestId: turn.requestId, sessionId: turn.sessionId,
+                        responseId: rid
+                    ))
+                }
+                currentResponseId = rid
+                bytesPlayedForCurrentResponse += chunk.payload.count
+            }
+        }
+        func bargeIn(clearedBytes: Int) {}
+        func finish() {
+            guard let turn else { return }
+            onPlaybackEvent?(.ended(
+                requestId: turn.requestId, sessionId: turn.sessionId,
+                responseId: currentResponseId ?? turn.sessionId,
+                bytesPlayed: bytesPlayedForCurrentResponse
+            ))
+            self.turn = nil
+            currentResponseId = nil
+            bytesPlayedForCurrentResponse = 0
+        }
+        func stop(barge: Bool) {}
     }
 
     func testNewTurnBargesInAndPlayerClearsPriorPlayback() {
