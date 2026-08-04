@@ -6,6 +6,51 @@ import { join } from 'node:path'
 import { TurnLedger } from '../ledger.mjs'
 
 describe('terminal result redelivery ledger', () => {
+  it('projects request-correlated stage timestamps, TTFT, and end-to-end latency', () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'turn-timing-'))
+    const ledger = new TurnLedger({ stateDir })
+    ledger.create({
+      requestId: 'req-timing', deviceId: 'watch', bodySha256: 'sha', sessionId: 's',
+      watchCreatedAt: '2026-08-04T00:00:00.000Z',
+    })
+    const bridgeAcceptedAt = ledger.get('req-timing').timing.bridge_accepted_at
+    const firstAudioAt = new Date(Date.parse(bridgeAcceptedAt) + 1250).toISOString()
+    ledger.update('req-timing', { state: 'processing', detail: 'realtime_processing' })
+    ledger.markFirstAudioReady('req-timing', { at: firstAudioAt, source: 'direct' })
+    ledger.markFirstAudioReady('req-timing', { at: '2026-08-04T00:00:09.000Z', source: 'background' })
+    ledger.setResult('req-timing', { text: 'done' })
+
+    const projection = ledger.projection('req-timing')
+    assert.equal(projection.request_id, 'req-timing')
+    assert.equal(projection.timing.watch_created_at, '2026-08-04T00:00:00.000Z')
+    assert.ok(projection.timing.bridge_accepted_at)
+    assert.ok(projection.timing.processing_started_at)
+    assert.equal(projection.timing.first_audio_ready_at, firstAudioAt)
+    assert.equal(projection.timing.first_audio_source, 'direct')
+    assert.equal(projection.timing.voice_ttft_ms, 1250)
+    assert.ok(Number.isFinite(projection.timing.end_to_end_ms))
+  })
+
+  it('backfills old ledgers with a Bridge-domain timing baseline', () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'legacy-turn-timing-'))
+    const first = new TurnLedger({ stateDir })
+    first.create({ requestId: 'req-legacy', deviceId: 'watch', bodySha256: 'sha', sessionId: 's' })
+    const legacy = first.get('req-legacy')
+    delete legacy.timing
+    first.save()
+
+    const restarted = new TurnLedger({ stateDir })
+    const acceptedAt = restarted.get('req-legacy').timing.bridge_accepted_at
+    restarted.markFirstAudioReady('req-legacy', {
+      at: new Date(Date.parse(acceptedAt) + 800).toISOString(),
+      source: 'direct',
+    })
+    const projection = restarted.projection('req-legacy')
+    assert.equal(projection.timing.watch_created_at, null)
+    assert.equal(projection.timing.first_audio_source, 'direct')
+    assert.equal(projection.timing.voice_ttft_ms, 800)
+  })
+
   it('persists ACK across restart and never replays it', () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'result-ack-'))
     const first = new TurnLedger({ stateDir })

@@ -137,6 +137,7 @@ export function createBridge(overrides = {}) {
     const interim = { kind: 'interim', request_id: requestId, delivery_sequence: 1, ...payload }
     if (interim.audio) interim.audio.kind = 'interim'
     interimPayloads.set(requestId, interim)
+    if (interim.audio) ledger.markFirstAudioReady(requestId, { source: 'interim' })
     const event = {
       type: 'turn.interim',
       interim,
@@ -211,6 +212,7 @@ export function createBridge(overrides = {}) {
       })
       log({ evt: 'announcement_bound', request_id: requestId, task_id: taskId, response_id: responseId, pcm_bytes: pcm24k.length, m4a_bytes: m4a.length })
       log({ evt: 'l1_audio_ready', request_id: requestId, task_id: taskId, source: 'background', response_id: responseId, codec: 'm4a', duration_ms: meta.duration_ms, size_bytes: meta.size_bytes, sha256: meta.sha256 })
+      ledger.markFirstAudioReady(requestId, { source: 'background' })
       attachPendingResultAudio(requestId)
     } catch (error) {
       // 转码失败：文本结果照常交付（降级），原因入日志
@@ -408,6 +410,7 @@ export function createBridge(overrides = {}) {
           resultAudio.put(requestId, m4a)
           audioBase64 = m4a.toString('base64')
           log({ evt: 'l1_audio_ready', request_id: requestId, task_id: null, source: 'direct', response_id: result.responseIds?.[0] ?? null, codec: 'm4a', duration_ms: resultAudioMeta.duration_ms, size_bytes: resultAudioMeta.size_bytes, sha256: resultAudioMeta.sha256 })
+          ledger.markFirstAudioReady(requestId, { source: 'direct' })
         } catch (error) {
           log({ evt: 'encode_failed', request_id: requestId, err: String(error.message) })
           log({ evt: 'l1_audio_failed', request_id: requestId, task_id: null, source: 'direct', response_id: result.responseIds?.[0] ?? null, stage: 'encode', reason: String(error.message) })
@@ -493,6 +496,7 @@ export function createBridge(overrides = {}) {
       deviceId: authInfo.deviceId,
       bodySha256: bodySha,
       sessionId: supervisor.sessionId,
+      watchCreatedAt: body.created_at,
     })
     log({ evt: 'turn_accepted', request_id: requestId, device_id: authInfo.deviceId, audio_bytes: audioBuf.length })
     // Snapshot the `accepted` receipt before processing starts mutating state;
