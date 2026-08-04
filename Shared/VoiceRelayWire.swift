@@ -228,6 +228,23 @@ final class RelayClient {
         }
     }
 
+    /// Best-effort streaming fast path. The caller always retains the complete
+    /// m4a outbox entry, so a rejected chunk cannot lose or duplicate a turn.
+    func uploadVoiceStreamChunk(_ chunk: VoiceStreamChunk) async throws {
+        let path = "/v1/voice/streams/chunks"
+        let body = try JSONEncoder().encode(chunk)
+        let request = RelaySignedRequestBuilder(baseURL: baseURL, credentials: credentials)
+            .request(method: "POST", path: path, requestId: chunk.requestId, body: body)
+        let (data, response): (Data, URLResponse)
+        do { (data, response) = try await session.data(for: request) }
+        catch { throw RelayUploadError.transport(error) }
+        guard let http = response as? HTTPURLResponse else { throw RelayUploadError.badResponse }
+        guard http.statusCode == 202 else {
+            let code = (try? JSONDecoder().decode(BridgeErrorBody.self, from: data))?.error ?? "ERR_UNKNOWN"
+            throw RelayUploadError.bridge(code: code, httpStatus: http.statusCode)
+        }
+    }
+
     func acknowledgeResult(requestId: String) async throws {
         let path = "/v1/voice/turns/\(requestId)/ack"
         let body = try JSONSerialization.data(withJSONObject: ["protocol_version": 1])

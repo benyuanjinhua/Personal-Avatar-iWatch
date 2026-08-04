@@ -90,4 +90,17 @@ final class VoiceStreamProtocolTests: XCTestCase {
         XCTAssertEqual(ended.append(chunk(1, end: true)), .fallback(.streamEndedWithGap))
         XCTAssertTrue(ended.didFallback)
     }
+
+    func testEmptyPayloadIsAllowedOnlyForEOS() {
+        let empty = VoiceStreamChunk(
+            requestId: requestId, streamId: streamId, direction: .uplink, sequence: 0,
+            capturedAtMs: 1, codec: "aac_lc", sampleRate: 16_000, payload: Data()
+        )
+        XCTAssertEqual(VoiceStreamValidator().validate(empty), .emptyPayload)
+        let eos = VoiceStreamChunk(
+            requestId: requestId, streamId: streamId, direction: .uplink, sequence: 0,
+            capturedAtMs: 1, codec: "aac_lc", sampleRate: 16_000, payload: Data(), endOfStream: true
+        )
+        XCTAssertNil(VoiceStreamValidator().validate(eos))
+    }
 }

@@ -37,6 +37,9 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
 
     private var recorder: AVAudioRecorder?
     private var meterTimer: Timer?
+    private var streamTimer: Timer?
+    private var streamOffset = 0
+    private var streamHandler: ((Data, Bool) -> Void)?
     private var currentURL: URL?
     /// ESS-219：录音开始的单调时钟戳，取代 AVAudioRecorder.currentTime
     /// 计时。真机在 2026-08-03 16:30/16:35 两次出现 duration_ms=5.1e7ms
@@ -45,7 +48,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
     /// 而是给出与 deviceCurrentTime 混淆的值。改用 DispatchTime 自己算差值。
     private var recordingStartUptime: DispatchTime?
 
-    func start() async throws {
+    func start(streamHandler: ((Data, Bool) -> Void)? = nil) async throws {
         let granted = await requestPermission()
         guard granted else {
             WatchLog.error("recorder", "permission_denied", code: "ERR_MIC_PERMISSION")
@@ -107,6 +110,13 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         recorder = audioRecorder
         recordingStartUptime = .now()
         isRecording = true
+        self.streamHandler = streamHandler
+        streamOffset = 0
+        if streamHandler != nil {
+            streamTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.emitStreamBytes(end: false) }
+            }
+        }
         startMetering()
         WatchLog.info("recorder", "record_started", detail: "aac \(Self.sampleRate)Hz max=\(Int(Self.maxDuration))s")
     }
@@ -115,6 +125,10 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
     func finish() throws -> Recording {
         let durationMs = elapsedRecordingMs()
         recorder?.stop()
+        emitStreamBytes(end: true)
+        streamTimer?.invalidate()
+        streamTimer = nil
+        streamHandler = nil
         recordingStartUptime = nil
         stopMetering()
         isRecording = false
@@ -151,6 +165,9 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
     func cancel() {
         WatchLog.info("recorder", "record_cancelled")
         recorder?.stop()
+        streamTimer?.invalidate()
+        streamTimer = nil
+        streamHandler = nil
         if let currentURL { try? FileManager.default.removeItem(at: currentURL) }
         currentURL = nil
         recorder = nil
@@ -158,6 +175,19 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         isRecording = false
         stopMetering()
         releaseSession(reason: "cancel")
+    }
+
+    private func emitStreamBytes(end: Bool) {
+        guard let streamHandler, let currentURL,
+              let snapshot = try? Data(contentsOf: currentURL), snapshot.count >= streamOffset else { return }
+        var offset = streamOffset
+        while offset < snapshot.count {
+            let upper = min(offset + 64 * 1024, snapshot.count)
+            streamHandler(snapshot.subdata(in: offset..<upper), false)
+            offset = upper
+        }
+        streamOffset = snapshot.count
+        if end { streamHandler(Data(), true) }
     }
 
     /// ESS-219：单调时钟计算录音时长，并对超过 `maxDuration` 的异常量级

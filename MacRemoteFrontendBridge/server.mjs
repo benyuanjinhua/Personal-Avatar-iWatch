@@ -34,6 +34,7 @@ import { ResultAudioStore } from './result-audio.mjs'
 import { QwenRealtimeSessionSupervisor } from './supervisor.mjs'
 import { prepareDownlinkMessage } from './audio-policy.mjs'
 import { VoiceStreamDownlink } from './voice-stream-downlink.mjs'
+import { VoiceStreamUplink } from './voice-stream-uplink.mjs'
 
 const BASE = dirname(fileURLToPath(import.meta.url))
 
@@ -99,6 +100,17 @@ export function createBridge(overrides = {}) {
   // （网关只下发 sessionId 匹配的任务权限事件），写开关关闭时定向 reject。
   supervisor.onPermissionRequested = task => watcher.denyRealtimePermission(task)
   let streamDownlink = null
+  const streamUplink = new VoiceStreamUplink({
+    enabled: CONFIG.voice_streaming_v2 === true,
+    maxPayloadBytes: CONFIG.voice_stream_max_payload_bytes ?? 64 * 1024,
+    maxBufferedBytes: CONFIG.voice_stream_max_buffered_bytes ?? 256 * 1024,
+    maxSequenceWindow: CONFIG.voice_stream_max_sequence_window ?? 32,
+    onChunk: ({ requestId, payload, chunk }) => log({
+      evt: 'voice_uplink_chunk_received', request_id: requestId,
+      stream_id: chunk.stream_id, sequence: chunk.sequence, bytes: payload.length,
+    }),
+    log,
+  })
   // ESS-36 可观测性 + ESS-37 取证：supervisor journal（ws.connecting/close
   // code/error frame、probe、stall、rebuild、全部网关事件摘要）全量落 Bridge
   // 结构化日志，request_id 由 journal 的 label 字段携带 —— accepted →
@@ -947,6 +959,18 @@ export function createBridge(overrides = {}) {
         if (req.method !== 'POST') throw new ApiError(ERR.METHOD_NOT_ALLOWED)
         const r = handleCreateTurn(rawBody, verify())
         return reply(r.status, r.body)
+      }
+
+      if (pathName === '/v1/voice/streams/chunks') {
+        if (req.method !== 'POST') throw new ApiError(ERR.METHOD_NOT_ALLOWED)
+        const authInfo = verify()
+        let chunk
+        try { chunk = JSON.parse(rawBody.toString('utf8')) } catch { throw new ApiError(ERR.BAD_JSON) }
+        if (chunk?.request_id !== authInfo.requestId) {
+          throw new ApiError(ERR.MISSING_FIELD, 'x-request-id must match stream request_id')
+        }
+        const result = streamUplink.ingest(chunk)
+        return reply(202, { request_id: chunk.request_id, ...result })
       }
 
       if (pathName === '/v1/client-logs') {

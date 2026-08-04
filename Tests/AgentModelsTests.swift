@@ -31,13 +31,21 @@ func cloudConfigurationRoundTrips() throws {
         bearerToken: "secret",
         autoListen: true,
         hapticsEnabled: true,
-        conciseReply: false
+        conciseReply: false,
+        voiceStreamingV2: false
     )
     let decoded = try JSONDecoder().decode(
         AgentConfiguration.self,
         from: JSONEncoder().encode(value)
     )
     #expect(decoded == value)
+}
+
+@Test
+func legacyConfigurationKeepsStreamingDisabled() throws {
+    let legacy = Data(#"{"mode":"demo","endpoint":"","bearerToken":"","autoListen":false,"hapticsEnabled":true,"conciseReply":true}"#.utf8)
+    let decoded = try JSONDecoder().decode(AgentConfiguration.self, from: legacy)
+    #expect(decoded.voiceStreamingV2 == false)
 }
 
 @Test
