@@ -151,7 +151,8 @@ final class WristAgentPhoneRelay: ObservableObject {
         guard let outbox else {
             relayStatus = "outbox 不可用"
             notify(status: RelayStatusUpdate(
-                requestId: envelope.requestId, phase: .failed, detail: "手机存储不可用"
+                requestId: envelope.requestId, phase: .failed, detail: "手机没能保存这段录音",
+                errorCode: "ERR_RETRY_WRITE_FAILED", failureStage: .execution
             ))
             return
         }
@@ -163,13 +164,24 @@ final class WristAgentPhoneRelay: ObservableObject {
                 ))
             case .duplicate(let existing):
                 // 幂等：不产生第二个请求，只把当前状态重发给 Watch。
-                let phase: VoiceRelayPhase = existing.state == .delivered ? .accepted : .waitingForMac
-                notify(status: RelayStatusUpdate(requestId: existing.requestId, phase: phase))
+                switch existing.state {
+                case .delivered:
+                    notify(status: RelayStatusUpdate(requestId: existing.requestId, phase: .accepted))
+                case .queued:
+                    notify(status: RelayStatusUpdate(requestId: existing.requestId, phase: .waitingForMac))
+                case .failed:
+                    notify(status: RelayStatusUpdate(
+                        requestId: existing.requestId, phase: .failed,
+                        detail: "这次请求已经结束，请重新发起",
+                        errorCode: existing.failureCode ?? "ERR_UNKNOWN", failureStage: .macUnreachable
+                    ))
+                }
             }
         } catch {
             notify(status: RelayStatusUpdate(
                 requestId: envelope.requestId, phase: .failed,
-                detail: "入队失败：\((error as? VoiceOutboxError)?.description ?? error.localizedDescription)"
+                detail: "手机没能保存这段录音",
+                errorCode: "ERR_RETRY_WRITE_FAILED", failureStage: .execution
             ))
         }
         refreshEntries()
@@ -220,9 +232,10 @@ final class WristAgentPhoneRelay: ObservableObject {
             audioData = try outbox.audioData(for: entry.requestId)
         } catch {
             // 密文缺失/损坏：无法重建同一请求，明确失败而不是伪造内容。
-            outbox.remove(requestId: entry.requestId)
+            outbox.markTerminalFailed(requestId: entry.requestId, code: "ERR_RETRY_CACHE_MISSING")
             notify(status: RelayStatusUpdate(
-                requestId: entry.requestId, phase: .failed, detail: "本地音频已不可用"
+                requestId: entry.requestId, phase: .failed, detail: "原来的录音没有留住",
+                errorCode: "ERR_RETRY_CACHE_MISSING", failureStage: .execution
             ))
             return
         }
@@ -235,10 +248,11 @@ final class WristAgentPhoneRelay: ObservableObject {
             connectEventsIfNeeded()
         } catch let error as RelayUploadError where !error.isRetryable {
             // Bridge 稳定 4xx：毒消息，不再重试。
-            outbox.remove(requestId: entry.requestId)
+            outbox.markTerminalFailed(requestId: entry.requestId, code: error.stableCode)
             relayStatus = "Bridge 拒绝 \(entry.requestId.prefix(8))…：\(error.stableCode)"
             notify(status: RelayStatusUpdate(
-                requestId: entry.requestId, phase: .failed, detail: error.stableCode
+                requestId: entry.requestId, phase: .failed, detail: "Mac 拒绝了这次请求",
+                errorCode: error.stableCode, failureStage: .execution
             ))
         } catch {
             let next = outbox.markFailed(requestId: entry.requestId)
@@ -247,6 +261,15 @@ final class WristAgentPhoneRelay: ObservableObject {
                updated.attemptCount == Self.stuckNotificationThreshold,
                !notifiedStuckRequestIds.contains(entry.requestId) {
                 notifiedStuckRequestIds.insert(entry.requestId)
+                // ESS-253 / U2 / D2 E-18：达到有界阈值即结束本次自动重试，
+                // 明确告诉 Watch 进入 S-FAIL；用户可从 Watch 的缓存录音手动重试。
+                let code = (error as? RelayUploadError)?.stableCode ?? "ERR_TRANSPORT"
+                outbox.markTerminalFailed(requestId: entry.requestId, code: code)
+                notify(status: RelayStatusUpdate(
+                    requestId: entry.requestId, phase: .failed,
+                    detail: "Mac 没有应答，请确认助手正在运行",
+                    errorCode: code, failureStage: .macUnreachable
+                ))
                 postStuckNotification()
             }
             _ = next
@@ -286,7 +309,9 @@ final class WristAgentPhoneRelay: ObservableObject {
         guard let outbox else { return }
         for expired in outbox.purgeExpired() {
             notify(status: RelayStatusUpdate(
-                requestId: expired.requestId, phase: .failed, detail: "超过保留期未能送达 Mac"
+                requestId: expired.requestId, phase: .failed,
+                detail: "Mac 一直没有应答",
+                errorCode: "ERR_TRANSPORT", failureStage: .macUnreachable
             ))
         }
         refreshEntries()
@@ -440,7 +465,9 @@ final class WristAgentPhoneRelay: ObservableObject {
         // 旧版 caption 通道照旧（iPhone 前台状态行）。
         if let phase = VoiceRelayPhase(rawValue: envelope.state.rawValue) {
             notify(status: RelayStatusUpdate(
-                requestId: projection.requestId, phase: phase, detail: projection.detailText
+                requestId: projection.requestId, phase: phase, detail: projection.detailText,
+                errorCode: projection.errorCode,
+                failureStage: envelope.failureStage
             ))
         }
         // 终态先下发文本（§ESS-38：文字先行，语音随后 transferFile 补上）。
