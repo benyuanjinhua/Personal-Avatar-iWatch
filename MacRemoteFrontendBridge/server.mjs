@@ -118,6 +118,13 @@ export function createBridge(overrides = {}) {
     const { ts, label, event, ...rest } = item
     if (label && RT_GATEWAY_EVENTS.has(event)) ledger.bumpEvents(label)
     log({ evt: 'realtime', request_id: label ?? null, event, ...rest })
+    // ESS-234：Gateway 侧偶发不发 announcement，导致 background turn 卡在
+    // "有 interim 没 result_audio_attached" 的非终态。task.completed 到达时启
+    // 5s 兜底计时；到期仍无 announcement 就从 realtime salvage 合成 final result。
+    if (event === 'task.completed' && rest.task?.id) {
+      const turn = ledger.byTaskId(String(rest.task.id))
+      if (turn?.request_id) armRealtimeFallbackTimer(turn.request_id, 'task.completed')
+    }
   })
   const sourceAllowed = makeSourceGate(CONFIG.allowed_peer_ips)
 
@@ -164,6 +171,13 @@ export function createBridge(overrides = {}) {
 
   const pendingResultAudio = new Map() // request_id → { meta, base64, speechText, at }
   const pendingAnnouncements = new Map() // task_id → raw announcement, waiting for ledger binding
+  // ESS-234：background turn 从 supervisor 侧 injectTurn 返回时聚合的 24kHz PCM
+  // （turn.result.audio24k）在此暂存，等 task.completed 后 5s 无 announcement 触发
+  // 兜底合成 final result（Gateway 侧偶发不发 announcement 的必现路径）。
+  const realtimeAudioSalvage = new Map() // request_id → { pcm24k: Buffer, taskId, at }
+  // ESS-234：已启动 task.completed 5s 兜底计时的 request_id，防止重复触发。
+  const realtimeFallbackTimers = new Map() // request_id → Timeout
+  const REALTIME_FALLBACK_WAIT_MS = CONFIG.realtime_fallback_wait_ms ?? 5_000
   const PENDING_AUDIO_TTL_MS = 10 * 60 * 1000
   const MAX_PENDING_ANNOUNCEMENTS = 64
   const MAX_PENDING_ANNOUNCEMENT_BYTES = (CONFIG.max_announcement_pcm_bytes ?? 5_760_000) * 4
@@ -180,6 +194,81 @@ export function createBridge(overrides = {}) {
       speechText: entry.speechText,
     })
     log({ evt: 'result_audio_attached', request_id: requestId, size_bytes: entry.meta.size_bytes, duration_ms: entry.meta.duration_ms })
+  }
+
+  // ESS-234：从 realtime salvage 里的 24kHz PCM 合成 final result 兜底。
+  // 只在 task.completed 后 5s 仍无 result_audio_attached 时被调用；如 Gateway
+  // announcement 迟到，attachPendingResultAudio 的 turn.state 幂等分支 + 先删
+  // 再 setResult 的顺序保证不会二次覆盖已合成的音频。
+  async function synthesizeRealtimeFallback(requestId, reason) {
+    const salvage = realtimeAudioSalvage.get(requestId)
+    if (!salvage) return false
+    // 已被 announcement 走通了：无需兜底，清理即可。
+    const turn = ledger.get(requestId)
+    if (turn?.result?.audio) {
+      realtimeAudioSalvage.delete(requestId)
+      return false
+    }
+    // 空 PCM 无从合成：仅诊断留痕，让 turn 保持"无音频完成"状态。
+    if (!salvage.pcm24k?.length) {
+      log({ evt: 'realtime_fallback_skipped', request_id: requestId, reason: 'empty_pcm24k' })
+      realtimeAudioSalvage.delete(requestId)
+      return false
+    }
+    try {
+      const m4a = await audio.encode24kToM4a(salvage.pcm24k)
+      const meta = {
+        kind: 'result',
+        sha256: sha256hex(m4a),
+        codec: 'm4a',
+        duration_ms: Math.round(salvage.pcm24k.length / 48), // 24kHz mono PCM16
+        size_bytes: m4a.length,
+      }
+      resultAudio.put(requestId, m4a)
+      pendingResultAudio.set(requestId, {
+        meta,
+        base64: m4a.length <= CONFIG.max_result_audio_bytes ? m4a.toString('base64') : null,
+        speechText: null,
+        at: Date.now(),
+      })
+      log({
+        evt: 'result_synthesized_from_realtime', request_id: requestId,
+        task_id: salvage.taskId, pcm_bytes: salvage.pcm24k.length, m4a_bytes: m4a.length,
+        cause: reason,
+      })
+      log({
+        evt: 'l1_audio_ready', request_id: requestId, task_id: salvage.taskId,
+        source: 'realtime_fallback', response_id: null, codec: 'm4a',
+        duration_ms: meta.duration_ms, size_bytes: meta.size_bytes, sha256: meta.sha256,
+      })
+      ledger.markFirstAudioReady(requestId, { source: 'realtime_fallback' })
+      attachPendingResultAudio(requestId)
+      realtimeAudioSalvage.delete(requestId)
+      return true
+    } catch (error) {
+      log({
+        evt: 'realtime_fallback_encode_failed', request_id: requestId,
+        err: String(error.message), cause: reason,
+      })
+      realtimeAudioSalvage.delete(requestId)
+      return false
+    }
+  }
+
+  // ESS-234：任一路径观察到 task.completed 后调用；5s 窗口内 announcement 未到
+  // 就触发合成。幂等：同一 requestId 已有定时器则跳过；已合成 / 已被 announcement
+  // 走通的 requestId 由 synthesizeRealtimeFallback 内部 early-return 保护。
+  function armRealtimeFallbackTimer(requestId, cause) {
+    if (realtimeFallbackTimers.has(requestId)) return
+    if (!realtimeAudioSalvage.has(requestId)) return
+    const timer = setTimeout(() => {
+      realtimeFallbackTimers.delete(requestId)
+      Promise.resolve(synthesizeRealtimeFallback(requestId, cause)).catch(error => {
+        log({ evt: 'realtime_fallback_error', request_id: requestId, err: String(error.message) })
+      })
+    }, REALTIME_FALLBACK_WAIT_MS)
+    timer.unref?.()
+    realtimeFallbackTimers.set(requestId, timer)
   }
 
   async function bindAnnouncement(announcement, turn) {
@@ -296,6 +385,14 @@ export function createBridge(overrides = {}) {
         log({ evt: 'announcement_unmatched_expired', task_id: taskId, response_id: entry.responseId, reason: 'ttl' })
       }
     }
+    // ESS-234：过期未被 task.completed 触发的 salvage 条目清理（一般不会发生——
+    // 5s 窗口远短于 10min TTL；此为异常防御）。
+    for (const [requestId, entry] of realtimeAudioSalvage) {
+      if (entry.at < cutoff) {
+        realtimeAudioSalvage.delete(requestId)
+        log({ evt: 'realtime_salvage_expired', request_id: requestId, task_id: entry.taskId })
+      }
+    }
   }, 60_000)
   pendingAudioSweeper.unref?.()
 
@@ -380,6 +477,14 @@ export function createBridge(overrides = {}) {
           log({ evt: 'l1_audio_ready', request_id: requestId, task_id: result.taskId, source: 'interim', response_id: null, codec: 'm4a', duration_ms: null, size_bytes: interimAudio.size_bytes, sha256: interimAudio.sha256, fallback: true })
         }
         emitInterim(requestId, { text: interimText, audio: interimAudio })
+        // ESS-234：把 realtime 阶段聚合的 24kHz PCM 存到 salvage map——若 Gateway
+        // 侧 task.completed 后 5s 内没发 announcement（必现 bug），server 侧就用这
+        // 段音频合成 final result 兜底，避免 Watch 卡在"分身处理中"永久挂起。
+        if (result.audio24k?.length) {
+          realtimeAudioSalvage.set(requestId, {
+            pcm24k: result.audio24k, taskId: result.taskId, at: Date.now(),
+          })
+        }
         // Background path: only now (task event captured) is it background_accepted (§6).
         ledger.update(requestId, {
           task_id: result.taskId,
@@ -1134,6 +1239,10 @@ export function createBridge(overrides = {}) {
     clearInterval(resultDeliverySweep)
     for (const client of eventClients) client.ws.close()
     for (const timer of workTimers.values()) clearTimeout(timer)
+    // ESS-234：清 in-flight 兜底计时器 + 释放 salvage PCM 引用
+    for (const timer of realtimeFallbackTimers.values()) clearTimeout(timer)
+    realtimeFallbackTimers.clear()
+    realtimeAudioSalvage.clear()
     return Promise.all(servers.map(s => new Promise(r => s.close(r))))
   }
 
