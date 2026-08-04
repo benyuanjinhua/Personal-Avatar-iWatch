@@ -192,12 +192,29 @@ describe('ESS-41 B4: queued task ownership and delayed announcement rebinding', 
   it('announcement arriving before ledger binding is retained and rebound by task_id', async () => {
     const ctx = await launch({
       scenario: 'queued-announcement-first',
-      overrides: { audiopipe_path: './test/fake-audiopipe' },
+      overrides: { audiopipe_path: './test/fake-audiopipe', voice_streaming_v2: true },
     })
+    const events = ctx.client.events()
     try {
+      await new Promise((resolve, reject) => {
+        events.ws.once('open', resolve)
+        events.ws.once('error', reject)
+      })
       const id = rid()
       await ctx.client.createTurn(id, noisePcm())
       await waitFor(async () => (await ctx.client.getTurn(id)).json.task_id === 'task_queued')
+      const announcementChunks = await waitFor(() => {
+        const chunks = events.received.filter(event =>
+          event.type === 'voice.stream.chunk'
+          && event.chunk.request_id === id
+          && Buffer.from(event.chunk.payload, 'base64').equals(Buffer.alloc(24_000, 6)))
+        return chunks.length ? chunks : null
+      })
+      assert.equal(announcementChunks[0].chunk.sequence, 1, 'late-bound announcement first delta follows the interim chunk')
+      await waitFor(() => events.received.some(event =>
+        event.type === 'voice.stream.chunk'
+        && event.chunk.request_id === id
+        && event.chunk.end_of_stream === true))
       ctx.mock.emitTask('task.completed', {
         ...ctx.mock.tasks.get('task_queued'), status: 'completed',
         resultMetadata: { presentation: { speech: '排队任务最终完成。' } },
@@ -209,6 +226,7 @@ describe('ESS-41 B4: queued task ownership and delayed announcement rebinding', 
       assert.equal(done.result.speech_text, '排队任务完成。')
       assert.equal(done.result.audio.duration_ms, 500)
     } finally {
+      events.ws.close()
       await ctx.bridge.stop(); await ctx.mock.stop()
     }
   })

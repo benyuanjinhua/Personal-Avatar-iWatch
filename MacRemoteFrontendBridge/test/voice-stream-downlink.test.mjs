@@ -2,6 +2,7 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { VoiceStreamDownlink } from '../voice-stream-downlink.mjs'
 import { QwenRealtimeSessionSupervisor } from '../supervisor.mjs'
+import { PendingAnnouncementStreams } from '../pending-announcement-streams.mjs'
 
 const requestId = 'req_test'
 const delta = n => Buffer.from(`delta-${n}`)
@@ -120,5 +121,53 @@ describe('Realtime audio.delta ownership routing', () => {
     supervisor.handleServerEvent({ type: 'audio.delta', responseId: 'resp_ann', audio: delta(0).toString('base64'), sampleRate: 24_000 })
     supervisor.handleServerEvent({ type: 'audio.done', responseId: 'resp_ann' })
     assert.deepEqual(seen, [['delta', 'task_42'], ['done', 'task_42']])
+  })
+})
+
+describe('announcement stream late ledger binding', () => {
+  it('replays the first delta and EOS in order after task.accepted binds request_id', () => {
+    const events = []
+    const pending = new PendingAnnouncementStreams({
+      enabled: true,
+      append: item => events.push(['delta', item.requestId, Buffer.from(item.audio, 'base64').toString()]),
+      finish: requestId => events.push(['done', requestId]),
+      fallback: (requestId, reason) => events.push(['fallback', requestId, reason]),
+    })
+    // Exact regression order: audio.delta -> no ledger task binding -> task.accepted.
+    assert.equal(pending.push({ taskId: 'task_late', responseId: 'resp_ann', audio: delta(0).toString('base64') }).status, 'pending')
+    assert.equal(pending.end('task_late').status, 'pending')
+    assert.deepEqual(events, [])
+    assert.deepEqual(pending.bind('task_late', 'req_late'), { status: 'replayed', chunks: 1, ended: true })
+    assert.deepEqual(events, [['delta', 'req_late', 'delta-0'], ['done', 'req_late']])
+    pending.close()
+  })
+
+  it('falls back exactly once with request_id when pending binding times out', () => {
+    let timeout
+    const events = []
+    const logs = []
+    const pending = new PendingAnnouncementStreams({
+      enabled: true,
+      ttlMs: 25,
+      setTimer: fn => { timeout = fn; return { unref() {} } },
+      clearTimer: () => {},
+      append: () => assert.fail('expired chunk must not be replayed'),
+      finish: () => assert.fail('expired EOS must not be replayed'),
+      fallback: (requestId, reason) => events.push([requestId, reason]),
+      log: entry => logs.push(entry),
+    })
+    pending.push({ taskId: 'task_late', responseId: 'resp_ann', audio: delta(0).toString('base64') })
+    timeout()
+    assert.equal(pending.bind('task_late', 'req_late').status, 'fallback')
+    assert.deepEqual(events, [['req_late', 'pending_binding_timed_out']])
+    assert.equal(logs.find(item => item.reason === 'pending_binding_timed_out').task_id, 'task_late')
+    assert.equal(pending.bind('task_late', 'req_late').status, 'empty')
+  })
+
+  it('is a no-op while streaming is disabled', () => {
+    const pending = new PendingAnnouncementStreams({ append: () => assert.fail(), finish: () => assert.fail(), fallback: () => assert.fail() })
+    assert.equal(pending.push({ taskId: 'task', audio: delta(0).toString('base64') }).status, 'disabled')
+    assert.equal(pending.end('task').status, 'disabled')
+    assert.equal(pending.bind('task', 'req').status, 'empty')
   })
 })

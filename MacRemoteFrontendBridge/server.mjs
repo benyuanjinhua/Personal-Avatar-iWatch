@@ -35,6 +35,7 @@ import { QwenRealtimeSessionSupervisor } from './supervisor.mjs'
 import { prepareDownlinkMessage } from './audio-policy.mjs'
 import { VoiceStreamDownlink } from './voice-stream-downlink.mjs'
 import { VoiceStreamUplink } from './voice-stream-uplink.mjs'
+import { PendingAnnouncementStreams } from './pending-announcement-streams.mjs'
 
 const BASE = dirname(fileURLToPath(import.meta.url))
 
@@ -1079,6 +1080,16 @@ export function createBridge(overrides = {}) {
     },
     log,
   })
+  const pendingAnnouncementStreams = new PendingAnnouncementStreams({
+    enabled: CONFIG.voice_streaming_v2 === true,
+    maxEntries: CONFIG.voice_stream_pending_max_entries ?? 64,
+    maxBufferedBytes: CONFIG.voice_stream_pending_max_buffered_bytes ?? 256 * 1024,
+    ttlMs: CONFIG.voice_stream_pending_ttl_ms ?? 1_500,
+    append: item => streamDownlink.append(item),
+    finish: requestId => streamDownlink.finish(requestId),
+    fallback: (requestId, reason) => streamDownlink.fallback(requestId, reason),
+    log,
+  })
   supervisor.onTurnAudioDelta = ({ requestId, event }) => {
     streamDownlink.append({ requestId, responseId: event.responseId, audio: event.audio, sampleRate: event.sampleRate ?? 24_000 })
   }
@@ -1086,7 +1097,10 @@ export function createBridge(overrides = {}) {
   supervisor.onAnnouncementAudioDelta = ({ capture, event }) => {
     const turn = capture.taskId ? ledger.byTaskId(capture.taskId) : null
     if (!turn) {
-      log({ evt: 'voice_stream_announcement_unmatched', task_id: capture.taskId, response_id: capture.responseId })
+      pendingAnnouncementStreams.push({
+        taskId: capture.taskId, responseId: capture.responseId,
+        audio: event.audio, sampleRate: event.sampleRate ?? 24_000,
+      })
       return
     }
     streamDownlink.append({
@@ -1097,7 +1111,14 @@ export function createBridge(overrides = {}) {
   supervisor.onAnnouncementAudioDone = ({ capture }) => {
     const turn = capture.taskId ? ledger.byTaskId(capture.taskId) : null
     if (turn) streamDownlink.finish(turn.request_id)
+    else pendingAnnouncementStreams.end(capture.taskId)
   }
+
+  ledger.on('turn', projection => {
+    if (!projection.task_id) return
+    const turn = ledger.byTaskId(String(projection.task_id))
+    if (turn) pendingAnnouncementStreams.bind(projection.task_id, turn.request_id)
+  })
 
   function sendTerminalDelivery(turn, client, cause) {
     const event = { type: 'turn.state', turn: ledger.projection(turn) }
@@ -1314,6 +1335,7 @@ export function createBridge(overrides = {}) {
     for (const timer of realtimeFallbackTimers.values()) clearTimeout(timer)
     realtimeFallbackTimers.clear()
     realtimeAudioSalvage.clear()
+    pendingAnnouncementStreams.close()
     return Promise.all(servers.map(s => new Promise(r => s.close(r))))
   }
 
