@@ -50,10 +50,14 @@ export function canonicalString(deviceId, method, pathName, requestId, timestamp
 }
 
 export class DeviceAuth {
-  constructor({ stateDir, timestampSkewMs, pairingCodeTtlMs, log = () => {} }) {
+  constructor({ stateDir, timestampSkewMs, pairingCodeTtlMs, allowedPairingDeviceIds = [], log = () => {} }) {
     this.path = join(stateDir, 'devices.json')
     this.timestampSkewMs = timestampSkewMs
     this.pairingCodeTtlMs = pairingCodeTtlMs
+    // ESS-175: 允许 config 通过 allowed_pairing_device_ids 固定 pair 出的 device_id
+    // （例如 "jackson-watch"）。如果 pair body 里带了 device_id 但不在列表里，
+    // 拒绝；如果没带 device_id，走原来的 dev_* 随机生成。
+    this.allowedPairingDeviceIds = Array.isArray(allowedPairingDeviceIds) ? allowedPairingDeviceIds : []
     this.log = log
     this.state = { devices: {}, nonces: {} }
     try { this.state = JSON.parse(readFileSync(this.path, 'utf8')) } catch { /* first boot */ }
@@ -84,7 +88,21 @@ export class DeviceAuth {
     if (!codeOk) throw new ApiError(ERR.PAIRING_CODE_INVALID)
     this.pairingCodeUsed = true
 
-    const deviceId = 'dev_' + crypto.randomBytes(8).toString('hex')
+    // ESS-175: 允许调用方指定 device_id（仅限 allowed_pairing_device_ids 白名单），
+    // 未指定时按原路径随机生成 dev_*。已配对过的 device_id 不允许重复配对——
+    // 由白梦林先手动清 devices.json 里对应条目再重跑。
+    let deviceId
+    if (body.device_id) {
+      if (!this.allowedPairingDeviceIds.includes(body.device_id)) {
+        throw new ApiError(ERR.MISSING_FIELD, 'device_id not in allowed_pairing_device_ids')
+      }
+      if (this.state.devices[body.device_id]) {
+        throw new ApiError(ERR.MISSING_FIELD, 'device_id already paired; clear devices.json to re-pair')
+      }
+      deviceId = body.device_id
+    } else {
+      deviceId = 'dev_' + crypto.randomBytes(8).toString('hex')
+    }
     const token = crypto.randomBytes(32).toString('hex')
     this.state.devices[deviceId] = {
       name: String(body.device_name).slice(0, 64),
@@ -150,6 +168,29 @@ export function inCgnat(ip) {
   const m = ip.match(/^100\.(\d+)\.\d+\.\d+$/)
   return Boolean(m && Number(m[1]) >= 64 && Number(m[1]) <= 127)
 }
+
+// ESS-175: allowed_peer_ips entries can be exact IPv4 ("192.168.1.5") or
+// CIDR ("192.168.0.0/16"). Config is the trust declaration—CGNAT is no
+// longer required. Loopback stays hard-wired. Anything else (public IPv4,
+// IPv6 beyond ::1) must be listed explicitly in config.
+function ipv4ToInt(ip) {
+  const parts = ip.split('.').map(Number)
+  if (parts.length !== 4 || parts.some(p => !Number.isInteger(p) || p < 0 || p > 255)) return null
+  return ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0
+}
+export function ipMatchesAllowlistEntry(ip, entry) {
+  if (!entry) return false
+  if (!entry.includes('/')) return ip === entry
+  const [prefix, bitsStr] = entry.split('/')
+  const bits = Number(bitsStr)
+  if (!Number.isInteger(bits) || bits < 0 || bits > 32) return false
+  const ipInt = ipv4ToInt(ip)
+  const prefixInt = ipv4ToInt(prefix)
+  if (ipInt === null || prefixInt === null) return false
+  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0
+  return (ipInt & mask) === (prefixInt & mask)
+}
 export function makeSourceGate(allowedPeerIps) {
-  return ip => ip === '127.0.0.1' || ip === '::1' || (inCgnat(ip) && allowedPeerIps.includes(ip))
+  const entries = Array.isArray(allowedPeerIps) ? allowedPeerIps : []
+  return ip => ip === '127.0.0.1' || ip === '::1' || entries.some(e => ipMatchesAllowlistEntry(ip, e))
 }
