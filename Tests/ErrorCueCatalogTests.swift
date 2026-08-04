@@ -114,28 +114,65 @@ final class ErrorCueCatalogTests: XCTestCase {
                        "白梦林铁律：族 H 绝不给重试按钮，重复执行有副作用")
     }
 
-    /// D2 E-99：未知/兜底走族 B（可重试），别把新码悄悄退化成「不给重试」。
+    /// D2 v1.1 E-99：未知/兜底走族 B（可重试），文案先劝重试、再退到重说，
+    /// 与按钮语义一致（ESS-261）。别把新码悄悄退化成「不给重试」。
     func testGenericFallbackAllowsRetry() {
         XCTAssertEqual(ErrorCueCatalog.generic.recoveryFamily, .retry,
                        "D2 E-99 = 族 B（不是 A）")
         XCTAssertTrue(ErrorCueCatalog.generic.recoveryFamily.allowsCachedRetry)
+        XCTAssertEqual(ErrorCueCatalog.generic.text,
+                       "刚才这件事没成，点重试再来一次；还不行就再说一遍。",
+                       "D2 v1.1 E-99 定稿文案——文案与「重试」按钮语义一致")
         // 未知 code 同样走 generic 族 B。
         let unknown = ErrorCueCatalog.cue(for: "ERR_SOMETHING_NEW")
         XCTAssertEqual(unknown.recoveryFamily, .retry)
+        XCTAssertEqual(unknown.text, ErrorCueCatalog.generic.text)
     }
 
-    /// 恢复族判定收在一处：`allowsCachedRetry` 只有族 H 返回 false。
-    /// 视图不得再按 code 硬编码分支。
+    /// 恢复族判定收在一处：`allowsCachedRetry` 只有族 B 返回 true。
+    /// 视图不得再按 code 硬编码分支。ESS-261 把 A/C 及 D/E/F/G 一并对齐——
+    /// 「重试（不用重新说）」只应对族 B（缓存录音原样重发），其他族的动作
+    /// 各自不同（知道了/怎么开/看文字/重播），不能共用重试按钮。
     func testAllowsCachedRetryTable() {
-        XCTAssertTrue(RecoveryFamily.reRecord.allowsCachedRetry)
-        XCTAssertTrue(RecoveryFamily.retry.allowsCachedRetry)
-        XCTAssertTrue(RecoveryFamily.waitAndRetry.allowsCachedRetry)
-        XCTAssertTrue(RecoveryFamily.authorize.allowsCachedRetry)
-        XCTAssertTrue(RecoveryFamily.textOnly.allowsCachedRetry)
-        XCTAssertTrue(RecoveryFamily.replay.allowsCachedRetry)
-        XCTAssertTrue(RecoveryFamily.silent.allowsCachedRetry)
+        XCTAssertFalse(RecoveryFamily.reRecord.allowsCachedRetry,
+                       "族 A：录音本身有问题，重发缓存只会再失败")
+        XCTAssertTrue(RecoveryFamily.retry.allowsCachedRetry,
+                      "族 B 是唯一允许「重试（不用重新说）」的族")
+        XCTAssertFalse(RecoveryFamily.waitAndRetry.allowsCachedRetry,
+                       "族 C：对端忙，立刻重试无意义")
+        XCTAssertFalse(RecoveryFamily.authorize.allowsCachedRetry,
+                       "族 D：权限缺失，重试仍会被拦")
+        XCTAssertFalse(RecoveryFamily.textOnly.allowsCachedRetry,
+                       "族 E：动作是「看文字」不是重试")
+        XCTAssertFalse(RecoveryFamily.replay.allowsCachedRetry,
+                       "族 F：动作是「重播」不是重试")
+        XCTAssertFalse(RecoveryFamily.silent.allowsCachedRetry,
+                       "族 G：不上卡片，按钮语义不适用")
         XCTAssertFalse(RecoveryFamily.manualConfirm.allowsCachedRetry,
-                       "族 H 是唯一禁止重试的族——ESS-257 白梦林拍板")
+                       "族 H：结果未知，重跑有重复副作用——ESS-257 白梦林拍板")
+    }
+
+    /// ESS-261 缺口二：族 A / C 的具体码不再露出「重试（不用重新说）」按钮。
+    /// D2.0 原则 3 —— 恢复动作必须与错误成因匹配。
+    func testFamilyAAndCCodesDoNotAllowCachedRetry() {
+        // 族 A：录音本身有问题
+        for code in [
+            "ERR_AUDIO_TOO_SHORT",
+            "ERR_TRANSCRIPT_DISCARDED",
+            "ERR_REALTIME_STALLED",
+            "ERR_REALTIME_NO_EVENTS",
+            "ERR_REALTIME_TIMEOUT",
+        ] {
+            let entry = ErrorCueCatalog.cue(for: code)
+            XCTAssertEqual(entry.recoveryFamily, .reRecord, "\(code) → 族 A")
+            XCTAssertFalse(entry.recoveryFamily.allowsCachedRetry,
+                           "\(code) 属族 A，不得出重试按钮")
+        }
+        // 族 C：对端忙
+        let voiceBusy = ErrorCueCatalog.cue(for: "ERR_VOICE_BUSY")
+        XCTAssertEqual(voiceBusy.recoveryFamily, .waitAndRetry, "族 C")
+        XCTAssertFalse(voiceBusy.recoveryFamily.allowsCachedRetry,
+                       "ERR_VOICE_BUSY 属族 C，不得出重试按钮")
     }
 
     /// D2.3 禁用词：卡片文案里不允许把错误码原样拼进用户可见文本。

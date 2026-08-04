@@ -225,6 +225,96 @@ final class AvatarErrorPresenterTests: XCTestCase {
         )
     }
 
+    /// ESS-261 R-02.1 运行时证据：族 A（`ERR_AUDIO_TOO_SHORT` 等）不再露出
+    /// 「重试（不用重新说）」按钮——`allowsCachedRetry=false`。走 xcodebuild
+    /// test 的 watchOS 模拟器宿主，落 `error_card_presented` 一条 WatchLog
+    /// 事件供复审在 bridge.log 上按 event=error_card_presented 直接读到
+    /// 「族 A 卡片同时满足文案与无重试按钮」这一事实。
+    func testFamilyACardOmitsRetryButton() {
+        let presenter = presenter()
+        let requestId = "019fcb4a-0000-7000-8000-0000000000a01"
+        let now = Date(timeIntervalSince1970: 1_722_000_100)
+        XCTAssertTrue(presenter.present(
+            code: "ERR_AUDIO_TOO_SHORT",
+            requestId: requestId,
+            now: now,
+            clipLoader: { _ in nil },
+            playAudio: { _, _ in false },
+            playHaptic: haptic
+        ))
+        let active = try? XCTUnwrap(presenter.active)
+        XCTAssertEqual(active?.entry.code, "ERR_AUDIO_TOO_SHORT")
+        XCTAssertEqual(active?.entry.recoveryFamily, .reRecord,
+                       "族 A：录音本身有问题，缓存重发无用")
+        XCTAssertFalse(active?.entry.recoveryFamily.allowsCachedRetry ?? true,
+                       "视图据此不出『重试（不用重新说）』按钮——D2.0 原则 3")
+        XCTAssertEqual(hapticsFired, [requestId],
+                       "触觉照打——语音降级不吞感知")
+
+        // R-02.1：把「族 A 卡片与无重试按钮同时成立」显式落到 WatchLog。
+        // presenter.present 已经写过一条；这里再补一条压缩过的断言快照，
+        // 便于门禁脚本按稳定字段串 grep。
+        WatchLog.info(
+            "avatar_error",
+            "family_a_no_retry_asserted",
+            requestId: requestId,
+            detail: "family=reRecord allows_cached_retry=false"
+                + " code=ERR_AUDIO_TOO_SHORT"
+        )
+    }
+
+    /// ESS-261 R-02.1 运行时证据：族 C（`ERR_VOICE_BUSY`）不再露出
+    /// 「重试（不用重新说）」按钮——对端忙，立刻重试无意义。
+    func testFamilyCCardOmitsRetryButton() {
+        let presenter = presenter()
+        let requestId = "019fcb4a-0000-7000-8000-0000000000c01"
+        let now = Date(timeIntervalSince1970: 1_722_000_200)
+        XCTAssertTrue(presenter.present(
+            code: "ERR_VOICE_BUSY",
+            requestId: requestId,
+            now: now,
+            clipLoader: clipLoader,
+            playAudio: audio,
+            playHaptic: haptic
+        ))
+        let active = try? XCTUnwrap(presenter.active)
+        XCTAssertEqual(active?.entry.code, "ERR_VOICE_BUSY")
+        XCTAssertEqual(active?.entry.recoveryFamily, .waitAndRetry,
+                       "族 C：对端忙 / 限流")
+        XCTAssertFalse(active?.entry.recoveryFamily.allowsCachedRetry ?? true,
+                       "视图据此不出『重试（不用重新说）』按钮")
+
+        WatchLog.info(
+            "avatar_error",
+            "family_c_no_retry_asserted",
+            requestId: requestId,
+            detail: "family=waitAndRetry allows_cached_retry=false"
+                + " code=ERR_VOICE_BUSY"
+        )
+    }
+
+    /// ESS-261 缺口一：兜底 E-99 文案与「重试」按钮语义一致。
+    func testGenericE99CopyMatchesRetryButtonSemantic() {
+        let presenter = presenter()
+        let requestId = "019fcb4a-0000-7000-8000-0000000000e99"
+        let now = Date(timeIntervalSince1970: 1_722_000_300)
+        XCTAssertTrue(presenter.present(
+            code: "ERR_SOMETHING_NEW",
+            requestId: requestId,
+            now: now,
+            clipLoader: { _ in nil },
+            playAudio: { _, _ in false },
+            playHaptic: haptic
+        ))
+        let active = try? XCTUnwrap(presenter.active)
+        XCTAssertEqual(active?.entry.text,
+                       "刚才这件事没成，点重试再来一次；还不行就再说一遍。",
+                       "D2 v1.1 E-99 定稿文案")
+        XCTAssertEqual(active?.entry.recoveryFamily, .retry, "族 B")
+        XCTAssertTrue(active?.entry.recoveryFamily.allowsCachedRetry ?? false,
+                      "族 B：按钮就是「重试（不用重新说）」，与文案一致")
+    }
+
     func testAllBundledClipsExistInAppBundle() {
         // ESS-180-B R-02.1：真机/模拟器 bundle 里必须能加载 5 条错误语音；缺失
         // 属于打包遗漏（xcodegen 或 Watch/Resources 被跳过）。
