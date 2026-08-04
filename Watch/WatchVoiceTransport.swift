@@ -79,6 +79,9 @@ final class WatchVoiceTransport: ObservableObject {
             detail: "phase=\(update.phase.rawValue)\(update.detail.map { " detail=\($0)" } ?? "")"
         )
         remoteStatus = update
+        if let envelope = update.failedStatusEnvelope() {
+            _ = journal?.apply(envelope)
+        }
         // ESS-231：任何 phase >= accepted 都算 iPhone 已把 turn 转到 Bridge，
         // 取消兜底 watchdog；同时清除 UI 告警状态。
         if update.phase != .recorded && update.phase != .waitingForPhone && update.phase != .waitingForMac {

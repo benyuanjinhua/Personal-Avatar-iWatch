@@ -79,6 +79,8 @@ final class WristAgentPhoneRelay: ObservableObject {
     private static let bridgeURLKey = "wristagent.relay.bridge_url"
     /// 连续失败到该次数时提醒用户打开 App（后台网络受限时人工兜底）。
     private static let stuckNotificationThreshold = 3
+    /// Mac 不可达最多尝试次数；达到后发失败终态，禁止无限 waiting。
+    private static let uploadFailureThreshold = 5
     /// 结果语音本地上限（最后一道防线；Bridge 侧已有转码上限）。
     private static let maxResultAudioBytes = 20 * 1024 * 1024
 
@@ -163,8 +165,14 @@ final class WristAgentPhoneRelay: ObservableObject {
                 ))
             case .duplicate(let existing):
                 // 幂等：不产生第二个请求，只把当前状态重发给 Watch。
-                let phase: VoiceRelayPhase = existing.state == .delivered ? .accepted : .waitingForMac
-                notify(status: RelayStatusUpdate(requestId: existing.requestId, phase: phase))
+                switch existing.state {
+                case .delivered:
+                    notify(status: RelayStatusUpdate(requestId: existing.requestId, phase: .accepted))
+                case .queued:
+                    notify(status: RelayStatusUpdate(requestId: existing.requestId, phase: .waitingForMac))
+                case .failed:
+                    notify(status: failedStatus(requestId: existing.requestId, code: existing.failureCode ?? "ERR_UNKNOWN"))
+                }
             }
         } catch {
             notify(status: RelayStatusUpdate(
@@ -220,9 +228,9 @@ final class WristAgentPhoneRelay: ObservableObject {
             audioData = try outbox.audioData(for: entry.requestId)
         } catch {
             // 密文缺失/损坏：无法重建同一请求，明确失败而不是伪造内容。
-            outbox.remove(requestId: entry.requestId)
-            notify(status: RelayStatusUpdate(
-                requestId: entry.requestId, phase: .failed, detail: "本地音频已不可用"
+            outbox.markTerminalFailed(requestId: entry.requestId, code: "ERR_RETRY_CACHE_MISSING")
+            notify(status: failedStatus(
+                requestId: entry.requestId, code: "ERR_RETRY_CACHE_MISSING", detail: "本地录音不可读取，请重新说一次"
             ))
             return
         }
@@ -235,14 +243,23 @@ final class WristAgentPhoneRelay: ObservableObject {
             connectEventsIfNeeded()
         } catch let error as RelayUploadError where !error.isRetryable {
             // Bridge 稳定 4xx：毒消息，不再重试。
-            outbox.remove(requestId: entry.requestId)
+            outbox.markTerminalFailed(requestId: entry.requestId, code: error.stableCode)
             relayStatus = "Bridge 拒绝 \(entry.requestId.prefix(8))…：\(error.stableCode)"
             notify(status: RelayStatusUpdate(
-                requestId: entry.requestId, phase: .failed, detail: error.stableCode
+                requestId: entry.requestId, phase: .failed, detail: "Mac 拒绝了这次请求",
+                errorCode: error.stableCode, failureStage: .macUnreachable
             ))
         } catch {
             let next = outbox.markFailed(requestId: entry.requestId)
-            relayStatus = "Mac 不可达，等待重试（第 \(entry.attemptCount + 1) 次失败）"
+            if let updated = outbox.entry(for: entry.requestId),
+               updated.attemptCount >= Self.uploadFailureThreshold {
+                let code = (error as? RelayUploadError)?.stableCode ?? "ERR_TRANSPORT"
+                outbox.markTerminalFailed(requestId: entry.requestId, code: code)
+                relayStatus = "Mac 暂时无法连接，已结束等待"
+                notify(status: failedStatus(requestId: entry.requestId, code: code))
+            } else {
+                relayStatus = "Mac 不可达，等待重试（第 \(entry.attemptCount + 1) 次失败）"
+            }
             if let updated = outbox.entry(for: entry.requestId),
                updated.attemptCount == Self.stuckNotificationThreshold,
                !notifiedStuckRequestIds.contains(entry.requestId) {
@@ -660,6 +677,13 @@ final class WristAgentPhoneRelay: ObservableObject {
 
     private func notify(status: RelayStatusUpdate) {
         watchChannel?.notifyWatch(status: status)
+    }
+
+    private func failedStatus(requestId: String, code: String, detail: String = "Mac 暂时无法连接，请稍后重试") -> RelayStatusUpdate {
+        RelayStatusUpdate(
+            requestId: requestId, phase: .failed, detail: detail,
+            errorCode: code, failureStage: .macUnreachable
+        )
     }
 
     private func notifyResult(_ payload: VoiceRelayResultPayload) {

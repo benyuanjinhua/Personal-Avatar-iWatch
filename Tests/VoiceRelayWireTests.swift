@@ -132,6 +132,25 @@ final class VoiceRelayEventsTests: XCTestCase {
         XCTAssertEqual(RelayStatusUpdate.decode(from: data), update)
     }
 
+    func testLegacyRelayStatusStillDecodesWithoutFailureFields() throws {
+        let data = Data(#"{"protocol_version":"1.0","request_id":"req-old","phase":"waiting_for_mac","updated_at":"2026-08-04T00:00:00Z"}"#.utf8)
+        let update = try XCTUnwrap(RelayStatusUpdate.decode(from: data))
+        XCTAssertNil(update.errorCode)
+        XCTAssertNil(update.failureStage)
+    }
+
+    func testCodedFailureProjectsToJournalEnvelope() throws {
+        let update = RelayStatusUpdate(
+            requestId: "req-fail", phase: .failed, detail: "Mac 暂时无法连接",
+            errorCode: "ERR_TRANSPORT", failureStage: .macUnreachable
+        )
+        let envelope = try XCTUnwrap(update.failedStatusEnvelope())
+        XCTAssertEqual(envelope.state, .failed)
+        XCTAssertEqual(envelope.errorCode, "ERR_TRANSPORT")
+        XCTAssertEqual(envelope.failureStage, .macUnreachable)
+        XCTAssertNil(RelayStatusUpdate(requestId: "req-ok", phase: .accepted).failedStatusEnvelope())
+    }
+
     func testVoiceRelayResultPayloadRoundTrip() throws {
         let payload = VoiceRelayResultPayload(
             requestId: "req-1", text: "答案", audioSha256: String(repeating: "a", count: 64),

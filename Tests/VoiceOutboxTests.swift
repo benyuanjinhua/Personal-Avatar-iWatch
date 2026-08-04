@@ -79,6 +79,29 @@ final class VoiceOutboxTests: XCTestCase {
         XCTAssertEqual(outbox.entries.count, 1, "不产生第二个请求")
     }
 
+    func testTerminalFailureIsPersistentAndIdempotent() throws {
+        let outbox = try makeOutbox()
+        let envelope = makeEnvelope()
+        _ = try outbox.enqueue(envelope: envelope, audioData: audio)
+
+        for _ in 0..<5 { outbox.markFailed(requestId: envelope.requestId) }
+        outbox.markTerminalFailed(requestId: envelope.requestId, code: "ERR_TRANSPORT")
+        outbox.markTerminalFailed(requestId: envelope.requestId, code: "ERR_BAD_RESPONSE")
+
+        let failed = try XCTUnwrap(outbox.entry(for: envelope.requestId))
+        XCTAssertEqual(failed.state, .failed)
+        XCTAssertEqual(failed.attemptCount, 5)
+        XCTAssertEqual(failed.failureCode, "ERR_TRANSPORT", "失败终态首次写入后吸收重复收口")
+        XCTAssertTrue(outbox.dueEntries(at: .distantFuture).isEmpty, "失败终态不得继续调度")
+        XCTAssertThrowsError(try outbox.audioData(for: envelope.requestId), "终态后缓存音频应删除")
+
+        guard case .duplicate(let duplicate) = try outbox.enqueue(envelope: envelope, audioData: audio) else {
+            return XCTFail("同 request_id 终态后必须幂等返回")
+        }
+        XCTAssertEqual(duplicate.state, .failed)
+        XCTAssertEqual(outbox.entries.count, 1)
+    }
+
     func testSameRequestIdDifferentAudioIsRejected() throws {
         let outbox = try makeOutbox()
         let requestId = UUIDv7.generate()

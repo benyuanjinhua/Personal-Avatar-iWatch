@@ -78,6 +78,10 @@ struct RelayStatusUpdate: Codable, Equatable {
     let phase: VoiceRelayPhase
     /// 面向用户的补充说明（如失败原因、权限摘要）；不含凭据与内部路径。
     let detail: String?
+    /// 失败终态的稳定短码。可选字段保证旧版载荷继续解码。
+    let errorCode: String?
+    /// 失败发生阶段；本地上送失败固定为 waiting_for_mac。
+    let failureStage: VoiceFailureStage?
     let updatedAt: Date
 
     enum CodingKeys: String, CodingKey {
@@ -85,15 +89,34 @@ struct RelayStatusUpdate: Codable, Equatable {
         case requestId = "request_id"
         case phase
         case detail
+        case errorCode = "error_code"
+        case failureStage = "failure_stage"
         case updatedAt = "updated_at"
     }
 
-    init(requestId: String, phase: VoiceRelayPhase, detail: String? = nil, updatedAt: Date = Date()) {
+    init(
+        requestId: String, phase: VoiceRelayPhase, detail: String? = nil,
+        errorCode: String? = nil, failureStage: VoiceFailureStage? = nil,
+        updatedAt: Date = Date()
+    ) {
         self.protocolVersion = VoiceRequestEnvelope.currentProtocolVersion
         self.requestId = requestId
         self.phase = phase
         self.detail = detail
+        self.errorCode = errorCode
+        self.failureStage = failureStage
         self.updatedAt = updatedAt
+    }
+
+    /// Relay caption 的失败终态投影到 Watch 的既有 Journal 信封链。
+    /// 非失败状态仍由 Bridge voice_status 通道推进，避免重复入账。
+    func failedStatusEnvelope() -> VoiceStatusEnvelope? {
+        guard phase == .failed else { return nil }
+        return .status(
+            requestId: requestId, state: .failed, occurredAt: updatedAt,
+            detail: detail, failureStage: failureStage ?? .macUnreachable,
+            errorCode: errorCode ?? "ERR_UNKNOWN"
+        )
     }
 
     func jsonData() throws -> Data {

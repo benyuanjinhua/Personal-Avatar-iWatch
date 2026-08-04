@@ -32,6 +32,8 @@ enum VoiceOutboxState: String, Codable {
     case queued
     /// Bridge 已受理（202）。受理即删除本地音频，条目保留用于幂等与历史。
     case delivered
+    /// 有界重试耗尽或本地缓存损坏后的吸收终态；保留记录以维持 request_id 幂等。
+    case failed
 }
 
 struct VoiceOutboxEntry: Codable, Equatable, Identifiable {
@@ -42,6 +44,7 @@ struct VoiceOutboxEntry: Codable, Equatable, Identifiable {
     var nextAttemptAt: Date
     let enqueuedAt: Date
     var deliveredAt: Date?
+    var failureCode: String?
 
     var id: String { requestId }
 }
@@ -143,7 +146,8 @@ final class VoiceOutbox {
             attemptCount: 0,
             nextAttemptAt: now(),
             enqueuedAt: now(),
-            deliveredAt: nil
+            deliveredAt: nil,
+            failureCode: nil
         )
         entries.append(entry)
         persistIndex()
@@ -191,6 +195,17 @@ final class VoiceOutbox {
         try? fileManager.removeItem(at: audioURL(for: requestId))
     }
 
+    /// 失败吸收终态：删除不可再用的音频，但保留索引阻止同 request_id 重入队。
+    func markTerminalFailed(requestId: String, code: String) {
+        mutate(requestId: requestId) { entry in
+            guard entry.state == .queued else { return }
+            entry.state = .failed
+            entry.failureCode = code
+            entry.deliveredAt = now()
+        }
+        try? fileManager.removeItem(at: audioURL(for: requestId))
+    }
+
     /// 上送失败（网络/Mac 不可达）：退避后重试，返回下一次尝试时间。
     @discardableResult
     func markFailed(requestId: String) -> Date? {
@@ -220,7 +235,7 @@ final class VoiceOutbox {
         let removable = entries.filter { entry in
             switch entry.state {
             case .queued: return entry.enqueuedAt < cutoff
-            case .delivered: return (entry.deliveredAt ?? entry.enqueuedAt) < cutoff
+            case .delivered, .failed: return (entry.deliveredAt ?? entry.enqueuedAt) < cutoff
             }
         }
         guard !removable.isEmpty else { return [] }
