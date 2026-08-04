@@ -32,7 +32,7 @@ import { TaskWatcher } from './taskwatch.mjs'
 import { AudioPipeline } from './audio.mjs'
 import { ResultAudioStore } from './result-audio.mjs'
 import { QwenRealtimeSessionSupervisor } from './supervisor.mjs'
-import { allowDownlinkMessage, rejectAudio } from './audio-policy.mjs'
+import { prepareDownlinkMessage } from './audio-policy.mjs'
 
 const BASE = dirname(fileURLToPath(import.meta.url))
 
@@ -57,6 +57,8 @@ export function createBridge(overrides = {}) {
     stateDir,
     timestampSkewMs: CONFIG.timestamp_skew_ms,
     pairingCodeTtlMs: CONFIG.pairing_code_ttl_ms,
+    // ESS-175: 允许 config 声明可 pair 的固定 device_id 列表（如 jackson-watch）。
+    allowedPairingDeviceIds: CONFIG.allowed_pairing_device_ids ?? [],
     log,
   })
   const ledger = new TurnLedger({
@@ -116,6 +118,13 @@ export function createBridge(overrides = {}) {
     const { ts, label, event, ...rest } = item
     if (label && RT_GATEWAY_EVENTS.has(event)) ledger.bumpEvents(label)
     log({ evt: 'realtime', request_id: label ?? null, event, ...rest })
+    // ESS-234：Gateway 侧偶发不发 announcement，导致 background turn 卡在
+    // "有 interim 没 result_audio_attached" 的非终态。task.completed 到达时启
+    // 5s 兜底计时；到期仍无 announcement 就从 realtime salvage 合成 final result。
+    if (event === 'task.completed' && rest.task?.id) {
+      const turn = ledger.byTaskId(String(rest.task.id))
+      if (turn?.request_id) armRealtimeFallbackTimer(turn.request_id, 'task.completed')
+    }
   })
   const sourceAllowed = makeSourceGate(CONFIG.allowed_peer_ips)
 
@@ -135,14 +144,15 @@ export function createBridge(overrides = {}) {
     const interim = { kind: 'interim', request_id: requestId, delivery_sequence: 1, ...payload }
     if (interim.audio) interim.audio.kind = 'interim'
     interimPayloads.set(requestId, interim)
-    const message = JSON.stringify({
+    if (interim.audio) ledger.markFirstAudioReady(requestId, { source: 'interim' })
+    const event = {
       type: 'turn.interim',
       interim,
-    })
+    }
     for (const client of eventClients) {
       const turn = ledger.get(requestId)
       if (turn && client.deviceId === turn.device_id && client.ws.readyState === client.ws.OPEN) {
-        if (allowDownlinkMessage({ type: 'turn.interim', interim }, log)) client.ws.send(message)
+        client.ws.send(JSON.stringify(prepareDownlinkMessage(event, log)))
       }
     }
   }
@@ -161,6 +171,13 @@ export function createBridge(overrides = {}) {
 
   const pendingResultAudio = new Map() // request_id → { meta, base64, speechText, at }
   const pendingAnnouncements = new Map() // task_id → raw announcement, waiting for ledger binding
+  // ESS-234：background turn 从 supervisor 侧 injectTurn 返回时聚合的 24kHz PCM
+  // （turn.result.audio24k）在此暂存，等 task.completed 后 5s 无 announcement 触发
+  // 兜底合成 final result（Gateway 侧偶发不发 announcement 的必现路径）。
+  const realtimeAudioSalvage = new Map() // request_id → { pcm24k: Buffer, taskId, at }
+  // ESS-234：已启动 task.completed 5s 兜底计时的 request_id，防止重复触发。
+  const realtimeFallbackTimers = new Map() // request_id → Timeout
+  const REALTIME_FALLBACK_WAIT_MS = CONFIG.realtime_fallback_wait_ms ?? 5_000
   const PENDING_AUDIO_TTL_MS = 10 * 60 * 1000
   const MAX_PENDING_ANNOUNCEMENTS = 64
   const MAX_PENDING_ANNOUNCEMENT_BYTES = (CONFIG.max_announcement_pcm_bytes ?? 5_760_000) * 4
@@ -177,6 +194,81 @@ export function createBridge(overrides = {}) {
       speechText: entry.speechText,
     })
     log({ evt: 'result_audio_attached', request_id: requestId, size_bytes: entry.meta.size_bytes, duration_ms: entry.meta.duration_ms })
+  }
+
+  // ESS-234：从 realtime salvage 里的 24kHz PCM 合成 final result 兜底。
+  // 只在 task.completed 后 5s 仍无 result_audio_attached 时被调用；如 Gateway
+  // announcement 迟到，attachPendingResultAudio 的 turn.state 幂等分支 + 先删
+  // 再 setResult 的顺序保证不会二次覆盖已合成的音频。
+  async function synthesizeRealtimeFallback(requestId, reason) {
+    const salvage = realtimeAudioSalvage.get(requestId)
+    if (!salvage) return false
+    // 已被 announcement 走通了：无需兜底，清理即可。
+    const turn = ledger.get(requestId)
+    if (turn?.result?.audio) {
+      realtimeAudioSalvage.delete(requestId)
+      return false
+    }
+    // 空 PCM 无从合成：仅诊断留痕，让 turn 保持"无音频完成"状态。
+    if (!salvage.pcm24k?.length) {
+      log({ evt: 'realtime_fallback_skipped', request_id: requestId, reason: 'empty_pcm24k' })
+      realtimeAudioSalvage.delete(requestId)
+      return false
+    }
+    try {
+      const m4a = await audio.encode24kToM4a(salvage.pcm24k)
+      const meta = {
+        kind: 'result',
+        sha256: sha256hex(m4a),
+        codec: 'm4a',
+        duration_ms: Math.round(salvage.pcm24k.length / 48), // 24kHz mono PCM16
+        size_bytes: m4a.length,
+      }
+      resultAudio.put(requestId, m4a)
+      pendingResultAudio.set(requestId, {
+        meta,
+        base64: m4a.length <= CONFIG.max_result_audio_bytes ? m4a.toString('base64') : null,
+        speechText: null,
+        at: Date.now(),
+      })
+      log({
+        evt: 'result_synthesized_from_realtime', request_id: requestId,
+        task_id: salvage.taskId, pcm_bytes: salvage.pcm24k.length, m4a_bytes: m4a.length,
+        cause: reason,
+      })
+      log({
+        evt: 'l1_audio_ready', request_id: requestId, task_id: salvage.taskId,
+        source: 'realtime_fallback', response_id: null, codec: 'm4a',
+        duration_ms: meta.duration_ms, size_bytes: meta.size_bytes, sha256: meta.sha256,
+      })
+      ledger.markFirstAudioReady(requestId, { source: 'realtime_fallback' })
+      attachPendingResultAudio(requestId)
+      realtimeAudioSalvage.delete(requestId)
+      return true
+    } catch (error) {
+      log({
+        evt: 'realtime_fallback_encode_failed', request_id: requestId,
+        err: String(error.message), cause: reason,
+      })
+      realtimeAudioSalvage.delete(requestId)
+      return false
+    }
+  }
+
+  // ESS-234：任一路径观察到 task.completed 后调用；5s 窗口内 announcement 未到
+  // 就触发合成。幂等：同一 requestId 已有定时器则跳过；已合成 / 已被 announcement
+  // 走通的 requestId 由 synthesizeRealtimeFallback 内部 early-return 保护。
+  function armRealtimeFallbackTimer(requestId, cause) {
+    if (realtimeFallbackTimers.has(requestId)) return
+    if (!realtimeAudioSalvage.has(requestId)) return
+    const timer = setTimeout(() => {
+      realtimeFallbackTimers.delete(requestId)
+      Promise.resolve(synthesizeRealtimeFallback(requestId, cause)).catch(error => {
+        log({ evt: 'realtime_fallback_error', request_id: requestId, err: String(error.message) })
+      })
+    }, REALTIME_FALLBACK_WAIT_MS)
+    timer.unref?.()
+    realtimeFallbackTimers.set(requestId, timer)
   }
 
   async function bindAnnouncement(announcement, turn) {
@@ -209,6 +301,7 @@ export function createBridge(overrides = {}) {
       })
       log({ evt: 'announcement_bound', request_id: requestId, task_id: taskId, response_id: responseId, pcm_bytes: pcm24k.length, m4a_bytes: m4a.length })
       log({ evt: 'l1_audio_ready', request_id: requestId, task_id: taskId, source: 'background', response_id: responseId, codec: 'm4a', duration_ms: meta.duration_ms, size_bytes: meta.size_bytes, sha256: meta.sha256 })
+      ledger.markFirstAudioReady(requestId, { source: 'background' })
       attachPendingResultAudio(requestId)
     } catch (error) {
       // 转码失败：文本结果照常交付（降级），原因入日志
@@ -292,6 +385,14 @@ export function createBridge(overrides = {}) {
         log({ evt: 'announcement_unmatched_expired', task_id: taskId, response_id: entry.responseId, reason: 'ttl' })
       }
     }
+    // ESS-234：过期未被 task.completed 触发的 salvage 条目清理（一般不会发生——
+    // 5s 窗口远短于 10min TTL；此为异常防御）。
+    for (const [requestId, entry] of realtimeAudioSalvage) {
+      if (entry.at < cutoff) {
+        realtimeAudioSalvage.delete(requestId)
+        log({ evt: 'realtime_salvage_expired', request_id: requestId, task_id: entry.taskId })
+      }
+    }
   }, 60_000)
   pendingAudioSweeper.unref?.()
 
@@ -362,9 +463,8 @@ export function createBridge(overrides = {}) {
         // 受理回执只允许固定文案 + 预生成资产，保证内容与用户请求有确定因果。
         const interimText = '收到，正在处理，请稍后'
         let interimAudio = null
-        if (result.audio24k?.length) {
-          rejectAudio({ kind: null, requestId, source: 'realtime_interim', causal: true, log })
-        }
+        // Realtime 自由生成的音频不是产品下行资产，直接忽略；只有下面固定文案
+        // 的预生成音频进入出口门禁，避免把“未发送内容”误记为下行拒绝。
         if (!interimAudio && fallbackInterimAudio) {
           interimAudio = {
             kind: 'interim',
@@ -377,6 +477,14 @@ export function createBridge(overrides = {}) {
           log({ evt: 'l1_audio_ready', request_id: requestId, task_id: result.taskId, source: 'interim', response_id: null, codec: 'm4a', duration_ms: null, size_bytes: interimAudio.size_bytes, sha256: interimAudio.sha256, fallback: true })
         }
         emitInterim(requestId, { text: interimText, audio: interimAudio })
+        // ESS-234：把 realtime 阶段聚合的 24kHz PCM 存到 salvage map——若 Gateway
+        // 侧 task.completed 后 5s 内没发 announcement（必现 bug），server 侧就用这
+        // 段音频合成 final result 兜底，避免 Watch 卡在"分身处理中"永久挂起。
+        if (result.audio24k?.length) {
+          realtimeAudioSalvage.set(requestId, {
+            pcm24k: result.audio24k, taskId: result.taskId, at: Date.now(),
+          })
+        }
         // Background path: only now (task event captured) is it background_accepted (§6).
         ledger.update(requestId, {
           task_id: result.taskId,
@@ -407,6 +515,7 @@ export function createBridge(overrides = {}) {
           resultAudio.put(requestId, m4a)
           audioBase64 = m4a.toString('base64')
           log({ evt: 'l1_audio_ready', request_id: requestId, task_id: null, source: 'direct', response_id: result.responseIds?.[0] ?? null, codec: 'm4a', duration_ms: resultAudioMeta.duration_ms, size_bytes: resultAudioMeta.size_bytes, sha256: resultAudioMeta.sha256 })
+          ledger.markFirstAudioReady(requestId, { source: 'direct' })
         } catch (error) {
           log({ evt: 'encode_failed', request_id: requestId, err: String(error.message) })
           log({ evt: 'l1_audio_failed', request_id: requestId, task_id: null, source: 'direct', response_id: result.responseIds?.[0] ?? null, stage: 'encode', reason: String(error.message) })
@@ -492,6 +601,7 @@ export function createBridge(overrides = {}) {
       deviceId: authInfo.deviceId,
       bodySha256: bodySha,
       sessionId: supervisor.sessionId,
+      watchCreatedAt: body.created_at,
     })
     log({ evt: 'turn_accepted', request_id: requestId, device_id: authInfo.deviceId, audio_bytes: audioBuf.length })
     // Snapshot the `accepted` receipt before processing starts mutating state;
@@ -660,6 +770,133 @@ export function createBridge(overrides = {}) {
     return { status: 200, body: { chunk_id: chunkId, accepted: Math.min(lines.length, MAX_LOG_LINES_PER_CHUNK) } }
   }
 
+  // ---- ESS-184/207 下行链路探针注入 + 回执 -------------------------------
+  //
+  // /v1/probe/inject（loopback-only，不校 HMAC）：把一段预生成的短音频以
+  //   kind=probe 直接落到账本 completed，走真实 WSS 出口 → iPhone Relay →
+  //   Watch。语义上等价于用户说了一句话且立刻得到语音回执，但不经过
+  //   qwen-audio-realtime，也不会往用户对话历史里塞真 turn。
+  //
+  // /v1/probe/ack（需 HMAC，iPhone Relay 转发 Watch 的 probe_playback_ack）：
+  //   只落日志 evt=probe_acked，供 downlink-probe.mjs 判定 H5；顺手把探针
+  //   turn 标 acknowledged 以停掉持久重投 sweep。
+
+  function pickProbeDevice() {
+    const devices = auth.state?.devices ?? {}
+    for (const [deviceId] of Object.entries(devices)) return deviceId
+    return null
+  }
+
+  function handleProbeInject(rawBody) {
+    let body
+    try { body = JSON.parse(rawBody.toString('utf8')) } catch { throw new ApiError(ERR.BAD_JSON) }
+    const requestId = body.request_id
+    const audioBase64 = body.audio_base64
+    const sha = typeof body.sha256 === 'string' ? body.sha256.toLowerCase() : null
+    if (!requestId || typeof audioBase64 !== 'string' || !sha) {
+      throw new ApiError(ERR.MISSING_FIELD, 'request_id, audio_base64, sha256')
+    }
+    let audioBuf
+    try { audioBuf = Buffer.from(audioBase64, 'base64') } catch { throw new ApiError(ERR.AUDIO_INVALID) }
+    if (audioBuf.length === 0) throw new ApiError(ERR.AUDIO_INVALID)
+    if (audioBuf.length > CONFIG.max_audio_bytes) throw new ApiError(ERR.AUDIO_TOO_LARGE)
+    if (sha256hex(audioBuf) !== sha) throw new ApiError(ERR.AUDIO_HASH_MISMATCH)
+
+    const deviceId = pickProbeDevice()
+    if (!deviceId) throw new ApiError(ERR.DEVICE_UNKNOWN, 'no paired device')
+
+    // 幂等：同 request_id 已在账本，且是 probe，直接重发终态（H1 事件再落一次）；
+    // 不是 probe（比如生产 request_id 撞车）→ 拒绝，宁缺毋滥。
+    const existing = ledger.get(requestId)
+    if (existing) {
+      const isProbe = existing.result?.audio?.kind === 'probe'
+      if (!isProbe) throw new ApiError(ERR.IDEMPOTENCY_CONFLICT, 'request_id belongs to a non-probe turn')
+    } else {
+      ledger.create({
+        requestId,
+        deviceId,
+        bodySha256: sha256hex(rawBody),
+        sessionId: supervisor.sessionId,
+      })
+    }
+
+    resultAudio.put(requestId, audioBuf)
+    const meta = {
+      kind: 'probe',
+      sha256: sha,
+      codec: 'm4a',
+      duration_ms: Number.isFinite(body.duration_ms) ? body.duration_ms : null,
+      size_bytes: audioBuf.length,
+    }
+    // H1 事件：与生产 direct 结果同事件名 `l1_audio_ready`；`kind: meta.kind`
+    // 必须落上，`downlink-probe.mjs` 的 H1 分类严格要求 `entry.kind === 'probe'`
+    // 才认。毕玄 2026-08-03 22:04Z 复审接受 —— 之前只写 `probe: true` 属于事件
+    // 契约缺口，真实 CLI 会稳定停在 ERR_PROBE_STOPPED_AT_H1。
+    log({
+      evt: 'l1_audio_ready', request_id: requestId, task_id: null,
+      source: 'direct', response_id: null, codec: 'm4a',
+      duration_ms: meta.duration_ms, size_bytes: meta.size_bytes,
+      sha256: meta.sha256, kind: meta.kind, probe: true,
+    })
+
+    // path=direct + setResult(completed) → ledger emit → allowDownlinkMessage
+    // 因为 PR #59 已把 'probe' 加入 AUDIO_KINDS，本条不会被拒；随后经 WSS
+    // 抵达 iPhone Relay，Relay 认 kind=probe 走 transferProbe → Watch。
+    ledger.update(requestId, { path: 'direct' })
+    ledger.setResult(requestId, {
+      text: typeof body.text === 'string' ? body.text : null,
+      audioBase64,
+      audio: meta,
+      extra: { source: 'probe' },
+    }, 'completed')
+
+    return { status: 202, body: { request_id: requestId, device_id: deviceId, size_bytes: audioBuf.length, sha256: sha } }
+  }
+
+  function handleProbeAck(rawBody, authInfo) {
+    let body
+    try { body = JSON.parse(rawBody.toString('utf8')) } catch { throw new ApiError(ERR.BAD_JSON) }
+    const requestId = typeof body.request_id === 'string' ? body.request_id : null
+    if (!requestId) throw new ApiError(ERR.MISSING_FIELD, 'request_id')
+
+    // 毕玄 2026-08-03 15:33Z 复审 §2：`/v1/probe/ack` 之前只验 HMAC 就落
+    // `evt=probe_acked`，任一已配对客户端可对任意 rid 发假 ACK 骗过 H5——
+    // 五跳「假 PASS」直接绕过门禁。强校验四条不过就拒收、不落事件：
+    // (a) turn 必须存在；
+    // (b) 必须是探针 turn（kind=probe）；
+    // (c) ACK 的 device_id 必须等于该 probe turn 的目标设备；
+    // (d) ACK 的 sha 必须等于 H1 注入音频 sha（bit-perfect 到手播）。
+    const turn = ledger.get(requestId)
+    if (!turn) throw new ApiError(ERR.NOT_FOUND, 'unknown request_id')
+    if (turn.result?.audio?.kind !== 'probe') {
+      throw new ApiError(ERR.NOT_FOUND, 'not a probe turn')
+    }
+    if (turn.device_id !== authInfo.deviceId) {
+      // 用 NOT_FOUND 复用生产 get-turn 的跨设备语义（不暴露 turn 存在与否）。
+      throw new ApiError(ERR.NOT_FOUND, 'device mismatch')
+    }
+    const ackSha = typeof body.sha256 === 'string' ? body.sha256.toLowerCase() : null
+    const injectSha = turn.result?.audio?.sha256?.toLowerCase() ?? null
+    if (!ackSha || !injectSha || ackSha !== injectSha) {
+      throw new ApiError(ERR.AUDIO_HASH_MISMATCH, 'ack sha does not match injected audio')
+    }
+
+    // H5 事件——只在四条强校验都过之后才落，避免历史事件被伪造。
+    log({
+      evt: 'probe_acked',
+      request_id: requestId,
+      device_id: authInfo.deviceId,
+      played_ok: Boolean(body.played_ok),
+      played_at_ms: Number.isFinite(body.played_at_ms) ? body.played_at_ms : null,
+      duration_ms: Number.isFinite(body.duration_ms) ? body.duration_ms : null,
+      sha256: ackSha,
+      error_code: typeof body.error_code === 'string' ? body.error_code.slice(0, 80) : null,
+    })
+
+    ledger.acknowledgeResult(requestId, { source: 'probe' })
+    return { status: 200, body: { request_id: requestId, acknowledged: true } }
+  }
+
   // ---- HTTP plumbing ------------------------------------------------------
 
   function readBody(req) {
@@ -713,6 +950,25 @@ export function createBridge(overrides = {}) {
       if (pathName === '/v1/client-logs') {
         if (req.method !== 'POST') throw new ApiError(ERR.METHOD_NOT_ALLOWED)
         const r = handleClientLogs(rawBody, verify())
+        return reply(r.status, r.body)
+      }
+
+      // ESS-184/207 探针注入：loopback-only（不校 HMAC——本机唯一进入路径
+      // 是本机用户 curl/脚本；生产 tailscale/公网 sourceAllowed 就把非 CGNAT
+      // 拦在门外，probe 白名单探针只用于门禁自检，不外放）。
+      if (pathName === '/v1/probe/inject') {
+        if (req.method !== 'POST') throw new ApiError(ERR.METHOD_NOT_ALLOWED)
+        if (ip !== '127.0.0.1' && ip !== '::1') throw new ApiError(ERR.SOURCE_NOT_ALLOWED)
+        const r = handleProbeInject(rawBody)
+        return reply(r.status, r.body)
+      }
+
+      // ESS-184/207 探针回执：iPhone Relay 转发 Watch 侧 probe_playback_ack。
+      // 走 HMAC 与其余北向端点一致——auth 的 device_id 就是 log evt=probe_acked
+      // 的 device_id，跨端可对账。
+      if (pathName === '/v1/probe/ack') {
+        if (req.method !== 'POST') throw new ApiError(ERR.METHOD_NOT_ALLOWED)
+        const r = handleProbeAck(rawBody, verify())
         return reply(r.status, r.body)
       }
 
@@ -778,6 +1034,22 @@ export function createBridge(overrides = {}) {
   const wss = new WebSocketServer({ noServer: true })
   const eventClients = new Set() // { ws, deviceId }
   const eventsHeartbeatMs = CONFIG.events_heartbeat_ms ?? 20_000
+  const resultDeliverySweepMs = CONFIG.result_delivery_sweep_ms ?? 1_000
+
+  function sendTerminalDelivery(turn, client, cause) {
+    const event = { type: 'turn.state', turn: ledger.projection(turn) }
+    // ESS-181 契约：不达标就剥音频保文字，永远不静默丢弃投影。
+    client.ws.send(JSON.stringify(prepareDownlinkMessage(event, log)))
+    const delivery = ledger.markResultRedelivered(turn.request_id, {
+      baseDelayMs: CONFIG.result_delivery_backoff_base_ms ?? 2_000,
+      maxDelayMs: CONFIG.result_delivery_backoff_max_ms ?? 300_000,
+    })
+    log({
+      evt: 'result_redelivered', request_id: turn.request_id, device_id: client.deviceId,
+      status: turn.state, attempt: delivery?.attempt, retry_after_ms: delivery?.delay_ms, cause,
+    })
+    return true
+  }
 
   // Real task steps are a text-only event and never enter the audio pipeline.
   watcher.onProgress = progress => {
@@ -800,11 +1072,18 @@ export function createBridge(overrides = {}) {
 
   ledger.on('turn', projection => {
     const event = { type: 'turn.state', turn: projection }
-    const message = JSON.stringify(event)
-    for (const client of eventClients) {
-      if (client.deviceId === projection.device_id && client.ws.readyState === client.ws.OPEN) {
-        if (allowDownlinkMessage(event, log)) client.ws.send(message)
-      }
+    const clients = [...eventClients].filter(client =>
+      client.deviceId === projection.device_id && client.ws.readyState === client.ws.OPEN)
+    if (['completed', 'failed', 'cancelled'].includes(projection.status)) {
+      // 初次终态发送也推进同一份持久退避账本，避免 1s sweep 把快乐路径
+      // 误判成“尚未投递”并立即向 iPhone/Watch 再发一遍。
+      const client = clients[0]
+      const turn = ledger.get(projection.request_id)
+      if (client && turn) sendTerminalDelivery(turn, client, 'state_change')
+      return
+    }
+    for (const client of clients) {
+      client.ws.send(JSON.stringify(prepareDownlinkMessage(event, log)))
     }
   })
 
@@ -830,6 +1109,13 @@ export function createBridge(overrides = {}) {
           terminalTtlMs: CONFIG.result_delivery_ttl_ms ?? 30 * 60 * 1000,
           maxDeliveryAttempts: CONFIG.result_delivery_max_attempts ?? 5,
         }).filter(t => t.device_id === deviceId)
+        const snapshot = {
+          type: 'snapshot',
+          turns: replayTurns.map(t => ledger.projection(t)),
+        }
+        // ESS-181 契约：不达标就剥音频保文字，永远不静默丢弃投影。
+        ws.send(JSON.stringify(prepareDownlinkMessage(snapshot, log)))
+        // 快照已经承载本轮终态投递，发送成功后推进同一份持久退避账本。
         for (const turn of replayTurns) {
           if (['completed', 'failed', 'cancelled'].includes(turn.state)) {
             const delivery = ledger.markResultRedelivered(turn.request_id, {
@@ -839,21 +1125,17 @@ export function createBridge(overrides = {}) {
             log({
               evt: 'result_redelivered', request_id: turn.request_id, device_id: deviceId,
               status: turn.state, attempt: delivery?.attempt, retry_after_ms: delivery?.delay_ms,
+              cause: 'connect_snapshot',
             })
           }
         }
-        const snapshot = {
-          type: 'snapshot',
-          turns: replayTurns.map(t => ledger.projection(t)),
-        }
-        if (allowDownlinkMessage(snapshot, log)) ws.send(JSON.stringify(snapshot))
         // interim 不改变账本状态，但非终态回合重连时仍须重放；客户端用
         // request_id + delivery_sequence 去重，已持久入 Watch 队列的不会重复播。
         for (const [requestId, interim] of interimPayloads) {
           const turn = ledger.get(requestId)
           if (turn?.device_id === deviceId && !['completed', 'failed', 'cancelled'].includes(turn.state)) {
             const event = { type: 'turn.interim', interim }
-            if (allowDownlinkMessage(event, log)) ws.send(JSON.stringify(event))
+            ws.send(JSON.stringify(prepareDownlinkMessage(event, log)))
           }
         }
         ws.on('close', () => eventClients.delete(client))
@@ -880,6 +1162,21 @@ export function createBridge(overrides = {}) {
     }
   }, eventsHeartbeatMs)
   eventsHeartbeat.unref?.()
+
+  // 未 ACK 终态不能只等下一次 reconnect/turn_accepted。只要 iPhone events
+  // 通道仍在线，就按账本退避主动补投；ACK 到达后 due 集合立即消失。
+  const resultDeliverySweep = setInterval(() => {
+    const due = ledger.dueTerminalDeliveries({
+      terminalTtlMs: CONFIG.result_delivery_ttl_ms ?? 30 * 60 * 1000,
+      maxDeliveryAttempts: CONFIG.result_delivery_max_attempts ?? 5,
+    })
+    for (const turn of due) {
+      const client = [...eventClients].find(candidate =>
+        candidate.deviceId === turn.device_id && candidate.ws.readyState === candidate.ws.OPEN)
+      if (client) sendTerminalDelivery(turn, client, 'connected_sweep')
+    }
+  }, resultDeliverySweepMs)
+  resultDeliverySweep.unref?.()
 
   // ---- restart recovery (§4.1) -------------------------------------------
 
@@ -939,8 +1236,13 @@ export function createBridge(overrides = {}) {
     resultAudio.stopSweeper()
     clearInterval(pendingAudioSweeper)
     clearInterval(eventsHeartbeat)
+    clearInterval(resultDeliverySweep)
     for (const client of eventClients) client.ws.close()
     for (const timer of workTimers.values()) clearTimeout(timer)
+    // ESS-234：清 in-flight 兜底计时器 + 释放 salvage PCM 引用
+    for (const timer of realtimeFallbackTimers.values()) clearTimeout(timer)
+    realtimeFallbackTimers.clear()
+    realtimeAudioSalvage.clear()
     return Promise.all(servers.map(s => new Promise(r => s.close(r))))
   }
 

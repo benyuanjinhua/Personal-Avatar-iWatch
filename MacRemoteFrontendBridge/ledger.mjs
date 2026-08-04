@@ -31,7 +31,20 @@ export class TurnLedger extends EventEmitter {
   load() {
     try {
       const raw = JSON.parse(readFileSync(this.path, 'utf8'))
-      for (const [id, turn] of Object.entries(raw.turns || {})) this.turns.set(id, turn)
+      for (const [id, turn] of Object.entries(raw.turns || {})) {
+        // Pre-ESS-235 ledgers have no timing object. Backfill only timestamps
+        // from the Bridge clock domain; Watch timestamps cannot be reconstructed.
+        turn.timing = {
+          watch_created_at: null,
+          bridge_accepted_at: turn.created_at ?? null,
+          processing_started_at: null,
+          first_audio_ready_at: null,
+          first_audio_source: null,
+          completed_at: null,
+          ...turn.timing,
+        }
+        this.turns.set(id, turn)
+      }
     } catch { /* first boot */ }
   }
 
@@ -58,13 +71,14 @@ export class TurnLedger extends EventEmitter {
 
   // Idempotent create. Returns { turn, replay } — replay=true means the
   // request_id already exists and the caller must NOT start a second execution.
-  create({ requestId, deviceId, bodySha256, sessionId }) {
+  create({ requestId, deviceId, bodySha256, sessionId, watchCreatedAt = null }) {
     const existing = this.turns.get(requestId)
     if (existing) {
       if (existing.body_sha256 !== bodySha256) return { turn: existing, conflict: true }
       return { turn: existing, replay: true }
     }
     const now = new Date().toISOString()
+    const watchAt = Number.isFinite(Date.parse(watchCreatedAt)) ? new Date(watchCreatedAt).toISOString() : null
     const turn = {
       request_id: requestId,
       device_id: deviceId,
@@ -85,6 +99,14 @@ export class TurnLedger extends EventEmitter {
       task_event_count: 0,        // 仅 SSE/task 生命周期事件（taskwatch 熔断预算，ESS-41）
       created_at: now,
       updated_at: now,
+      timing: {
+        watch_created_at: watchAt,
+        bridge_accepted_at: now,
+        processing_started_at: null,
+        first_audio_ready_at: null,
+        first_audio_source: null,
+        completed_at: null,
+      },
     }
     this.turns.set(requestId, turn)
     this.save()
@@ -99,7 +121,11 @@ export class TurnLedger extends EventEmitter {
       // Terminal states are final: late gateway events must not resurrect a turn.
       return turn
     }
-    Object.assign(turn, patch, { updated_at: new Date().toISOString() })
+    const updatedAt = new Date().toISOString()
+    const timing = { ...turn.timing, ...patch.timing }
+    if (patch.state === 'processing' && !timing.processing_started_at) timing.processing_started_at = updatedAt
+    if (patch.state && TERMINAL.has(patch.state) && !timing.completed_at) timing.completed_at = updatedAt
+    Object.assign(turn, patch, { updated_at: updatedAt, timing })
     if (persist) this.save()
     this.emitState(turn)
     return turn
@@ -148,6 +174,16 @@ export class TurnLedger extends EventEmitter {
     return this.update(requestId, { state: 'failed', error: errCode, detail, permission: null })
   }
 
+  markFirstAudioReady(requestId, { at = new Date().toISOString(), source = null } = {}) {
+    const turn = this.turns.get(requestId)
+    if (!turn) return null
+    const timing = { ...turn.timing }
+    if (timing.first_audio_ready_at) return turn
+    timing.first_audio_ready_at = at
+    timing.first_audio_source = source
+    return this.update(requestId, { timing })
+  }
+
   bumpEvents(requestId) {
     const turn = this.turns.get(requestId)
     if (!turn) return 0
@@ -175,6 +211,15 @@ export class TurnLedger extends EventEmitter {
   projection(turn) {
     if (typeof turn === 'string') turn = this.turns.get(turn)
     if (!turn) return null
+    const timing = { ...turn.timing }
+    // Derived durations must stay in one clock domain. watch_created_at is
+    // retained for trace correlation only; mixing Watch and Bridge wall clocks
+    // would silently add clock skew to P50/P95.
+    const startAt = Date.parse(timing.bridge_accepted_at)
+    const firstAudioAt = Date.parse(timing.first_audio_ready_at)
+    const completedAt = Date.parse(timing.completed_at)
+    if (Number.isFinite(startAt) && Number.isFinite(firstAudioAt)) timing.voice_ttft_ms = Math.max(0, firstAudioAt - startAt)
+    if (Number.isFinite(startAt) && Number.isFinite(completedAt)) timing.end_to_end_ms = Math.max(0, completedAt - startAt)
     return {
       request_id: turn.request_id,
       device_id: turn.device_id,
@@ -187,6 +232,7 @@ export class TurnLedger extends EventEmitter {
       error: turn.error,
       created_at: turn.created_at,
       updated_at: turn.updated_at,
+      timing,
     }
   }
 
@@ -198,6 +244,20 @@ export class TurnLedger extends EventEmitter {
     turn.updated_at = new Date().toISOString()
     this.save()
     return turn
+  }
+
+  dueTerminalDeliveries({ now = Date.now(), terminalTtlMs = 30 * 60 * 1000, maxDeliveryAttempts = 5 } = {}) {
+    return [...this.turns.values()].filter(turn =>
+      this.isTerminalDeliveryDue(turn, { now, terminalTtlMs, maxDeliveryAttempts }))
+  }
+
+  isTerminalDeliveryDue(turn, { now = Date.now(), terminalTtlMs = 30 * 60 * 1000, maxDeliveryAttempts = 5 } = {}) {
+    if (!TERMINAL.has(turn.state) || turn.delivered_ack) return false
+    if ((turn.delivery_attempts || 0) >= maxDeliveryAttempts) return false
+    const nextDeliveryAt = Date.parse(turn.next_delivery_at)
+    if (Number.isFinite(nextDeliveryAt) && now < nextDeliveryAt) return false
+    const terminalAt = Date.parse(turn.updated_at)
+    return Number.isFinite(terminalAt) && now - terminalAt <= terminalTtlMs
   }
 
   markResultRedelivered(requestId, { now = Date.now(), baseDelayMs = 2_000, maxDelayMs = 300_000 } = {}) {
@@ -213,12 +273,7 @@ export class TurnLedger extends EventEmitter {
   replayable({ now = Date.now(), terminalTtlMs = 30 * 60 * 1000, maxDeliveryAttempts = 5 } = {}) {
     return [...this.turns.values()].filter(turn => {
       if (!TERMINAL.has(turn.state)) return true
-      if (turn.delivered_ack) return false
-      if ((turn.delivery_attempts || 0) >= maxDeliveryAttempts) return false
-      const nextDeliveryAt = Date.parse(turn.next_delivery_at)
-      if (Number.isFinite(nextDeliveryAt) && now < nextDeliveryAt) return false
-      const terminalAt = Date.parse(turn.updated_at)
-      return Number.isFinite(terminalAt) && now - terminalAt <= terminalTtlMs
+      return this.isTerminalDeliveryDue(turn, { now, terminalTtlMs, maxDeliveryAttempts })
     })
   }
 

@@ -27,7 +27,7 @@ final class WelcomeGreeter: ObservableObject {
 
     @Published private(set) var stage: Stage = .pending
 
-    private let player = SpeechPlayer()
+    private let player = SpeechPlayer(instanceTag: "welcome")
     private let defaults: UserDefaults
     private var greetedThisSession = false
 

@@ -18,6 +18,14 @@ protocol WatchFeedbackChannel: AnyObject {
     /// 返回 false 表示未能持久化——调用方不得记为已交付，必须允许后续快照重试。
     @discardableResult
     func transferSpeech(fileURL: URL, envelope: VoiceStatusEnvelope) -> Bool
+    /// ESS-171：WSS 快照到达 = Bridge 还没收到我们的 /ack。踢一次下行队列，
+    /// 让已 deferred / 到期未交付的条目立刻重投，别等 reachability 抖动触发。
+    func retryPendingDownlinks(requestIds: [String], trigger: String)
+    /// ESS-184/207 探针语音下行：与 transferSpeech 传输语义相同（transferFile），
+    /// 但走独立 messageKey（`voice_probe_envelope`）与独立 kind（`.probe`），
+    /// Watch 端匹配后进探针分支——不入 vault、不入 journal、播完回 probe_ack。
+    @discardableResult
+    func transferProbe(fileURL: URL, envelope: VoiceStatusEnvelope) -> Bool
 }
 
 /// WristAgentPhoneRelay（ESS-28）：iPhone Companion Relay 编排器。
@@ -39,6 +47,10 @@ final class WristAgentPhoneRelay: ObservableObject {
     }
 
     weak var watchChannel: WatchFeedbackChannel?
+    /// ESS-184/207 探针回执上送句柄。iPhone 侧的 `PhoneConnectivity` 收到
+    /// Watch 的 `probe_playback_ack` 后调 `postProbeAck(...)`——不走 outbox，
+    /// 因为探针本来就是一次性门禁事件、丢了就丢了下一场再跑。
+    private var probeAckTasks: [String: Task<Void, Never>] = [:]
 
     private var outbox: VoiceOutbox?
     private var credentials: RelayDeviceCredentials?
@@ -98,6 +110,14 @@ final class WristAgentPhoneRelay: ObservableObject {
         scheduleDrain(after: 0)
         connectEventsIfNeeded()
         clientLogUplink.start()
+    }
+
+    /// WCSession 的激活/可达变化会唤醒 iPhone 进程；每个唤醒点都恢复 events，
+    /// 避免只在下一次语音上送时才顺便建立 WebSocket。
+    func resumeEvents(trigger: String) {
+        guard isPaired else { return }
+        relayLog("恢复事件通道（\(trigger)）")
+        connectEventsIfNeeded()
     }
 
     // MARK: - 配对
@@ -212,6 +232,7 @@ final class WristAgentPhoneRelay: ObservableObject {
             notifiedStuckRequestIds.remove(entry.requestId)
             relayStatus = "已上送 \(entry.requestId.prefix(8))…"
             notify(status: RelayStatusUpdate(requestId: entry.requestId, phase: .accepted))
+            connectEventsIfNeeded()
         } catch let error as RelayUploadError where !error.isRetryable {
             // Bridge 稳定 4xx：毒消息，不再重试。
             outbox.remove(requestId: entry.requestId)
@@ -329,8 +350,9 @@ final class WristAgentPhoneRelay: ObservableObject {
             }
         }
         eventsConnected = false
-        eventsTask?.cancel(with: .goingAway, reason: nil)
-        eventsTask = nil
+        task.cancel(with: .goingAway, reason: nil)
+        // 旧连接的迟到失败不得清掉已由唤醒入口建立的新连接。
+        if eventsTask === task { eventsTask = nil }
         guard !Task.isCancelled else { return }
         // 指数退避重连；Mac 恢复后事件流自动续上。
         eventsReconnectAttempt += 1
@@ -347,6 +369,18 @@ final class WristAgentPhoneRelay: ObservableObject {
         case "turn.state":
             if let turn = message.turn { process(projection: turn) }
         case "snapshot":
+            // ESS-171：completed turn 出现在 snapshot 里 = Bridge 还没收到我们的 /ack。
+            // 先清掉这些 request_id 的乐观缓存（否则 stageAndTransferSpeech 会短路），
+            // 再走一次正常投影处理，最后踢一下下行队列。
+            let pendingCompleted = (message.turns ?? []).filter { $0.status == "completed" }
+            for turn in pendingCompleted {
+                if let sha = turn.result?.audio?.sha256.lowercased() {
+                    deliveredResultAudio.remove(audioDeliveryKey(turn.requestId, sha))
+                }
+            }
+            watchChannel?.retryPendingDownlinks(
+                requestIds: pendingCompleted.map(\.requestId), trigger: "wss-snapshot"
+            )
             message.turns?.forEach { process(projection: $0) }
         case "turn.interim":
             if let interim = message.interim { process(interim: interim) }
@@ -393,6 +427,15 @@ final class WristAgentPhoneRelay: ObservableObject {
     }
 
     private func process(projection: BridgeTurnProjection) {
+        // ESS-184/207：kind=probe 走独立通道——不入结果账本、不发状态信封、
+        // 不占 iPhone 前台状态行；只把音频直投给 Watch 走探针分支。
+        // 探针 turn 只能是 completed（Bridge 侧 /v1/probe/inject 直接进终态），
+        // 但仍防御性检查，避免注入路径变化时把非 completed 事件误发。
+        if projection.result?.audio?.kind == .probe {
+            guard projection.status == "completed" else { return }
+            deliverProbeAudio(projection: projection)
+            return
+        }
         guard let envelope = projection.statusEnvelope() else { return }
         // 旧版 caption 通道照旧（iPhone 前台状态行）。
         if let phase = VoiceRelayPhase(rawValue: envelope.state.rawValue) {
@@ -471,6 +514,82 @@ final class WristAgentPhoneRelay: ObservableObject {
     }
 
     /// 结果语音下载：Range 断点续传 + sha256 校验，校验不过重下、不过夜。
+    // MARK: - 探针语音下行（ESS-184/207）
+
+    /// kind=probe 的语音：只有 inline base64（Bridge /v1/probe/inject 一次性
+    /// 注入，走真实链路但不上传大文件、不进 result-audio 有界下载路径）。
+    /// 与结果链路完全隔离——不走 ResultAudioLedger、不落 ConversationHistory、
+    /// 不发状态信封（避免 Watch VoiceTurnJournal 记一条假 turn）。
+    private func deliverProbeAudio(projection: BridgeTurnProjection) {
+        guard let result = projection.result,
+              let meta = result.audio,
+              let base64 = result.audioBase64,
+              let data = Data(base64Encoded: base64) else {
+            relayLog("探针语音缺 inline base64，跳过（探针 turn 不走下载兜底）")
+            return
+        }
+        let sha = RelayWire.sha256Hex(data)
+        guard sha == meta.sha256.lowercased() else {
+            relayLog("探针语音内联校验失败 \(projection.requestId.prefix(8))…")
+            return
+        }
+        let url = resultAudioDirectory.appendingPathComponent("\(projection.requestId)-probe.m4a")
+        guard (try? data.write(to: url, options: .atomic)) != nil else {
+            relayLog("探针语音落盘失败 \(projection.requestId.prefix(8))…")
+            return
+        }
+        // 探针专用信封：state 保持 completed 便于 Watch 端沿用 VoiceStatusEnvelope
+        // 解码，但携带 kind=.probe——Watch 端严格按 kind 分流到 playProbe，绝不
+        // 走 storeSpeech（后者会入 vault + journal）。
+        let payload = VoiceResultPayload(
+            summary: result.text ?? result.speechText ?? "探针",
+            isTruncated: false,
+            speechSha256: sha,
+            speechDurationMs: meta.durationMs
+        )
+        let envelope = VoiceStatusEnvelope.status(
+            requestId: projection.requestId,
+            state: .completed,
+            detail: "kind=probe",
+            result: payload,
+            audioKind: .probe
+        )
+        Self.downlinkLogger.log("l2_relay_probe_ready request_id=\(projection.requestId, privacy: .public) bytes=\(data.count) sha256=\(sha, privacy: .public)")
+        guard watchChannel?.transferProbe(fileURL: url, envelope: envelope) == true else {
+            relayLog("探针语音入队失败 \(projection.requestId.prefix(8))…")
+            return
+        }
+    }
+
+    /// PhoneConnectivity 收到 Watch 的 `probe_playback_ack` 后调用；HTTP 上送
+    /// Bridge /v1/probe/ack。失败仅重试一小段窗口——探针是一次性门禁，超期就
+    /// 让下一场探针重跑，别把 iPhone 卡在无限重试里。
+    func postProbeAck(_ ack: ProbeAckEnvelope) {
+        // 同一 request_id 的探针 ack 已在途/已发过：不重复。
+        guard probeAckTasks[ack.requestId] == nil else { return }
+        probeAckTasks[ack.requestId] = Task { [weak self] in
+            var attempt = 0
+            let maxAttempts = 5
+            while attempt < maxAttempts && !Task.isCancelled {
+                guard let self else { return }
+                if let client = self.makeClient() {
+                    do {
+                        try await client.acknowledgeProbe(ack)
+                        self.relayStatus = "探针回执已发 \(ack.requestId.prefix(8))…"
+                        self.probeAckTasks[ack.requestId] = nil
+                        return
+                    } catch {
+                        self.relayLog("探针回执上送失败，重试中")
+                    }
+                }
+                attempt += 1
+                let delay = RetryBackoff.outboxDefault.delay(forAttempt: attempt)
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+            await MainActor.run { self?.probeAckTasks[ack.requestId] = nil }
+        }
+    }
+
     private func downloadAndTransferSpeech(
         projection: BridgeTurnProjection, meta: BridgeResultAudioMeta
     ) async {
@@ -482,21 +601,35 @@ final class WristAgentPhoneRelay: ObservableObject {
         let partialURL = resultAudioDirectory
             .appendingPathComponent("\(projection.requestId).m4a.partial")
         var assembled = (try? Data(contentsOf: partialURL)) ?? Data()
+        Self.downlinkLogger.info(
+            "result audio fetch started request_id=\(projection.requestId, privacy: .public) state=queued bytes_staged=\(assembled.count) expected_bytes=\(meta.sizeBytes ?? -1)"
+        )
         for attempt in 0..<3 {
             do {
+                let rangeStart = assembled.isEmpty ? nil : assembled.count
+                Self.downlinkLogger.info(
+                    "result audio fetch attempted request_id=\(projection.requestId, privacy: .public) state=attempted attempt=\(attempt + 1) range_start=\(rangeStart ?? 0)"
+                )
                 let (data, status) = try await client.fetchResultAudio(
                     requestId: projection.requestId,
-                    rangeStart: assembled.isEmpty ? nil : assembled.count
+                    rangeStart: rangeStart
                 )
                 switch status {
                 case 206: assembled.append(data)
                 case 200: assembled = data
-                case 404: return // 音频已过保留期/不存在：文本降级
+                case 404:
+                    Self.downlinkLogger.error(
+                        "result audio fetch failed request_id=\(projection.requestId, privacy: .public) state=failed reason=not-found attempt=\(attempt + 1)"
+                    )
+                    return // 音频已过保留期/不存在：文本降级
                 case 416: assembled = Data() // 断点越界：从头再来
                 default: throw RelayUploadError.bridge(code: "ERR_AUDIO_FETCH", httpStatus: status)
                 }
                 if RelayWire.sha256Hex(assembled) == meta.sha256.lowercased() {
                     try? FileManager.default.removeItem(at: partialURL)
+                    Self.downlinkLogger.info(
+                        "result audio fetch completed request_id=\(projection.requestId, privacy: .public) state=downloaded bytes=\(assembled.count) attempt=\(attempt + 1)"
+                    )
                     stageAndTransferSpeech(projection: projection, data: assembled, sha: meta.sha256.lowercased())
                     return
                 }
@@ -505,11 +638,17 @@ final class WristAgentPhoneRelay: ObservableObject {
                 }
             } catch {
                 try? assembled.write(to: partialURL, options: .atomic) // 保留断点
+                Self.downlinkLogger.error(
+                    "result audio fetch interrupted request_id=\(projection.requestId, privacy: .public) state=attempted-no-ack bytes_staged=\(assembled.count) attempt=\(attempt + 1) error=\(String(describing: error), privacy: .public)"
+                )
                 let delay = RetryBackoff.outboxDefault.delay(forAttempt: attempt + 1)
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             }
         }
         try? assembled.write(to: partialURL, options: .atomic)
+        Self.downlinkLogger.error(
+            "result audio fetch deferred request_id=\(projection.requestId, privacy: .public) state=queued bytes_staged=\(assembled.count) reason=retry-exhausted"
+        )
         relayLog("结果语音下载未完成，已保留断点；文本结果已先行送达")
     }
 

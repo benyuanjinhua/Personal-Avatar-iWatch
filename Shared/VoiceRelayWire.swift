@@ -243,6 +243,22 @@ final class RelayClient {
         }
     }
 
+    /// ESS-184/207 探针播放回执：POST /v1/probe/ack。Bridge 落 evt=probe_acked
+    /// 供 downlink-probe.mjs 判定 H5；不入结果账本，也不影响结果 ACK 状态机。
+    func acknowledgeProbe(_ ack: ProbeAckEnvelope) async throws {
+        let body = try ack.jsonData()
+        let request = RelaySignedRequestBuilder(baseURL: baseURL, credentials: credentials)
+            .request(method: "POST", path: "/v1/probe/ack", requestId: ack.requestId, body: body)
+        let (data, response): (Data, URLResponse)
+        do { (data, response) = try await session.data(for: request) }
+        catch { throw RelayUploadError.transport(error) }
+        guard let http = response as? HTTPURLResponse else { throw RelayUploadError.badResponse }
+        guard http.statusCode == 200 else {
+            let code = (try? JSONDecoder().decode(BridgeErrorBody.self, from: data))?.error ?? "ERR_UNKNOWN"
+            throw RelayUploadError.bridge(code: code, httpStatus: http.statusCode)
+        }
+    }
+
     /// 上送一个 turn；重试时以同一 request_id 重新调用（新 nonce/签名），Bridge 幂等去重。
     func upload(envelope: VoiceRequestEnvelope, audioData: Data) async throws -> VoiceTurnResponse {
         let body = try JSONEncoder().encode(VoiceTurnUpload(envelope: envelope, audioData: audioData))

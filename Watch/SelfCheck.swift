@@ -37,7 +37,7 @@ final class SelfCheckRunner: ObservableObject {
     @Published private(set) var stage: Stage = .idle
 
     private let recorder = AudioRecorder()
-    private let player = SpeechPlayer()
+    private let player = SpeechPlayer(instanceTag: "selfcheck")
     private let defaults: UserDefaults
     private let signals = SignalCounter()
     private var interrupted = false
@@ -386,7 +386,12 @@ final class SelfCheckRunner: ObservableObject {
                 // 分两段捕错：让 detail 能区分「category 失败」和「activate
                 // 失败」——真机上后者是主要故障模式（561145203）。
                 do {
-                    try session.setCategory(.playback, mode: .default, policy: .longFormAudio)
+                    // ESS-226 hotfix: 与 SpeechPlayer 保持一致，用 .default 而非 .longFormAudio。
+                    // 从 SpeechPlayer 的 .default 会话切换到 .longFormAudio 激活会在真机上抛 -50
+                    // (NSOSStatusErrorDomain#561145203)，让 S1→S2 yield probe 假 fail、
+                    // 连带 S2 报 ERR_PLAY_INCOMPLETE。yield probe 的目的只是"会话可复用"，
+                    // 具体 policy 应跟运行时一致。
+                    try session.setCategory(.playback, mode: .default, policy: .default)
                 } catch {
                     lastFailingStage = "set_category"
                     let nsError = error as NSError

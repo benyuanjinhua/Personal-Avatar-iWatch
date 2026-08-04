@@ -14,6 +14,9 @@ enum WatchDownlinkKind: String, Codable, CaseIterable {
     case voiceStatus
     /// 结果语音文件（ESS-38 下行音频）。
     case speech
+    /// ESS-184/207 下行链路探针文件；语义同 speech（transferFile 走音频），
+    /// 但 Watch 侧走探针分支——不入 vault、不入 journal、播完发 probe_ack。
+    case probe
 }
 
 enum WatchDownlinkState: String, Codable {
@@ -186,6 +189,23 @@ final class WatchDownlinkOutbox {
         )
     }
 
+    /// ESS-184/207 下行探针文件：与 `enqueueSpeech` 传输语义相同（transferFile），
+    /// 但用 `kind=.probe` 与独立 messageKey，让 Watch 端能走探针分支且与结果链路
+    /// 的去重/内存队列互不干扰（一场探针不会被前一条 speech 的载荷复用挡掉）。
+    @discardableResult
+    func enqueueProbe(
+        requestId: String,
+        messageKey: String,
+        envelope: Data,
+        audio: Data,
+        fileName: String
+    ) throws -> EnqueueResult {
+        try enqueue(
+            requestId: requestId, kind: .probe, messageKey: messageKey,
+            payload: envelope, audio: audio, audioFileName: fileName
+        )
+    }
+
     private func enqueue(
         requestId: String,
         kind: WatchDownlinkKind,
@@ -194,7 +214,7 @@ final class WatchDownlinkOutbox {
         audio: Data?,
         audioFileName: String?
     ) throws -> EnqueueResult {
-        // speech 的去重摘要取「信封 + 音频」，避免同一回合换音频却被当成重复。
+        // speech/probe 的去重摘要取「信封 + 音频」，避免同一回合换音频却被当成重复。
         var digestInput = semanticPayload(payload, kind: kind)
         if let audio { digestInput.append(contentsOf: SHA256.hash(data: audio)) }
         let sha = RelayWire.sha256Hex(digestInput)
@@ -272,6 +292,28 @@ final class WatchDownlinkOutbox {
 
     func earliestNextAttempt() -> Date? {
         items.filter { $0.state == .queued }.map(\.nextAttemptAt).min()
+    }
+
+    /// Bridge 的 completed snapshot 仍包含该回合，说明 Watch 的业务 ACK 尚未抵达。
+    /// WCSession 的 didFinish 只代表文件交给了 Watch 传输层，不能继续用对应的
+    /// delivered tombstone 阻止业务层重投。先持久化移除 tombstone，下一次
+    /// enqueueSpeech 才能用重新下载的音频建立一个可投递条目。
+    @discardableResult
+    func invalidateDeliveredSpeech(requestId: String) -> Bool {
+        let removed = items.filter {
+            $0.requestId == requestId && $0.kind == .speech && $0.state == .delivered
+        }
+        guard !removed.isEmpty else { return false }
+
+        let snapshot = items
+        let removedIds = Set(removed.map(\.id))
+        items.removeAll { removedIds.contains($0.id) }
+        guard persistIndexReportingFailure(operation: "invalidate-delivered-speech") else {
+            items = snapshot
+            return false
+        }
+        removedIds.forEach { pendingPayloadDiscards.remove($0) }
+        return true
     }
 
     func payload(for id: String) throws -> Data {
@@ -455,7 +497,7 @@ final class WatchDownlinkOutbox {
     /// Bridge snapshots regenerate occurred_at. It is transport metadata, not
     /// delivery identity; excluding it makes replay idempotent across reconnects.
     private func semanticPayload(_ payload: Data, kind: WatchDownlinkKind) -> Data {
-        guard kind == .voiceStatus || kind == .speech,
+        guard kind == .voiceStatus || kind == .speech || kind == .probe,
               let envelope = try? VoiceStatusEnvelope.decode(from: payload),
               let canonical = try? VoiceStatusEnvelope.status(
                 requestId: envelope.requestId,

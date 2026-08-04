@@ -89,7 +89,8 @@ final class PlaybackEndgameChainTests: XCTestCase {
             directory: FileManager.default.temporaryDirectory
                 .appendingPathComponent("ess154-tests-\(UUID().uuidString)", isDirectory: true)
         ))
-        player.onPlaybackEndgame = { rid, endgame in
+        // ESS-239: 补齐 ESS-233 引入的 bytes 中间参数（本测试不校验 bytes，用 _ 忽略）
+        player.onPlaybackEndgame = { rid, _, endgame in
             receivedEndgame = endgame
             guard let outcome = PlaybackEndgamePolicy.outcome(for: endgame) else { return }
             if let cue = outcome.haptic {

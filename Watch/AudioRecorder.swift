@@ -38,6 +38,12 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
     private var recorder: AVAudioRecorder?
     private var meterTimer: Timer?
     private var currentURL: URL?
+    /// ESS-219：录音开始的单调时钟戳，取代 AVAudioRecorder.currentTime
+    /// 计时。真机在 2026-08-03 16:30/16:35 两次出现 duration_ms=5.1e7ms
+    /// (≈14.2 小时，量级贴近 deviceCurrentTime/系统 uptime)——currentTime 在
+    /// 会话被抢占 / record(forDuration:) 到点自停后不返回文档承诺的 0，
+    /// 而是给出与 deviceCurrentTime 混淆的值。改用 DispatchTime 自己算差值。
+    private var recordingStartUptime: DispatchTime?
 
     func start() async throws {
         let granted = await requestPermission()
@@ -99,6 +105,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
 
         currentURL = url
         recorder = audioRecorder
+        recordingStartUptime = .now()
         isRecording = true
         startMetering()
         WatchLog.info("recorder", "record_started", detail: "aac \(Self.sampleRate)Hz max=\(Int(Self.maxDuration))s")
@@ -106,8 +113,9 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
 
     /// 结束录音并保留文件（transferFile 需要文件在传输完成前存在）。
     func finish() throws -> Recording {
-        let durationMs = Int(((recorder?.currentTime ?? 0) * 1000).rounded())
+        let durationMs = elapsedRecordingMs()
         recorder?.stop()
+        recordingStartUptime = nil
         stopMetering()
         isRecording = false
         releaseSession(reason: "finish")
@@ -121,6 +129,21 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         }
         currentURL = nil
         recorder = nil
+
+        // ESS-225 AC #5：字节数与时长严重不自洽时告警。PR #66 的单调时钟
+        // 消灭了「44KB 报 14.2 小时」的溢出，但同源反向异常
+        // 「24KB 报 31ms」（真机 16:22:31 样本）逃出 sanitizeDurationMs 的 60s
+        // 上限门——DispatchTime 差值虽单调，仍可能因 finish() 相对 record start
+        // 时钟戳漂移（如中断恢复后 uptime 语义变化、或首次录音戳未落）返回
+        // 与文件字节数不匹配的量级。加一道后置门，未来同类漂移可自动可见。
+        if let mismatchDetail = Self.durationBytesMismatch(durationMs: durationMs, bytes: data.count) {
+            WatchLog.error(
+                "recorder", "duration_bytes_inconsistent",
+                detail: mismatchDetail,
+                code: "ERR_DURATION_INCONSISTENT"
+            )
+        }
+
         WatchLog.info("recorder", "record_finished", detail: "duration_ms=\(durationMs) bytes=\(data.count)")
         return Recording(fileURL: url, data: data, durationMs: max(1, durationMs))
     }
@@ -131,9 +154,54 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         if let currentURL { try? FileManager.default.removeItem(at: currentURL) }
         currentURL = nil
         recorder = nil
+        recordingStartUptime = nil
         isRecording = false
         stopMetering()
         releaseSession(reason: "cancel")
+    }
+
+    /// ESS-219：单调时钟计算录音时长，并对超过 `maxDuration` 的异常量级
+    /// 留痕、截断到上限。返回值保证在 `[0, maxDuration*1000]` 区间内，
+    /// 供 `record_finished` 落日志与 `Recording.durationMs` 一致使用。
+    private func elapsedRecordingMs() -> Int {
+        guard let start = recordingStartUptime else { return 0 }
+        let elapsedNs = DispatchTime.now().uptimeNanoseconds &- start.uptimeNanoseconds
+        return Self.sanitizeDurationMs(rawMs: Int(elapsedNs / 1_000_000))
+    }
+
+    /// ESS-219 验收标准：`duration_ms` 超过录音上限视为计算错误，留痕后截断。
+    /// 独立 static 便于单测直接验证边界，无需真实起录。
+    static func sanitizeDurationMs(rawMs: Int) -> Int {
+        let maxMs = Int(maxDuration * 1000)
+        if rawMs > maxMs {
+            WatchLog.error(
+                "recorder", "record_duration_out_of_range",
+                detail: "raw_ms=\(rawMs) max_ms=\(maxMs)",
+                code: "ERR_DURATION_OVERFLOW"
+            )
+            return maxMs
+        }
+        return max(0, rawMs)
+    }
+
+    /// ESS-225 AC #5 防御门：字节数与时长不自洽时返回 detail，调用点落
+    /// `duration_bytes_inconsistent` 事件。AAC 32kbps ≈ 4000B/s；expected_ms
+    /// = bytes * 1000 / 4000；允许 3× 冗余覆盖 AAC 起始/结束帧与容器开销。
+    ///
+    /// 真机窗口 (2026-08-03 16:20~16:40) 校准：
+    /// - 正常样本 `duration_ms=4318 bytes=42887` → expected≈10721 → 门内（3573~32163）
+    /// - 异常样本 `duration_ms=51129344 bytes=43296` → expected≈10824 → 门外（触发）
+    /// - 异常样本 `duration_ms=31 bytes=24588`     → expected≈6147  → 门外（触发）
+    ///
+    /// <4KB 的样本走 too_short 阈值判定，本门不参与以避免噪声。
+    static func durationBytesMismatch(durationMs: Int, bytes: Int) -> String? {
+        guard bytes >= 4_000, durationMs >= 0 else { return nil }
+        let bytesPerSecond = 4_000 // AVEncoderBitRateKey 32_000 bps
+        let expectedMs = bytes * 1_000 / bytesPerSecond
+        let lowerBound = expectedMs / 3
+        let upperBound = expectedMs * 3
+        guard durationMs < lowerBound || durationMs > upperBound else { return nil }
+        return "duration_ms=\(durationMs) bytes=\(bytes) expected_ms≈\(expectedMs)"
     }
 
     /// ESS-72：录音结束必须把共享会话交还出去。录音把会话激活成

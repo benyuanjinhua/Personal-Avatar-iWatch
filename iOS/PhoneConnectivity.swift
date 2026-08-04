@@ -115,6 +115,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
             }
             // 会话刚激活正是此前静默丢弃的时刻，这里必须补投。
             self.flushDownlink(trigger: "activation")
+            self.relay.resumeEvents(trigger: "wc-activation")
         }
     }
 
@@ -125,11 +126,17 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     }
 
     nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
-        Task { @MainActor in self.flushDownlink(trigger: "reachability") }
+        Task { @MainActor in
+            self.flushDownlink(trigger: "reachability")
+            self.relay.resumeEvents(trigger: "wc-reachability")
+        }
     }
 
     nonisolated func sessionWatchStateDidChange(_ session: WCSession) {
-        Task { @MainActor in self.flushDownlink(trigger: "watch-state") }
+        Task { @MainActor in
+            self.flushDownlink(trigger: "watch-state")
+            self.relay.resumeEvents(trigger: "wc-watch-state")
+        }
     }
 
     /// 系统回执：userInfo 队列条目已交付 Watch（或最终失败）。
@@ -153,6 +160,13 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
             Task { @MainActor in self.relay.acknowledgeResult(requestId: ack.requestId) }
             return
         }
+        // ESS-184/207 探针回执（sendMessage 快路径）：即时通道优先，两路（含
+        // transferUserInfo）都到时靠 postProbeAck 内的 in-flight 去重挡住。
+        if let ackData = message[ProbeAckMessage.envelopeKey] as? Data,
+           let ack = ProbeAckEnvelope.decode(from: ackData) {
+            Task { @MainActor in self.relay.postProbeAck(ack) }
+            return
+        }
         if let summaryData = message[WatchClientLogMessage.selfCheckSummaryKey] as? Data {
             Task { @MainActor in self.ingestSelfCheckSummary(data: summaryData) }
             return
@@ -173,6 +187,11 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         if let ackData = userInfo[ResultDeliveryAckMessage.envelopeKey] as? Data,
            let ack = ResultDeliveryAck.decode(from: ackData) {
             Task { @MainActor in self.relay.acknowledgeResult(requestId: ack.requestId) }
+            return
+        }
+        if let ackData = userInfo[ProbeAckMessage.envelopeKey] as? Data,
+           let ack = ProbeAckEnvelope.decode(from: ackData) {
+            Task { @MainActor in self.relay.postProbeAck(ack) }
             return
         }
         if let summaryData = userInfo[WatchClientLogMessage.selfCheckSummaryKey] as? Data {
@@ -326,6 +345,51 @@ extension PhoneConnectivity: WatchFeedbackChannel {
         return true
     }
 
+    /// Bridge 仍回放 completed turn 说明业务 ACK 未到。WCSession 的 didFinish 不能作为
+    /// 业务送达判据：先撤销已 delivered 的 speech tombstone，让紧随其后的 projection
+    /// 能重新下载并入队；queued / inFlight 条目保持原样，由 flush 正常恢复。
+    func retryPendingDownlinks(requestIds: [String], trigger: String) {
+        requestIds.forEach { _ = downlink?.invalidateDeliveredSpeech(requestId: $0) }
+        flushDownlink(trigger: trigger)
+    }
+
+    /// ESS-184/207 探针语音下行：与 transferSpeech 走同一 outbox 通道
+    /// （transferFile + 系统托管队列），但用独立 kind/messageKey 让 Watch 端
+    /// 走探针分支。不消耗结果链路的 ledger、不入 EncryptedAudioVault。
+    @discardableResult
+    func transferProbe(fileURL: URL, envelope: VoiceStatusEnvelope) -> Bool {
+        guard let data = try? envelope.jsonData() else { return false }
+        guard let downlink else {
+            Self.downlinkLogger.error(
+                "下行队列不可用，探针无法保证送达 request_id=\(envelope.requestId, privacy: .public)"
+            )
+            return false
+        }
+        guard let audio = try? Data(contentsOf: fileURL) else {
+            Self.downlinkLogger.error(
+                "探针语音读取失败 request_id=\(envelope.requestId, privacy: .public)"
+            )
+            return false
+        }
+        do {
+            _ = try downlink.enqueueProbe(
+                requestId: envelope.requestId,
+                messageKey: VoiceProbeMessage.envelopeKey,
+                envelope: data,
+                audio: audio,
+                fileName: fileURL.lastPathComponent
+            )
+        } catch {
+            Self.downlinkLogger.error(
+                "探针入队失败 request_id=\(envelope.requestId, privacy: .public) error=\(String(describing: error), privacy: .public)"
+            )
+            return false
+        }
+        refreshDownlinkCount()
+        flushDownlink(trigger: "probe-enqueue")
+        return true
+    }
+
     private func enqueueDownlink(
         requestId: String, kind: WatchDownlinkKind, key: String, data: Data
     ) {
@@ -379,7 +443,7 @@ extension PhoneConnectivity: WatchFeedbackChannel {
                 continue
             }
             switch item.kind {
-            case .speech:
+            case .speech, .probe:
                 guard let audioURL = downlink.stagedAudioURL(for: item.id) else {
                     downlink.markFailed(id: item.id, reason: "staged-audio-missing")
                     continue

@@ -38,7 +38,11 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     /// finishPlayback（含 30s 挂起超时兜底）时按具体终局回调；决策与
     /// 是否发触觉/横幅在 PlaybackEndgamePolicy + PushToTalkController。
     /// 欢迎语与自检不设此回调 → 零开销、行为完全不变。
-    var onPlaybackEndgame: ((_ requestId: String?, _ endgame: PlaybackEndgame) -> Void)?
+    /// ESS-233: `bytes` 参数用于让上层区分 interim/fallback（16.8KB 固定大小）
+    /// 与真实回复音频（通常 > 100KB）——PushToTalkController 据此决定是否触发
+    /// result ACK（interim 未终态，ACK 会被 Bridge 拒 ERR_MISSING_FIELD 并造成
+    /// iPhone 无限重试）。0 = 未知（player_init 失败等边缘路径）。
+    var onPlaybackEndgame: ((_ requestId: String?, _ bytes: Int, _ endgame: PlaybackEndgame) -> Void)?
     /// ESS-154 T2-4：起播挂起兜底（30s 无 play_started 即认作失败终局）。
     /// 一旦 beginPlayback 成功起播（或任何终局路径先到）即取消。
     private var deferredWatchdog: Task<Void, Never>?
@@ -55,22 +59,40 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     /// 代码。仅 SelfCheckRunner 在 S6 窗口内设置；生产路径恒为空集。
     var selfCheckForcedActivationFailures: Set<String> = []
 
+    /// ESS-228 Phase 1（E1 evidence-only）：实例身份标签。四个长期存活的
+    /// SpeechPlayer 各注册一份 interruption observer，仅靠 `context` 无法在
+    /// 单条 began/ended 上区分归属；调用方按 `ptt` / `error_speech` / `welcome`
+    /// / `selfcheck` 传入固定标签，让 `bridge.log` 里 `began` 事件可按
+    /// `instance=` 去重、按 `watch_ts` 分组给出真实频率。
+    let instanceTag: String
+
     var currentContext: String? { isPlaying ? context : nil }
 
-    override init() {
+    init(instanceTag: String = "unknown") {
+        self.instanceTag = instanceTag
         super.init()
+        WatchLog.info(
+            "player", "interruption_observer_registered",
+            detail: "instance=\(instanceTag) queue=main"
+        )
         // 播放中断（电话/系统占用）是真机欢迎语「响一半没了」的候选根因，必须留痕。
         interruptionObserver = NotificationCenter.default.addObserver(
             forName: AVAudioSession.interruptionNotification, object: nil, queue: .main
         ) { [weak self] notification in
             let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
             let kind = raw.flatMap(AVAudioSession.InterruptionType.init(rawValue:))
+            // ESS-228 Phase 1 (E3)：先取 userInfo 详情——`type` 已有，追加
+            // `reason` / `options.shouldResume` / `wasSuspended` 三项。
+            // `.appWasSuspended` 命中与否是 `.ended 为什么不来` 的关键分水岭。
+            let userInfoDetail = Self.interruptionUserInfoDetail(notification.userInfo)
             Task { @MainActor in
                 guard let self, let kind else { return }
                 self.isSessionInterrupted = kind == .began
                 WatchLog.info(
                     "player", "session_interruption", requestId: self.context,
                     detail: "state=\(kind == .began ? "began" : "ended") "
+                        + "instance=\(self.instanceTag) "
+                        + userInfoDetail + " "
                         + self.activationEvidence()
                 )
                 // ESS-73：.began 只负责停当前播放并留痕——系统此刻已暂停
@@ -87,6 +109,10 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     deinit {
         if let interruptionObserver {
             NotificationCenter.default.removeObserver(interruptionObserver)
+            WatchLog.info(
+                "player", "interruption_observer_removed",
+                detail: "instance=\(instanceTag)"
+            )
         }
     }
 
@@ -110,7 +136,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             onFinish?(false)
             // player_init_failed 属于 T2「起播前失败」，同 exhausted 语义（用户
             // 什么也听不到、音频未被消费）；走 T2 追加告知。
-            onPlaybackEndgame?(context, .exhausted)
+            onPlaybackEndgame?(context, data.count, .exhausted)
             return false
         }
         player.delegate = self
@@ -226,7 +252,9 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             return
         }
         do {
-            try session.setCategory(.playback, mode: .default, policy: .longFormAudio)
+            // ESS-226: 用 .default 让 OS 按当前默认输出设备路由——
+            // BT 连接 → BT，未连 → Watch 扬声器；不再强偏好 BT。
+            try session.setCategory(.playback, mode: .default, policy: .default)
         } catch {
             WatchLog.error(
                 "player", "session_policy_rejected", requestId: context,
@@ -396,6 +424,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private func finishPlayback(endgame: PlaybackEndgame) {
         cancelDeferredWatchdog()
         let requestId = context
+        let bytes = currentAudioBytes  // ESS-233: 在 reset 前捕获，传给 endgame 回调
         audioPlayer = nil
         currentAudioBytes = 0
         isPlaying = false
@@ -406,7 +435,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         // 决策仍走 PlaybackRecoveryPolicy.finishOutcome）；T2 决策通过独立
         // 回调追加，二者互不干扰、welcome/自检不设 T2 回调即零开销。
         callback?(endgame == .success)
-        onPlaybackEndgame?(requestId, endgame)
+        onPlaybackEndgame?(requestId, bytes, endgame)
     }
 
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
@@ -430,11 +459,13 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             // SelfCheck 依赖不吊死上层，见 SelfCheck.swift:34）。仅补 T2 告知回调，
             // 让用户能感知「语音没能播出」——原状态下解码失败零反馈。
             self.cancelDeferredWatchdog()
+            let bytes = self.currentAudioBytes  // ESS-233: 捕获 bytes 传给 endgame 回调
             self.isPlaying = false
             self.audioPlayer = nil
+            self.currentAudioBytes = 0
             self.onFinish = nil
             self.context = nil
-            self.onPlaybackEndgame?(requestId, .exhausted)
+            self.onPlaybackEndgame?(requestId, bytes, .exhausted)
         }
     }
 
@@ -446,7 +477,82 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     private func activationEvidence() -> String {
-        "scene_phase=\(Self.scenePhaseDescription()) interruption=\(isSessionInterrupted ? "active" : "inactive")"
+        // ESS-228 Phase 1 (E4)：会话/路由状态实时快照。这些字段来自
+        // `AVAudioSession.sharedInstance()`，只读、不改变任何行为。
+        // watchOS 的 interruption userInfo 大概率不携带抢占方 App 标识，
+        // 但 route / other_audio / secondary_silence 组合足以还原「谁在响」。
+        let session = AVAudioSession.sharedInstance()
+        let category = session.category.rawValue
+        let mode = session.mode.rawValue
+        let routePolicy = "\(session.routeSharingPolicy.rawValue)"
+        let otherAudio = session.isOtherAudioPlaying ? "yes" : "no"
+        let secondarySilence = session.secondaryAudioShouldBeSilencedHint ? "yes" : "no"
+        let route = Self.routeDescription(session)
+        let inputs = session.currentRoute.inputs
+            .map { "\($0.portType.rawValue)(\($0.portName))" }
+            .joined(separator: "+")
+        let inputsField = inputs.isEmpty ? "none" : inputs
+        return "scene_phase=\(Self.scenePhaseDescription()) "
+            + "interruption=\(isSessionInterrupted ? "active" : "inactive") "
+            + "category=\(category) mode=\(mode) route_share=\(routePolicy) "
+            + "other_audio=\(otherAudio) secondary_silence=\(secondarySilence) "
+            + "route_out=\(route) route_in=\(inputsField)"
+    }
+
+    /// ESS-228 Phase 1 (E3)：从 interruption userInfo 抽取新的取证字段——
+    /// `reason` / `should_resume` / `was_suspended`。仅生成字符串，不动
+    /// 任何决策路径。
+    /// - `reason` 命中 `.appWasSuspended` 是「.ended 从不投递」最直接的
+    ///   系统侧解释假说（`began` 在挂起窗口补发、`ended` 在挂起中丢弃）；
+    ///   命中 `.default` 则说明是 App 存活时的抢占，方向完全不同。
+    /// - `should_resume` 反映系统是否希望我们在 `.ended` 后自动续播——
+    ///   对应「回落 vs 主动放弃」的产品决策判断。
+    /// - `was_suspended` 键在部分 iOS/watchOS 版本存在；缺失即写 `absent`。
+    private static func interruptionUserInfoDetail(_ userInfo: [AnyHashable: Any]?) -> String {
+        let rawType = (userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt).map(String.init) ?? "nil"
+        let reason = interruptionReasonDescription(userInfo)
+        let shouldResume = interruptionShouldResumeDescription(userInfo)
+        let wasSuspended = interruptionWasSuspendedDescription(userInfo)
+        return "type=\(rawType) reason=\(reason) should_resume=\(shouldResume) was_suspended=\(wasSuspended)"
+    }
+
+    private static func interruptionReasonDescription(_ userInfo: [AnyHashable: Any]?) -> String {
+        guard let userInfo else { return "absent" }
+        // AVAudioSessionInterruptionReasonKey 在 iOS 14.5+/watchOS 8+ 存在；
+        // 值是 UInt。0=default，1=appWasSuspended（iOS 16 起弃用），
+        // 2=builtInMicMuted，3=routeDisconnected（Apple 内部）。命名以运行时
+        // 字符串为准，未识别的直接以数值返回，防止我们编未见过的值。
+        let key = "AVAudioSessionInterruptionReasonKey"
+        if let raw = userInfo[key] as? UInt {
+            switch raw {
+            case 0: return "default"
+            case 1: return "app_was_suspended"
+            case 2: return "built_in_mic_muted"
+            case 3: return "route_disconnected"
+            default: return "unknown(\(raw))"
+            }
+        }
+        if let raw = userInfo[key] as? Int, raw >= 0 {
+            return interruptionReasonDescription([key: UInt(raw) as Any])
+        }
+        return "absent"
+    }
+
+    private static func interruptionShouldResumeDescription(_ userInfo: [AnyHashable: Any]?) -> String {
+        guard let userInfo else { return "absent" }
+        // AVAudioSessionInterruptionOptionKey 是位掩码；`shouldResume` = 1。
+        guard let raw = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt else { return "absent" }
+        return AVAudioSession.InterruptionOptions(rawValue: raw).contains(.shouldResume) ? "yes" : "no"
+    }
+
+    private static func interruptionWasSuspendedDescription(_ userInfo: [AnyHashable: Any]?) -> String {
+        guard let userInfo else { return "absent" }
+        // AVAudioSessionInterruptionWasSuspendedKey 在部分版本存在（NSNumber）。
+        // 使用字面串键，避免不同 SDK 下常量不可用而编译失败。
+        let key = "AVAudioSessionInterruptionWasSuspendedKey"
+        if let flag = userInfo[key] as? Bool { return flag ? "yes" : "no" }
+        if let num = userInfo[key] as? NSNumber { return num.boolValue ? "yes" : "no" }
+        return "absent"
     }
 
     private static func scenePhaseDescription() -> String {
