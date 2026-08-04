@@ -333,6 +333,14 @@ extension PhoneConnectivity: WatchFeedbackChannel {
         return true
     }
 
+    /// Bridge 仍回放 completed turn 说明业务 ACK 未到。WCSession 的 didFinish 不能作为
+    /// 业务送达判据：先撤销已 delivered 的 speech tombstone，让紧随其后的 projection
+    /// 能重新下载并入队；queued / inFlight 条目保持原样，由 flush 正常恢复。
+    func retryPendingDownlinks(requestIds: [String], trigger: String) {
+        requestIds.forEach { _ = downlink?.invalidateDeliveredSpeech(requestId: $0) }
+        flushDownlink(trigger: trigger)
+    }
+
     private func enqueueDownlink(
         requestId: String, kind: WatchDownlinkKind, key: String, data: Data
     ) {

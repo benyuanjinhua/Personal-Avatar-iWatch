@@ -18,6 +18,9 @@ protocol WatchFeedbackChannel: AnyObject {
     /// 返回 false 表示未能持久化——调用方不得记为已交付，必须允许后续快照重试。
     @discardableResult
     func transferSpeech(fileURL: URL, envelope: VoiceStatusEnvelope) -> Bool
+    /// ESS-171：WSS 快照到达 = Bridge 还没收到我们的 /ack。踢一次下行队列，
+    /// 让已 deferred / 到期未交付的条目立刻重投，别等 reachability 抖动触发。
+    func retryPendingDownlinks(requestIds: [String], trigger: String)
 }
 
 /// WristAgentPhoneRelay（ESS-28）：iPhone Companion Relay 编排器。
@@ -357,6 +360,18 @@ final class WristAgentPhoneRelay: ObservableObject {
         case "turn.state":
             if let turn = message.turn { process(projection: turn) }
         case "snapshot":
+            // ESS-171：completed turn 出现在 snapshot 里 = Bridge 还没收到我们的 /ack。
+            // 先清掉这些 request_id 的乐观缓存（否则 stageAndTransferSpeech 会短路），
+            // 再走一次正常投影处理，最后踢一下下行队列。
+            let pendingCompleted = (message.turns ?? []).filter { $0.status == "completed" }
+            for turn in pendingCompleted {
+                if let sha = turn.result?.audio?.sha256.lowercased() {
+                    deliveredResultAudio.remove(audioDeliveryKey(turn.requestId, sha))
+                }
+            }
+            watchChannel?.retryPendingDownlinks(
+                requestIds: pendingCompleted.map(\.requestId), trigger: "wss-snapshot"
+            )
             message.turns?.forEach { process(projection: $0) }
         case "turn.interim":
             if let interim = message.interim { process(interim: interim) }
