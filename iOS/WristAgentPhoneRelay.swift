@@ -164,8 +164,18 @@ final class WristAgentPhoneRelay: ObservableObject {
                 ))
             case .duplicate(let existing):
                 // 幂等：不产生第二个请求，只把当前状态重发给 Watch。
-                let phase: VoiceRelayPhase = existing.state == .delivered ? .accepted : .waitingForMac
-                notify(status: RelayStatusUpdate(requestId: existing.requestId, phase: phase))
+                switch existing.state {
+                case .delivered:
+                    notify(status: RelayStatusUpdate(requestId: existing.requestId, phase: .accepted))
+                case .queued:
+                    notify(status: RelayStatusUpdate(requestId: existing.requestId, phase: .waitingForMac))
+                case .failed:
+                    notify(status: RelayStatusUpdate(
+                        requestId: existing.requestId, phase: .failed,
+                        detail: "这次请求已经结束，请重新发起",
+                        errorCode: existing.failureCode ?? "ERR_UNKNOWN", failureStage: .macUnreachable
+                    ))
+                }
             }
         } catch {
             notify(status: RelayStatusUpdate(
@@ -222,7 +232,7 @@ final class WristAgentPhoneRelay: ObservableObject {
             audioData = try outbox.audioData(for: entry.requestId)
         } catch {
             // 密文缺失/损坏：无法重建同一请求，明确失败而不是伪造内容。
-            outbox.remove(requestId: entry.requestId)
+            outbox.markTerminalFailed(requestId: entry.requestId, code: "ERR_RETRY_CACHE_MISSING")
             notify(status: RelayStatusUpdate(
                 requestId: entry.requestId, phase: .failed, detail: "原来的录音没有留住",
                 errorCode: "ERR_RETRY_CACHE_MISSING", failureStage: .execution
@@ -238,7 +248,7 @@ final class WristAgentPhoneRelay: ObservableObject {
             connectEventsIfNeeded()
         } catch let error as RelayUploadError where !error.isRetryable {
             // Bridge 稳定 4xx：毒消息，不再重试。
-            outbox.remove(requestId: entry.requestId)
+            outbox.markTerminalFailed(requestId: entry.requestId, code: error.stableCode)
             relayStatus = "Bridge 拒绝 \(entry.requestId.prefix(8))…：\(error.stableCode)"
             notify(status: RelayStatusUpdate(
                 requestId: entry.requestId, phase: .failed, detail: "Mac 拒绝了这次请求",
@@ -253,8 +263,8 @@ final class WristAgentPhoneRelay: ObservableObject {
                 notifiedStuckRequestIds.insert(entry.requestId)
                 // ESS-253 / U2 / D2 E-18：达到有界阈值即结束本次自动重试，
                 // 明确告诉 Watch 进入 S-FAIL；用户可从 Watch 的缓存录音手动重试。
-                outbox.remove(requestId: entry.requestId)
                 let code = (error as? RelayUploadError)?.stableCode ?? "ERR_TRANSPORT"
+                outbox.markTerminalFailed(requestId: entry.requestId, code: code)
                 notify(status: RelayStatusUpdate(
                     requestId: entry.requestId, phase: .failed,
                     detail: "Mac 没有应答，请确认助手正在运行",
