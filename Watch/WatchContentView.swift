@@ -101,6 +101,15 @@ struct WatchContentView: View {
                             .foregroundStyle(.orange)
                     }
 
+                    // ESS-258 / D1 铁律 + D3 铁律 1：15s 无 iPhone 回执触发的
+                    // `iphone_relay_stuck` 触觉必须在屏幕上有对应格子。这是
+                    // S-THINK 的 mid-turn 提示，非终态——回执随后到达时
+                    // `cancelIphoneRelayWatchdog` 会把 requestId 从集合里移出，
+                    // SwiftUI 自动撤下本 banner，不残留。
+                    if let stuckRequestId = activeStuckRequestId {
+                        iphoneRelayStuckHint(requestId: stuckRequestId)
+                    }
+
                     // ESS-55 JIT 通知授权：只在首次长任务场景出现，冷启动不弹；
                     // 「暂不」永久收起，降级为触觉 + 未读，不再骚扰。
                     if notifier.shouldPromptAuthorization {
@@ -174,6 +183,56 @@ struct WatchContentView: View {
         .frame(maxWidth: .infinity)
         .padding(8)
         .background(Color.cyan.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    // MARK: - iPhone Relay 15s 无回执提示（ESS-258 / Gap-2）
+
+    /// 当前活跃回合被 15s watchdog 判为「iPhone 侧无回执」的 requestId。
+    /// 只有既是活跃回合、又在 stuck 集合里才返回；`cancelIphoneRelayWatchdog`
+    /// 撤下集合成员后本值即为 nil，SwiftUI 自动隐藏 banner。
+    private var activeStuckRequestId: String? {
+        Self.stuckRequestIdToShow(activeTurn: activeTurn, stuckRequestIds: transport.iphoneRelayStuckRequestIds)
+    }
+
+    /// 纯函数抽出便于 WatchTests 覆盖 UI 决策：只有回合仍在活跃、且该
+    /// requestId 落进 stuck 集合时才返回，其余（无回合 / 已进终态 /
+    /// 集合不包含）返回 nil。
+    static func stuckRequestIdToShow(activeTurn: VoiceTurnRecord?, stuckRequestIds: Set<String>) -> String? {
+        guard let turn = activeTurn, turn.isActive else { return nil }
+        return stuckRequestIds.contains(turn.requestId) ? turn.requestId : nil
+    }
+
+    /// 非终态提示格子：文案遵循 D2 原则——第一人称分身、说清发生了什么 +
+    /// 能做什么 + 系统兜底，不出现裸码、不出现 D2.3 禁用词。视觉用暖黄
+    /// 与错误红区分（这不是失败终态，回执可能随后就到）。
+    /// `.onAppear` 里落 `iphone_relay_stuck_shown` 是 R-02.1 运行时证据：
+    /// 它与 `transport` 侧的 `iphone_relay_stuck`（触觉发起点）成对出现，
+    /// 证明「触觉 + 屏幕格子」同回合同时到位。
+    private func iphoneRelayStuckHint(requestId: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("手机那边还没回话", systemImage: "iphone.gen3.slash")
+                .font(.caption2.bold())
+                .foregroundStyle(.yellow)
+            Text("去手机上打开一次 WristAgent，接通后我会自动继续；不用再说一遍。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(8)
+        .background(Color.yellow.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
+        .onAppear { Self.logIphoneRelayStuckShown(requestId: requestId) }
+    }
+
+    /// 抽出便于 WatchTests 覆盖 R-02.1 证据：与 transport 侧的
+    /// `iphone_relay_stuck`（触觉发起）成对出现，证明「触觉 + 屏幕格子」
+    /// 同回合同时到位（D3 铁律 1）。事件名 / detail 变化会改变链上工具
+    /// 的解析口径，改前先看 Scripts/*.mjs。
+    static func logIphoneRelayStuckShown(requestId: String) {
+        WatchLog.info(
+            "ui", "iphone_relay_stuck_shown", requestId: requestId,
+            detail: "surface=main_screen"
+        )
     }
 
     // MARK: - 通知授权引导（ESS-55）
