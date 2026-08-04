@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import os
 
 /// iPhone → Mac 上送队列的重试退避策略：指数增长 + 抖动，封顶后保持。
 struct RetryBackoff {

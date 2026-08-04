@@ -148,13 +148,23 @@ final class WatchDownlinkOutbox {
         } catch {
             throw WatchDownlinkError.storageFailure(error.localizedDescription)
         }
-        if
-            let data = try? Data(contentsOf: indexURL),
-            let saved = try? JSONDecoder().decode([WatchDownlinkItem].self, from: data)
-        {
-            items = saved
-        } else {
-            items = []
+        do {
+            let data = try Data(contentsOf: indexURL)
+            if let saved = try? JSONDecoder().decode([WatchDownlinkItem].self, from: data) {
+                items = saved
+            } else {
+                items = []
+                log(.persistFailed(operation: "load-index", reason: "JSON decode failed"))
+            }
+        } catch {
+            // 文件不存在是正常的首次启动场景，不视为错误
+            let nsError = error as NSError
+            if nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileReadNoSuchFileError {
+                items = []
+            } else {
+                items = []
+                log(.persistFailed(operation: "load-index", reason: error.localizedDescription))
+            }
         }
         // 冷启动：上一次进程交给系统但没等到回执的条目，一律重投。
         recoverInFlight()

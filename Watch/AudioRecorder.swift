@@ -145,7 +145,27 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         isRecording = false
         releaseSession(reason: "finish")
 
-        guard let url = currentURL, let data = try? Data(contentsOf: url), !data.isEmpty else {
+        guard let url = currentURL else {
+            WatchLog.error(
+                "recorder", "record_empty",
+                detail: "duration_ms=\(durationMs) url=nil", code: "ERR_NO_RECORDING"
+            )
+            throw RecorderError.noRecording
+        }
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            let nsError = error as NSError
+            let code = (nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileReadNoSuchFileError)
+                ? "ERR_FILE_NOT_FOUND" : "ERR_FILE_READ"
+            WatchLog.error(
+                "recorder", "record_read_failed",
+                detail: "duration_ms=\(durationMs) error=\(error.localizedDescription)", code: code
+            )
+            throw RecorderError.noRecording
+        }
+        guard !data.isEmpty else {
             WatchLog.error(
                 "recorder", "record_empty",
                 detail: "duration_ms=\(wallClockMs)", code: "ERR_NO_RECORDING"
