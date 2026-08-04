@@ -59,6 +59,7 @@ iPhone Relay ──HTTPS/WSS(HMAC 签名)──▶ server.mjs（北向 API）
 | POST | `/v1/voice/turns/{id}/cancel` | 取消（后台任务映射到 `DELETE /api/tasks/:id`） |
 | POST | `/v1/voice/turns/{id}/permission` | `{permission_id, decision: allow\|deny}` |
 | GET | `/v1/voice/turns/{id}/audio` | 结果语音（AAC/M4A）有界取回；支持 `Range` 断点续传，`x-audio-sha256` 响应头供校验（ESS-38） |
+| POST | `/v1/voice/turns/{id}/deliver` | HTTP 轮询兜底；到期的未 ACK 终态返回完整 `turn.state` envelope，并推进共享投递退避账本；无待投结果返回 204 |
 | POST | `/v1/voice/turns/:id/ack` | Watch 结果校验落盘后的幂等交付确认 |
 | WSS | `/v1/voice/events` | `turn.state` 推送；连接回放非终态及 30 分钟内未 ACK 终态 snapshot |
 | GET | `/v1/health` | 健康检查（无鉴权，仅源 IP 门禁） |

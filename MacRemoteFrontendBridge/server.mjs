@@ -633,6 +633,31 @@ export function createBridge(overrides = {}) {
     return { status: 200, body: ledger.projection(turn) }
   }
 
+  function handleDeliverTurn(requestId, authInfo) {
+    const turn = ledger.get(requestId)
+    if (!turn || turn.device_id !== authInfo.deviceId) throw new ApiError(ERR.NOT_FOUND)
+    const due = ledger.isTerminalDeliveryDue(turn, {
+      terminalTtlMs: CONFIG.result_delivery_ttl_ms ?? 30 * 60 * 1000,
+      maxDeliveryAttempts: CONFIG.result_delivery_max_attempts ?? 5,
+    })
+    if (!due) return { status: 204, body: null }
+
+    // Build the same envelope as the WSS `turn.state` event before advancing
+    // the shared delivery ledger. The projection includes the bounded inline
+    // audio payload when one is present, so HTTP remains a complete fallback.
+    const body = { type: 'turn.state', turn: ledger.projection(turn) }
+    const delivery = ledger.markResultRedelivered(requestId, {
+      baseDelayMs: CONFIG.result_delivery_backoff_base_ms ?? 2_000,
+      maxDelayMs: CONFIG.result_delivery_backoff_max_ms ?? 300_000,
+    })
+    log({
+      evt: 'result_redelivered', request_id: requestId, device_id: authInfo.deviceId,
+      status: turn.state, attempt: delivery?.attempt, retry_after_ms: delivery?.delay_ms,
+      cause: 'http_poll',
+    })
+    return { status: 200, body }
+  }
+
   // GET /v1/voice/turns/:id/audio（ESS-38）：结果语音的有界取回。
   // 请求级鉴权（HMAC 覆盖 path）+ 设备归属校验；支持 Range 断点续传，
   // sha256 随响应头下发，iPhone 校验一致后才 transferFile 给 Watch。
@@ -1010,6 +1035,15 @@ export function createBridge(overrides = {}) {
       if (m) {
         if (req.method !== 'GET') throw new ApiError(ERR.METHOD_NOT_ALLOWED)
         return handleGetTurnAudio(m[1], verify(), req, res)
+      }
+
+      m = pathName.match(/^\/v1\/voice\/turns\/([A-Za-z0-9_-]+)\/deliver$/)
+      if (m) {
+        if (req.method !== 'POST') throw new ApiError(ERR.METHOD_NOT_ALLOWED)
+        const authInfo = verify()
+        if (authInfo.requestId !== m[1]) throw new ApiError(ERR.MISSING_FIELD, 'x-request-id must match turn id')
+        const r = handleDeliverTurn(m[1], authInfo)
+        return r.status === 204 ? (res.writeHead(204), res.end()) : reply(r.status, r.body)
       }
 
       m = pathName.match(/^\/v1\/voice\/turns\/([A-Za-z0-9_-]+)\/cancel$/)

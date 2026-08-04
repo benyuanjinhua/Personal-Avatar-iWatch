@@ -88,6 +88,7 @@ export class BridgeClient {
   }
 
   getTurn(requestId) { return this.signed('GET', `/v1/voice/turns/${requestId}`) }
+  deliverTurn(requestId) { return this.signed('POST', `/v1/voice/turns/${requestId}/deliver`, { requestId }) }
   ackTurn(requestId) { return this.signed('POST', `/v1/voice/turns/${requestId}/ack`, { requestId, json: { protocol_version: 1 } }) }
 
   // ESS-184/207：探针注入是 loopback-only、不签 HMAC；回执与其他北向签名一致。
