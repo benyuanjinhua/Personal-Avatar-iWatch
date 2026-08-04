@@ -49,26 +49,28 @@ enum RecoveryFamily: String, Equatable {
 
     /// UI 是否允许出「重试（不用重新说）」按钮。
     ///
-    /// ESS-257 首版只关闭族 H 的重试按钮——这是本 issue 白梦林点头的唯一
-    /// UX 收紧。族 A/C 严格按 D2 也不应给「重试缓存录音」按钮（缓存对它们
-    /// 没用/没意义），但那是另一格 UX 变更，本 PR 不动，避免与既有回合的
-    /// 用户预期冲突（TODO：见 D2.1 恢复族全量落地跟进单）。
+    /// D2.0 原则 3：**恢复动作必须与错误成因匹配**。「重试（不用重新说）」
+    /// 是族 B 的动作——用缓存录音原样重发。其余族的按钮语义都不是缓存重
+    /// 发：A 走「知道了」（缓存录音本身有问题，重发只会再失败）；C 走
+    /// 「知道了」（对端忙，立刻重试无意义）；D 走「怎么开」（权限缺失，
+    /// 无论录音还是重试都被拦）；E 走「看文字」；F 走「重播」；G 不上卡片；
+    /// H 走「知道了」（结果未知，重跑有重复副作用）。
+    ///
+    /// ESS-257 首版收紧 H；ESS-261 收紧 A/C 并把 D/E/F/G 一并对齐到语义正
+    /// 确的位置——只有族 B 返回 true。视图层仍只读这一个字段，不按 code
+    /// 硬编码分支。
     var allowsCachedRetry: Bool {
-        switch self {
-        case .manualConfirm:
-            return false
-        case .reRecord, .retry, .waitAndRetry, .authorize, .textOnly, .replay, .silent:
-            return true
-        }
+        self == .retry
     }
 }
 
 enum ErrorCueCatalog {
     /// 兜底文案 —— 未映射的错误码/无 code 的失败仍要说话，不允许静默。
-    /// D2 E-99：族 B，允许一键重试。
+    /// D2 v1.1 E-99：族 B，允许一键重试。文案先劝重试、再退到重说，因为
+    /// 未知码下我们并不知道用户那句话有没有问题（D2.0 原则 5）。
     static let generic = ErrorCueEntry(
         code: "GENERIC",
-        text: "刚才没成功，你可以再说一次。",
+        text: "刚才这件事没成，点重试再来一次；还不行就再说一遍。",
         clip: "ErrorCue_Generic",
         recoveryFamily: .retry
     )
