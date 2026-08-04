@@ -26,6 +26,7 @@ export class MockGateway extends EventEmitter {
     this.mediaEvents = []
     this.droppedFrames = 0
     this.voiceClients = new Set()
+    this.audioAppendMessages = []
     this.announceSeq = 0
   }
 
@@ -163,6 +164,7 @@ export class MockGateway extends EventEmitter {
       }
       if (msg.type === 'audio.append') {
         this.mediaEvents.push(msg)
+        this.audioAppendMessages.push(msg)
         if (this.holder?.ws !== ws) {
           this.droppedFrames += 1 // 真实网关行为：非 owner 的帧静默丢弃
           return

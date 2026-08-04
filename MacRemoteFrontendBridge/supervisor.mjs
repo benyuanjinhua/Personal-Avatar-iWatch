@@ -615,7 +615,9 @@ export class QwenRealtimeSessionSupervisor {
   // opts.shouldRun：注入前询问是否仍需执行（排队期间被取消/判死的 turn 直接跳过）。
   // 停摆（零事件）/ 断链 → 销毁重建会话并以同一幂等键重放，最多 maxTurnAttempts
   // 次；其余失败（超时、所有权被真实用户抢占、cancel）不重放，保持原语义。
-  injectTurn(pcm16k, { label = '', onStart, shouldRun } = {}) {
+  injectTurn(pcm16k, {
+    label = '', onStart, shouldRun, parentRequestId = null, contextSummary = null,
+  } = {}) {
     const run = async () => {
       if (this.mediaSession) {
         throw Object.assign(new Error('realtime media owner is busy'), { code: 'ERR_VOICE_BUSY' })
@@ -639,7 +641,7 @@ export class QwenRealtimeSessionSupervisor {
         }
         this.touchIdle()
         try {
-          return await this.runTurn(pcm16k, label, attempt)
+          return await this.runTurn(pcm16k, label, attempt, { parentRequestId, contextSummary })
         } catch (error) {
           const retryable = (error.stalled === true || error.connectionLost === true
             || error.retryable === true) && !this.closedByUs
@@ -655,7 +657,7 @@ export class QwenRealtimeSessionSupervisor {
     return next
   }
 
-  runTurn(pcm16k, label, attempt = 1) {
+  runTurn(pcm16k, label, attempt = 1, { parentRequestId = null, contextSummary = null } = {}) {
     const frameBytes = Math.round(16000 * this.cfg.frameMs / 1000) * 2
     const silence = Buffer.alloc(Math.round(16000 * this.cfg.trailingSilenceMs / 1000) * 2)
     const payload = Buffer.concat([pcm16k, silence])
@@ -673,7 +675,13 @@ export class QwenRealtimeSessionSupervisor {
           throw error
         }
         const frame = payload.subarray(offset, offset + frameBytes)
-        this.ws.send(JSON.stringify({ type: 'audio.append', audio: frame.toString('base64') }))
+        const context = offset === 0 ? {
+          ...(parentRequestId ? { parent_request_id: parentRequestId } : {}),
+          ...(contextSummary ? { context_summary: contextSummary } : {}),
+        } : {}
+        this.ws.send(JSON.stringify({
+          type: 'audio.append', audio: frame.toString('base64'), ...context,
+        }))
         await sleep(this.cfg.paceMs)
       }
       this.record({ event: 'turn.inject.done' })

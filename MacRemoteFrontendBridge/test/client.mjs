@@ -69,7 +69,10 @@ export class BridgeClient {
     })
   }
 
-  createTurn(requestId, audioBuf, { codec = 'pcm16le_16k', durationMs = 1000, protocolVersion = 1, sha256 = null } = {}) {
+  createTurn(requestId, audioBuf, {
+    codec = 'pcm16le_16k', durationMs = 1000, protocolVersion = 1, sha256 = null,
+    parentRequestId, contextSummary,
+  } = {}) {
     return this.signed('POST', '/v1/voice/turns', {
       requestId,
       json: {
@@ -83,6 +86,8 @@ export class BridgeClient {
           sha256: sha256 ?? sha256hex(audioBuf),
         },
         audio_base64: audioBuf.toString('base64'),
+        ...(parentRequestId !== undefined ? { parent_request_id: parentRequestId } : {}),
+        ...(contextSummary !== undefined ? { context_summary: contextSummary } : {}),
       },
     })
   }

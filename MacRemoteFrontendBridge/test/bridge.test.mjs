@@ -153,6 +153,29 @@ describe('direct-answer path', () => {
     events.ws.close()
   })
 
+  it('accepts optional re-chat context and relays it on the first Mac WebSocket frame', async () => {
+    const id = rid()
+    const parentRequestId = rid()
+    const contextSummary = '问：现在几点？\n答：上午九点。'
+    const created = await ctx.client.createTurn(id, pcm(500), { parentRequestId, contextSummary })
+
+    assert.equal(created.status, 202)
+    await waitFor(() => ctx.mock.audioAppendMessages.some(message => message.parent_request_id === parentRequestId))
+    const relayed = ctx.mock.audioAppendMessages.find(message => message.parent_request_id === parentRequestId)
+    assert.equal(relayed.context_summary, contextSummary)
+  })
+
+  it('keeps legacy envelopes compatible and omits absent re-chat context from WebSocket frames', async () => {
+    const before = ctx.mock.audioAppendMessages.length
+    const created = await ctx.client.createTurn(rid(), pcm(500))
+
+    assert.equal(created.status, 202)
+    await waitFor(() => ctx.mock.audioAppendMessages.length > before)
+    const relayed = ctx.mock.audioAppendMessages.slice(before)
+    assert.ok(relayed.every(message => !('parent_request_id' in message)))
+    assert.ok(relayed.every(message => !('context_summary' in message)))
+  })
+
   it('same request_id + same body replays without a second execution; different body conflicts', async () => {
     const id = rid()
     const audio = pcm(300)
