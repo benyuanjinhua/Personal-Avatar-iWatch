@@ -169,6 +169,16 @@ export function createBridge(overrides = {}) {
   const MAX_PENDING_ANNOUNCEMENT_BYTES = (CONFIG.max_announcement_pcm_bytes ?? 5_760_000) * 4
   let pendingAnnouncementBytes = 0
 
+  // ESS-234 方案 B（β 路径 PM 决策）：后台 turn 的 task.completed 落账后若
+  // announcement 迟迟未到（现场 40+ 分钟仍无 announcement.started），从注入
+  // 阶段暂存的 realtime 24kHz PCM 合成 final result m4a，让 turn 达终态，
+  // 避免 Watch UI 一直显示"分身还在处理..."。窗口值 5s 保守但不会误伤"正常
+  // 但慢"：合成后 announcement 迟到走下方 bindAnnouncement 的幂等分支跳过，
+  // 不覆盖已交付的音频（元数据/文件都不被重写）。
+  const pendingRealtimeAudio = new Map() // request_id → { pcm24k: Buffer, at: number }
+  const realtimeFallbackTimers = new Map() // request_id → NodeJS.Timeout
+  const REALTIME_FALLBACK_DELAY_MS = CONFIG.realtime_fallback_delay_ms ?? 5_000
+
   function attachPendingResultAudio(requestId) {
     const entry = pendingResultAudio.get(requestId)
     const turn = ledger.get(requestId)
@@ -185,6 +195,15 @@ export function createBridge(overrides = {}) {
   async function bindAnnouncement(announcement, turn) {
     const { taskId, responseId, transcript, pcm24k, truncated } = announcement
     const requestId = turn.request_id
+    // ESS-234 幂等分支：realtime 兜底已经把结果音频交付出去后（含元数据 +
+    // 磁盘 m4a），迟到的 announcement 直接跳过——不再重编码、不覆盖文件、
+    // 不重投影，避免 sha256 与磁盘内容不一致，也避免 Watch 收到"同一段回复
+    // 的两个版本"。
+    const current = ledger.get(requestId)
+    if (current?.result?.audio) {
+      log({ evt: 'announcement_skipped_idempotent', request_id: requestId, task_id: taskId ?? null, response_id: responseId, reason: 'result_audio_already_attached' })
+      return
+    }
     if (pcm24k.length === 0) {
       // 纯文本播报：没有语音可交付，保留 transcript 作为语气摘要
       if (transcript) {
@@ -282,7 +301,80 @@ export function createBridge(overrides = {}) {
     if (projection.status === 'completed' && pendingResultAudio.has(projection.request_id)) {
       attachPendingResultAudio(projection.request_id)
     }
+    // ESS-234：后台 turn 进入 completed 且尚无结果音频 → 起 5s 窗口，窗口
+    // 过期仍无 announcement 就用 realtime 阶段暂存的 PCM 兜底合成 final
+    // result m4a。已交付音频 / 已有 pending announcement / 已经在等的 turn
+    // 都不再排。空 audio24k（如 background-no-ack）也照排——窗口过期后落
+    // realtime_fallback_skipped 诊断事件，取证时能看到"Bridge 认识到该 turn
+    // 缺音频但确实无原料可合成"，而不是黑箱地什么都不做。
+    // 终态非 completed（failed/cancelled）走清理。
+    if (projection.status === 'completed'
+        && projection.path === 'background'
+        && !projection.result?.audio
+        && !pendingResultAudio.has(projection.request_id)
+        && !realtimeFallbackTimers.has(projection.request_id)) {
+      scheduleRealtimeFallback(projection.request_id)
+    }
+    if (['failed', 'cancelled'].includes(projection.status)) {
+      cancelRealtimeFallback(projection.request_id)
+      pendingRealtimeAudio.delete(projection.request_id)
+    }
   })
+
+  function scheduleRealtimeFallback(requestId) {
+    const timer = setTimeout(() => {
+      realtimeFallbackTimers.delete(requestId)
+      // 定时器持有 this，async 异常必须自吃，避免炸事件循环
+      maybeSynthesizeRealtimeFallback(requestId).catch(error => {
+        log({ evt: 'realtime_fallback_crashed', request_id: requestId, err: String(error.message) })
+      })
+    }, REALTIME_FALLBACK_DELAY_MS)
+    timer.unref?.()
+    realtimeFallbackTimers.set(requestId, timer)
+  }
+
+  function cancelRealtimeFallback(requestId) {
+    const timer = realtimeFallbackTimers.get(requestId)
+    if (!timer) return
+    clearTimeout(timer)
+    realtimeFallbackTimers.delete(requestId)
+  }
+
+  async function maybeSynthesizeRealtimeFallback(requestId) {
+    const turn = ledger.get(requestId)
+    if (!turn || turn.state !== 'completed') { pendingRealtimeAudio.delete(requestId); return }
+    // 5s 窗口内 announcement 到了（走了 bindAnnouncement → attachResultAudio），
+    // 结果已带 audio → 直接放弃兜底，不重复合成也不覆盖
+    if (turn.result?.audio) { pendingRealtimeAudio.delete(requestId); return }
+    const entry = pendingRealtimeAudio.get(requestId)
+    if (!entry?.pcm24k?.length) {
+      log({ evt: 'realtime_fallback_skipped', request_id: requestId, task_id: turn.task_id ?? null, reason: 'empty_realtime_audio' })
+      pendingRealtimeAudio.delete(requestId)
+      return
+    }
+    try {
+      const m4a = await audio.encode24kToM4a(entry.pcm24k)
+      const meta = {
+        kind: 'result',
+        sha256: sha256hex(m4a),
+        codec: 'm4a',
+        duration_ms: Math.round(entry.pcm24k.length / 48),
+        size_bytes: m4a.length,
+      }
+      resultAudio.put(requestId, m4a)
+      ledger.attachResultAudio(requestId, {
+        audioBase64: m4a.length <= CONFIG.max_result_audio_bytes ? m4a.toString('base64') : null,
+        audio: meta,
+      })
+      log({ evt: 'result_synthesized_from_realtime', request_id: requestId, task_id: turn.task_id ?? null, cause: 'announcement_missing_after_task_completed', pcm_bytes: entry.pcm24k.length, m4a_bytes: m4a.length, duration_ms: meta.duration_ms })
+      log({ evt: 'l1_audio_ready', request_id: requestId, task_id: turn.task_id ?? null, source: 'realtime_fallback', response_id: null, codec: 'm4a', duration_ms: meta.duration_ms, size_bytes: meta.size_bytes, sha256: meta.sha256 })
+      ledger.markFirstAudioReady(requestId, { source: 'realtime_fallback' })
+    } catch (error) {
+      log({ evt: 'realtime_fallback_encode_failed', request_id: requestId, task_id: turn.task_id ?? null, err: String(error.message) })
+    } finally {
+      pendingRealtimeAudio.delete(requestId)
+    }
+  }
 
   const pendingAudioSweeper = setInterval(() => {
     const cutoff = Date.now() - PENDING_AUDIO_TTL_MS
@@ -295,6 +387,11 @@ export function createBridge(overrides = {}) {
         pendingAnnouncementBytes -= entry.pcm24k.length
         log({ evt: 'announcement_unmatched_expired', task_id: taskId, response_id: entry.responseId, reason: 'ttl' })
       }
+    }
+    // 兜底：realtime 兜底暂存超期回收（正常路径由 ledger.on('turn') 的
+    // failed/cancelled 分支或 maybeSynthesizeRealtimeFallback 已 delete）。
+    for (const [requestId, entry] of pendingRealtimeAudio) {
+      if (entry.at < cutoff) pendingRealtimeAudio.delete(requestId)
     }
   }, 60_000)
   pendingAudioSweeper.unref?.()
@@ -380,6 +477,14 @@ export function createBridge(overrides = {}) {
           log({ evt: 'l1_audio_ready', request_id: requestId, task_id: result.taskId, source: 'interim', response_id: null, codec: 'm4a', duration_ms: null, size_bytes: interimAudio.size_bytes, sha256: interimAudio.sha256, fallback: true })
         }
         emitInterim(requestId, { text: interimText, audio: interimAudio })
+        // ESS-234：注入阶段聚合的 24kHz PCM（realtime 阶段模型自由生成的短
+        // 应答，通常是委派前的口头回执）暂存下来。task.completed 后若
+        // announcement 一直不来，就用它兜底合成 final result，让 turn 达终态。
+        // 空 audio24k（如 background-no-ack 场景）不入表，maybeSynthesize 分支
+        // 会照旧走 empty_realtime_audio 诊断日志。
+        if (result.audio24k?.length) {
+          pendingRealtimeAudio.set(requestId, { pcm24k: result.audio24k, at: Date.now() })
+        }
         // Background path: only now (task event captured) is it background_accepted (§6).
         ledger.update(requestId, {
           task_id: result.taskId,
@@ -1134,6 +1239,9 @@ export function createBridge(overrides = {}) {
     clearInterval(resultDeliverySweep)
     for (const client of eventClients) client.ws.close()
     for (const timer of workTimers.values()) clearTimeout(timer)
+    for (const timer of realtimeFallbackTimers.values()) clearTimeout(timer)
+    realtimeFallbackTimers.clear()
+    pendingRealtimeAudio.clear()
     return Promise.all(servers.map(s => new Promise(r => s.close(r))))
   }
 
