@@ -146,10 +146,68 @@ export class DeviceAuth {
 export function normalizeIp(ip) {
   return ip.startsWith('::ffff:') ? ip.slice(7) : ip
 }
-export function inCgnat(ip) {
-  const m = ip.match(/^100\.(\d+)\.\d+\.\d+$/)
-  return Boolean(m && Number(m[1]) >= 64 && Number(m[1]) <= 127)
+
+// IPv4 dotted-quad → unsigned 32-bit int, or null if malformed.
+export function parseIPv4(text) {
+  if (typeof text !== 'string') return null
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(text)
+  if (!m) return null
+  let acc = 0
+  for (let i = 1; i <= 4; i++) {
+    const octet = Number(m[i])
+    if (!Number.isInteger(octet) || octet < 0 || octet > 255) return null
+    acc = (acc * 256) + octet
+  }
+  return acc >>> 0
 }
+
+// "a.b.c.d/N" → {base, mask} (unsigned 32-bit), or null if malformed. The
+// address must be the canonical network base for the given prefix so a typo
+// like "192.168.1.5/24" is rejected rather than silently widened.
+export function parseCidr(text) {
+  if (typeof text !== 'string') return null
+  const slash = text.indexOf('/')
+  if (slash < 0) return null
+  const base = parseIPv4(text.slice(0, slash))
+  if (base === null) return null
+  const bitsText = text.slice(slash + 1)
+  if (!/^\d+$/.test(bitsText)) return null
+  const bits = Number(bitsText)
+  if (bits < 0 || bits > 32) return null
+  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0
+  if (((base & mask) >>> 0) !== base) return null
+  return { base, mask, bits }
+}
+
+// Source gate for the northbound TLS listener. Loopback is always allowed;
+// every other peer must exactly match an IP listed in allowed_peer_ips or
+// fall inside a listed IPv4 CIDR (e.g. "192.168.1.0/24"). LAN-connected
+// Watch clients on the office WiFi come in through the CIDR path.
+// Malformed entries fail loudly at boot so a typo cannot silently widen
+// or narrow the gate.
 export function makeSourceGate(allowedPeerIps) {
-  return ip => ip === '127.0.0.1' || ip === '::1' || (inCgnat(ip) && allowedPeerIps.includes(ip))
+  const exact = new Set()
+  const cidrs = []
+  for (const entry of allowedPeerIps ?? []) {
+    if (typeof entry !== 'string' || entry.length === 0) {
+      throw new Error(`invalid allowed_peer_ips entry: ${JSON.stringify(entry)}`)
+    }
+    if (entry.includes('/')) {
+      const cidr = parseCidr(entry)
+      if (!cidr) throw new Error(`invalid CIDR in allowed_peer_ips: ${entry}`)
+      cidrs.push(cidr)
+    } else {
+      if (parseIPv4(entry) === null) throw new Error(`invalid IP in allowed_peer_ips: ${entry}`)
+      exact.add(entry)
+    }
+  }
+  return ip => {
+    if (ip === '127.0.0.1' || ip === '::1') return true
+    if (exact.has(ip)) return true
+    if (cidrs.length === 0) return false
+    const num = parseIPv4(ip)
+    if (num === null) return false
+    for (const c of cidrs) if (((num & c.mask) >>> 0) === c.base) return true
+    return false
+  }
 }

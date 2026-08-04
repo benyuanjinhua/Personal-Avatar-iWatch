@@ -121,6 +121,15 @@ node server.mjs                 # 配对码写入 state/pairing-code.txt（0600�
 配置见 `config.json`（绑定 loopback + Tailscale IP，从不绑 0.0.0.0；`allowed_peer_ips`
 为应用层第二道准入）。
 
+`allowed_peer_ips` 支持两种条目（ESS-175）：
+- **精确 IPv4**：如 `"100.80.229.218"`（Tailscale peer）或 `"192.168.1.42"`（Watch 固定 IP）。
+- **IPv4 CIDR**：如 `"192.168.1.0/24"`（办公网 LAN）；地址必须是所给前缀下的规范网络基址
+  （`192.168.1.5/24` 会被 fail-closed 拒绝）。
+
+loopback（`127.0.0.1` / `::1`）永远放行；其余不在列表内的源 IP 一律 `ERR_SOURCE_NOT_ALLOWED`。
+配置里若有无法解析的条目（IP 越界、CIDR 前缀 >32、非字符串等），Bridge 直接在
+`createBridge()` 抛错拒绝启动——防止一个字打错静默把所有 peer 关在外面或放进来。
+
 ## 测试
 
 ```bash
