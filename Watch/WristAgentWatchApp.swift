@@ -22,6 +22,9 @@ struct WristAgentWatchApp: App {
                     // 因此在旧 build 上白测了一轮。改为上报可执行文件时间戳，
                     // Bridge 侧据此在开测前判定表端 build 是否覆盖待验收 commit。
                     WatchLog.info("lifecycle", "cold_start", detail: BuildFingerprint.current().detail)
+                    // ESS-280 观测（PM 明确要求「排障时得知道他当时开没开」）：
+                    // 冷启动补落一次当前开关值，Bridge 侧按 build 反向对账。
+                    services.debugSettings.logStateAtLaunch()
                     // ESS-45：降腕后 frontmost 保持从默认 ~8s 延长到 70s，
                     // 与 ExtendedRuntimeSession（VoiceSessionKeeper）叠加覆盖长任务等待。
                     WKExtension.shared().isFrontmostTimeoutExtended = true
