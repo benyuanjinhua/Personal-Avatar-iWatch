@@ -41,6 +41,8 @@ struct VoiceTurnRecord: Codable, Equatable, Identifiable {
     /// 状态机（`currentState` 仍为 `.completed`）、不进 failure/cancelled 分支，
     /// 仅供时间线在完成事件之后追加一行「已打断」，保留语音供重播。
     var playbackInterruptedAt: Date? = nil
+    /// completed 之后独立到达的结果语音降级码；不改变 turn 终态。
+    var resultAudioErrorCode: String? = nil
 
     var id: String { requestId }
     var currentState: VoiceTurnState { events.last?.state ?? .recorded }
@@ -213,6 +215,19 @@ final class VoiceTurnJournal: ObservableObject {
     /// completed 且结果载荷已挂上后的回调（ESS-55 通知链路）。重复/乱序的
     /// completed 信封被状态机拒绝时不会触发（幂等第一层；通知记账是第二层）。
     var onResultRecorded: ((String) -> Void)?
+    var onResultAudioDegraded: ((String, String) -> Void)?
+
+    @discardableResult
+    func recordAudioDegradation(requestId: String, errorCode: String) -> Bool {
+        guard let index = turns.firstIndex(where: { $0.requestId == requestId }),
+              turns[index].currentState == .completed,
+              turns[index].result != nil,
+              turns[index].resultAudioErrorCode == nil else { return false }
+        turns[index].resultAudioErrorCode = errorCode
+        save()
+        onResultAudioDegraded?(requestId, errorCode)
+        return true
+    }
 
     /// ESS-55 未读机制：最近一个未读结果（新的在前）。
     var firstUnreadResult: VoiceTurnRecord? {

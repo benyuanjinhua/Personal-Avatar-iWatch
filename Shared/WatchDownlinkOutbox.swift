@@ -12,6 +12,8 @@ enum WatchDownlinkKind: String, Codable, CaseIterable {
     case result
     /// `VoiceStatusEnvelope`：Watch 时间线入账单位（ESS-29）。
     case voiceStatus
+    /// 结果文本已到、语音交付失败的独立降级事件（E-12）。
+    case resultAudioDegradation
     /// 结果语音文件（ESS-38 下行音频）。
     case speech
     /// ESS-184/207 下行链路探针文件；语义同 speech（transferFile 走音频），

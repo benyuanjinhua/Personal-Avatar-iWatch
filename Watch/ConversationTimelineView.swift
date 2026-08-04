@@ -85,6 +85,13 @@ struct TurnTimelineSection: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
+        // resultAudioErrorCode 由 journal 持久化；App 冷启动后时间线仍保留
+        // 「文字已到、语音未播出」的事实，而不是把 completed 展示成全成功。
+        if turn.resultAudioErrorCode != nil {
+            Label("语音未播出，可查看文字或重播", systemImage: "speaker.slash.fill")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+        }
     }
 
     private func title(for event: VoiceTurnEvent) -> String {

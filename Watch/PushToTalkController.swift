@@ -106,6 +106,11 @@ final class PushToTalkController: ObservableObject {
         journal.onResultWithoutSpeech = { [weak self] requestId in
             self?.presentTranscriptOnly(requestId: requestId)
         }
+        journal.onResultAudioDegraded = { [weak self] requestId, code in
+            guard let self else { return }
+            self.presentTranscriptOnly(requestId: requestId)
+            self.presentAvatarError(code: code, requestId: requestId)
+        }
 
         // 触觉 cue（ESS-55）：挂在状态入账事件上而非 UI——熄屏/视图未挂载时
         // 结果到达/失败仍能靠震动感知（ESS-45 的 ExtendedRuntimeSession 保证
@@ -212,6 +217,23 @@ final class PushToTalkController: ObservableObject {
     /// 透传到回调，做语义级判断。
     private static let resultAckMinBytes = 20_000
 
+    /// 播放终局映射到结果卡错误码。错误提示音使用 `error-<request_id>` 作为
+    /// context；它自己的播放失败只留结构化日志，不能再次弹错误卡并递归播报。
+    /// `.halted` 是可恢复的系统中断，继续由「未播完 · 重播」承担，不升级为错误。
+    static func avatarErrorCode(requestId: String, endgame: PlaybackEndgame) -> String? {
+        guard !requestId.hasPrefix("error-") else { return nil }
+        switch endgame {
+        case .exhausted, .resumeFailed:
+            return "ERR_PLAYBACK_ACTIVATION"
+        case .deferredTimeout:
+            return "ERR_PLAYBACK_DEFERRED_TIMEOUT"
+        case .playRejected:
+            return "ERR_PLAY_RETURNED_FALSE"
+        case .success, .halted:
+            return nil
+        }
+    }
+
     private func handlePlaybackEndgame(requestId: String?, bytes: Int, endgame: PlaybackEndgame) {
         // ESS-171 + ESS-233: 播放成功且是真回复（非 interim/fallback）才触发 ACK。
         // interim（16.8KB fallback）尚未使 turn 达终态，ACK 会被 Bridge 拒
@@ -235,7 +257,17 @@ final class PushToTalkController: ObservableObject {
             "player", "playback_endgame", requestId: requestId,
             detail: "endgame=\(endgame.logToken) reason=\(outcome.reasonLabel)"
         )
-        if let cue = outcome.haptic, shouldPlayHaptic(requestId: requestId, endgame: endgame) {
+        var presentedError = false
+        if let requestId {
+            if let code = Self.avatarErrorCode(requestId: requestId, endgame: endgame) {
+                presentTranscriptOnly(requestId: requestId)
+                presentAvatarError(code: code, requestId: requestId)
+                presentedError = true
+            }
+        }
+        // E-13/E-14 的 presenter 已发一次失败触觉；其他终局仍沿用 T2 cue。
+        if !presentedError, let cue = outcome.haptic,
+           shouldPlayHaptic(requestId: requestId, endgame: endgame) {
             WatchHaptics.play(cue, requestId: requestId)
         }
         guard outcome.shouldNotifyBanner, let requestId else { return }
@@ -304,6 +336,8 @@ final class PushToTalkController: ObservableObject {
                 "player", "auto_play_missing_speech", requestId: requestId,
                 code: "ERR_NO_SPEECH_FILE"
             )
+            presentTranscriptOnly(requestId: requestId)
+            presentAvatarError(code: "ERR_NO_SPEECH_FILE", requestId: requestId)
             return
         }
         guard playbackLedger.claim(token: fileName) else {
@@ -530,6 +564,8 @@ final class PushToTalkController: ObservableObject {
                 "player", "result_speech_load_failed", requestId: requestId,
                 detail: "vault=\(speechVault != nil)", code: "ERR_VAULT_LOAD"
             )
+            presentTranscriptOnly(requestId: requestId)
+            presentAvatarError(code: "ERR_VAULT_LOAD", requestId: requestId)
             return
         }
         let started = player.play(data: data, context: requestId) { [weak self] finished in

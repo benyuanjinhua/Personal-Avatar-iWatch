@@ -62,6 +62,29 @@ final class PlaybackEndgameChainTests: XCTestCase {
         return try Data(contentsOf: url)
     }
 
+    // MARK: - PushToTalkController 终局错误卡映射
+
+    func testErrorSpeechFailureDoesNotPresentAnotherAvatarError() {
+        XCTAssertNil(
+            PushToTalkController.avatarErrorCode(
+                requestId: "error-ess254-\(UUID().uuidString)", endgame: .exhausted
+            ),
+            "错误提示音自身失败不得递归创建第二张错误卡"
+        )
+    }
+
+    func testResumeFailedMapsToActivationErrorWhileHaltedStaysReplayable() {
+        let requestId = "ess254-\(UUID().uuidString)"
+        XCTAssertEqual(
+            PushToTalkController.avatarErrorCode(requestId: requestId, endgame: .resumeFailed),
+            "ERR_PLAYBACK_ACTIVATION"
+        )
+        XCTAssertNil(
+            PushToTalkController.avatarErrorCode(requestId: requestId, endgame: .halted),
+            "系统中断由未播完重播入口处理，不应升级为播放错误卡"
+        )
+    }
+
     // MARK: - 场景 A：exhausted 走完 T2 决策 → haptic → 幂等
 
     /// R-02.1 主证据：回放 09:12 轮1 激活失败场景。

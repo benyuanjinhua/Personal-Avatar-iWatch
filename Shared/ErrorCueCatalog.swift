@@ -107,6 +107,27 @@ enum ErrorCueCatalog {
                 clip: "ErrorCue_VoiceBusy",
                 recoveryFamily: .waitAndRetry
             )
+        case "ERR_AUDIO_FETCH":
+            return ErrorCueEntry(
+                code: code,
+                text: "答案在，只是语音没留住——文字给你看。",
+                clip: "ErrorCue_TextOnly",
+                recoveryFamily: .textOnly
+            )
+        case "ERR_PLAYBACK_ACTIVATION", "ERR_SESSION_ACTIVATION":
+            return ErrorCueEntry(
+                code: code,
+                text: "我没抢到扬声器，没能说出来——点重播，或直接看文字。",
+                clip: nil,
+                recoveryFamily: .replay
+            )
+        case "ERR_PLAY_RETURNED_FALSE", "ERR_PLAYBACK_DEFERRED_TIMEOUT":
+            return ErrorCueEntry(
+                code: code,
+                text: "语音没能播出，点重播试一次。",
+                clip: nil,
+                recoveryFamily: .replay
+            )
         // 三个 realtime 停摆错误码用户感知一致：都是「那句没通」，共享同一条语音。
         case "ERR_REALTIME_STALLED",
              "ERR_REALTIME_NO_EVENTS",

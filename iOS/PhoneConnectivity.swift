@@ -306,6 +306,14 @@ extension PhoneConnectivity: WatchFeedbackChannel {
         )
     }
 
+    func notifyWatch(resultAudioDegradation envelope: VoiceResultAudioDegradationEnvelope) {
+        guard let data = try? envelope.jsonData() else { return }
+        enqueueDownlink(
+            requestId: envelope.requestId, kind: .resultAudioDegradation,
+            key: VoiceResultAudioDegradationMessage.envelopeKey, data: data
+        )
+    }
+
     /// 结果语音走系统托管 transferFile；metadata 带含 speechSha256 的信封，
     /// Watch 端（WatchSettingsStore.storeSpeech）校验通过才加密入库并挂到回合。
     ///
@@ -453,7 +461,7 @@ extension PhoneConnectivity: WatchFeedbackChannel {
                     item.messageKey: payload,
                     Self.downlinkItemIdKey: item.id
                 ])
-            case .relayStatus, .progress, .result, .voiceStatus:
+            case .relayStatus, .progress, .result, .voiceStatus, .resultAudioDegradation:
                 downlink.markInFlight(id: item.id)
                 // transferUserInfo 是系统托管的可靠队列，且有 didFinish 回执——
                 // 它、而不是 sendMessage，才是「送达」的判据。

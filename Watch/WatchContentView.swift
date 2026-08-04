@@ -330,6 +330,14 @@ struct WatchContentView: View {
                     .foregroundStyle(.secondary)
             }
 
+            // 错误码随 VoiceTurnJournal 落盘；冷启动恢复后仍明确告诉用户
+            // 本轮只有文字结果、语音没有成功播出，避免 completed 被误读为已听见。
+            if turn.resultAudioErrorCode != nil {
+                Label("语音未播出，可查看文字或重播", systemImage: "speaker.slash.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            }
+
             if turn.speechFileName != nil {
                 // ESS-58：播放被截断（锁屏挂起等）的回合显式标「未播完」，
                 // 语音保留在加密仓，可从头重播——中断不静默丢失。
