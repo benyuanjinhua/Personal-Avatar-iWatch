@@ -140,7 +140,7 @@ final class BridgeTurnProjectionTests: XCTestCase {
         ))
         let envelope = try XCTUnwrap(turn.statusEnvelope())
         XCTAssertEqual(envelope.state, .failed)
-        XCTAssertEqual(envelope.detail, "ERR_WORK_TIMEOUT")
+        XCTAssertEqual(envelope.detail, "刚才这件事没成，点重试再来一次；还不行就再说一遍。")
         XCTAssertEqual(envelope.failureStage, .execution)
     }
 
@@ -151,7 +151,7 @@ final class BridgeTurnProjectionTests: XCTestCase {
             XCTAssertEqual(turn.detailText, "没听清，请重说")
         }
         let other = try XCTUnwrap(projection(status: "failed", extra: #""error":"ERR_WORK_TIMEOUT""#))
-        XCTAssertEqual(other.detailText, "ERR_WORK_TIMEOUT", "其余失败仍透传稳定错误码")
+        XCTAssertEqual(other.detailText, "刚才这件事没成，点重试再来一次；还不行就再说一遍。")
     }
 
     func testPermissionRequiredNeedsPayload() throws {
