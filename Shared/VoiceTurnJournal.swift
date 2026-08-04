@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import os
 
 /// 一次状态变更事件（时间线的一行）。
 struct VoiceTurnEvent: Codable, Equatable {

@@ -132,9 +132,16 @@ final class WatchVoiceTransport: ObservableObject {
             WatchLog.error("transport", "result_audio_payload_undecodable", code: "ERR_DECODE")
             return
         }
-        guard let audioData = try? Data(contentsOf: tempURL) else {
+        let audioData: Data
+        do {
+            audioData = try Data(contentsOf: tempURL)
+        } catch {
+            let nsError = error as NSError
+            let code = (nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileReadNoSuchFileError)
+                ? "ERR_FILE_NOT_FOUND" : "ERR_FILE_READ"
             WatchLog.error(
-                "transport", "result_audio_unreadable", requestId: payload.requestId, code: "ERR_FILE_READ"
+                "transport", "result_audio_unreadable", requestId: payload.requestId,
+                detail: error.localizedDescription, code: code
             )
             return
         }
