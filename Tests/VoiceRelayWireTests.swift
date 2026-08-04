@@ -120,16 +120,41 @@ final class VoiceRelayEventsTests: XCTestCase {
 
     func testRelayStatusUpdateRoundTripUsesContractKeys() throws {
         let update = RelayStatusUpdate(
-            requestId: "req-1", phase: .waitingForMac, detail: "已到手机，等待 Mac",
+            requestId: "req-1", phase: .failed, detail: "Mac 没有应答",
+            errorCode: "ERR_TRANSPORT", failureStage: .macUnreachable,
             updatedAt: Date(timeIntervalSince1970: 1_753_920_000)
         )
         let data = try update.jsonData()
         let json = String(data: data, encoding: .utf8)!
-        for key in ["protocol_version", "request_id", "phase", "updated_at"] {
+        for key in ["protocol_version", "request_id", "phase", "error_code", "failure_stage", "updated_at"] {
             XCTAssertTrue(json.contains("\"\(key)\""), "缺少契约字段 \(key)")
         }
-        XCTAssertTrue(json.contains("waiting_for_mac"), "phase 用 §6 状态机字符串")
+        XCTAssertTrue(json.contains("ERR_TRANSPORT"))
+        XCTAssertTrue(json.contains("waiting_for_mac"), "failure_stage 用 §6 状态机字符串")
         XCTAssertEqual(RelayStatusUpdate.decode(from: data), update)
+    }
+
+    func testLegacyRelayStatusWithoutFailureFieldsStillDecodes() {
+        let json = """
+        {"protocol_version":"1.0","request_id":"req-1","phase":"waiting_for_mac","detail":"已到手机","updated_at":"2025-08-01T00:00:00Z"}
+        """
+        let update = RelayStatusUpdate.decode(from: Data(json.utf8))
+        XCTAssertEqual(update?.phase, .waitingForMac)
+        XCTAssertNil(update?.errorCode)
+        XCTAssertNil(update?.failureStage)
+    }
+
+    func testFailedRelayStatusProjectsStandardTerminalEnvelope() {
+        let requestId = UUID().uuidString.lowercased()
+        let update = RelayStatusUpdate(
+            requestId: requestId, phase: .failed, detail: "Mac 没有应答",
+            errorCode: "ERR_TRANSPORT", failureStage: .macUnreachable
+        )
+        let envelope = update.terminalFailureEnvelope
+        XCTAssertEqual(envelope?.state, .failed)
+        XCTAssertEqual(envelope?.errorCode, "ERR_TRANSPORT")
+        XCTAssertEqual(envelope?.failureStage, .macUnreachable)
+        XCTAssertNil(RelayStatusUpdate(requestId: requestId, phase: .waitingForMac).terminalFailureEnvelope)
     }
 
     func testVoiceRelayResultPayloadRoundTrip() throws {

@@ -78,6 +78,10 @@ struct RelayStatusUpdate: Codable, Equatable {
     let phase: VoiceRelayPhase
     /// 面向用户的补充说明（如失败原因、权限摘要）；不含凭据与内部路径。
     let detail: String?
+    /// ESS-253 / D2 C1：iPhone 本地终态失败也必须携带稳定短码，不能只塞进 detail。
+    let errorCode: String?
+    /// ESS-253 / D2 C2：失败发生在等待手机、等待 Mac 或执行阶段。
+    let failureStage: VoiceFailureStage?
     let updatedAt: Date
 
     enum CodingKeys: String, CodingKey {
@@ -85,14 +89,25 @@ struct RelayStatusUpdate: Codable, Equatable {
         case requestId = "request_id"
         case phase
         case detail
+        case errorCode = "error_code"
+        case failureStage = "failure_stage"
         case updatedAt = "updated_at"
     }
 
-    init(requestId: String, phase: VoiceRelayPhase, detail: String? = nil, updatedAt: Date = Date()) {
+    init(
+        requestId: String,
+        phase: VoiceRelayPhase,
+        detail: String? = nil,
+        errorCode: String? = nil,
+        failureStage: VoiceFailureStage? = nil,
+        updatedAt: Date = Date()
+    ) {
         self.protocolVersion = VoiceRequestEnvelope.currentProtocolVersion
         self.requestId = requestId
         self.phase = phase
         self.detail = detail
+        self.errorCode = errorCode
+        self.failureStage = failureStage
         self.updatedAt = updatedAt
     }
 
@@ -102,6 +117,20 @@ struct RelayStatusUpdate: Codable, Equatable {
 
     static func decode(from data: Data) -> RelayStatusUpdate? {
         try? RelayEventCoding.decoder.decode(RelayStatusUpdate.self, from: data)
+    }
+
+    /// D1 S-THINK → S-FAIL：旧 caption 通道收到带码失败时，转换成 journal 的
+    /// 标准信封，复用现有错误卡片、触觉和幂等终态处理。非失败状态仍只作 caption。
+    var terminalFailureEnvelope: VoiceStatusEnvelope? {
+        guard phase == .failed else { return nil }
+        return .status(
+            requestId: requestId,
+            state: .failed,
+            occurredAt: updatedAt,
+            detail: detail,
+            failureStage: failureStage,
+            errorCode: errorCode
+        )
     }
 }
 

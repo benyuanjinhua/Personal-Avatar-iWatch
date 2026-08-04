@@ -79,6 +79,16 @@ final class WatchVoiceTransport: ObservableObject {
             detail: "phase=\(update.phase.rawValue)\(update.detail.map { " detail=\($0)" } ?? "")"
         )
         remoteStatus = update
+        // ESS-253 / U1：iPhone 本地失败不会经过 Bridge WSS 的 VoiceStatusEnvelope。
+        // 在此把带码旧回执归一成标准终态，进入 D2 错误卡片/触觉链。
+        if let envelope = update.terminalFailureEnvelope {
+            let applied = journal?.apply(envelope) ?? false
+            WatchLog.error(
+                "turn", "relay_terminal_failure_projected", requestId: update.requestId,
+                detail: "applied=\(applied) failure_stage=\(update.failureStage?.rawValue ?? "unknown")",
+                code: update.errorCode
+            )
+        }
         // ESS-231：任何 phase >= accepted 都算 iPhone 已把 turn 转到 Bridge，
         // 取消兜底 watchdog；同时清除 UI 告警状态。
         if update.phase != .recorded && update.phase != .waitingForPhone && update.phase != .waitingForMac {
