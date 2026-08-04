@@ -31,7 +31,20 @@ export class TurnLedger extends EventEmitter {
   load() {
     try {
       const raw = JSON.parse(readFileSync(this.path, 'utf8'))
-      for (const [id, turn] of Object.entries(raw.turns || {})) this.turns.set(id, turn)
+      for (const [id, turn] of Object.entries(raw.turns || {})) {
+        // Pre-ESS-235 ledgers have no timing object. Backfill only timestamps
+        // from the Bridge clock domain; Watch timestamps cannot be reconstructed.
+        turn.timing = {
+          watch_created_at: null,
+          bridge_accepted_at: turn.created_at ?? null,
+          processing_started_at: null,
+          first_audio_ready_at: null,
+          first_audio_source: null,
+          completed_at: null,
+          ...turn.timing,
+        }
+        this.turns.set(id, turn)
+      }
     } catch { /* first boot */ }
   }
 
@@ -91,6 +104,7 @@ export class TurnLedger extends EventEmitter {
         bridge_accepted_at: now,
         processing_started_at: null,
         first_audio_ready_at: null,
+        first_audio_source: null,
         completed_at: null,
       },
     }
@@ -198,7 +212,10 @@ export class TurnLedger extends EventEmitter {
     if (typeof turn === 'string') turn = this.turns.get(turn)
     if (!turn) return null
     const timing = { ...turn.timing }
-    const startAt = Date.parse(timing.watch_created_at || timing.bridge_accepted_at)
+    // Derived durations must stay in one clock domain. watch_created_at is
+    // retained for trace correlation only; mixing Watch and Bridge wall clocks
+    // would silently add clock skew to P50/P95.
+    const startAt = Date.parse(timing.bridge_accepted_at)
     const firstAudioAt = Date.parse(timing.first_audio_ready_at)
     const completedAt = Date.parse(timing.completed_at)
     if (Number.isFinite(startAt) && Number.isFinite(firstAudioAt)) timing.voice_ttft_ms = Math.max(0, firstAudioAt - startAt)
