@@ -48,7 +48,11 @@ final class SpeechPlayerUserInterruptTests: XCTestCase {
         WatchLog.setObserver { module, event, detail, errorCode in
             sink.append(CapturedEvent(module: module, event: event, detail: detail, errorCode: errorCode))
         }
-        SpeechPlayer.sharedSessionOwner = nil
+        // ESS-277: 不在 setUp 中清 sharedSessionOwner——本类唯一测试
+        // testUserInterruptStopsPlaybackWithoutTriggeringFailureChain 在
+        // 测试体开头先 waitForHostWelcomeToFinish()，宿主欢迎语在此期间
+        // 播完并自然 release 会清掉 owner。提前清会导致欢迎语 release 时
+        // 找不到 owner、session 残留激活，引发后续测试崩溃。
     }
 
     override func tearDown() {
