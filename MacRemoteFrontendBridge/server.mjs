@@ -57,6 +57,8 @@ export function createBridge(overrides = {}) {
     stateDir,
     timestampSkewMs: CONFIG.timestamp_skew_ms,
     pairingCodeTtlMs: CONFIG.pairing_code_ttl_ms,
+    // ESS-175: 允许 config 声明可 pair 的固定 device_id 列表（如 jackson-watch）。
+    allowedPairingDeviceIds: CONFIG.allowed_pairing_device_ids ?? [],
     log,
   })
   const ledger = new TurnLedger({

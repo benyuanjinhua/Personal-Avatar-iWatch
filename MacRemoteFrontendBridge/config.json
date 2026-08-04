@@ -6,6 +6,7 @@
   "tls_key": "./certs/bridge.key",
   "state_dir": "./state",
   "allowed_peer_ips": ["100.80.229.218", "100.80.125.22"],
+  "allowed_pairing_device_ids": ["jackson-iphone", "jackson-watch"],
   "protocol_version": 1,
 
   "max_audio_bytes": 5242880,
