@@ -62,6 +62,7 @@
 		770DB683BEC61B9851F2B0D1 /* WatchDownlinkOutbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA60FA5DC7EA82EC5729B54B /* WatchDownlinkOutbox.swift */; };
 		7C465E62628112B008899B51 /* SpeechPlayerInterruptionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D83133781FDC42821BB13DF /* SpeechPlayerInterruptionTests.swift */; };
 		7CBCA51C89D61E95EAD52B9D /* SelfCheck.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9D95B86CF79B5796D5EA9DC /* SelfCheck.swift */; };
+		7CD3A14FB1B8F7A79D40B608 /* SpeechPlayerUserInterruptTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8BFD3B8E68CD0ED9C78C500 /* SpeechPlayerUserInterruptTests.swift */; };
 		7CE7CD69630867506FAD3360 /* VoiceRequestInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AB8CD6D695437D845CE87AF /* VoiceRequestInbox.swift */; };
 		7E75E969A72336DBE618BEBE /* VoiceInteractionCue.swift in Sources */ = {isa = PBXBuildFile; fileRef = D70795CA9CC1B496467FE2B8 /* VoiceInteractionCue.swift */; };
 		7F172712436C104970B3035C /* VoiceRelayWire.swift in Sources */ = {isa = PBXBuildFile; fileRef = 035DF4EEFBF9F540A0B791F7 /* VoiceRelayWire.swift */; };
@@ -212,6 +213,7 @@
 		C608A2AC1FA2B2981F7EB790 /* MainStatusCopy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainStatusCopy.swift; sourceTree = "<group>"; };
 		C6F558DCDF4B9CA8F0BA2E2D /* VoiceTurnJournal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceTurnJournal.swift; sourceTree = "<group>"; };
 		C85D18E0360A2A1EBDF04975 /* WatchSettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchSettingsStore.swift; sourceTree = "<group>"; };
+		C8BFD3B8E68CD0ED9C78C500 /* SpeechPlayerUserInterruptTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechPlayerUserInterruptTests.swift; sourceTree = "<group>"; };
 		CA60FA5DC7EA82EC5729B54B /* WatchDownlinkOutbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchDownlinkOutbox.swift; sourceTree = "<group>"; };
 		CA9DA8A923948AE9124C19F9 /* AvatarErrorPresenterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AvatarErrorPresenterTests.swift; sourceTree = "<group>"; };
 		CB1D464D47EC34B55A8C8411 /* AgentModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentModels.swift; sourceTree = "<group>"; };
@@ -363,6 +365,7 @@
 				9FDE52A8C1B2854E4646A286 /* SpeechPlayerInterruptionEvidenceTests.swift */,
 				0D83133781FDC42821BB13DF /* SpeechPlayerInterruptionTests.swift */,
 				AAD9BD4DBA7700C65F134EF3 /* SpeechPlayerReleaseTests.swift */,
+				C8BFD3B8E68CD0ED9C78C500 /* SpeechPlayerUserInterruptTests.swift */,
 				F9C49719F53E734FE041D10B /* VoiceOrbModeTests.swift */,
 			);
 			path = WatchTests;
@@ -625,6 +628,7 @@
 				D51204118681270691727D4C /* SpeechPlayerInterruptionEvidenceTests.swift in Sources */,
 				7C465E62628112B008899B51 /* SpeechPlayerInterruptionTests.swift in Sources */,
 				68EF687B6F0F17A356355833 /* SpeechPlayerReleaseTests.swift in Sources */,
+				7CD3A14FB1B8F7A79D40B608 /* SpeechPlayerUserInterruptTests.swift in Sources */,
 				BE736ADFC210C176CA197273 /* VoiceOrbModeTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

@@ -20,21 +20,32 @@ struct SubtitleSession: Identifiable, Equatable {
 /// 字幕式播放视图（ESS-48 MVP）：语音播放的同时展示全文，按播放进度
 /// 逐句高亮 + 自动滚动；播完停留在全文视图可回看。
 /// 时间轴映射按字符数加权（SubtitleScript），不是线性均分。
+///
+/// ESS-259 B-STOP：主屏文案「可点字幕打断」的真实入口——正在播放时轻点
+/// 任意位置停止播放、留在 S-READ 全文可回看；不重新入队、不算失败、
+/// 不发 `.failure` 触觉、不出错误卡片。
 struct SubtitlePlaybackView: View {
     let session: SubtitleSession
     @ObservedObject var player: SpeechPlayer
+    /// ESS-259：用户轻点字幕区触发的停止回调。仅在正在播放时才被调用；
+    /// nil 表示只读回看态（例如「查看全文」入口，无音频可停）。
+    let onUserStop: (() -> Void)?
 
     private let script: SubtitleScript
     @State private var currentIndex = 0
     /// 本会话内音频是否播过：区分「播完回看」与「从未进播放态」。
     @State private var hasTracked = false
+    /// ESS-259：本会话是否被用户轻点打断过——决定收尾文案「已打断」/「已播完」。
+    /// 视图级 state：sheet(item:) 每次新会话都会重建视图，天然与 session 生命周期对齐。
+    @State private var didUserStop = false
 
     /// 200ms 轮询 currentTime：句级高亮足够，且远低于表盘刷新成本敏感区。
     private let ticker = Timer.publish(every: 0.2, on: .main, in: .common).autoconnect()
 
-    init(session: SubtitleSession, player: SpeechPlayer) {
+    init(session: SubtitleSession, player: SpeechPlayer, onUserStop: (() -> Void)? = nil) {
         self.session = session
         self.player = player
+        self.onUserStop = onUserStop
         self.script = SubtitleScript.make(text: session.text)
     }
 
@@ -62,6 +73,11 @@ struct SubtitlePlaybackView: View {
                     }
                 }
                 .padding(.horizontal, 4)
+                // ESS-259：整块内容都是「点一下就停」的靶区——包含空白/句间
+                // 空隙。`contentShape(Rectangle())` 保证 ScrollView 里没有文本的
+                // 空白位置也接收点击；仅在正在播放时消费点击，回看态透传。
+                .contentShape(Rectangle())
+                .onTapGesture { userTappedToStop() }
             }
             .onReceive(ticker) { _ in tick(proxy: proxy) }
         }
@@ -107,14 +123,36 @@ struct SubtitlePlaybackView: View {
     @ViewBuilder
     private var statusHeader: some View {
         if isPlayingThisSession {
-            Label("播放中", systemImage: "speaker.wave.2.fill")
+            VStack(alignment: .leading, spacing: 2) {
+                Label("播放中", systemImage: "speaker.wave.2.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.cyan)
+                // ESS-259：明确告诉用户「可点字幕打断」的确切姿势，
+                // 与主屏副标题承诺对齐；仅在能真正停止（有回调）时显示。
+                if onUserStop != nil {
+                    Text("轻点任意位置停止")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } else if didUserStop {
+            Label("已打断，可回看", systemImage: "hand.tap")
                 .font(.caption2)
-                .foregroundStyle(.cyan)
+                .foregroundStyle(.secondary)
         } else if isFinished {
             Label("已播完，可回看", systemImage: "checkmark.circle")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
+    }
+
+    /// ESS-259：用户轻点触发停止。仅在本会话正在播放时向上层派发；否则
+    /// 不消费点击（避免回看态误产生 log/journal 事件）。didUserStop 标志
+    /// 立刻切文案，不等 player.isPlaying 传回来——UI 感知延迟不该超过一帧。
+    private func userTappedToStop() {
+        guard let onUserStop, isPlayingThisSession else { return }
+        didUserStop = true
+        onUserStop()
     }
 
     /// 中断恢复（降腕/来电，依赖 ESS-45）后无需特判：currentTime 即恢复点，

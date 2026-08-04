@@ -141,8 +141,12 @@ struct WatchContentView: View {
         // activeTurn——旧的 onChange 触发在「语音后到 + 回合已切换/已判失败」时
         // 会静默漏播。
         // 字幕式播放视图（ESS-48）：播放开始/纯文本结果到达时由控制器置入会话。
+        // ESS-259 B-STOP：正在播放本回合语音时轻点字幕区打断，只清播放不改状态、
+        // 不重新入队、不算失败——参见 `PushToTalkController.stopPlaybackByUser`。
         .sheet(item: $pushToTalk.subtitleSession) { session in
-            SubtitlePlaybackView(session: session, player: pushToTalk.player)
+            SubtitlePlaybackView(session: session, player: pushToTalk.player) {
+                pushToTalk.stopPlaybackByUser(requestId: session.requestId)
+            }
         }
         // ESS-163：Debug 面板作为覆盖 sheet 呈现——不占用首屏导航栈，
         // 手表下滑关闭；避免 NavigationLink 在首屏留下可见项。
@@ -337,7 +341,9 @@ struct WatchContentView: View {
             return MainStatusCopy(title: "我在听", subtitle: "松开发送（最长 60 秒）")
         }
         if isSpeaking {
-            return MainStatusCopy(title: "AI 分身正在说话…", subtitle: "全文同步展示，可点字幕打断")
+            // ESS-259 B-STOP：副标题承诺的「可点字幕打断」在 SubtitlePlaybackView
+            // 里由 `.onTapGesture` + `PushToTalkController.stopPlaybackByUser` 兑现。
+            return MainStatusCopy(title: "AI 分身正在说话…", subtitle: "全文同步展示，轻点字幕打断")
         }
         guard let turn = activeTurn, turn.isActive else {
             return MainStatusCopy(

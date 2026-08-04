@@ -303,6 +303,62 @@ final class VoiceTurnJournalTests: XCTestCase {
         }
         XCTAssertEqual(journal.turns.count, 3)
     }
+
+    /// ESS-259 B-STOP：用户轻点字幕区打断结果语音——只记时间戳、不改状态、
+    /// 不动 speechFileName（保留供重播）、幂等。
+    func testRecordPlaybackInterruptedDoesNotAffectStateOrSpeech() {
+        let journal = VoiceTurnJournal(directory: directory)
+        let id = newRequestId()
+        journal.begin(requestId: id)
+        journal.attachSpeech(requestId: id, fileName: "\(id).m4a")
+        journal.apply(.status(
+            requestId: id,
+            state: .completed,
+            result: VoiceResultPayload(summary: "已完成", isTruncated: false, speechSha256: "sha", speechDurationMs: 1200)
+        ))
+        let stateBefore = journal.turn(withId: id)!.currentState
+        let fileNameBefore = journal.turn(withId: id)!.speechFileName
+
+        let stamped = Date(timeIntervalSince1970: 1_800_000_000)
+        XCTAssertTrue(journal.recordPlaybackInterrupted(requestId: id, at: stamped))
+
+        let turn = journal.turn(withId: id)!
+        XCTAssertEqual(turn.playbackInterruptedAt, stamped)
+        XCTAssertEqual(turn.currentState, stateBefore, "打断不得改状态机（回合仍是 completed）")
+        XCTAssertEqual(turn.speechFileName, fileNameBefore, "语音必须留在加密仓可重播")
+    }
+
+    /// 幂等：同一次播放里连点两下只记录第一次的时间戳。
+    func testRecordPlaybackInterruptedIsIdempotent() {
+        let journal = VoiceTurnJournal(directory: directory)
+        let id = newRequestId()
+        journal.begin(requestId: id)
+        let first = Date(timeIntervalSince1970: 1_800_000_000)
+        let second = first.addingTimeInterval(0.5)
+        XCTAssertTrue(journal.recordPlaybackInterrupted(requestId: id, at: first))
+        XCTAssertFalse(journal.recordPlaybackInterrupted(requestId: id, at: second),
+                       "第二次点击必须被丢弃，保持首次时间戳")
+        XCTAssertEqual(journal.turn(withId: id)?.playbackInterruptedAt, first)
+    }
+
+    /// 打断标记随 voice-turns.json 持久化——重启 App 仍显示「已打断」时间线行。
+    func testRecordPlaybackInterruptedPersists() {
+        let id = newRequestId()
+        let stamped = Date(timeIntervalSince1970: 1_800_000_000)
+        do {
+            let journal = VoiceTurnJournal(directory: directory)
+            journal.begin(requestId: id)
+            journal.recordPlaybackInterrupted(requestId: id, at: stamped)
+        }
+        let reopened = VoiceTurnJournal(directory: directory)
+        XCTAssertEqual(reopened.turn(withId: id)?.playbackInterruptedAt, stamped)
+    }
+
+    /// 未知 request_id：不写盘、返回 false。
+    func testRecordPlaybackInterruptedUnknownRequestIdIgnored() {
+        let journal = VoiceTurnJournal(directory: directory)
+        XCTAssertFalse(journal.recordPlaybackInterrupted(requestId: newRequestId()))
+    }
 }
 
 /// ESS-55：文字与语音解耦 + 未读结果机制。

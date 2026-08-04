@@ -77,6 +77,14 @@ struct TurnTimelineSection: View {
                 .font(.caption2)
                 .foregroundStyle(decision ? .green : .orange)
         }
+
+        // ESS-259 B-STOP：用户轻点字幕区打断结果语音后追加一行「已打断」——
+        // 回合状态仍是 `.completed`（不算失败），语音留在加密仓可重播。
+        if turn.playbackInterruptedAt != nil {
+            Label("你打断了语音播放（可重播）", systemImage: "hand.tap")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
     }
 
     private func title(for event: VoiceTurnEvent) -> String {

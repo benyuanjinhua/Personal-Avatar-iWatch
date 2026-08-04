@@ -37,6 +37,10 @@ struct VoiceTurnRecord: Codable, Equatable, Identifiable {
     /// ESS-180：failed 事件的 Bridge 稳定错误码（`ERR_*`）；成功回合恒为 nil。
     /// UI 拿它查 `ErrorCueCatalog` 决定拟人化文案与语音提示。
     var errorCode: String?
+    /// ESS-259 B-STOP：用户主动点字幕区打断结果语音播放的时刻。设值不改
+    /// 状态机（`currentState` 仍为 `.completed`）、不进 failure/cancelled 分支，
+    /// 仅供时间线在完成事件之后追加一行「已打断」，保留语音供重播。
+    var playbackInterruptedAt: Date? = nil
 
     var id: String { requestId }
     var currentState: VoiceTurnState { events.last?.state ?? .recorded }
@@ -229,6 +233,18 @@ final class VoiceTurnJournal: ObservableObject {
     /// 按 request_id 查找回合（结果语音定向交付用）。
     func turn(withId requestId: String) -> VoiceTurnRecord? {
         turns.first(where: { $0.requestId == requestId })
+    }
+
+    /// ESS-259 B-STOP：记录一次「用户点字幕区打断播放」。首次调用落时间戳并
+    /// 持久化；重复调用幂等——同一次播放里连点两下不叠加。不改状态机、
+    /// 不动 `speechFileName`（语音留仓可重播）、不派发 onStateApplied。
+    @discardableResult
+    func recordPlaybackInterrupted(requestId: String, at date: Date = Date()) -> Bool {
+        guard let index = turns.firstIndex(where: { $0.requestId == requestId }) else { return false }
+        guard turns[index].playbackInterruptedAt == nil else { return false }
+        turns[index].playbackInterruptedAt = date
+        save()
+        return true
     }
 
     /// 结果语音已加密落盘。
