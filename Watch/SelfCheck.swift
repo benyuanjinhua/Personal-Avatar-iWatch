@@ -60,6 +60,15 @@ final class SelfCheckRunner: ObservableObject {
         return outcome
     }
 
+    /// ESS-163 复审补丁：Debug 面板要在 `.idle`（本进程冷启动同 build 已跑过、
+    /// autoRunIfNeeded 走了 selfcheck_skipped 分支）时也能展示最近一次结论。
+    /// 本进程刚跑完 → 取活体 `stage`；否则退到磁盘 RunRecord。旧记录缺
+    /// failedStep/reason 字段无法还原时返回 nil，UI 走空态而不是硬编默认。
+    var latestOutcome: SelfCheckPolicy.Outcome? {
+        if case .finished(let outcome) = stage { return outcome }
+        return loadLastRun()?.outcome
+    }
+
     // MARK: - 入口
 
     /// 冷启动入口：同一 build 只跑一次（inconclusive 例外，见 SelfCheckPolicy）。
@@ -525,7 +534,9 @@ final class SelfCheckRunner: ObservableObject {
             WatchLog.error("selfcheck", "selfcheck_finished", detail: detail, code: code)
             errorInfo = ClientLogEntry.ErrorInfo(code: code, description: detail)
         }
-        saveLastRun(SelfCheckPolicy.RunRecord(fingerprintDetail: fingerprint, result: outcome.result))
+        // ESS-163：改走 from(outcome:)，把 failedStep / code / reason 一并落盘，
+        // 下次冷启动同 build 跳过自检时 Debug 面板能完整还原结论文案。
+        saveLastRun(SelfCheckPolicy.RunRecord.from(outcome: outcome, fingerprintDetail: fingerprint))
         stage = .finished(outcome)
         // 结论必须尽快到 Bridge——门禁判定读的是 bridge.log，不是手表本地文件。
         WatchLogShipper.shared.ship(reason: "selfcheck_finished")

@@ -91,14 +91,74 @@ enum SelfCheckPolicy {
     }
 
     /// 上一次自检的持久化记录（UserDefaults JSON）。
+    /// ESS-163 复审补丁：Debug 面板在冷启动同 build 已跑过（`selfcheck_skipped`）时
+    /// 需要从这里还原「最近一次结果」。追加 `failedStep` / `code` /
+    /// `inconclusiveReason` 三个可选字段，`RunRecord.from(outcome:)` 落盘、
+    /// `outcome` 还原。旧 JSON 缺字段 → Codable 解为 nil → `outcome==nil` 走空态，
+    /// 行为向后兼容，也不会因为老记录里没这些键而 decode 失败。
     struct RunRecord: Codable, Equatable {
         /// BuildFingerprint.detail 全串（version/build/built_at）作为 build 身份。
         let fingerprintDetail: String
         let result: String
+        let failedStep: String?
+        let code: String?
+        let inconclusiveReason: String?
 
-        init(fingerprintDetail: String, result: Result) {
+        init(
+            fingerprintDetail: String,
+            result: Result,
+            failedStep: SelfCheckPolicy.Step? = nil,
+            code: String? = nil,
+            inconclusiveReason: SelfCheckPolicy.InconclusiveReason? = nil
+        ) {
             self.fingerprintDetail = fingerprintDetail
             self.result = result.rawValue
+            self.failedStep = failedStep?.rawValue
+            self.code = code
+            self.inconclusiveReason = inconclusiveReason?.rawValue
+        }
+
+        /// 从完整 Outcome 建记录：`SelfCheckRunner.finish()` 落盘走这里，
+        /// 避免各处再拆解枚举。
+        static func from(outcome: Outcome, fingerprintDetail: String) -> RunRecord {
+            switch outcome {
+            case .pass:
+                return RunRecord(fingerprintDetail: fingerprintDetail, result: .pass)
+            case .failed(let step, let code):
+                return RunRecord(
+                    fingerprintDetail: fingerprintDetail, result: .fail,
+                    failedStep: step, code: code
+                )
+            case .inconclusive(let reason):
+                return RunRecord(
+                    fingerprintDetail: fingerprintDetail, result: .inconclusive,
+                    inconclusiveReason: reason
+                )
+            }
+        }
+
+        /// 还原为 Outcome。旧记录（缺失新字段）无法还原时返回 nil，
+        /// UI 侧退回到「无历史结论可展示」的空态；不做「猜个默认值」这种
+        /// 会误导排查的兜底。
+        var outcome: Outcome? {
+            switch result {
+            case Result.pass.rawValue:
+                return .pass
+            case Result.fail.rawValue:
+                guard let rawStep = failedStep,
+                      let step = SelfCheckPolicy.Step(rawValue: rawStep) else {
+                    return nil
+                }
+                return .failed(step: step, code: code)
+            case Result.inconclusive.rawValue:
+                guard let rawReason = inconclusiveReason,
+                      let reason = SelfCheckPolicy.InconclusiveReason(rawValue: rawReason) else {
+                    return nil
+                }
+                return .inconclusive(reason)
+            default:
+                return nil
+            }
         }
     }
 

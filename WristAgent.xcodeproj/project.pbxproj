@@ -35,6 +35,7 @@
 		389212E3DA6FAA59F9910D22 /* SelfCheckPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5781515B605FE09873311309 /* SelfCheckPolicy.swift */; };
 		3AC49353250C083758E9D4DA /* ErrorCue_AudioTooShort.m4a in Resources */ = {isa = PBXBuildFile; fileRef = D0D77E1443D17416407EACA7 /* ErrorCue_AudioTooShort.m4a */; };
 		3BED828277BCE6296AFDC424 /* PlaybackRecoveryPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 905294A59B10050708A50FBF /* PlaybackRecoveryPolicy.swift */; };
+		3C5CC29413DC9E075BCE129D /* DebugPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC023A855C86E4F149A86DAB /* DebugPanelView.swift */; };
 		3F6EA24FB3A3B46BD00BC2D0 /* WristAgentApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36A3DD675D9E3E4CDC7C7C5A /* WristAgentApp.swift */; };
 		402E9DC1E4E2E918917E9B58 /* WatchSettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C85D18E0360A2A1EBDF04975 /* WatchSettingsStore.swift */; };
 		41214906A025D5C1E7C4ECA9 /* SecureTokenStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC28E8D4A89C399924568EEB /* SecureTokenStore.swift */; };
@@ -82,6 +83,7 @@
 		AB38F702523DAB57ECDB758F /* AudioRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98840DEEAC5DA7B6F8FCC628 /* AudioRecorder.swift */; };
 		AC284F28E28E5427A577455B /* AgentModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB1D464D47EC34B55A8C8411 /* AgentModels.swift */; };
 		AF4B996A0E38234DCEE5FC09 /* WatchLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDF08FF1AA89A3FD36122100 /* WatchLog.swift */; };
+		AFAD025D181738E8D93753BB /* SelfCheckLatestOutcomeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10796288EEC2915673662B9E /* SelfCheckLatestOutcomeTests.swift */; };
 		B16D51DE77210C44933FBD3B /* ErrorCue_README.md in Resources */ = {isa = PBXBuildFile; fileRef = 44E84C0EE7746687AFA3A75F /* ErrorCue_README.md */; };
 		B61FF83E4DCF49ED91557083 /* EncryptedAudioVault.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7C56A17FC91DC667B51B7D6 /* EncryptedAudioVault.swift */; };
 		B8341DE12C11F07793D54054 /* MainStatusCopy.swift in Sources */ = {isa = PBXBuildFile; fileRef = C608A2AC1FA2B2981F7EB790 /* MainStatusCopy.swift */; };
@@ -157,6 +159,7 @@
 		0DAD45847A8F17F8D430ACB9 /* AudioRecorderHandoverTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRecorderHandoverTests.swift; sourceTree = "<group>"; };
 		0DFA30C0EEFD46DDC835A5B6 /* CompanionSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionSettings.swift; sourceTree = "<group>"; };
 		0EAD7935F2F128D8408C210F /* VoiceStatusEnvelope.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceStatusEnvelope.swift; sourceTree = "<group>"; };
+		10796288EEC2915673662B9E /* SelfCheckLatestOutcomeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfCheckLatestOutcomeTests.swift; sourceTree = "<group>"; };
 		13475F099EA8ADC39FB4651D /* ResultNotificationPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResultNotificationPolicy.swift; sourceTree = "<group>"; };
 		13F51C6DCBABB59C404B307D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		16A065FFB735532D201B2183 /* VoiceRequestEnvelope.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRequestEnvelope.swift; sourceTree = "<group>"; };
@@ -226,6 +229,7 @@
 		DE20A46446B578002D231E7D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		E36424AC38F0A8BB28751248 /* UUIDv7.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UUIDv7.swift; sourceTree = "<group>"; };
 		E92A4F28175D63C6FBD62D7E /* ConversationHistory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationHistory.swift; sourceTree = "<group>"; };
+		EC023A855C86E4F149A86DAB /* DebugPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebugPanelView.swift; sourceTree = "<group>"; };
 		F0D0D96E379DBB5414F01FA7 /* PermissionRequestView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionRequestView.swift; sourceTree = "<group>"; };
 		F16E394DC77EF14BAE142B32 /* WatchVoiceTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchVoiceTransport.swift; sourceTree = "<group>"; };
 		F7C56A17FC91DC667B51B7D6 /* EncryptedAudioVault.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EncryptedAudioVault.swift; sourceTree = "<group>"; };
@@ -311,6 +315,7 @@
 				38CFFC49761BA3D8F3C402C8 /* AvatarErrorCardView.swift */,
 				448AA6286D0C4ACA51DC8ADD /* AvatarErrorPresenter.swift */,
 				8D4D9B7BAB821EF5BEF00394 /* ConversationTimelineView.swift */,
+				EC023A855C86E4F149A86DAB /* DebugPanelView.swift */,
 				13F51C6DCBABB59C404B307D /* Info.plist */,
 				8F9C01710FDC8C90D754460F /* OpenWristAgentIntent.swift */,
 				F0D0D96E379DBB5414F01FA7 /* PermissionRequestView.swift */,
@@ -353,6 +358,7 @@
 				CA9DA8A923948AE9124C19F9 /* AvatarErrorPresenterTests.swift */,
 				5CAC488B088EEC6542FF5CAB /* PlaybackEndgameChainTests.swift */,
 				DD573B88FBB9CCE341ED1513 /* RecorderErrorCopyTests.swift */,
+				10796288EEC2915673662B9E /* SelfCheckLatestOutcomeTests.swift */,
 				CE83A54EC29559337BA73D64 /* SelfCheckYieldBarrierTests.swift */,
 				9FDE52A8C1B2854E4646A286 /* SpeechPlayerInterruptionEvidenceTests.swift */,
 				0D83133781FDC42821BB13DF /* SpeechPlayerInterruptionTests.swift */,
@@ -560,6 +566,7 @@
 				74339B1DE6A6C27DBE1885DD /* ClientLog.swift in Sources */,
 				54817C157F20C92848363962 /* ConversationHistory.swift in Sources */,
 				2600C4D0F1086887A7E1B04A /* ConversationTimelineView.swift in Sources */,
+				3C5CC29413DC9E075BCE129D /* DebugPanelView.swift in Sources */,
 				34140BE278C262CF0BACEABE /* EncryptedAudioVault.swift in Sources */,
 				1B82F586343739AA4F419D21 /* ErrorCueCatalog.swift in Sources */,
 				82B50E90942BDC1117375BB7 /* MainStatusCopy.swift in Sources */,
@@ -613,6 +620,7 @@
 				BD58016CCCEA3B35C68B307A /* AvatarErrorPresenterTests.swift in Sources */,
 				5DE908AEFD1FB51FD79565BA /* PlaybackEndgameChainTests.swift in Sources */,
 				707A59AAF2C9619F3909A162 /* RecorderErrorCopyTests.swift in Sources */,
+				AFAD025D181738E8D93753BB /* SelfCheckLatestOutcomeTests.swift in Sources */,
 				6B6BB598A338463642687ADC /* SelfCheckYieldBarrierTests.swift in Sources */,
 				D51204118681270691727D4C /* SpeechPlayerInterruptionEvidenceTests.swift in Sources */,
 				7C465E62628112B008899B51 /* SpeechPlayerInterruptionTests.swift in Sources */,

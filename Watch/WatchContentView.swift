@@ -13,6 +13,9 @@ struct WatchContentView: View {
     @ObservedObject private var notifier: ResultNotifier
     /// ESS-180：屏幕分身错误卡片状态机。
     @ObservedObject private var errorPresenter: AvatarErrorPresenter
+    /// ESS-163 PD 裁定：首屏零可见开发入口，Debug 面板改用「长按主界面
+    /// 标题 2 秒」隐藏手势进入，不加任何可见提示。
+    @State private var showDebugPanel = false
 
     init(pushToTalk: PushToTalkController, welcome: WelcomeGreeter, selfCheck: SelfCheckRunner) {
         self.pushToTalk = pushToTalk
@@ -56,13 +59,9 @@ struct WatchContentView: View {
                         welcomeBanner
                     }
 
-                    // ESS-65 / G9：自检期间必须有明确提示（铁律 4），
-                    // 没通过时给出可区分「代码坏了 / 没授权」的文案 + 手动重跑（铁律 5）。
-                    if selfCheck.isRunning {
-                        selfCheckRunningBanner
-                    } else if let attention = selfCheck.pendingAttention {
-                        selfCheckAttentionCard(attention)
-                    }
+                    // ESS-163：装机自检的过程/结果不再默认铺在首屏，
+                    // 收进「开发者面板」入口。日志证据（selfcheck_*）不变，
+                    // ESS-65 铁律 3/5 通过面板内的重跑按钮与业务入口独立保留。
 
                     // ESS-180：主界面禁止「已等待 N 秒」——处理中只允许语义化
                     // 阶段词（正在思考…/正在查询…），30/60 秒切换文案而非数秒。
@@ -70,10 +69,17 @@ struct WatchContentView: View {
                     TimelineView(.periodic(from: .now, by: 5)) { context in
                         let status = statusCopy(now: context.date)
                         VStack(spacing: 10) {
+                            // ESS-163：主界面标题就是这个 status.title——长按 2 秒
+                            // 唤起 Debug 面板；不加可见提示。手势不消费 tap，
+                            // 语音球的 DragGesture 与欢迎语打断均不受影响。
                             Text(status.title)
                                 .font(.footnote.bold())
                                 .multilineTextAlignment(.center)
                                 .lineLimit(2)
+                                .contentShape(Rectangle())
+                                .onLongPressGesture(minimumDuration: 2.0) {
+                                    showDebugPanel = true
+                                }
 
                             Text(status.subtitle)
                                 .font(.caption2)
@@ -114,6 +120,11 @@ struct WatchContentView: View {
                     .buttonStyle(.bordered)
                     .tint(.secondary)
 
+                    // ESS-163 PD 裁定：Debug 面板入口迁出首屏，改为长按主界面
+                    // 标题 2 秒隐藏手势唤起（见上面 status.title 的
+                    // onLongPressGesture）。此处不再放任何可见 NavigationLink /
+                    // Button，避免最终用户看到开发者入口。
+
                     if let remote = transport.remoteStatus,
                        remote.requestId != activeTurn?.requestId {
                         Text(remote.detail ?? remote.phase.displayText)
@@ -132,6 +143,13 @@ struct WatchContentView: View {
         // 字幕式播放视图（ESS-48）：播放开始/纯文本结果到达时由控制器置入会话。
         .sheet(item: $pushToTalk.subtitleSession) { session in
             SubtitlePlaybackView(session: session, player: pushToTalk.player)
+        }
+        // ESS-163：Debug 面板作为覆盖 sheet 呈现——不占用首屏导航栈，
+        // 手表下滑关闭；避免 NavigationLink 在首屏留下可见项。
+        .sheet(isPresented: $showDebugPanel) {
+            NavigationStack {
+                DebugPanelView(selfCheck: selfCheck)
+            }
         }
     }
 
@@ -156,39 +174,6 @@ struct WatchContentView: View {
         .frame(maxWidth: .infinity)
         .padding(8)
         .background(Color.cyan.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    // MARK: - 装机音频自检（ESS-65 / G9）
-
-    private var selfCheckRunningBanner: some View {
-        VStack(spacing: 3) {
-            Label("正在自检音频链路，约 15 秒", systemImage: "waveform.badge.magnifyingglass")
-                .font(.caption2.bold())
-            Text("装机门禁 · 按住语音球可跳过")
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(8)
-        .background(Color.purple.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    private func selfCheckAttentionCard(_ outcome: SelfCheckPolicy.Outcome) -> some View {
-        VStack(spacing: 4) {
-            Text(SelfCheckPolicy.userMessage(outcome: outcome))
-                .font(.caption2)
-                .multilineTextAlignment(.center)
-
-            Button("重新自检") {
-                selfCheck.rerun()
-            }
-            .buttonStyle(.bordered)
-            .tint(.purple)
-            .font(.caption2)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(8)
-        .background(Color.purple.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
     }
 
     // MARK: - 通知授权引导（ESS-55）
