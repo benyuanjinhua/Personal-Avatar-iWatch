@@ -112,8 +112,19 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
     }
 
     /// 结束录音并保留文件（transferFile 需要文件在传输完成前存在）。
+    ///
+    /// ESS-225 P0：wall-clock delta（`elapsedRecordingMs()`）在
+    /// `PushToTalkController.releaseRequestedWhileStarting` 路径下失真——
+    /// `start()` 的 `await requestPermission()` 挂起期间用户释放 → pressEnded
+    /// 只置位 defer 标志 → start 恢复后立即 `finishRecording()`，从
+    /// `recordingStartUptime` 到此处只隔几毫秒，但 `AVAudioRecorder` 已为 60s
+    /// maxDuration 预分配了 ~24KB M4A 容器表。修法：`AVURLAsset(url:).duration`
+    /// 读取 mdat 真实音频秒数作为主时长源，wall-clock 保留做取证对照。
+    /// `AVURLAsset.duration` sync 虽 deprecated，但本地小文件行为稳定；
+    /// `finish()` 是 sync 契约（transferFile 依赖同步返回 Recording），保持
+    /// sync 优于把整条链改 async。
     func finish() throws -> Recording {
-        let durationMs = elapsedRecordingMs()
+        let wallClockMs = elapsedRecordingMs()
         recorder?.stop()
         recordingStartUptime = nil
         stopMetering()
@@ -123,29 +134,42 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         guard let url = currentURL, let data = try? Data(contentsOf: url), !data.isEmpty else {
             WatchLog.error(
                 "recorder", "record_empty",
-                detail: "duration_ms=\(durationMs)", code: "ERR_NO_RECORDING"
+                detail: "duration_ms=\(wallClockMs)", code: "ERR_NO_RECORDING"
             )
             throw RecorderError.noRecording
         }
         currentURL = nil
         recorder = nil
 
-        // ESS-225 AC #5：字节数与时长严重不自洽时告警。PR #66 的单调时钟
-        // 消灭了「44KB 报 14.2 小时」的溢出，但同源反向异常
-        // 「24KB 报 31ms」（真机 16:22:31 样本）逃出 sanitizeDurationMs 的 60s
-        // 上限门——DispatchTime 差值虽单调，仍可能因 finish() 相对 record start
-        // 时钟戳漂移（如中断恢复后 uptime 语义变化、或首次录音戳未落）返回
-        // 与文件字节数不匹配的量级。加一道后置门，未来同类漂移可自动可见。
+        let assetMs = Self.audioAssetDurationMs(url: url)
+        let durationMs = Self.sanitizeDurationMs(rawMs: assetMs ?? wallClockMs)
+
+        // ESS-225 AC #5：字节数与时长严重不自洽时告警。asset 路径接管后，
+        // 正常路径不再触发；仅在 asset 也读不出且 wall-clock 又与字节数
+        // 不匹配时才告警，带 wall_clock_ms / asset_ms 双字段对照。
         if let mismatchDetail = Self.durationBytesMismatch(durationMs: durationMs, bytes: data.count) {
             WatchLog.error(
                 "recorder", "duration_bytes_inconsistent",
-                detail: mismatchDetail,
+                detail: "\(mismatchDetail) wall_clock_ms=\(wallClockMs) asset_ms=\(assetMs.map(String.init) ?? "-")",
                 code: "ERR_DURATION_INCONSISTENT"
             )
         }
 
-        WatchLog.info("recorder", "record_finished", detail: "duration_ms=\(durationMs) bytes=\(data.count)")
+        WatchLog.info(
+            "recorder", "record_finished",
+            detail: "duration_ms=\(durationMs) bytes=\(data.count) wall_clock_ms=\(wallClockMs) asset_ms=\(assetMs.map(String.init) ?? "-")"
+        )
         return Recording(fileURL: url, data: data, durationMs: max(1, durationMs))
+    }
+
+    /// ESS-225 P0：读 m4a 容器内音频真实秒数，返回 ms；失败或非法（≤0/NaN/∞）返回 nil。
+    /// 用于取代 wall-clock 作为主时长源——wall-clock 在 `releaseRequestedWhileStarting`
+    /// 路径下失真，而容器 duration 与文件字节数强相关，不受此影响。
+    static func audioAssetDurationMs(url: URL) -> Int? {
+        let asset = AVURLAsset(url: url)
+        let seconds = CMTimeGetSeconds(asset.duration)
+        guard seconds.isFinite, seconds > 0 else { return nil }
+        return Int((seconds * 1000).rounded())
     }
 
     func cancel() {

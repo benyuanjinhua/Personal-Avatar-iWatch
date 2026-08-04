@@ -146,19 +146,84 @@ final class AudioRecorderDurationTests: XCTestCase {
         XCTAssertNotNil(AudioRecorder.durationBytesMismatch(durationMs: 31_000, bytes: 40_000))
     }
 
+    // MARK: - ESS-225 P0：AVURLAsset 读容器真实音频时长
+
+    /// 用宿主 App 包内已知时长的 M4A（`WelcomeSpeech.m4a` ≈3.3s）验证
+    /// `audioAssetDurationMs` 读出的时长落在 3~4 秒——证明容器时长与文件
+    /// 字节数无关，不受 M4A 容器预分配干扰。
+    func testAssetDurationReadsRealAudioSecondsNotContainerBytes() throws {
+        let url = try XCTUnwrap(
+            Bundle.main.url(forResource: "WelcomeSpeech", withExtension: "m4a"),
+            "WelcomeSpeech.m4a 不在宿主 App 包内"
+        )
+        let ms = try XCTUnwrap(
+            AudioRecorder.audioAssetDurationMs(url: url),
+            "本地 m4a 文件必须能读出真实音频时长"
+        )
+        XCTAssertGreaterThan(ms, 3_000, "WelcomeSpeech ≈3.3s，容器读出的时长必须 ≥3s")
+        XCTAssertLessThan(ms, 4_000, "WelcomeSpeech ≈3.3s，容器读出的时长必须 ≤4s")
+    }
+
+    /// 文件不存在 / URL 指向空 → 返回 nil，`finish()` 自然回落到 wall-clock 兜底。
+    func testAssetDurationReturnsNilForMissingFile() {
+        let bogus = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ess225-does-not-exist-\(UUID().uuidString).m4a")
+        XCTAssertNil(AudioRecorder.audioAssetDurationMs(url: bogus))
+    }
+
+    /// 端到端：真实起录 → 短暂等待 → 收尾。验证 `record_finished` detail 同时
+    /// 带 `wall_clock_ms=` 与 `asset_ms=` 两个取证字段——这是 P0 修复后 R-02.1
+    /// 运行时证据的核心对照维度。headless 模拟器起录失败时跳过。
+    func testFinishReturnsAssetDurationEvenWhenWallClockIsTiny() async throws {
+        try await Task.sleep(for: .seconds(4)) // 让宿主欢迎语播完
+        let events = EventLog()
+        WatchLog.setObserver { module, event, detail, code in
+            events.record(module: module, event: event, detail: detail, code: code)
+        }
+        defer { WatchLog.setObserver(nil) }
+
+        let recorder = AudioRecorder()
+        do {
+            try await recorder.start()
+        } catch RecorderError.permissionDenied {
+            throw XCTSkip("宿主未授权麦克风：先 xcrun simctl privacy <sim> grant microphone")
+        } catch RecorderError.cannotCreateRecorder {
+            recorder.cancel()
+            throw XCTSkip("当前环境无法真实采集（headless 模拟器），本用例真机跑 G9")
+        }
+        try await Task.sleep(for: .milliseconds(700))
+        let recording = try recorder.finish()
+        defer { try? FileManager.default.removeItem(at: recording.fileURL) }
+
+        let finishedDetail = events.entries().first { $0.event == "record_finished" }?.detail ?? ""
+        XCTAssertTrue(
+            finishedDetail.contains("wall_clock_ms="),
+            "record_finished detail 必须带 wall_clock_ms 做取证对照"
+        )
+        XCTAssertTrue(
+            finishedDetail.contains("asset_ms="),
+            "record_finished detail 必须带 asset_ms 做取证对照"
+        )
+        XCTAssertGreaterThan(recording.durationMs, 0, "duration_ms 必须 >0")
+    }
+
     private final class EventLog: @unchecked Sendable {
         private let lock = NSLock()
-        private var entries: [(module: String, event: String, detail: String?, code: String?)] = []
+        private var records: [(module: String, event: String, detail: String?, code: String?)] = []
         func record(module: String, event: String, detail: String?, code: String?) {
             lock.lock(); defer { lock.unlock() }
-            entries.append((module, event, detail, code))
+            records.append((module, event, detail, code))
         }
         func count(module: String, event: String, detailContains fragment: String? = nil) -> Int {
             lock.lock(); defer { lock.unlock() }
-            return entries.filter {
+            return records.filter {
                 $0.module == module && $0.event == event
                     && (fragment == nil || $0.detail?.contains(fragment!) == true)
             }.count
+        }
+        func entries() -> [(module: String, event: String, detail: String?, code: String?)] {
+            lock.lock(); defer { lock.unlock() }
+            return records
         }
     }
 }
