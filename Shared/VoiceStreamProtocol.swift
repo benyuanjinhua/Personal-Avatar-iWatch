@@ -1,11 +1,12 @@
 import CryptoKit
 import Foundation
 
-/// ESS-249 L1: streaming is an explicitly enabled debug path until the L2
-/// foreground/wrist-down/screen-off device gate passes. Production must keep
-/// the complete m4a + transferFile path as its default.
+/// ESS-356: streaming gate defaults to enabled. Production enables realtime
+/// by default; the L2 foreground/wrist-down/screen-off device gate can still
+/// gate the actual transport path when it lands.
+/// The complete m4a + transferFile path remains the reliable fallback.
 enum VoiceStreamingGate {
-    static let defaultEnabled = false
+    static let defaultEnabled = true
 }
 
 /// Compile-time transport contract. `sendMessageData` is reachable-only and

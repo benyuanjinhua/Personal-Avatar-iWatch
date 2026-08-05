@@ -11,9 +11,9 @@ import Foundation
 /// `applicationContext` 或 iPhone Relay 载荷，避免最终用户被开发者态污染。
 ///
 /// 门禁契约：`isStreamingActive` 是 ESS-279 / R4 wire-up 的唯一读点。
-/// 编译期默认（`VoiceStreamingGate.defaultEnabled`）保持 OFF —— 只有开发者
-/// 在设置页显式打开本开关才会走流式；关掉后必须**立即**触发已注册的
-/// 回退回调，让在途流式回合丢弃分片、清序号/计时器，下一回合走旧链路。
+/// 编译期默认（`VoiceStreamingGate.defaultEnabled`，ESS-356 后为 ON）—— 
+/// 关掉后必须**立即**触发已注册的回退回调，让在途流式回合丢弃分片、
+/// 清序号/计时器，下一回合走旧链路。
 @MainActor
 final class WatchDebugSettings: ObservableObject {
     /// 本机存储 key，不与 `AgentConfiguration` 共享 namespace。
@@ -38,8 +38,8 @@ final class WatchDebugSettings: ObservableObject {
         if defaults.object(forKey: Self.streamingEnabledDefaultsKey) != nil {
             self.streamingEnabled = defaults.bool(forKey: Self.streamingEnabledDefaultsKey)
         } else {
-            // 缺 key → 与编译期 gate 对齐：默认 OFF。
-            self.streamingEnabled = false
+            // 缺 key → 与编译期 gate 对齐：默认跟随 VoiceStreamingGate.defaultEnabled。
+            self.streamingEnabled = VoiceStreamingGate.defaultEnabled
         }
     }
 
@@ -50,8 +50,8 @@ final class WatchDebugSettings: ObservableObject {
     /// 保留一层间接是为了让编译期 gate 能在未来提高优先级（例如加入 L2
     /// 真机三态门禁）而无需散点修改调用侧。当前语义等价于 debug 开关本身。
     var isStreamingActive: Bool {
-        // 编译期默认仍是 OFF；本 debug 开关是唯一的运行时提升路径。
-        // 之后若加入真机三态硬门禁，把它 AND 在这里即可，wire-up 点无需改。
+        // 编译期默认跟随 VoiceStreamingGate.defaultEnabled（ESS-356 后为 ON）；
+        // 本 debug 开关可覆盖此默认。之后若加入真机三态硬门禁，把它 AND 在这里即可。
         streamingEnabled
     }
 

@@ -17,8 +17,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     let relay: WristAgentPhoneRelay
     /// ESS-321 real-time media session (Watch ↔ iPhone ↔ Bridge). Lazily
     /// constructed on the first uplink envelope so households that never
-    /// enable streaming (VoiceStreamingGate.defaultEnabled == false) do not
-    /// pay for the WSS setup.
+    /// enable streaming do not pay for the WSS setup.
     private lazy var realtimeSession: PhoneRealtimeSession = {
         let session = PhoneRealtimeSession(transportFactory: { [weak self] requestId, sessionId in
             self?.makeRealtimeTransport(requestId: requestId, sessionId: sessionId)

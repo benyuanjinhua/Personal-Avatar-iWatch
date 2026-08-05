@@ -42,10 +42,31 @@ func cloudConfigurationRoundTrips() throws {
 }
 
 @Test
-func legacyConfigurationKeepsStreamingDisabled() throws {
+func legacyConfigurationDecodesWithoutVoiceStreamingV2AsFalse() throws {
+    // Upgrade safety: a stored config without voiceStreamingV2 must still decode as false.
     let legacy = Data(#"{"mode":"demo","endpoint":"","bearerToken":"","autoListen":false,"hapticsEnabled":true,"conciseReply":true}"#.utf8)
     let decoded = try JSONDecoder().decode(AgentConfiguration.self, from: legacy)
     #expect(decoded.voiceStreamingV2 == false)
+}
+
+@Test
+func freshConfigurationDefaultsVoiceStreamingV2ToTrue() {
+    // ESS-356: fresh install (no stored config) defaults streaming to ON.
+    let fresh = AgentConfiguration(
+        mode: .cloud,
+        endpoint: "https://agent.example.com",
+        bearerToken: "secret",
+        autoListen: true,
+        hapticsEnabled: true,
+        conciseReply: false
+    )
+    #expect(fresh.voiceStreamingV2 == true)
+}
+
+@Test
+func demoConfigurationDefaultsVoiceStreamingV2ToTrue() {
+    // ESS-356: demo config (used for Watch/iOS first-launch) defaults streaming to ON.
+    #expect(AgentConfiguration.demo.voiceStreamingV2 == true)
 }
 
 @Test
