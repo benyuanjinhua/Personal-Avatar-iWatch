@@ -145,8 +145,17 @@ inspect control frames.
   client is expected to reserialise before send).
 - Server downlink is emitted in strict monotone order per `response_id`; the
   client is allowed to reorder a small window (implementation-specific).
-- `audio.done` MUST arrive with `final_sequence` equal to the highest
-  emitted delta. Client uses it as the completion barrier.
+- `audio.done` carries a `final_sequence` value. **Server guarantee:**
+  the emitted `final_sequence` equals the largest `N` such that every
+  `0..N` delta has already been sent — the client can therefore treat
+  `final_sequence` as an unconditional completion barrier without
+  auditing density itself. If the upstream reports a `final_sequence`
+  higher than the emitted-so-far dense prefix (because a delta was lost
+  or the tail delta never arrived), the server clamps the emitted
+  `final_sequence` down to the dense prefix and logs
+  `done_barrier_clamped` with `reason` in {`gap_before_final_sequence`,
+  `final_sequence_not_yet_emitted`}. A response that produced zero
+  contiguous deltas ends with `final_sequence == -1`.
 
 #### Barge-in
 

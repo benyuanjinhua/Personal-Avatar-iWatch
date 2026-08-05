@@ -200,7 +200,52 @@ describe('RealtimeSession — downlink ordering', () => {
     })
     const done = sent.find(e => e.type === 'audio.done')
     assert.equal(done.final_sequence, 1, 'client is told the real barrier so it can finish')
-    assert.ok(logs.some(l => l.evt === 'done_deferred_awaiting_deltas'))
+    const clamped = logs.find(l => l.evt === 'done_barrier_clamped')
+    assert.equal(clamped?.reason, 'final_sequence_not_yet_emitted')
+    assert.equal(clamped?.claimed_final_sequence, 5)
+    assert.equal(clamped?.effective_final_sequence, 1)
+  })
+
+  it('audio.done clamps to the dense prefix when there is an interior gap (毕玄 regression)', () => {
+    // 缺序反例：agent 发 0, 2, done(final_sequence=2). 缺了 1.
+    // 修复前会直接放出 done(2)——客户端以为完整收到 0..2 但其实缺 1；
+    // 修复后 clamp 到最高连续前缀（0）并在日志里记 gap 原因。
+    const { session, sent, agent, scope, logs } = harness()
+    start(session, scope)
+    agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: 0, audio: b64('x') })
+    agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: 2, audio: b64('x') })
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: 2 })
+    const done = sent.find(e => e.type === 'audio.done')
+    assert.ok(done, 'done emitted')
+    assert.equal(done.final_sequence, 0, 'client completes on the contiguous run it actually received')
+    const clamped = logs.find(l => l.evt === 'done_barrier_clamped')
+    assert.equal(clamped?.reason, 'gap_before_final_sequence')
+    assert.equal(clamped?.claimed_final_sequence, 2)
+    assert.equal(clamped?.effective_final_sequence, 0)
+    assert.equal(clamped?.high_watermark, 2)
+  })
+
+  it('audio.done with a fully dense 0..final_sequence keeps the claimed final_sequence and does not log a clamp', () => {
+    const { session, sent, agent, scope, logs } = harness()
+    start(session, scope)
+    for (const seq of [0, 1, 2]) {
+      agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: seq, audio: b64('x') })
+    }
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: 2 })
+    const done = sent.find(e => e.type === 'audio.done')
+    assert.equal(done.final_sequence, 2)
+    assert.equal(logs.filter(l => l.evt === 'done_barrier_clamped').length, 0)
+  })
+
+  it('audio.done arriving before any delta clamps to -1 and logs the shortfall', () => {
+    const { session, sent, agent, scope, logs } = harness()
+    start(session, scope)
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: 3 })
+    const done = sent.find(e => e.type === 'audio.done')
+    assert.equal(done.final_sequence, -1, 'zero-delta done clamps to -1 so client can detect the empty response')
+    const clamped = logs.find(l => l.evt === 'done_barrier_clamped')
+    assert.equal(clamped?.reason, 'final_sequence_not_yet_emitted')
+    assert.equal(clamped?.effective_final_sequence, -1)
   })
 
   it('a second audio.done is idempotent (does not double-emit)', () => {

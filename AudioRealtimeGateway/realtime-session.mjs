@@ -372,26 +372,37 @@ export class RealtimeSession {
 
   _emitDone(event) {
     if (this.doneEmitted) return
-    const finalSequence = Number.isInteger(event.final_sequence)
+    const claimed = Number.isInteger(event.final_sequence)
       ? event.final_sequence
       : this.downlinkHighWatermark
-    // The barrier is the client's obligation, but the server refuses to
-    // emit `audio.done` before the delta with `sequence == final_sequence`
-    // has been emitted: without this, done-before-first-delta and
-    // done-before-tail-delta collapse into indistinguishable failures.
-    if (finalSequence >= 0 && !this.seenDownlinkSequences.has(finalSequence)) {
-      this.log('done_deferred_awaiting_deltas', {
+    // The barrier is only meaningful if `0..final_sequence` has actually
+    // been emitted — checking that the `final_sequence` frame alone
+    // exists lets a hole like {0, 2, done(2)} slip through and the
+    // client would then complete on a response that lost seq=1
+    // (毕玄 review on PR #159). Compute the highest dense prefix and,
+    // on any gap or missing tail, clamp to it so the client completes
+    // on the contiguous run it actually received, and log the shortfall
+    // for reconciliation.
+    const densePrefix = this._highestDensePrefix()
+    let effectiveFinal
+    if (claimed < 0) {
+      effectiveFinal = densePrefix
+    } else if (claimed > densePrefix) {
+      const reason = this.seenDownlinkSequences.has(claimed)
+        ? 'gap_before_final_sequence'
+        : 'final_sequence_not_yet_emitted'
+      this.log('done_barrier_clamped', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
-        response_id: this.responseId, final_sequence: finalSequence,
+        response_id: this.responseId, claimed_final_sequence: claimed,
+        effective_final_sequence: densePrefix,
         high_watermark: this.downlinkHighWatermark,
+        reason,
       })
-      // Deliver `done` with the actual high-watermark instead of the claimed
-      // one. This lets the client complete rather than stall; the mismatch
-      // is captured in the log for the receiving team to reconcile.
-      this.finalSequence = this.downlinkHighWatermark
+      effectiveFinal = densePrefix
     } else {
-      this.finalSequence = finalSequence
+      effectiveFinal = claimed
     }
+    this.finalSequence = effectiveFinal
     this.doneEmitted = true
     this._sendJson({
       type: 'audio.done',
@@ -403,6 +414,15 @@ export class RealtimeSession {
       request_id: this.scope.request_id, session_id: this.scope.session_id,
       response_id: this.responseId, final_sequence: this.finalSequence,
     })
+  }
+
+  // Largest N such that every 0..N is in `seenDownlinkSequences`; -1 if
+  // even seq=0 is missing. Small integer scan is fine — a realtime
+  // response is bounded to O(hundreds) of deltas.
+  _highestDensePrefix() {
+    let n = -1
+    while (this.seenDownlinkSequences.has(n + 1)) n += 1
+    return n
   }
 
   // === Housekeeping =======================================================
