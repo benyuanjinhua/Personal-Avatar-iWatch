@@ -252,8 +252,12 @@ Grepping a single `request_id` yields the whole turn:
 | `max_frame_bytes` | `65536` | Per-frame hard cap |
 | `max_events_per_second` | `200` | Per-connection rate limit |
 | `max_uplink_bytes_per_second` | `524288` | 512 KiB/s uplink cap |
-| `agent_transport` | `mock` | `mock` for tests; production loader is out of scope of ESS-403 (see ESS-401 integration). |
-| `provider_key_env` | `AUDIO_REALTIME_PROVIDER_KEY` | Env var to read the provider key from; not read from config file. |
+| `agent_transport` | `agent` | `agent` connects the production qwen-audio-agent loopback WSS; `mock` is test-only. |
+| `agent_gateway_url` | `ws://127.0.0.1:3101/api/realtime` | Existing qwen-audio-agent endpoint. Keep loopback-only. |
+| `agent_connect_timeout_ms` | `10000` | Fail the northbound turn with a structured upstream timeout. |
+| `agent_max_pending_bytes` | `2097152` | Hard cap while waiting for upstream `voice.ready`. |
+| `agent_takeover_voice` | `true` | Explicit Watch speech takes ownership from a stale/local frontend. |
+| `provider_key_env` | `AUDIO_REALTIME_PROVIDER_KEY` | Legacy readiness metadata only; the qwen service owns the provider credential. |
 
 Relative paths in `tls_cert` / `tls_key` / `state_dir` are all resolved
 against the **module directory** (`AudioRealtimeGateway/`, i.e. the directory
@@ -278,9 +282,9 @@ source allowlist accepts loopback (for the smoke) plus Tailnet CGNAT
    auto-provisioned certs are trusted out-of-the-box).
 2. Populate `state/devices.json` from Mac Bridge (or via a provisioning
    API); the two share the HMAC device format.
-3. Store the upstream provider key in the environment:
-   `export AUDIO_REALTIME_PROVIDER_KEY=...` — do **not** put it in
-   `config.json` (the code refuses to read it from there).
+3. Confirm qwen-audio-agent is healthy on `127.0.0.1:3101` with voice
+   configured. Its launchd service owns the provider key; do **not** copy that
+   key into this Gateway or `config.json`.
 4. `npm start`. The service logs `gateway_ready` when TLS + WSS + issuer
    are up; the log carries `bind`, `port`, and `public_host` so operators
    can grep the deployment address without reading config.

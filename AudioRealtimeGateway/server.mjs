@@ -9,9 +9,9 @@
 //   • GET  /v1/health
 //   • WSS  /api/realtime                    (Bearer <token>, single upgrade)
 //
-// Provider key never leaves the server side — it's read from an env var and
-// held only by the (out-of-scope for ESS-403) real Agent transport. Only the
-// mock transport ships in this module.
+// Provider credentials stay in the existing qwen-audio-agent service. The
+// production adapter talks only to its loopback WSS; the mock remains for
+// deterministic protocol tests.
 
 import http from 'node:http'
 import https from 'node:https'
@@ -25,6 +25,7 @@ import { DeviceStore, AuthError } from './device-auth.mjs'
 import { TokenIssuer, IssuerError } from './token-issuer.mjs'
 import { RealtimeSession } from './realtime-session.mjs'
 import { MockAgentTransport } from './agent-transport.mjs'
+import { QwenAgentTransport } from './qwen-agent-transport.mjs'
 
 const BASE = dirname(fileURLToPath(import.meta.url))
 
@@ -285,15 +286,19 @@ function refuseUpgrade(socket, status, code) {
   socket.destroy()
 }
 
-function createAgentTransport(CONFIG, { log, providerKey }) {
+function createAgentTransport(CONFIG, { log }) {
   const kind = CONFIG.agent_transport ?? 'mock'
   if (kind === 'mock') return new MockAgentTransport({ log: (...args) => log('mock_agent', { detail: args.map(String).join(' ') }) })
-  // Real Agent transport wiring lives in ESS-401 integration; refuse to
-  // silently downgrade in production. This branch fails loud so nobody ships
-  // the mock by accident.
+  // Production uses the already deployed qwen-audio-agent as the provider
+  // owner instead of duplicating DashScope protocol and credential handling.
   if (kind === 'agent') {
-    if (!providerKey) throw new Error('provider key missing for agent_transport=agent (set env: ' + (CONFIG.provider_key_env ?? 'AUDIO_REALTIME_PROVIDER_KEY') + ')')
-    throw new Error('agent_transport=agent is not wired in this module — implement in ESS-401 integration')
+    return new QwenAgentTransport({
+      gatewayUrl: CONFIG.agent_gateway_url ?? 'ws://127.0.0.1:3101/api/realtime',
+      connectTimeoutMs: CONFIG.agent_connect_timeout_ms ?? 10_000,
+      maxPendingBytes: CONFIG.agent_max_pending_bytes ?? 2 * 1024 * 1024,
+      takeover: CONFIG.agent_takeover_voice !== false,
+      log: (evt, extra) => log(evt, extra),
+    })
   }
   throw new Error('unknown agent_transport: ' + kind)
 }
