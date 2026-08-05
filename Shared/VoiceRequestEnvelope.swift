@@ -89,7 +89,8 @@ struct VoiceRequestEnvelope: Codable, Equatable {
 
     private static let decoder: JSONDecoder = {
         let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
+        // ESS-386：容错策略，兼容 Bridge 下行的 `.000Z` 毫秒时间戳。
+        decoder.dateDecodingStrategy = VoiceDateDecoding.strategy
         return decoder
     }()
 }
