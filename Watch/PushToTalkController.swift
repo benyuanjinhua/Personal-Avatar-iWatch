@@ -68,9 +68,18 @@ final class PushToTalkController: ObservableObject {
     private static let logger = Logger(subsystem: "com.benyuan.wristagent.watch", category: "PlaybackTrigger")
     private let recorder = AudioRecorder()
     var voiceStreamingEnabled: () -> Bool = { VoiceStreamingGate.defaultEnabled }
+/// ESS-383: the single request_id for this turn, shared between the streaming
+    /// uplink and the complete-file fallback. Generated once in `pressBegan()`,
+    /// consumed by `submit()`. Never cleared mid-recording — even after a streaming
+    /// abort, `submit()` must reuse it so the Bridge sees the same `request_id`
+    /// on both paths and can associate the streaming frames with the fallback upload.
     private var streamRequestId: UUID?
     private var streamId: UUID?
     private var streamSequence = 0
+    /// ESS-383: set when the streaming path aborted before `submit()` could consume
+    /// `streamRequestId`. When true, `submit()` still uses `streamRequestId` but
+    /// routes through the complete-file path instead of `adapter.commit()`.
+    private var streamAborted = false (fix(ESS-383): keep streamRequestId alive through streaming abort for unified request_id)
     /// ESS-321 real-time adapter. Lazily created on first press when the
     /// streaming gate is on. Wiring lives in `ensureRealtimeAdapter()`.
     private(set) var realtimeAdapter: WatchRealtimeMediaAdapter?
@@ -401,6 +410,7 @@ final class PushToTalkController: ObservableObject {
         streamRequestId = streaming ? UUIDv7.generate() : nil
         streamId = streaming ? UUID() : nil
         streamSequence = 0
+        streamAborted = false (fix(ESS-383): keep streamRequestId alive through streaming abort for unified request_id)
         WatchHaptics.play(.recordingStarted)
         Task {
             do {
@@ -471,12 +481,13 @@ final class PushToTalkController: ObservableObject {
         }
     }
 
-    /// ESS-362: reset the streaming identifiers after any streaming start
-    /// abort. `submit(recording:)` keys off `streamRequestId != nil` to decide
-    /// between the realtime commit branch and the reliable full-file branch;
-    /// leaving stale ids around would strand the turn on a dead adapter.
+    /// ESS-383: reset streaming identifiers after an abort WITHOUT clearing
+    /// `streamRequestId`. The request_id is shared between the streaming path
+    /// and the complete-file fallback — `submit()` still needs it so the Bridge
+    /// sees the same UUID on both paths. Only `streamId` and `streamSequence`
+    /// are reset; `streamAborted` signals `submit()` to skip `adapter.commit()`.
     private func clearStreamStateAfterAbort() {
-        streamRequestId = nil
+        streamAborted = true (fix(ESS-383): keep streamRequestId alive through streaming abort for unified request_id)
         streamId = nil
         streamSequence = 0
     }
@@ -525,6 +536,10 @@ final class PushToTalkController: ObservableObject {
     }
 
     /// 提交录音：生成信封发送，同时留一份重试缓存（失败重发不用重新说话）。
+    /// ESS-383: `streamRequestId` is always preserved (even after streaming abort)
+    /// so the Bridge sees the same `request_id` on both the streaming frames and
+    /// the complete-file upload. `streamAborted` gates whether we route through
+    /// `adapter.commit()` or the reliable full-file path.
     private func submit(recording: AudioRecorder.Recording) {
         let requestId = streamRequestId ?? UUIDv7.generate()
         let envelope = VoiceRequestEnvelope.voiceRequest(
@@ -550,7 +565,8 @@ final class PushToTalkController: ObservableObject {
             submitFullFileFallback(
                 recording: recording, requestId: requestIdStr, reason: deferredReason
             )
-        } else if let adapter = realtimeAdapter,
+        } else if !streamAborted,
+                  let adapter = realtimeAdapter, (fix(ESS-383): keep streamRequestId alive through streaming abort for unified request_id)
                   adapter.currentTurn?.requestId == requestIdStr {
             // ESS-321: streaming path is live. Retain the m4a so a fast-channel
             // failure can invoke the single-shot fallback with the real body;
@@ -569,6 +585,7 @@ final class PushToTalkController: ObservableObject {
         WatchHaptics.play(.requestSubmitted)
         streamRequestId = nil
         streamId = nil
+        streamAborted = false (fix(ESS-383): keep streamRequestId alive through streaming abort for unified request_id)
     }
 
     private func emitUplinkChunk(payload: Data, end: Bool) {
