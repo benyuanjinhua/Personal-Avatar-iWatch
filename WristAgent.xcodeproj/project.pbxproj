@@ -14,6 +14,7 @@
 		070E69DBE697BF3DE0503A23 /* ResultNotifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = 797588258D8FFBB69B05BB71 /* ResultNotifier.swift */; };
 		0B14BB8E0DE371AE0274D4F9 /* PhoneConnectivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08AB0CED9CE83E1BB446A82C /* PhoneConnectivity.swift */; };
 		0B21A7424638FD9297A195A5 /* AudioRealtimeAgentTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = F5EC070D0A3D70F7AFB66387 /* AudioRealtimeAgentTransport.swift */; };
+		0D7392794831202FC96236B2 /* BargeInGenerationCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5752A6573A7A674BF8880E4 /* BargeInGenerationCoordinator.swift */; };
 		101BD3B5E0F900E18D2C7B6A /* VoiceStreamChunkMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = ECD1DB988318EDCB4DD695B6 /* VoiceStreamChunkMessage.swift */; };
 		16999EF5199C5B5E800A83B8 /* VoiceRequestEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16A065FFB735532D201B2183 /* VoiceRequestEnvelope.swift */; };
 		18C00E8A4DDBDF394954DE30 /* WatchStreamReceiver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 825EC2CED4ACE4E583D94864 /* WatchStreamReceiver.swift */; };
@@ -110,6 +111,7 @@
 		9CC8DFCBBBA03E71A76FA9BB /* RealtimePlaybackReceiptTracker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 716B2884D666AEE57BA6AB37 /* RealtimePlaybackReceiptTracker.swift */; };
 		9FCAF92E7F4BAF6D75258EC3 /* AvatarErrorCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38CFFC49761BA3D8F3C402C8 /* AvatarErrorCardView.swift */; };
 		9FE3E5082197E2851CD75F30 /* WatchVoiceTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = F16E394DC77EF14BAE142B32 /* WatchVoiceTransport.swift */; };
+		A0B992F64AF3212C3F47CB0E /* BargeInGenerationCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5752A6573A7A674BF8880E4 /* BargeInGenerationCoordinator.swift */; };
 		A3BFF832F44C4739239AB662 /* WatchDebugSettingsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 50DEF68818AC545EED28B44F /* WatchDebugSettingsTests.swift */; };
 		A652F6C5B6F5B21BBF4854E1 /* AudioRealtimeAgentConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CA20270A3348D748D8929F4 /* AudioRealtimeAgentConfig.swift */; };
 		A74A27941BC416F02C965D17 /* BuildFingerprint.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32C8DAF30CCFE15F09A5351A /* BuildFingerprint.swift */; };
@@ -285,6 +287,7 @@
 		9A2CDFE23539DF4DB5ADDAF7 /* CompanionContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionContentView.swift; sourceTree = "<group>"; };
 		9F3363DB5FB9EF9FF44F0744 /* PlaybackEndgamePolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackEndgamePolicy.swift; sourceTree = "<group>"; };
 		9FDE52A8C1B2854E4646A286 /* SpeechPlayerInterruptionEvidenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechPlayerInterruptionEvidenceTests.swift; sourceTree = "<group>"; };
+		A5752A6573A7A674BF8880E4 /* BargeInGenerationCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BargeInGenerationCoordinator.swift; sourceTree = "<group>"; };
 		AAD9BD4DBA7700C65F134EF3 /* SpeechPlayerReleaseTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechPlayerReleaseTests.swift; sourceTree = "<group>"; };
 		B1CE1503A0D6F97C52A835D5 /* WatchAppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchAppDelegate.swift; sourceTree = "<group>"; };
 		B4ABFE757D618285BCA3C777 /* ErrorCue_TranscriptDiscarded.m4a */ = {isa = PBXFileReference; path = ErrorCue_TranscriptDiscarded.m4a; sourceTree = "<group>"; };
@@ -346,6 +349,7 @@
 				089122E724A393364FA3F2CA /* AudioRealtimeAgentSession.swift */,
 				F5EC070D0A3D70F7AFB66387 /* AudioRealtimeAgentTransport.swift */,
 				CC3ECBAA9A62DE9AED7C9C34 /* AudioSessionPolicy.swift */,
+				A5752A6573A7A674BF8880E4 /* BargeInGenerationCoordinator.swift */,
 				5A61F7EAFB8A0CCF3D03F1D2 /* BridgeTurnProjection.swift */,
 				32C8DAF30CCFE15F09A5351A /* BuildFingerprint.swift */,
 				234EBF336FF2F9724F289524 /* ClientLog.swift */,
@@ -662,6 +666,7 @@
 				059C813BE15ED9958BC3C63A /* AudioRealtimeAgentSession.swift in Sources */,
 				0B21A7424638FD9297A195A5 /* AudioRealtimeAgentTransport.swift in Sources */,
 				293E9641FC4B28984DCC0CF9 /* AudioSessionPolicy.swift in Sources */,
+				0D7392794831202FC96236B2 /* BargeInGenerationCoordinator.swift in Sources */,
 				CD555D87536F29C54A475DFB /* BridgeTurnProjection.swift in Sources */,
 				A74A27941BC416F02C965D17 /* BuildFingerprint.swift in Sources */,
 				486B5477826ED3933D89132E /* ClientLog.swift in Sources */,
@@ -727,6 +732,7 @@
 				8A5EEAA528E32C9DAB749BFD /* AudioSessionPolicy.swift in Sources */,
 				9FCAF92E7F4BAF6D75258EC3 /* AvatarErrorCardView.swift in Sources */,
 				CCB3BBBEF6EAB9DDD84249E5 /* AvatarErrorPresenter.swift in Sources */,
+				A0B992F64AF3212C3F47CB0E /* BargeInGenerationCoordinator.swift in Sources */,
 				E817250A3DAFD3D2F889876B /* BridgeTurnProjection.swift in Sources */,
 				1EF906148F17573C9B7D948E /* BuildFingerprint.swift in Sources */,
 				74339B1DE6A6C27DBE1885DD /* ClientLog.swift in Sources */,

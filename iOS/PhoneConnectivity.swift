@@ -356,7 +356,21 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
                 agentSession: session,
                 requestId: requestId,
                 sessionId: sessionId,
-                generation: 1
+                generation: 1,
+                replacementSession: { [agentFlag] generation in
+                    guard let credentials = RelayCredentialsStore.read(),
+                          credentials.deviceId == agentFlag.deviceId,
+                          let gatewayURL = URL(string: agentFlag.gatewayURLString) else {
+                        throw AgentSessionTokenError.invalidGatewayURL
+                    }
+                    let issued = try await AgentSessionTokenClient(
+                        gatewayURL: gatewayURL, credentials: credentials
+                    ).mint(requestId: requestId, sessionId: sessionId, generation: generation)
+                    guard let freshConfig = agentFlag.resolveConfig(ephemeralToken: issued.token) else {
+                        throw AgentSessionTokenError.invalidGatewayURL
+                    }
+                    return AudioRealtimeAgentSession(config: freshConfig, sessionId: sessionId)
+                }
             )
             transport.onDownlink = { [weak self] envelope in
                 self?.forwardRealtimeDownlink(envelope)
