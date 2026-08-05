@@ -11,6 +11,9 @@ struct BridgeEventMessage: Decodable {
     let turns: [BridgeTurnProjection]?
     let interim: BridgeInterimProjection?
     let progress: BridgeProgressProjection?
+    /// ESS-324 B3：Bridge 下行流式分片（voice-stream-downlink.mjs emit() 的 envelope）。
+    /// 与 VoiceStreamChunk wire 格式对齐；chunk == nil 表示 JSON 中无此字段（非流式事件）。
+    let chunk: VoiceStreamChunk?
 
     static func decode(from data: Data) -> BridgeEventMessage? {
         try? VoiceProtocolJSON.decoder.decode(BridgeEventMessage.self, from: data)

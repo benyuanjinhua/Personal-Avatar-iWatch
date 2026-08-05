@@ -394,6 +394,11 @@ extension PhoneConnectivity: WatchFeedbackChannel {
         )
     }
 
+    // ESS-349：本处原有一份 forwardStreamChunkToWatch 的精简实现（来自 #121/B4），
+    // 与 #125/B2 的实现重复。保留 B2 那一份（见本文件下方）——它多了
+    // `direction == .downlink` 守卫与逐条结构化日志，缺了这两样就无法在
+    // bridge.log 里回溯「分片到底有没有发出去」，等于把 R-02 需要的证据抹掉。
+
     /// 结果语音走系统托管 transferFile；metadata 带含 speechSha256 的信封，
     /// Watch 端（WatchSettingsStore.storeSpeech）校验通过才加密入库并挂到回合。
     ///

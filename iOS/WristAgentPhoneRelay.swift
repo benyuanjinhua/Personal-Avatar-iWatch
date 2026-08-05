@@ -27,10 +27,15 @@ protocol WatchFeedbackChannel: AnyObject {
     /// Watch 端匹配后进探针分支——不入 vault、不入 journal、播完回 probe_ack。
     @discardableResult
     func transferProbe(fileURL: URL, envelope: VoiceStatusEnvelope) -> Bool
-    /// ESS-324 B4：转发 Bridge WSS downlink stream chunk 到 Watch。
-    /// 走 `sendMessageData` 即时通道；不可达时因 stream 本身是 best-effort，
-    /// 直接回退整段 m4a 路径，不排队。
-    func forwardStreamChunkToWatch(_ chunk: VoiceStreamChunk)
+    /// ESS-324 B2/B4：下行 stream chunk → Watch。reachable 时走 `sendMessageData`
+    /// 快路径；不可达时返回 false，调用方走整段 m4a 降级。
+    ///
+    /// ESS-349：B2（#125）与 B4（#121）各自独立声明过这个方法，签名不一致——
+    /// B4 返回 `Void`，B2 返回 `Bool` 且调用点 `:492` 依赖返回值判断要不要降级。
+    /// 统一取 `Bool`：**丢掉返回值就丢掉了「转发失败要回退整段 m4a」的唯一信号**，
+    /// 结果是分片没送到、整段也没补，用户侧表现为「有文字无语音」。
+    @discardableResult
+    func forwardStreamChunkToWatch(_ chunk: VoiceStreamChunk) -> Bool
 }
 
 /// WristAgentPhoneRelay（ESS-28）：iPhone Companion Relay 编排器。
@@ -437,6 +442,9 @@ final class WristAgentPhoneRelay: ObservableObject {
             if let interim = message.interim { process(interim: interim) }
         case "turn.progress":
             if let progress = message.progress, progress.isValid { process(progress: progress) }
+        case "voice.stream.chunk":
+            // ESS-324 B2：Bridge 下行流式分片 → 校验 sha256 → 转发 Watch
+            if let chunk = message.chunk { process(streamChunk: chunk) }
         default:
             break // 未知事件类型：忽略，不中断事件流。
         }
@@ -475,6 +483,31 @@ final class WristAgentPhoneRelay: ObservableObject {
               watchChannel?.transferSpeech(fileURL: url, envelope: envelope) == true
         else { return }
         deliveredInterims.insert(key)
+    }
+
+    // MARK: - ESS-324 B2 流式下行分片处理
+
+    /// Bridge → iPhone → Watch 下行流式分片转发。
+    /// 校验 sha256 后经 WCSession sendMessageData 快路径投递；
+    /// 不可达或 payload 超阈值时返回 false，调用方走整段 m4a 降级。
+    private func process(streamChunk chunk: VoiceStreamChunk) {
+        let computed = VoiceStreamChunk.sha256(chunk.payload)
+        guard computed == chunk.payloadSha256.lowercased() else {
+            Self.downlinkLogger.warning(
+                "voice.stream.chunk digest mismatch request_id=\(chunk.requestId, privacy: .public) stream_id=\(chunk.streamId, privacy: .public) seq=\(chunk.sequence)"
+            )
+            return
+        }
+        let sent = watchChannel?.forwardStreamChunkToWatch(chunk) ?? false
+        if sent {
+            Self.downlinkLogger.info(
+                "voice.stream.chunk forwarded request_id=\(chunk.requestId, privacy: .public) seq=\(chunk.sequence) bytes=\(chunk.payload.count)"
+            )
+        } else {
+            Self.downlinkLogger.info(
+                "voice.stream.chunk fallback request_id=\(chunk.requestId, privacy: .public) seq=\(chunk.sequence) reason=watch_unreachable_or_oversize"
+            )
+        }
     }
 
     private func process(projection: BridgeTurnProjection) {
