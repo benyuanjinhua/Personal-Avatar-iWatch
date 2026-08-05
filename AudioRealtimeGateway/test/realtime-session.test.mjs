@@ -30,6 +30,31 @@ function harness(overrides = {}) {
   return { session, sent, logs, closes, agent, scope }
 }
 
+// Controllable timer harness: instead of setTimeout, capture the pending
+// callback so tests can advance time explicitly. Only one pending timer at
+// a time is enough for the barrier — heartbeat/idle are disabled above.
+function controlledClock() {
+  const pending = []
+  return {
+    setTimer: (fn, ms) => {
+      const t = { fn, ms }
+      pending.push(t)
+      return t
+    },
+    clearTimer: t => {
+      const i = pending.indexOf(t)
+      if (i >= 0) pending.splice(i, 1)
+    },
+    fireAll: () => {
+      while (pending.length) {
+        const t = pending.shift()
+        t.fn()
+      }
+    },
+    pendingCount: () => pending.length,
+  }
+}
+
 function b64(str) { return Buffer.from(str, 'utf8').toString('base64') }
 
 function start(session, scope) {
@@ -186,46 +211,45 @@ describe('RealtimeSession — downlink ordering', () => {
     assert.equal(done.generation, scope.generation)
   })
 
-  it('audio.done arriving with a bogus final_sequence uses the actual high-watermark', () => {
-    const { session, sent, agent, scope, logs } = harness()
-    start(session, scope)
-    for (const seq of [0, 1]) {
-      agent.emit(scope.request_id, {
-        type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: seq, audio: b64('x'),
-      })
-    }
-    // Upstream lies: final_sequence=5 but we only saw 0,1.
-    agent.emit(scope.request_id, {
-      type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: 5,
-    })
-    const done = sent.find(e => e.type === 'audio.done')
-    assert.equal(done.final_sequence, 1, 'client is told the real barrier so it can finish')
-    const clamped = logs.find(l => l.evt === 'done_barrier_clamped')
-    assert.equal(clamped?.reason, 'final_sequence_not_yet_emitted')
-    assert.equal(clamped?.claimed_final_sequence, 5)
-    assert.equal(clamped?.effective_final_sequence, 1)
-  })
-
-  it('audio.done clamps to the dense prefix when there is an interior gap (毕玄 regression)', () => {
-    // 缺序反例：agent 发 0, 2, done(final_sequence=2). 缺了 1.
-    // 修复前会直接放出 done(2)——客户端以为完整收到 0..2 但其实缺 1；
-    // 修复后 clamp 到最高连续前缀（0）并在日志里记 gap 原因。
+  it('holds audio.done until a late-arriving interior delta backfills the gap (毕玄 regression)', () => {
+    // 反例来自 PR #159 复审：agent 发 0, 2, done(final_sequence=2)，
+    // 缺 seq=1。旧 clamp 实现会立即发 done(0) 让客户端"完成"，seq=1
+    // 迟到后被当作 post_done 丢弃 —— 违反 ESS-388 契约。
+    // 新的 pending barrier 语义：done 到达时不发送，等 seq=1 到达后
+    // 恰好发一次 done(2)，使用原始 final_sequence。
     const { session, sent, agent, scope, logs } = harness()
     start(session, scope)
     agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: 0, audio: b64('x') })
     agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: 2, audio: b64('x') })
     agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: 2 })
-    const done = sent.find(e => e.type === 'audio.done')
-    assert.ok(done, 'done emitted')
-    assert.equal(done.final_sequence, 0, 'client completes on the contiguous run it actually received')
-    const clamped = logs.find(l => l.evt === 'done_barrier_clamped')
-    assert.equal(clamped?.reason, 'gap_before_final_sequence')
-    assert.equal(clamped?.claimed_final_sequence, 2)
-    assert.equal(clamped?.effective_final_sequence, 0)
-    assert.equal(clamped?.high_watermark, 2)
+    assert.equal(sent.filter(e => e.type === 'audio.done').length, 0, 'done must not be released while seq=1 is missing')
+    assert.ok(logs.some(l => l.evt === 'done_barrier_pending' && l.pending_final_sequence === 2))
+    // Backfill the missing delta — barrier releases with the ORIGINAL final_sequence.
+    agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: 1, audio: b64('x') })
+    const dones = sent.filter(e => e.type === 'audio.done')
+    assert.equal(dones.length, 1, 'exactly one done after the gap closes')
+    assert.equal(dones[0].final_sequence, 2, 'the original final_sequence, not a clamped value')
   })
 
-  it('audio.done with a fully dense 0..final_sequence keeps the claimed final_sequence and does not log a clamp', () => {
+  it('waits for tail deltas when final_sequence exceeds the current high-watermark', () => {
+    // `0, 1, done(3), 2, 3` — done arrives before the tail. Barrier must
+    // wait, then release exactly one done(3) when seq=3 arrives.
+    const { session, sent, agent, scope } = harness()
+    start(session, scope)
+    for (const seq of [0, 1]) {
+      agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: seq, audio: b64('x') })
+    }
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: 3 })
+    assert.equal(sent.filter(e => e.type === 'audio.done').length, 0, 'no done while 2,3 missing')
+    agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: 2, audio: b64('x') })
+    assert.equal(sent.filter(e => e.type === 'audio.done').length, 0, 'still no done — seq=3 missing')
+    agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: 3, audio: b64('x') })
+    const dones = sent.filter(e => e.type === 'audio.done')
+    assert.equal(dones.length, 1, 'exactly one done after the full tail arrives')
+    assert.equal(dones[0].final_sequence, 3)
+  })
+
+  it('audio.done with a fully dense 0..final_sequence releases immediately with the claimed final_sequence', () => {
     const { session, sent, agent, scope, logs } = harness()
     start(session, scope)
     for (const seq of [0, 1, 2]) {
@@ -234,18 +258,65 @@ describe('RealtimeSession — downlink ordering', () => {
     agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: 2 })
     const done = sent.find(e => e.type === 'audio.done')
     assert.equal(done.final_sequence, 2)
-    assert.equal(logs.filter(l => l.evt === 'done_barrier_clamped').length, 0)
+    assert.equal(logs.filter(l => l.evt === 'done_barrier_gap_timeout').length, 0)
   })
 
-  it('audio.done arriving before any delta clamps to -1 and logs the shortfall', () => {
-    const { session, sent, agent, scope, logs } = harness()
+  it('audio.done with final_sequence=-1 (empty response) releases immediately', () => {
+    const { session, sent, agent, scope } = harness()
     start(session, scope)
-    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: 3 })
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: -1 })
     const done = sent.find(e => e.type === 'audio.done')
-    assert.equal(done.final_sequence, -1, 'zero-delta done clamps to -1 so client can detect the empty response')
-    const clamped = logs.find(l => l.evt === 'done_barrier_clamped')
-    assert.equal(clamped?.reason, 'final_sequence_not_yet_emitted')
-    assert.equal(clamped?.effective_final_sequence, -1)
+    assert.ok(done, 'done emitted for empty response')
+    assert.equal(done.final_sequence, -1)
+  })
+
+  it('gap timeout fires exactly one structured fail-closed and drops late deltas', () => {
+    // Reviewer requirement: gap timeout triggers a single structured
+    // fail-closed/fallback; must NOT forge a smaller endpoint, must NOT
+    // let the same turn double-execute.
+    const clock = controlledClock()
+    const { session, sent, agent, scope, closes, logs } = harness({
+      doneBarrierGapMs: 2_000,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: 0, audio: b64('x') })
+    agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: 2, audio: b64('x') })
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: 2 })
+    assert.equal(clock.pendingCount(), 1, 'barrier timer armed once')
+    assert.equal(sent.filter(e => e.type === 'audio.done').length, 0)
+    clock.fireAll()  // advance past doneBarrierGapMs
+    const errs = sent.filter(e => e.type === 'error')
+    assert.equal(errs.length, 1, 'exactly one structured fail-closed')
+    assert.equal(errs[0].code, 'ERR_STREAM_GAP_TIMEOUT')
+    assert.equal(errs[0].pending_final_sequence, 2, 'no forged smaller endpoint — pending stays 2')
+    assert.equal(errs[0].dense_prefix, 0)
+    assert.equal(closes[0]?.code, 1008, 'socket closed once')
+    assert.equal(sent.filter(e => e.type === 'audio.done').length, 0, 'no done was ever released')
+    // Late delta after the fail-closed must not resurrect this generation.
+    agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: 1, audio: b64('x') })
+    assert.equal(sent.filter(e => e.type === 'audio.done').length, 0, 'still no done — turn is dead')
+    assert.equal(sent.filter(e => e.type === 'audio.delta' && e.sequence === 1).length, 0, 'late delta not forwarded')
+    assert.ok(logs.some(l => l.evt === 'done_barrier_gap_timeout' && l.pending_final_sequence === 2))
+  })
+
+  it('cancel while barrier is pending stops the gap timer without a fail-closed', () => {
+    const clock = controlledClock()
+    const { session, sent, agent, scope, closes } = harness({
+      doneBarrierGapMs: 2_000,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: 0, audio: b64('x') })
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: 2 })
+    assert.equal(clock.pendingCount(), 1, 'barrier timer armed')
+    session.onFrame(JSON.stringify({
+      type: 'cancel', session_id: scope.session_id, request_id: scope.request_id, generation: scope.generation,
+    }))
+    assert.equal(clock.pendingCount(), 0, 'cancel cleared the barrier timer')
+    clock.fireAll()  // firing nothing — timer already cleared
+    assert.equal(sent.filter(e => e.type === 'error').length, 0, 'cancel is authoritative — no fail-closed')
+    assert.equal(closes.length, 0, 'socket stays open under cancel')
   })
 
   it('a second audio.done is idempotent (does not double-emit)', () => {

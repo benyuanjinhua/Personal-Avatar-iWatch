@@ -43,6 +43,7 @@ export class RealtimeSession {
     protocolVersion = 1,
     heartbeatIntervalMs = 15_000,
     idleDisconnectMs = 60_000,
+    doneBarrierGapMs = 2_000,
     maxFrameBytes = 64 * 1024,
     maxEventsPerSecond = 200,
     maxUplinkBytesPerSecond = 512 * 1024,
@@ -64,6 +65,7 @@ export class RealtimeSession {
     this.protocolVersion = protocolVersion
     this.heartbeatIntervalMs = heartbeatIntervalMs
     this.idleDisconnectMs = idleDisconnectMs
+    this.doneBarrierGapMs = doneBarrierGapMs
     this.maxFrameBytes = maxFrameBytes
     this.maxEventsPerSecond = maxEventsPerSecond
     this.maxUplinkBytesPerSecond = maxUplinkBytesPerSecond
@@ -88,8 +90,14 @@ export class RealtimeSession {
     this.downlinkHighWatermark = -1
     this.doneEmitted = false
     this.cancelled = false
-    this.finalSequence = null       // set when audio.done arrives
+    // `pendingFinalSequence` is the raw `final_sequence` the upstream sent on
+    // `agent.audio.done`; we hold it verbatim until `0..pendingFinalSequence`
+    // is dense in `seenDownlinkSequences`, then release ONE downstream
+    // `audio.done(final_sequence=pendingFinalSequence)`. Never rewritten.
+    this.pendingFinalSequence = null
+    this.finalSequence = null       // set when the downstream done is released
     this.staleGenerationDropped = 0
+    this._barrierTimer = null
 
     this.agentTurn = null
 
@@ -161,6 +169,7 @@ export class RealtimeSession {
     this.state = CLOSED
     if (this._heartbeatTimer) this.clearTimer(this._heartbeatTimer)
     if (this._idleTimer) this.clearTimer(this._idleTimer)
+    this._clearBarrierTimer()
     if (this.agentTurn) { try { this.agentTurn.close() } catch { /* ignore */ } }
     this.log('session_ended', {
       request_id: this.scope.request_id, session_id: this.scope.session_id,
@@ -272,6 +281,10 @@ export class RealtimeSession {
       })
     }
     this.cancelled = true
+    // Cancel is authoritative — kill any pending done barrier so the gap
+    // timer cannot fire a fail-closed after the client has moved on.
+    this._clearBarrierTimer()
+    this.pendingFinalSequence = null
     try { this.agentTurn?.cancel() } catch { /* best effort */ }
     this.log('cancel_received', {
       request_id: this.scope.request_id, session_id: this.scope.session_id,
@@ -342,6 +355,19 @@ export class RealtimeSession {
       return
     }
     if (!Number.isInteger(event.sequence) || event.sequence < 0) return
+    // Deltas whose sequence is beyond the upstream-claimed final_sequence
+    // are dropped — upstream is contradicting itself, and forwarding them
+    // would let a client receive frames past the promised barrier.
+    if (this.pendingFinalSequence !== null && event.sequence > this.pendingFinalSequence) {
+      this.staleGenerationDropped += 1
+      this.log('stale_generation_dropped', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        reason: 'past_pending_final_sequence',
+        sequence: event.sequence, pending_final_sequence: this.pendingFinalSequence,
+        total_dropped: this.staleGenerationDropped,
+      })
+      return
+    }
     if (this.seenDownlinkSequences.has(event.sequence)) {
       this.log('duplicate_sequence', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
@@ -368,52 +394,104 @@ export class RealtimeSession {
       sample_rate: event.sample_rate ?? 24_000, codec: event.codec ?? 'pcm_s16le',
       audio: event.audio,
     })
+    // A backfilled hole may have completed the dense prefix; check whether
+    // an upstream `audio.done` we've been holding can now be released.
+    this._maybeReleaseDone()
   }
 
   _emitDone(event) {
     if (this.doneEmitted) return
+    // ESS-388 §"强制契约": save the upstream `final_sequence` verbatim as
+    // the pending barrier and hold `audio.done` until every 0..N delta has
+    // been emitted downstream. Never rewrite the barrier; never emit done
+    // before it (毕玄 review on PR #159 — the old clamp let a hole like
+    // {0, 2, done(2)} slip through as done(0) and the client would then
+    // silently lose seq=1 when it arrived late).
     const claimed = Number.isInteger(event.final_sequence)
       ? event.final_sequence
       : this.downlinkHighWatermark
-    // The barrier is only meaningful if `0..final_sequence` has actually
-    // been emitted — checking that the `final_sequence` frame alone
-    // exists lets a hole like {0, 2, done(2)} slip through and the
-    // client would then complete on a response that lost seq=1
-    // (毕玄 review on PR #159). Compute the highest dense prefix and,
-    // on any gap or missing tail, clamp to it so the client completes
-    // on the contiguous run it actually received, and log the shortfall
-    // for reconciliation.
-    const densePrefix = this._highestDensePrefix()
-    let effectiveFinal
-    if (claimed < 0) {
-      effectiveFinal = densePrefix
-    } else if (claimed > densePrefix) {
-      const reason = this.seenDownlinkSequences.has(claimed)
-        ? 'gap_before_final_sequence'
-        : 'final_sequence_not_yet_emitted'
-      this.log('done_barrier_clamped', {
+    if (this.pendingFinalSequence === null) {
+      this.pendingFinalSequence = claimed
+      this.log('done_barrier_pending', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
-        response_id: this.responseId, claimed_final_sequence: claimed,
-        effective_final_sequence: densePrefix,
+        response_id: this.responseId,
+        pending_final_sequence: claimed,
         high_watermark: this.downlinkHighWatermark,
-        reason,
+        missing: this._missingBelow(claimed),
       })
-      effectiveFinal = densePrefix
-    } else {
-      effectiveFinal = claimed
+    } else if (claimed !== this.pendingFinalSequence) {
+      // Upstream re-emitted done with a different final_sequence — a
+      // protocol violation. Keep the first one we saw (already committed)
+      // and log the divergence for post-hoc reconciliation.
+      this.log('done_barrier_conflicting_final_sequence', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        response_id: this.responseId,
+        pending_final_sequence: this.pendingFinalSequence,
+        rejected_final_sequence: claimed,
+      })
     }
-    this.finalSequence = effectiveFinal
-    this.doneEmitted = true
-    this._sendJson({
-      type: 'audio.done',
-      session_id: this.scope.session_id, request_id: this.scope.request_id,
-      response_id: this.responseId, generation: this.scope.generation,
-      final_sequence: this.finalSequence,
-    })
-    this.log('downlink_done', {
-      request_id: this.scope.request_id, session_id: this.scope.session_id,
-      response_id: this.responseId, final_sequence: this.finalSequence,
-    })
+    this._maybeReleaseDone()
+  }
+
+  // Release the held `audio.done` if the dense prefix has caught up to the
+  // upstream-claimed `pendingFinalSequence`. Idempotent: only fires once,
+  // always with the original `pendingFinalSequence`.
+  _maybeReleaseDone() {
+    if (this.doneEmitted) return
+    if (this.pendingFinalSequence === null) return
+    const target = this.pendingFinalSequence
+    // A negative claim (e.g. -1) means "no frames" — release immediately.
+    if (target < 0 || this._highestDensePrefix() >= target) {
+      this._clearBarrierTimer()
+      this.finalSequence = target
+      this.doneEmitted = true
+      this._sendJson({
+        type: 'audio.done',
+        session_id: this.scope.session_id, request_id: this.scope.request_id,
+        response_id: this.responseId, generation: this.scope.generation,
+        final_sequence: this.finalSequence,
+      })
+      this.log('downlink_done', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        response_id: this.responseId, final_sequence: this.finalSequence,
+      })
+      return
+    }
+    // Still waiting for holes to be backfilled — arm the gap timer once.
+    this._armBarrierTimer()
+  }
+
+  _armBarrierTimer() {
+    if (this._barrierTimer !== null) return
+    if (this.doneBarrierGapMs <= 0) return
+    this._barrierTimer = this.setTimer(() => {
+      this._barrierTimer = null
+      if (this.state !== OPEN) return
+      if (this.doneEmitted || this.cancelled) return
+      if (this.pendingFinalSequence === null) return
+      // Structured fail-closed: single event, no forged smaller endpoint,
+      // no double execution. Client falls back per turn to the legacy path.
+      this.log('done_barrier_gap_timeout', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        response_id: this.responseId,
+        pending_final_sequence: this.pendingFinalSequence,
+        dense_prefix: this._highestDensePrefix(),
+        high_watermark: this.downlinkHighWatermark,
+        missing: this._missingBelow(this.pendingFinalSequence),
+      })
+      this.fail('ERR_STREAM_GAP_TIMEOUT', {
+        pending_final_sequence: this.pendingFinalSequence,
+        dense_prefix: this._highestDensePrefix(),
+        retriable: false,
+      })
+    }, this.doneBarrierGapMs)
+  }
+
+  _clearBarrierTimer() {
+    if (this._barrierTimer !== null) {
+      this.clearTimer(this._barrierTimer)
+      this._barrierTimer = null
+    }
   }
 
   // Largest N such that every 0..N is in `seenDownlinkSequences`; -1 if
@@ -423,6 +501,14 @@ export class RealtimeSession {
     let n = -1
     while (this.seenDownlinkSequences.has(n + 1)) n += 1
     return n
+  }
+
+  _missingBelow(target) {
+    const missing = []
+    for (let s = 0; s <= target && missing.length < 16; s++) {
+      if (!this.seenDownlinkSequences.has(s)) missing.push(s)
+    }
+    return missing
   }
 
   // === Housekeeping =======================================================
@@ -442,6 +528,10 @@ export class RealtimeSession {
       generation: this.scope.generation, code, retriable: Boolean(retriable),
     })
     this.closeSocket(1008, code)
+    // Terminate synchronously so no further agent events squeak through
+    // between now and when the transport's real close callback fires.
+    // `onSocketClose` is idempotent (`state === CLOSED` early-return).
+    this.onSocketClose(1008, code)
   }
 
   _gracefulClose(reason) {
