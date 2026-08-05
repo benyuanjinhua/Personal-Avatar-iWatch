@@ -38,9 +38,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     /// A failed mint drains them through the legacy Bridge exactly once.
     private var pendingAgentEnvelopes = AgentEnvelopeBuffer()
     private var agentTokenTask: Task<Void, Never>?
-    private var agentTokenTaskID: UUID?
-    private var agentTokenTurn: (requestId: String, sessionId: String)?
-    private var agentTokenFailedTurn: (requestId: String, sessionId: String)?
+    private var agentTokenState = AgentTokenMintState()
     private var pendingConfiguration: AgentConfiguration?
     private let historyStorageKey = "wristagent.phone.conversation.history"
     private let voiceInbox: VoiceRequestInbox?
@@ -232,28 +230,24 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
             return
         }
 
-        if agentTokenTurn?.requestId == identity.requestId,
-           agentTokenTurn?.sessionId == identity.sessionId,
+        let turn = AgentTokenMintState.Turn(requestId: identity.requestId, sessionId: identity.sessionId)
+        if agentTokenState.turn == turn,
            agentEphemeralToken != nil {
             realtimeSession.forward(envelope)
             return
         }
-        if agentTokenFailedTurn?.requestId == identity.requestId,
-           agentTokenFailedTurn?.sessionId == identity.sessionId {
+        if agentTokenState.failedTurn == turn {
             // Minting already failed for this turn. Keep the entire turn on
             // Bridge; never retry mid-turn and create a second execution.
             realtimeSession.forward(envelope)
             return
         }
 
-        if agentTokenTurn?.requestId != identity.requestId || agentTokenTurn?.sessionId != identity.sessionId {
+        if agentTokenState.activate(turn) {
             agentTokenTask?.cancel()
             agentTokenTask = nil
-            agentTokenTaskID = nil
             agentEphemeralToken = nil
-            agentTokenFailedTurn = nil
             _ = pendingAgentEnvelopes.drain()
-            agentTokenTurn = identity
         }
         switch pendingAgentEnvelopes.append(envelope, encodedByteCount: data.count) {
         case .buffered:
@@ -261,21 +255,16 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         case .overflow(let buffered, let incoming, let snapshot):
             agentTokenTask?.cancel()
             agentEphemeralToken = nil
-            agentTokenFailedTurn = agentTokenTurn
+            guard agentTokenState.markCurrentTurnFailed(turn) else { return }
             Self.logAgentFallback(reason: "buffer_overflow", snapshot: snapshot, degradedCount: buffered.count + 1)
             for item in buffered { realtimeSession.forward(item) }
             realtimeSession.forward(incoming)
             return
         }
         guard agentTokenTask == nil else { return }
-        let taskID = UUID()
-        agentTokenTaskID = taskID
+        guard let taskID = agentTokenState.registerTask() else { return }
         agentTokenTask = Task { [weak self] in
-            await self?.mintAgentTokenAndDrain(
-                requestId: identity.requestId,
-                sessionId: identity.sessionId,
-                taskID: taskID
-            )
+            await self?.mintAgentTokenAndDrain(turn: turn, taskID: taskID)
         }
     }
 
@@ -296,47 +285,48 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         }
     }
 
-    private func mintAgentTokenAndDrain(requestId: String, sessionId: String, taskID: UUID) async {
+    private func mintAgentTokenAndDrain(turn: AgentTokenMintState.Turn, taskID: UUID) async {
         defer {
-            if agentTokenTaskID == taskID {
+            if agentTokenState.finish(taskId: taskID, turn: turn) {
                 agentTokenTask = nil
-                agentTokenTaskID = nil
             }
         }
         guard let credentials = RelayCredentialsStore.read(),
               credentials.deviceId == agentFlag.deviceId,
               let gatewayURL = URL(string: agentFlag.gatewayURLString) else {
-            drainPendingAgentEnvelopesToBridge(reason: "missing_credentials_or_gateway")
+            drainPendingAgentEnvelopesToBridge(
+                reason: "missing_credentials_or_gateway", turn: turn, taskID: taskID
+            )
             return
         }
         do {
             let issued = try await AgentSessionTokenClient(
                 gatewayURL: gatewayURL,
                 credentials: credentials
-            ).mint(requestId: requestId, sessionId: sessionId, generation: 1)
-            guard agentTokenTurn?.requestId == requestId,
-                  agentTokenTurn?.sessionId == sessionId,
-                  agentTokenFailedTurn?.requestId != requestId || agentTokenFailedTurn?.sessionId != sessionId else { return }
+            ).mint(requestId: turn.requestId, sessionId: turn.sessionId, generation: 1)
+            guard agentTokenState.owns(taskId: taskID, turn: turn) else { return }
             agentEphemeralToken = issued.token
             let (buffered, _) = pendingAgentEnvelopes.drain()
             Self.logger.info(
-                "agent ephemeral token minted request=\(requestId.prefix(8), privacy: .public) session=\(sessionId.prefix(8), privacy: .public) ttl_ms=\(issued.ttlMs, privacy: .public)"
+                "agent ephemeral token minted request=\(turn.requestId.prefix(8), privacy: .public) session=\(turn.sessionId.prefix(8), privacy: .public) ttl_ms=\(issued.ttlMs, privacy: .public)"
             )
             for envelope in buffered { realtimeSession.forward(envelope) }
         } catch {
-            guard agentTokenTurn?.requestId == requestId,
-                  agentTokenTurn?.sessionId == sessionId,
-                  agentTokenFailedTurn?.requestId != requestId || agentTokenFailedTurn?.sessionId != sessionId else { return }
+            guard agentTokenState.owns(taskId: taskID, turn: turn) else { return }
             Self.logger.error(
-                "agent token mint failed request=\(requestId.prefix(8), privacy: .public) error=\(String(describing: error), privacy: .public)"
+                "agent token mint failed request=\(turn.requestId.prefix(8), privacy: .public) error=\(String(describing: error), privacy: .public)"
             )
-            drainPendingAgentEnvelopesToBridge(reason: AgentTokenFallbackReason.reason(for: error))
+            drainPendingAgentEnvelopesToBridge(
+                reason: AgentTokenFallbackReason.reason(for: error), turn: turn, taskID: taskID
+            )
         }
     }
 
-    private func drainPendingAgentEnvelopesToBridge(reason: String) {
+    private func drainPendingAgentEnvelopesToBridge(
+        reason: String, turn: AgentTokenMintState.Turn, taskID: UUID
+    ) {
+        guard agentTokenState.markFailed(taskId: taskID, turn: turn) else { return }
         agentEphemeralToken = nil
-        agentTokenFailedTurn = agentTokenTurn
         let (buffered, snapshot) = pendingAgentEnvelopes.drain()
         Self.logAgentFallback(reason: reason, snapshot: snapshot, degradedCount: buffered.count)
         for envelope in buffered { realtimeSession.forward(envelope) }
