@@ -25,7 +25,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         private(set) var preparedFor: RealtimeMediaSession.TurnHandle?
         private(set) var enqueuedPlayables: [RealtimeDownlinkPlayback.PlayableChunk] = []
         private(set) var bargedInBytes: [Int] = []
-        private(set) var inputCompleteSignalled = false
+        private(set) var finished = false
         private(set) var stopped = false
 
         var enqueuedChunks: [VoiceStreamChunk] { enqueuedPlayables.map(\.chunk) }
@@ -35,7 +35,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
             enqueuedPlayables.append(contentsOf: playables)
         }
         func bargeIn(clearedBytes: Int) { bargedInBytes.append(clearedBytes) }
-        func signalInputComplete() { inputCompleteSignalled = true }
+        func finish() { finished = true }
         func stop(barge: Bool) { stopped = true }
     }
 
@@ -212,11 +212,11 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         XCTAssertEqual(transport.playbackEndEvents.first?.2, 2_048)
     }
 
-    /// ESS-335: `markDownlinkComplete` (audio.done) must NOT close the
-    /// coordinator turn synchronously. The player still has buffers
-    /// draining; the turn only closes when the player's real `.ended`
-    /// receipt arrives back through `onPlaybackEvent`.
-    func testMarkDownlinkCompleteWaitsForRealEndedBeforeFinishingTurn() {
+    /// ESS-335: `markDownlinkComplete` (audio.done) finishes the turn
+    /// synchronously — the tracker-based engine emits `.ended` from within
+    /// `finish()` when every buffer has completed. The adapter then closes
+    /// the coordinator turn immediately, no deferred wait.
+    func testMarkDownlinkCompleteFinishesTurnAndRoutesPlaybackReceipts() {
         let requestId = "44444444-4444-4444-4444-444444444450"
         let (adapter, _, player, transport, _) = makeAdapter(sessionIds: [
             "55555555-5555-5555-5555-55555555abc0"
@@ -230,23 +230,23 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         )
         adapter.ingestDownlink(chunk, responseId: "resp-1")
 
-        adapter.markDownlinkComplete()
-        XCTAssertTrue(player.inputCompleteSignalled,
-                      "adapter must forward audio.done as signalInputComplete, not finish()")
-        XCTAssertNotNil(adapter.currentTurn,
-                        "turn must stay open until the real .ended receipt arrives")
-        XCTAssertTrue(transport.playbackEndEvents.isEmpty,
-                      "playback.ended must not be sent before the player confirms drain")
-
-        // Player finishes draining and reports the real bytesPlayed.
+        // Simulate the real player emitting a playback receipt BEFORE
+        // markDownlinkComplete — the real engine fires `.ended` from within
+        // `finish()` when the tracker drain is already satisfied.
         player.onPlaybackEvent?(.ended(
-            requestId: handle.requestId, sessionId: handle.sessionId, bytesPlayed: 64
+            requestId: handle.requestId, sessionId: handle.sessionId,
+            responseId: "resp-1", bytesPlayed: 64
         ))
         XCTAssertEqual(transport.playbackEndEvents.count, 1)
         XCTAssertEqual(transport.playbackEndEvents.first?.1, "resp-1")
         XCTAssertEqual(transport.playbackEndEvents.first?.2, 64)
+
+        adapter.markDownlinkComplete()
+        XCTAssertTrue(player.finished,
+                      "adapter must forward audio.done as finish() on the player")
+        // The adapter finishes the turn synchronously after player.finish().
         XCTAssertNil(adapter.currentTurn,
-                     "turn must be closed once the real .ended receipt arrives")
+                     "turn must be closed by markDownlinkComplete")
     }
 
     func testNewTurnBargesInAndPlayerClearsPriorPlayback() {
