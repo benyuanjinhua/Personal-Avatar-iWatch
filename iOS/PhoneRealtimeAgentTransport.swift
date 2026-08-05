@@ -93,7 +93,7 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
                 return
             }
             agentSession.commitUplink(requestId: requestId, generation: gate.generation,
-                                      finalSequence: commit.capturedAtMs > 0 ? Int(commit.capturedAtMs % 4096) : 0)
+                                      finalSequence: commit.sequence)
             completion(nil)
 
         case .bargeInRequest:

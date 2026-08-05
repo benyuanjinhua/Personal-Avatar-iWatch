@@ -56,6 +56,7 @@ final class RealtimeUplinkStreamTests: XCTestCase {
                 return XCTFail("expected audio.commit")
             }
             XCTAssertEqual(commit.requestId, requestId)
+            XCTAssertEqual(commit.sequence, 2)
         default:
             XCTFail("expected emitted commit")
         }
