@@ -32,13 +32,15 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
     /// changes to its coordinator (used for UI/log evidence).
     var onStateChange: ((PhoneRealtimeSession.State) -> Void)?
 
-    private let agentSession: AudioRealtimeAgentSession
+    private var agentSession: AudioRealtimeAgentSession
+    private let replacementSession: (Int) async throws -> AudioRealtimeAgentSession
     private let requestId: String
     private let sessionId: String
 
     /// Current turn generation. iPhone owns this counter; Watch requests
     /// advancement via `bargein.request`.
-    private var generation: Int
+    private var gate: BargeInGenerationCoordinator
+    private var cancelTimeout: Task<Void, Never>?
 
     /// Pending completion for the latest `send` call — the Agent transport
     /// is asynchronous (WSS), so `send` reports completion via this pending
@@ -50,12 +52,14 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
         agentSession: AudioRealtimeAgentSession,
         requestId: String,
         sessionId: String,
-        generation: Int = 0
+        generation: Int = 0,
+        replacementSession: @escaping (Int) async throws -> AudioRealtimeAgentSession
     ) {
         self.agentSession = agentSession
         self.requestId = requestId
         self.sessionId = sessionId
-        self.generation = generation
+        self.gate = BargeInGenerationCoordinator(generation: generation)
+        self.replacementSession = replacementSession
         wireAgentSession()
         _ = agentSession.connect(requestId: requestId, generation: generation)
     }
@@ -77,7 +81,7 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
                     userInfo: [NSLocalizedDescriptionKey: "missing audio.append payload"]))
                 return
             }
-            agentSession.sendAudioChunk(append, requestId: requestId, generation: generation)
+            agentSession.sendAudioChunk(append, requestId: requestId, generation: gate.generation)
             // Agent session handles send completion internally; report ack
             // synchronously to keep the PhoneRealtimeSession contract.
             completion(nil)
@@ -88,7 +92,7 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
                     userInfo: [NSLocalizedDescriptionKey: "missing audio.commit payload"]))
                 return
             }
-            agentSession.commitUplink(requestId: requestId, generation: generation,
+            agentSession.commitUplink(requestId: requestId, generation: gate.generation,
                                       finalSequence: commit.capturedAtMs > 0 ? Int(commit.capturedAtMs % 4096) : 0)
             completion(nil)
 
@@ -142,6 +146,7 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
     }
 
     func close(reason: String) {
+        cancelTimeout?.cancel()
         agentSession.disconnect(reason: reason)
     }
 
@@ -149,33 +154,48 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
 
     private func handleBargeInRequest(fromGeneration: Int) {
         Self.logger.info(
-            "agent bargein.request from_gen=\(fromGeneration, privacy: .public) current=\(self.generation, privacy: .public)"
+            "agent bargein.request from_gen=\(fromGeneration, privacy: .public) current=\(self.gate.generation, privacy: .public)"
         )
-        // Dedupe: if fromGeneration equals current, this is a stale request
-        // (Watch already transitioned but the message arrived late).
-        guard fromGeneration >= generation else {
-            Self.logger.info("agent bargein.request stale — ignoring")
-            return
+        guard case .cancel(let old) = gate.request(from: fromGeneration) else { return }
+        agentSession.cancel(requestId: requestId, generation: old, reason: "barge-in") { [weak self] in
+            self?.failReplacement("cancel_failed")
         }
-        let oldGeneration = generation
-        generation += 1
+        cancelTimeout?.cancel()
+        cancelTimeout = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            self?.settleCancel(old)
+        }
+    }
 
-        // Send cancel(oldGeneration) on the Agent WSS
-        agentSession.cancel(requestId: requestId, generation: oldGeneration,
-                            reason: "barge-in")
+    private func settleCancel(_ old: Int) {
+        guard case .mintAndConnect(let next) = gate.cancelSettled(generation: old) else { return }
+        cancelTimeout?.cancel()
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let fresh = try await replacementSession(next)
+                agentSession.disconnect(reason: "generation_replaced")
+                agentSession = fresh
+                wireAgentSession()
+                guard fresh.connect(requestId: requestId, generation: next) else {
+                    failReplacement("wss_upgrade_failed")
+                    return
+                }
+            } catch {
+                failReplacement("token_mint_failed")
+            }
+        }
+    }
 
-        // Reply to Watch: generation.open(new_generation) — this unblocks
-        // the Watch's pending window and sets activeGeneration = new_gen
-        let downlink = RealtimeDownlinkEnvelope.generationOpen(
-            requestId: requestId,
-            sessionId: sessionId,
-            generation: generation
-        )
-        onDownlink?(downlink)
-
-        Self.logger.info(
-            "agent generation.advance \(oldGeneration, privacy: .public) → \(self.generation, privacy: .public)"
-        )
+    private func failReplacement(_ reason: String) {
+        guard case .fallback = gate.fail(reason) else { return }
+        agentSession.disconnect(reason: reason)
+        onDownlink?(.bargeInFailed(
+            requestId: requestId, sessionId: sessionId,
+            fromGeneration: gate.generation, reason: reason
+        ))
+        onStateChange?(.failed(reason: reason))
     }
 
     // MARK: - Agent session wiring
@@ -183,6 +203,7 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
     private func wireAgentSession() {
         agentSession.onAudioDelta = { [weak self] chunk, responseId, gen in
             guard let self else { return }
+            guard gen == self.gate.generation else { return }
             let envelope = RealtimeDownlinkEnvelope.audioDelta(
                 chunk, responseId: responseId, generation: gen
             )
@@ -190,6 +211,7 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
         }
         agentSession.onAudioDone = { [weak self] rid, responseId, gen, finalSeq in
             guard let self else { return }
+            guard gen == self.gate.generation else { return }
             let envelope = RealtimeDownlinkEnvelope.audioDone(
                 requestId: rid, sessionId: self.sessionId,
                 responseId: responseId,
@@ -208,9 +230,11 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
             }
         }
         agentSession.onCancelAck = { [weak self] rid, gen, cancelledRespId in
+            guard let self else { return }
             Self.logger.info(
                 "agent cancel.ack rid=\(rid.prefix(8), privacy: .public) gen=\(gen) cancelled=\(cancelledRespId.prefix(8), privacy: .public)"
             )
+            self.settleCancel(gen)
         }
         agentSession.onConnectionStateChange = { [weak self] state in
             guard let self else { return }
@@ -220,6 +244,10 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
                     "agent connected sid=\(sid.prefix(8), privacy: .public) rid=\(rid.prefix(8), privacy: .public) gen=\(gen)"
                 )
                 self.onStateChange?(.active(requestId: rid, sessionId: sid))
+                if case .open(let opened) = self.gate.ready(generation: gen) {
+                    self.onDownlink?(.generationOpen(requestId: rid, sessionId: sid, generation: opened))
+                    Self.logger.info("agent generation.open rid=\(rid.prefix(8), privacy: .public) sid=\(sid.prefix(8), privacy: .public) gen=\(opened)")
+                }
             case .failed(let sid, let reason):
                 Self.logger.error(
                     "agent failed sid=\(sid.prefix(8), privacy: .public) reason=\(reason, privacy: .public)"
