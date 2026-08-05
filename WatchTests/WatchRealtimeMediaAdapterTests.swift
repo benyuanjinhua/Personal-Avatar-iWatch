@@ -7,6 +7,38 @@ import XCTest
 /// single-shot fallback on transport failure).
 @MainActor
 final class WatchRealtimeMediaAdapterTests: XCTestCase {
+
+    func testRealtimePlaybackAudioSessionGateActivatesOncePerTurn() throws {
+        var gate = RealtimePlaybackAudioSessionGate()
+        var activations = 0
+
+        try gate.activate { activations += 1 }
+        try gate.activate { activations += 1 }
+
+        XCTAssertTrue(gate.isActivated)
+        XCTAssertEqual(activations, 1)
+
+        gate.reset()
+        try gate.activate { activations += 1 }
+        XCTAssertEqual(activations, 2)
+    }
+
+    func testRealtimePlaybackAudioSessionGateRetriesAfterActivationFailure() {
+        enum Failure: Error { case rejected }
+        var gate = RealtimePlaybackAudioSessionGate()
+        var attempts = 0
+
+        XCTAssertThrowsError(try gate.activate {
+            attempts += 1
+            throw Failure.rejected
+        })
+        XCTAssertFalse(gate.isActivated)
+
+        XCTAssertNoThrow(try gate.activate { attempts += 1 })
+        XCTAssertTrue(gate.isActivated)
+        XCTAssertEqual(attempts, 2)
+    }
+
     private final class MockRecorder: WatchRealtimeMediaAdapter.Recorder {
         var onFrame: ((Data) -> Void)?
         var onFailure: ((Error) -> Void)?
