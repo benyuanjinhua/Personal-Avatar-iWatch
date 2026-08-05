@@ -46,10 +46,26 @@ function assertStructuredStartupFailure(result, { expectDetail }) {
 }
 
 test('missing TLS cert → structured startup_failed, exit 1, no bare stack', () => {
-  // Default config.json points at ./certs/gateway.crt which does not exist in
-  // a fresh checkout → readFileSync throws synchronously inside createGateway().
-  const result = runServer()
-  assertStructuredStartupFailure(result, { expectDetail: /ENOENT|no such file/ })
+  // The "missing cert" condition must be a fact this test constructs, not an
+  // assumption about the workspace: smoke/deploy-smoke.mjs generates
+  // AudioRealtimeGateway/certs/ on any run, so pointing at the module's
+  // default config would make this case pass/fail depending on leftovers.
+  const dir = mkdtempSync(join(tmpdir(), 'gw-startup-'))
+  try {
+    const base = JSON.parse(readFileSync(join(HERE, '..', 'config.json'), 'utf8'))
+    const config = {
+      ...base,
+      tls_cert: join(dir, 'no-such-gateway.crt'),
+      tls_key: join(dir, 'no-such-gateway.key'),
+    }
+    const configPath = join(dir, 'config.json')
+    writeFileSync(configPath, JSON.stringify(config))
+
+    const result = runServer({ GATEWAY_CONFIG_PATH: configPath })
+    assertStructuredStartupFailure(result, { expectDetail: /ENOENT|no such file/ })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('unknown agent_transport → structured startup_failed, exit 1, no bare stack', () => {
