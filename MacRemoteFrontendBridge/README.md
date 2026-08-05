@@ -6,6 +6,11 @@
 events socket 相同的来源白名单和 HMAC 请求头；`x-request-id` 必须等于查询参数
 `request_id`，并要求 `session_id`。第一条消息必须是：
 
+流式链路的 Bridge 侧门禁有两项：`realtime_media_v1` 控制双向 realtime WSS，
+`voice_streaming_v2` 控制分片上下行与公告流。两者默认均为 `false`；部署环境需在
+`config.json` 中显式开启。Watch 侧默认值、远程配置和本地 debug override 由客户端
+独立控制，详见 ESS-356；任一侧关闭都会回退到整包链路。
+
 ```json
 {"type":"start","protocol_version":1,"request_id":"req_...","session_id":"session_..."}
 ```
