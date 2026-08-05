@@ -16,6 +16,8 @@ struct WatchContentView: View {
     /// ESS-280（R1 生效）：设置页承载流式开关与自检；首屏不消费本对象，
     /// 但需要传给 `WatchSettingsView`（TabView 第 2 页）。
     @ObservedObject private var debugSettings: WatchDebugSettings
+    /// ESS-307：设置页配置 + 下行积压计数。
+    @ObservedObject private var settings: WatchSettingsStore
     /// ESS-280 方案 A（PM Jackson Bai 2026-08-04 拍板；R-04.6 后一条覆盖前一条）：
     /// 三屏结构 —— 0 = 主界面、1 = 状态时间线（原挂在主屏 NavigationLink 下的
     /// `ConversationTimelineView` 抬升为独立屏）、2 = 设置。冷启动落 tag 0。
@@ -26,7 +28,8 @@ struct WatchContentView: View {
         pushToTalk: PushToTalkController,
         welcome: WelcomeGreeter,
         selfCheck: SelfCheckRunner,
-        debugSettings: WatchDebugSettings
+        debugSettings: WatchDebugSettings,
+        settings: WatchSettingsStore
     ) {
         self.pushToTalk = pushToTalk
         self.welcome = welcome
@@ -37,6 +40,7 @@ struct WatchContentView: View {
         self.notifier = pushToTalk.notifier
         self.errorPresenter = pushToTalk.errorPresenter
         self.debugSettings = debugSettings
+        self.settings = settings
     }
 
     var body: some View {
@@ -49,12 +53,12 @@ struct WatchContentView: View {
                 .tag(0)
 
             NavigationStack {
-                ConversationTimelineView(journal: journal)
+                ConversationTimelineView(journal: journal, settings: settings)
             }
             .tag(1)
 
             NavigationStack {
-                WatchSettingsView(selfCheck: selfCheck, debugSettings: debugSettings)
+                WatchSettingsView(selfCheck: selfCheck, debugSettings: debugSettings, settings: settings)
             }
             .tag(2)
         }
@@ -136,9 +140,25 @@ struct WatchContentView: View {
                     }
 
                     if transport.pendingCount > 0 {
-                        Text("待送达 \(transport.pendingCount) 条")
+                        Text("待发送 \(transport.pendingCount) 条")
                             .font(.caption2)
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    // ESS-307 (D5 Gap-7)：下行队列积压可见性。
+                    // 条件：有积压 AND 当前无处理中回合（处理中优先，积压不抢位）。
+                    // 点击跳转到②历史时间线（tab 1）。
+                    // 样式：克制的等待态（非红色），无秒级计时。
+                    if showDownlinkBacklogHint {
+                        Button {
+                            selectedTab = 1
+                        } label: {
+                            Label("还有 \(settings.downlinkBacklogCount) 条结果没送到", systemImage: "tray.and.arrow.down")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .buttonStyle(.plain)
                     }
 
                     // ESS-258 / D1 铁律 + D3 铁律 1：15s 无 iPhone 回执触发的
@@ -394,6 +414,20 @@ struct WatchContentView: View {
     private var isRecording: Bool { pushToTalk.state == .recording }
 
     private var activeTurn: VoiceTurnRecord? { journal.activeTurn }
+
+    /// ESS-307：下行积压提示是否可见。
+    /// 条件：队列有积压 AND 当前没有处理中的回合（处理中优先，不抢位）。
+    private var showDownlinkBacklogHint: Bool {
+        Self.shouldShowDownlinkBacklogHint(
+            backlogCount: settings.downlinkBacklogCount,
+            activeTurn: activeTurn
+        )
+    }
+
+    /// 纯函数抽出便于 WatchTests 覆盖 UI 决策：有积压且无活跃回合时显示。
+    static func shouldShowDownlinkBacklogHint(backlogCount: Int, activeTurn: VoiceTurnRecord?) -> Bool {
+        backlogCount > 0 && activeTurn?.isActive != true
+    }
 
     private var isSpeaking: Bool {
         player.isPlaying || welcome.stage == .playing

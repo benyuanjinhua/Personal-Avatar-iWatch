@@ -29,6 +29,10 @@ final class WatchAppServices {
             settings?.configuration.voiceStreamingV2 ?? VoiceStreamingGate.defaultEnabled
         }
         pushToTalk.onAutoPlayStarted = { [welcome] in welcome.interrupt() }
+        // ESS-321: pre-warm the adapter so the settings store's downlink
+        // dispatch has somewhere to send `audio.delta` payloads even before
+        // the first press has fired.
+        settings.realtimeAdapter = pushToTalk.ensureRealtimeAdapter()
         settings.activate()
         WatchLog.info("lifecycle", "services_bootstrapped", detail: reason)
     }

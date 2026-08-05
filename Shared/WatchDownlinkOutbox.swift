@@ -47,6 +47,9 @@ struct WatchDownlinkItem: Codable, Equatable, Identifiable {
     let enqueuedAt: Date
     var deliveredAt: Date?
     var lastError: String?
+    /// ESS-306 / D5 Gap-6：下行语音积压上限。多条 `.speech` 排队时，
+    /// 超过阈值的旧条目被标记为抑制自动播放（数据不丢，仍可手动重播）。
+    var autoPlaySuppressed: Bool
 }
 
 /// 结构化观测事件（ESS-21 验收要求「request_id 观测」）。
@@ -61,6 +64,8 @@ enum WatchDownlinkLogEvent: Equatable {
     case failed(requestId: String, kind: WatchDownlinkKind, itemId: String, attempt: Int, reason: String)
     /// 超过保留期仍未送达，放弃并留痕（不静默消失）。
     case expired(requestId: String, kind: WatchDownlinkKind, itemId: String)
+    /// ESS-306 / D5 Gap-6：下行语音积压超限，旧条目被抑制自动播放。
+    case speechBacklogSuppressed(suppressed: Int, kept: String, requestId: String)
     /// 状态迁移后索引写盘失败：内存与磁盘暂时不一致，靠下一次成功写盘收敛。
     /// 入队路径不会走到这里——入队落盘失败直接回滚并抛错，不会宣称成功。
     case persistFailed(operation: String, reason: String)
@@ -123,6 +128,12 @@ final class WatchDownlinkOutbox {
 
     /// 下行退避比上送更激进：Watch 通常只是「App 没打开」，恢复窗口以秒计。
     static let downlinkBackoff = RetryBackoff(baseDelay: 1, maxDelay: 60, jitterRatio: 0.2)
+
+    /// ESS-306 / D5 Gap-6：下行语音自动播放积压上限。
+    /// 队列中 `.speech` 条目超过此数时，旧条目标记 `autoPlaySuppressed`，
+    /// 只保留最新一条自动播放；其余仍投递但 Watch 侧不自动出声。
+    /// PD 在 ESS-248 附 C 第 3 条拍板的假设值，后续可按真机体感调整。
+    static let speechAutoPlayLimit = 3
 
     init(
         directory: URL,
@@ -264,7 +275,8 @@ final class WatchDownlinkOutbox {
             nextAttemptAt: now(),
             enqueuedAt: now(),
             deliveredAt: nil,
-            lastError: nil
+            lastError: nil,
+            autoPlaySuppressed: false
         )
         items.append(item)
         do {
@@ -277,6 +289,10 @@ final class WatchDownlinkOutbox {
             throw error
         }
         log(.enqueued(requestId: requestId, kind: kind, itemId: id))
+        if kind == .speech {
+            enforceSpeechBacklogCap()
+            try persistIndex()
+        }
         return .enqueued(item)
     }
 
@@ -476,6 +492,38 @@ final class WatchDownlinkOutbox {
     }
 
     // MARK: - 私有
+
+    /// ESS-306 / D5 Gap-6：下行语音积压上限。
+    /// 队列中非抑制 `.speech` 条目超过 `speechAutoPlayLimit` 时，
+    /// 将最旧的若干条标记为 `autoPlaySuppressed`，只保留最新一条自动播放。
+    /// 抑制 ≠ 丢弃：音频仍落盘、条目仍投递，Watch 侧靠此标志跳过自动播放。
+    private func enforceSpeechBacklogCap() {
+        let limit = Self.speechAutoPlayLimit
+        let speechIndices = items.indices.filter {
+            items[$0].kind == .speech
+                && !items[$0].autoPlaySuppressed
+                && items[$0].state != .delivered
+        }
+        guard speechIndices.count > limit else { return }
+
+        // 按 enqueuedAt 排序，保留最新的 `limit` 条，抑制其余。
+        let sorted = speechIndices.sorted { items[$0].enqueuedAt < items[$1].enqueuedAt }
+        let toSuppress = sorted.dropLast(limit)
+        var suppressed = 0
+        var keptItemId: String?
+        for idx in toSuppress {
+            items[idx].autoPlaySuppressed = true
+            suppressed += 1
+        }
+        if let newest = sorted.last {
+            keptItemId = items[newest].id
+        }
+        if suppressed > 0, let kept = keptItemId, let newest = sorted.last {
+            log(.speechBacklogSuppressed(
+                suppressed: suppressed, kept: kept, requestId: items[newest].requestId
+            ))
+        }
+    }
 
     private func mutate(id: String, operation: String, _ body: (inout WatchDownlinkItem) -> Void) {
         guard let index = items.firstIndex(where: { $0.id == id }) else { return }

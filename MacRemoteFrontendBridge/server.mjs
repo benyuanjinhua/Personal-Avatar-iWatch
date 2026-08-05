@@ -52,6 +52,14 @@ function pcmRms16(pcm) {
   return Math.sqrt(sum / samples)
 }
 
+function optionalBoundedString(value, field, maxLength) {
+  if (value === undefined || value === null) return null
+  if (typeof value !== 'string' || value.length > maxLength) {
+    throw new ApiError(ERR.MISSING_FIELD, `${field} must be a string up to ${maxLength} characters`)
+  }
+  return value
+}
+
 export function createBridge(overrides = {}) {
   const CONFIG = { ...JSON.parse(readFileSync(join(BASE, 'config.json'), 'utf8')), ...overrides }
   const log = obj => process.stdout.write(JSON.stringify({ ts: new Date().toISOString(), ...obj }) + '\n')
@@ -440,7 +448,7 @@ export function createBridge(overrides = {}) {
     workTimers.delete(requestId)
   }
 
-  async function processTurn(requestId, audioBuf, audioMeta) {
+  async function processTurn(requestId, audioBuf, audioMeta, context = {}) {
     armWorkDeadline(requestId)
     try {
       if (ledger.get(requestId)?.state === 'cancelled') return // cancelled while queued
@@ -463,6 +471,8 @@ export function createBridge(overrides = {}) {
       ledger.update(requestId, { state: 'processing', detail: 'realtime_processing' })
       const result = await supervisor.injectTurn(pcm16k, {
         label: requestId,
+        parentRequestId: context.parentRequestId ?? null,
+        contextSummary: context.contextSummary ?? null,
         // 串行队列：work deadline 在轮到本 turn 注入时重挂——按受理时刻起算
         // 的话，积压队尾在排队期就被判死（ESS-36 真机 4×ERR_WORK_TIMEOUT）。
         onStart: () => armWorkDeadline(requestId),
@@ -595,6 +605,8 @@ export function createBridge(overrides = {}) {
     if (!meta || !meta.codec || !Number.isFinite(meta.duration_ms) || !meta.sha256 || typeof body.audio_base64 !== 'string') {
       throw new ApiError(ERR.MISSING_FIELD, 'audio{codec,duration_ms,sha256}, audio_base64')
     }
+    const parentRequestId = optionalBoundedString(body.parent_request_id, 'parent_request_id', 128)
+    const contextSummary = optionalBoundedString(body.context_summary, 'context_summary', 8_000)
 
     const bodySha = sha256hex(rawBody)
 
@@ -639,7 +651,7 @@ export function createBridge(overrides = {}) {
     // Snapshot the `accepted` receipt before processing starts mutating state;
     // the 202 returns immediately, execution continues asynchronously.
     const receipt = { ...ledger.projection(turn), streaming }
-    processTurn(requestId, audioBuf, meta).catch(err =>
+    processTurn(requestId, audioBuf, meta, { parentRequestId, contextSummary }).catch(err =>
       log({ evt: 'process_turn_crashed', request_id: requestId, err: String(err) }))
     return { status: 202, body: receipt }
   }

@@ -15,6 +15,19 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     @Published private(set) var pendingDownlinkCount = 0
     /// ESS-28：加密 outbox + Tailscale 上送 + 结果回传编排器。
     let relay: WristAgentPhoneRelay
+    /// ESS-321 real-time media session (Watch ↔ iPhone ↔ Bridge). Lazily
+    /// constructed on the first uplink envelope so households that never
+    /// enable streaming (VoiceStreamingGate.defaultEnabled == false) do not
+    /// pay for the WSS setup.
+    private lazy var realtimeSession: PhoneRealtimeSession = {
+        let session = PhoneRealtimeSession(transportFactory: { [weak self] requestId, sessionId in
+            self?.makeRealtimeTransport(requestId: requestId, sessionId: sessionId)
+        })
+        session.onDownlink = { [weak self] envelope in
+            self?.forwardRealtimeDownlink(envelope)
+        }
+        return session
+    }()
     private var pendingConfiguration: AgentConfiguration?
     private let historyStorageKey = "wristagent.phone.conversation.history"
     private let voiceInbox: VoiceRequestInbox?
@@ -171,6 +184,10 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
             Task { @MainActor in self.ingestSelfCheckSummary(data: summaryData) }
             return
         }
+        if let realtimeUplink = message[RealtimeMediaMessage.uplinkEnvelopeKey] as? Data {
+            Task { @MainActor in self.handleRealtimeUplink(data: realtimeUplink) }
+            return
+        }
         guard
             let envelopeData = message[VoiceMessage.envelopeKey] as? Data,
             let envelope = try? VoiceRequestEnvelope.decode(from: envelopeData)
@@ -185,6 +202,62 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
               VoiceStreamValidator().validate(chunk) == nil,
               chunk.direction == .uplink else { return }
         Task { @MainActor in self.relay.forwardStreamChunk(chunk) }
+    }
+
+    /// ESS-321 real-time uplink dispatch. Called from `didReceiveMessage`
+    /// when the payload carries a `RealtimeUplinkEnvelope`.
+    @MainActor
+    private func handleRealtimeUplink(data: Data) {
+        guard let envelope = try? JSONDecoder().decode(RealtimeUplinkEnvelope.self, from: data),
+              envelope.protocolVersion == RealtimeWireVersion.uplink else { return }
+        realtimeSession.forward(envelope)
+    }
+
+    /// Bridge → iPhone → Watch: enqueue a decoded downlink envelope onto the
+    /// existing WatchDownlinkOutbox so it flows through the same durable
+    /// queue that carries status envelopes.
+    @MainActor
+    private func forwardRealtimeDownlink(_ envelope: RealtimeDownlinkEnvelope) {
+        guard let data = try? JSONEncoder().encode(envelope) else { return }
+        enqueueDownlink(
+            requestId: envelope.requestId,
+            kind: .relayStatus,
+            key: RealtimeMediaMessage.downlinkEnvelopeKey,
+            data: data
+        )
+    }
+
+    /// URLSessionWebSocketTask factory bound to the relay's credentials and
+    /// bridge URL. Returns `nil` if the phone is not paired yet (the watch
+    /// side will treat that as a transport failure and fall back to the
+    /// existing full-file relay flow).
+    ///
+    /// Bridge PR #113 `server.mjs` requires `?request_id=` + `?session_id=`
+    /// on the WSS handshake AND the signed request-id to equal the URL's
+    /// `request_id`, otherwise the socket closes with `ERR_STREAM_OWNERSHIP`.
+    /// The factory therefore signs with the turn's request id (not a fresh
+    /// UUID) and stamps both ids on the URL query.
+    @MainActor
+    private func makeRealtimeTransport(requestId: String, sessionId: String) -> PhoneRealtimeSession.Transport? {
+        guard let credentials = RelayCredentialsStore.read(),
+              var components = URLComponents(string: relay.bridgeURLString) else { return nil }
+        components.scheme = "wss"
+        components.path = "/v1/voice/realtime"
+        components.queryItems = [
+            URLQueryItem(name: "request_id", value: requestId),
+            URLQueryItem(name: "session_id", value: sessionId)
+        ]
+        guard let url = components.url else { return nil }
+        let builder = RelaySignedRequestBuilder(
+            baseURL: url.deletingLastPathComponent(), credentials: credentials
+        )
+        var request = builder.request(
+            method: "GET", path: "/v1/voice/realtime",
+            requestId: requestId, body: nil
+        )
+        request.url = url
+        let task = URLSession.shared.webSocketTask(with: request)
+        return PhoneRealtimeWebSocketTransport(task: task)
     }
 
     nonisolated func session(
@@ -514,6 +587,28 @@ extension PhoneConnectivity: WatchFeedbackChannel {
     private func refreshDownlinkCount() {
         downlink?.purgeExpired()
         pendingDownlinkCount = downlink?.pendingCount() ?? 0
+        pushDownlinkBacklog()
+    }
+
+    /// ESS-307：将下行队列积压信息推送到 Watch，让用户可见「还有 N 条结果没到」。
+    private func pushDownlinkBacklog() {
+        guard let downlink else { return }
+        let queuedIds = downlink.items
+            .filter { $0.state != .delivered }
+            .map { $0.requestId }
+        let payload = DownlinkBacklogPayload(
+            pendingCount: pendingDownlinkCount,
+            queuedRequestIds: queuedIds,
+            updatedAt: Date()
+        )
+        guard let data = try? payload.jsonData() else { return }
+        do {
+            try WCSession.default.updateApplicationContext([
+                DownlinkBacklogMessage.contextKey: data
+            ])
+        } catch {
+            Self.downlinkLogger.error("下行积压推送失败: \(error.localizedDescription)")
+        }
     }
 
     /// 队列不可用时的降级路径（尽力而为，无回执）。
@@ -545,6 +640,11 @@ extension PhoneConnectivity: WatchFeedbackChannel {
             downlinkLogger.error("downlink failed request_id=\(requestId, privacy: .public) kind=\(kind.rawValue, privacy: .public) item=\(itemId, privacy: .public) attempt=\(attempt) reason=\(reason, privacy: .public)")
         case .expired(let requestId, let kind, let itemId):
             downlinkLogger.error("downlink expired request_id=\(requestId, privacy: .public) kind=\(kind.rawValue, privacy: .public) item=\(itemId, privacy: .public)")
+        case .speechBacklogSuppressed(let suppressed, let kept, let requestId):
+            // ESS-306：下行语音积压超上限时抑制旧条目，只留最新一条。
+            // 抑制是有意为之而非故障，用 notice 级别——但必须可见，
+            // 否则用户会遇到「有几轮结果没播」而日志里查不到原因。
+            downlinkLogger.notice("downlink speech backlog suppressed request_id=\(requestId, privacy: .public) suppressed=\(suppressed) kept=\(kept, privacy: .public)")
         case .persistFailed(let operation, let reason):
             downlinkLogger.fault("downlink index persist failed operation=\(operation, privacy: .public) reason=\(reason, privacy: .public)")
         }
