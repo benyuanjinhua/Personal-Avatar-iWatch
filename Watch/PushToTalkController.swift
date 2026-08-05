@@ -99,6 +99,14 @@ final class PushToTalkController: ObservableObject {
                 WatchLog.error("journal", "persist_failed", detail: detail)
             }
         )
+        // ESS-363：冷启动时清理超期活跃回合的观测日志（诊断上次是否异常退出）。
+        journal.onStaleTurnsCleaned = { [weak self] staleIds, phase in
+            let holdReasons = staleIds.map { "turn_active:\($0)" }.joined(separator: ",")
+            WatchLog.info(
+                "lifecycle", "stale_turns_cleaned",
+                detail: "count=\(staleIds.count) holds=[\(holdReasons)] scene_phase=\(phase)"
+            )
+        }
         speechVault = try? EncryptedAudioVault(directory: base.appendingPathComponent("SpeechVault", isDirectory: true))
         transport = WatchVoiceTransport(journal: journal)
         retryStore = RetryRecordingStore(

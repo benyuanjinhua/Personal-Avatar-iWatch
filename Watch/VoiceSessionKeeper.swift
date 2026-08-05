@@ -24,6 +24,10 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
     private var lastInvalidationReasonCode: Int?
     private var holdReason: String?
     private var recordingStartDeferred = false
+    /// ESS-363：app 非 active 时触发的 session 请求——不能 start()，挂起到
+    /// 下次 appDidBecomeActive 再起；存下 reason 是为了挂起恢复后能落正确的事件。
+    private var startDeferredUntilActive = false
+    private var deferredReason: String?
 
     private var latestTurns: [VoiceTurnRecord] = []
     private var deliveredRequestIds: Set<String> = []
@@ -68,6 +72,7 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
     /// 回前台钩子（ESS-58）：锁屏收回会话（resignedFrontmost）后解锁回来，
     /// 若回合仍有持有理由则重新起会话；到期/出错收回的抑制不在此解除，
     /// ESS-45 的有界执行边界不变。
+    /// ESS-363：若此前因 app 非 active 挂起的 session 请求，这里补起。
     func appDidBecomeActive() {
         if restartSuppressed,
            let code = lastInvalidationReasonCode,
@@ -76,6 +81,17 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
             WatchLog.info("runtime", "session_rearmed", detail: "after_reason_code=\(code)")
         }
         lastInvalidationReasonCode = nil
+
+        // ESS-363：非 active 时 defer 的 session 请求，回到前台补起。
+        if startDeferredUntilActive, let reason = deferredReason {
+            startDeferredUntilActive = false
+            deferredReason = nil
+            WatchLog.info("runtime", "session_deferred_retry", detail: "reason=\(reason)")
+            startSessionIfNeeded(reason: reason)
+            // startSessionIfNeeded 会再跑一次完整决策+状态检查，这里不重复 reevaluate。
+            return
+        }
+
         reevaluate()
     }
 
@@ -121,6 +137,23 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
         if startPending { return }
         if let session, session.state == .running || session.state == .scheduled { return }
         guard !restartSuppressed else { return }
+
+        // ESS-363：WKExtendedRuntimeSession.start() 必须在 app active 时调用，
+        // 否则系统直接抛 ERR_RUNTIME_SESSION 甚至崩进程。
+        guard WKApplication.shared().applicationState == .active else {
+            if !startDeferredUntilActive {
+                startDeferredUntilActive = true
+                deferredReason = reason
+                WatchLog.info(
+                    "runtime", "session_start_deferred",
+                    detail: "reason=\(reason) scene_phase=\(Self.scenePhaseDescription())"
+                )
+            }
+            return
+        }
+        startDeferredUntilActive = false
+        deferredReason = nil
+
         let next = WKExtendedRuntimeSession()
         next.delegate = self
         session = next
@@ -151,6 +184,16 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
 
     private func heldDescription() -> String {
         sessionStartedAt.map { String(format: "held=%.1fs", Date().timeIntervalSince($0)) } ?? "held=not_started"
+    }
+
+    /// ESS-363：当前 app 生命周期状态的字符串描述，供事件日志引用。
+    private static func scenePhaseDescription() -> String {
+        switch WKApplication.shared().applicationState {
+        case .active: return "active"
+        case .inactive: return "inactive"
+        case .background: return "background"
+        @unknown default: return "unknown"
+        }
     }
 }
 
