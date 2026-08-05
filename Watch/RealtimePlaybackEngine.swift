@@ -92,9 +92,45 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
 
     func enqueue(playables: [RealtimeDownlinkPlayback.PlayableChunk]) {
         guard let turn = currentTurn else { return }
-        for playable in playables where
-            playable.chunk.requestId == turn.requestId &&
-            playable.chunk.streamId == turn.sessionId {
+        let matchingPlayables = playables.filter {
+            $0.chunk.requestId == turn.requestId && $0.chunk.streamId == turn.sessionId
+        }
+        guard !matchingPlayables.isEmpty else { return }
+
+        // ESS-385: AudioRecorder.finish() deactivates the process-wide
+        // AVAudioSession after committing the microphone stream. The realtime
+        // engine survives that transition, so a running AVAudioEngine alone
+        // does not prove that its output route is active. Reacquire the shared
+        // session immediately before scheduling each delivered batch.
+        let session = AVAudioSession.sharedInstance()
+        WatchLog.info(
+            "realtime_player", "session_activation_requested",
+            requestId: turn.requestId,
+            detail: "session_id=\(turn.sessionId) chunks=\(matchingPlayables.count)"
+        )
+        do {
+            try session.setActive(true)
+            WatchLog.info(
+                "realtime_player", "session_activated",
+                requestId: turn.requestId,
+                detail: "session_id=\(turn.sessionId) route=\(Self.routeDescription(session))"
+            )
+        } catch {
+            WatchLog.error(
+                "realtime_player", "session_activation_failed",
+                requestId: turn.requestId,
+                detail: "session_id=\(turn.sessionId)",
+                code: "ERR_REALTIME_PLAYBACK_ACTIVATION", error: error
+            )
+            onPlaybackEvent?(.failed(
+                requestId: turn.requestId, sessionId: turn.sessionId,
+                responseId: matchingPlayables.first?.responseId,
+                code: "ERR_REALTIME_PLAYBACK_ACTIVATION"
+            ))
+            return
+        }
+
+        for playable in matchingPlayables {
             guard let pcmBuffer = buffer(for: playable.chunk.payload) else { continue }
             let payloadBytes = playable.chunk.payload.count
             let responseId = playable.responseId
@@ -160,6 +196,17 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         playerNode.stop()
         audioEngine.stop()
         audioEngine.detach(playerNode)
+        do {
+            try AVAudioSession.sharedInstance().setActive(
+                false, options: .notifyOthersOnDeactivation
+            )
+            WatchLog.info("realtime_player", "session_released", detail: "reason=shutdown result=true")
+        } catch {
+            WatchLog.error(
+                "realtime_player", "session_release_failed",
+                detail: "reason=shutdown", error: error
+            )
+        }
         isRunning = false
     }
 
@@ -196,5 +243,10 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
             }
         }
         return pcmBuffer
+    }
+
+    private static func routeDescription(_ session: AVAudioSession) -> String {
+        let outputs = session.currentRoute.outputs.map { "\($0.portName)(\($0.portType.rawValue))" }
+        return outputs.isEmpty ? "none" : outputs.joined(separator: ",")
     }
 }
