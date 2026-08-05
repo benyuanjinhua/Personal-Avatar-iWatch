@@ -136,6 +136,7 @@
 		D51204118681270691727D4C /* SpeechPlayerInterruptionEvidenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FDE52A8C1B2854E4646A286 /* SpeechPlayerInterruptionEvidenceTests.swift */; };
 		D646FBAAC6F5F67130E21FB0 /* PhoneRealtimeWebSocketTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 670B3104058BFB1235409EF2 /* PhoneRealtimeWebSocketTransport.swift */; };
 		EE1A2B3C4D5E6F7A8B9C0D1E2F /* PhoneRealtimeAgentTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF2B3C4D5E6F7A8B9C0D1E2F3A /* PhoneRealtimeAgentTransport.swift */; };
+		AABBCCDDEEFF001122334455667788 /* SessionTokenProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFCCDDEEFF00112233445566778899 /* SessionTokenProvider.swift */; };
 		D73937DBAF6A7155D9CDC698 /* VoiceStreamChunkMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = ECD1DB988318EDCB4DD695B6 /* VoiceStreamChunkMessage.swift */; };
 		D9B1A7DECC44E46204E0FFF3 /* UUIDv7.swift in Sources */ = {isa = PBXBuildFile; fileRef = E36424AC38F0A8BB28751248 /* UUIDv7.swift */; };
 		DADA85367CAACD55C3514A81 /* CompanionSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0DFA30C0EEFD46DDC835A5B6 /* CompanionSettings.swift */; };
@@ -244,6 +245,7 @@
 		63B4FAFE429B15682CA5E9F8 /* RealtimeMediaWireFormat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeMediaWireFormat.swift; sourceTree = "<group>"; };
 		670B3104058BFB1235409EF2 /* PhoneRealtimeWebSocketTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneRealtimeWebSocketTransport.swift; sourceTree = "<group>"; };
 		FF2B3C4D5E6F7A8B9C0D1E2F3A /* PhoneRealtimeAgentTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneRealtimeAgentTransport.swift; sourceTree = "<group>"; };
+		FFCCDDEEFF00112233445566778899 /* SessionTokenProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionTokenProvider.swift; sourceTree = "<group>"; };
 		67C6A03628F073DFB7BD92CF /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		69D850E7D15B7525D07D9DBF /* ErrorCue_VoiceBusy.m4a */ = {isa = PBXFileReference; path = ErrorCue_VoiceBusy.m4a; sourceTree = "<group>"; };
 		6AE6645A23368CC50DBD7CCE /* WristAgent.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = WristAgent.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -336,6 +338,7 @@
 				4C41457A27FD24A41133AFFE /* RealtimeDownlinkPlayback.swift */,
 				1CEDAB5F3CD7B29B993F0FA2 /* RealtimeMediaFormat.swift */,
 				49D1CFEB2C03FAA07DA192C1 /* RealtimeMediaSession.swift */,
+				FFCCDDEEFF00112233445566778899 /* SessionTokenProvider.swift */,
 				63B4FAFE429B15682CA5E9F8 /* RealtimeMediaWireFormat.swift */,
 				716B2884D666AEE57BA6AB37 /* RealtimePlaybackReceiptTracker.swift */,
 				D57D9FD3BB121F4AAB879ACF /* RealtimeUplinkStream.swift */,
@@ -654,6 +657,7 @@
 				03A62E2D08DF9037D1ED20F3 /* RealtimeDownlinkPlayback.swift in Sources */,
 				7249351A21B20AAC649807D9 /* RealtimeMediaFormat.swift in Sources */,
 				87589EC57C16EFE13A79738E /* RealtimeMediaSession.swift in Sources */,
+				AABBCCDDEEFF001122334455667788 /* SessionTokenProvider.swift in Sources */,
 				ADA9DA139E2F37E309F1C70C /* RealtimeMediaWireFormat.swift in Sources */,
 				AFE89128B354D801AA7BF512 /* RealtimePlaybackReceiptTracker.swift in Sources */,
 				954F45FCF33EA311254AEDDF /* RealtimeUplinkStream.swift in Sources */,
