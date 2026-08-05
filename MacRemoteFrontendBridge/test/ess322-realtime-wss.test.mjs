@@ -82,6 +82,8 @@ describe('ESS-322 authenticated realtime media WSS', () => {
     ws.send(JSON.stringify({ type: 'playback.ended', response_id: 'resp_1' }))
     ws.send(JSON.stringify({ type: 'audio.commit' }))
     await waitFor(() => mock.mediaEvents.some(event => event.type === 'audio.commit'))
+    await waitFor(() => bridge.ledger.get(requestId)?.state === 'completed')
+    assert.equal(bridge.ledger.get(requestId).result.text, '现在是上午九点。')
     assert.deepEqual(mock.playbackReceipts.map(event => event.type), ['playback.started', 'playback.ended'])
     assert.equal(mock.mediaEvents.filter(event => event.type === 'audio.append').length, 2)
     ws.send(JSON.stringify({ type: 'close' }))

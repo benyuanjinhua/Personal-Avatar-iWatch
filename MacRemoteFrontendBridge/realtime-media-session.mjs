@@ -7,7 +7,10 @@ const ENDED = 'ended'
 const CANCELLED = 'cancelled'
 
 export class RealtimeMediaSession {
-  constructor({ requestId, sessionId, sendUpstream, sendDownstream, maxFrameBytes = 64 * 1024, log = () => {} }) {
+  constructor({
+    requestId, sessionId, sendUpstream, sendDownstream,
+    maxFrameBytes = 64 * 1024, log = () => {}, onResponseComplete = () => {},
+  }) {
     if (!requestId || !sessionId) throw new Error('requestId and sessionId are required')
     if (typeof sendUpstream !== 'function' || typeof sendDownstream !== 'function') {
       throw new Error('media transports are required')
@@ -18,11 +21,14 @@ export class RealtimeMediaSession {
     this.sendDownstream = sendDownstream
     this.maxFrameBytes = maxFrameBytes
     this.log = log
+    this.onResponseComplete = onResponseComplete
     this.state = OPEN
     this.nextInputSequence = 0
     this.seenOutputSequences = new Map()
     this.playingResponseId = null
     this.inputCommitted = false
+    this.assistantTranscript = ''
+    this.taskId = null
   }
 
   appendInput({ sequence, audio, sampleRate = 16_000, codec = 'pcm_s16le' }) {
@@ -68,6 +74,21 @@ export class RealtimeMediaSession {
         type: 'audio.delta', request_id: this.requestId, session_id: this.sessionId,
         response_id: event.responseId ?? null, sequence, sample_rate: event.sampleRate ?? 24_000,
         codec: 'pcm_s16le', audio: bytes.toString('base64'),
+      })
+      return true
+    }
+    if (event.type === 'transcript.final' && event.role === 'assistant') {
+      this.assistantTranscript = event.content ?? event.text ?? this.assistantTranscript
+    }
+    if (event.type === 'task.accepted' && event.task?.id) {
+      this.taskId = String(event.task.id)
+      return true
+    }
+    if (event.type === 'voice.state' && event.state === 'idle') {
+      this.onResponseComplete({
+        responseId: event.responseId ?? null,
+        assistantTranscript: this.assistantTranscript,
+        taskId: this.taskId,
       })
       return true
     }

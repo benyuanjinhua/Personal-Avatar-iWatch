@@ -381,6 +381,7 @@ export class QwenRealtimeSessionSupervisor {
     if (this.mediaSession && [
       'audio.delta', 'audio.done', 'response.started', 'response.interrupted',
       'transcript.delta', 'transcript.final', 'transcript.discard', 'playback.clear',
+      'task.accepted', 'voice.state',
     ].includes(event.type)) {
       this.mediaSession.onEvent(event)
       this.record({ event: `media.${event.type}`, label: this.mediaSession.label, ...summarize(event) })

@@ -5,13 +5,15 @@ import { RealtimeMediaSession } from '../realtime-media-session.mjs'
 function fixture() {
   const upstream = []
   const downstream = []
+  const completed = []
   const session = new RealtimeMediaSession({
     requestId: '019fcac2-20ce-75b6-a665-24eb965a32a9',
     sessionId: 'watch-session-1',
     sendUpstream: event => upstream.push(event),
     sendDownstream: event => downstream.push(event),
+    onResponseComplete: result => completed.push(result),
   })
-  return { session, upstream, downstream }
+  return { session, upstream, downstream, completed }
 }
 
 describe('ESS-265 realtime media plane', () => {
@@ -57,6 +59,20 @@ describe('ESS-265 realtime media plane', () => {
       { type: 'playback.started', responseId: 'resp-1' },
       { type: 'playback.ended', responseId: 'resp-1' },
     ])
+  })
+
+  it('reports direct and delegated turn completion only when the voice turn is idle', () => {
+    const direct = fixture()
+    direct.session.handleAgentEvent({ type: 'transcript.final', role: 'assistant', content: '直接结果' })
+    direct.session.handleAgentEvent({ type: 'audio.done', responseId: 'resp-direct' })
+    assert.equal(direct.completed.length, 0)
+    direct.session.handleAgentEvent({ type: 'voice.state', state: 'idle', responseId: 'resp-direct' })
+    assert.deepEqual(direct.completed, [{ responseId: 'resp-direct', assistantTranscript: '直接结果', taskId: null }])
+
+    const delegated = fixture()
+    delegated.session.handleAgentEvent({ type: 'task.accepted', task: { id: 'task-1' } })
+    delegated.session.handleAgentEvent({ type: 'voice.state', state: 'idle' })
+    assert.equal(delegated.completed[0].taskId, 'task-1')
   })
 
   it('barge-in cancels the active response and clears client playback', () => {
