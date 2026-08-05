@@ -877,4 +877,32 @@ final class PushToTalkController: ObservableObject {
             subtitleSession = SubtitleSession(requestId: requestId, text: text, hasAudio: false)
         }
     }
+
+    // MARK: - ESS-317 F2.4 再次对话
+
+    /// 从历史对话中发起新一轮对话，携带上一轮的问+答作为上下文。
+    /// Q1=a 口径（白梦林拍板）：只传上一轮的问 + 答文本，不传整条链、不建服务端会话。
+    ///
+    /// Bridge 侧需支持 `parent_request_id` 透传上下文（对应 F2.4 跨目录改动，
+    /// 落点归毕玄）。客户端侧此处只存储上下文并进入录音。
+    func continueConversation(from turn: VoiceTurnRecord) {
+        continuationContext = ContinuationContext(
+            parentRequestId: turn.requestId,
+            contextText: turn.result?.displaySummary ?? ""
+        )
+        WatchLog.info("history", "continue_conversation",
+                      detail: "parent_request_id=\(turn.requestId)")
+        // 跳转到 main screen 并进入录音状态由 WatchContentView 的
+        // selectedTab=0 + pressBegan 完成；这里只存上下文。
+        pressBegan()
+    }
+
+    /// ESS-317 再次对话的上下文（Q1=a：只传上一轮问+答文本）。
+    struct ContinuationContext {
+        let parentRequestId: String
+        let contextText: String
+    }
+
+    /// 当前续聊上下文，供提交语音请求时附加 `parent_request_id`。
+    private(set) var continuationContext: ContinuationContext?
 }
