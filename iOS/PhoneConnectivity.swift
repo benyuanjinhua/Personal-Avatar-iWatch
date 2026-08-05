@@ -394,17 +394,6 @@ extension PhoneConnectivity: WatchFeedbackChannel {
         )
     }
 
-    /// ESS-324 B2：下行 stream chunk → Watch。reachable 时走 `sendMessageData`
-    /// 快路径；不可达时返回 false，调用方走整段 m4a 降级。
-    @discardableResult
-    func forwardStreamChunkToWatch(_ chunk: VoiceStreamChunk) -> Bool {
-        let session = WCSession.default
-        guard session.activationState == .activated, session.isReachable,
-              let data = try? JSONEncoder().encode(chunk) else { return false }
-        session.sendMessageData(data, replyHandler: nil, errorHandler: { _ in })
-        return true
-    }
-
     /// 结果语音走系统托管 transferFile；metadata 带含 speechSha256 的信封，
     /// Watch 端（WatchSettingsStore.storeSpeech）校验通过才加密入库并挂到回合。
     ///
@@ -486,6 +475,31 @@ extension PhoneConnectivity: WatchFeedbackChannel {
         }
         refreshDownlinkCount()
         flushDownlink(trigger: "probe-enqueue")
+        return true
+    }
+
+    /// ESS-324 B2/B4：Bridge WSS downlink stream chunk → Watch `sendMessageData`。
+    /// stream 走即时通道（best-effort）；不可达/编码失败时返回 false，
+    /// 调用方（WristAgentPhoneRelay）回退整段 m4a 路径。
+    @discardableResult
+    func forwardStreamChunkToWatch(_ chunk: VoiceStreamChunk) -> Bool {
+        guard chunk.direction == .downlink else {
+            Self.downlinkLogger.warning("forwardStreamChunkToWatch: non-downlink chunk ignored")
+            return false
+        }
+        let session = WCSession.default
+        guard session.activationState == .activated, session.isReachable else {
+            Self.downlinkLogger.info("forwardStreamChunkToWatch: unreachable, fallback")
+            return false
+        }
+        guard let data = try? JSONEncoder().encode(chunk) else {
+            Self.downlinkLogger.error("forwardStreamChunkToWatch: encode failed")
+            return false
+        }
+        session.sendMessageData(data, replyHandler: nil) { error in
+            Self.downlinkLogger.error("forwardStreamChunkToWatch: send failed error=\(error.localizedDescription)")
+        }
+        Self.downlinkLogger.debug("forwardStreamChunkToWatch: sent seq=\(chunk.sequence) request_id=\(chunk.requestId)")
         return true
     }
 

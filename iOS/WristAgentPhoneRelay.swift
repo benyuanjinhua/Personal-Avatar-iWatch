@@ -27,8 +27,9 @@ protocol WatchFeedbackChannel: AnyObject {
     /// Watch 端匹配后进探针分支——不入 vault、不入 journal、播完回 probe_ack。
     @discardableResult
     func transferProbe(fileURL: URL, envelope: VoiceStatusEnvelope) -> Bool
-    /// ESS-324 B2：下行 stream chunk → Watch。reachable 时走 `sendMessageData`
-    /// 快路径；不可达时返回 false，调用方走整段 m4a 降级。
+    /// ESS-324 B2/B4：转发 Bridge WSS downlink stream chunk 到 Watch。
+    /// 走 `sendMessageData` 即时通道（reachable-only、best-effort，不排队）；
+    /// 不可达 / 非 downlink / 编码失败时返回 false，调用方走整段 m4a 降级。
     @discardableResult
     func forwardStreamChunkToWatch(_ chunk: VoiceStreamChunk) -> Bool
 }
