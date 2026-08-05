@@ -120,6 +120,7 @@ export function createGateway(overrides = {}) {
         if (err) return rejectStart(err)
         log('gateway_ready', {
           bind: CONFIG.bind, port: server.address().port,
+          public_host: CONFIG.public_host ?? null,
           tls: !CONFIG.dev_allow_plain_ws,
           protocol_version: CONFIG.protocol_version,
           provider_key_present: Boolean(providerKey),

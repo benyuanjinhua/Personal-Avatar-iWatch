@@ -31,7 +31,15 @@ import { DeviceStore, signRequest } from '../device-auth.mjs'
 
 const GW_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const CONFIG = JSON.parse(readFileSync(join(GW_DIR, 'config.json'), 'utf8'))
-const HOST = CONFIG.bind
+// ESS-447 B2: `config.bind` is now `0.0.0.0` so the Gateway accepts
+// connections from the Tailnet, but this smoke script deliberately drives
+// the loopback path — the reachability question ("does the Tailnet
+// hostname route to the Mac mini") is deployment infra, not application
+// behaviour. We still generate the cert SAN for `public_host` so real
+// device clients (on the Tailnet) validate the same cert this smoke
+// exercises. The Gateway's own source-allowlist accepts loopback
+// unconditionally, so the smoke never touches `allowed_peer_ips`.
+const HOST = CONFIG.bind === '0.0.0.0' ? '127.0.0.1' : CONFIG.bind
 const PORT = CONFIG.port
 const WS_BASE = `wss://${HOST}:${PORT}/api/realtime`
 
@@ -92,11 +100,21 @@ function ensureCerts() {
   mkdirSync(certDir, { recursive: true })
   const crt = resolve(GW_DIR, CONFIG.tls_cert)
   const key = resolve(GW_DIR, CONFIG.tls_key)
+  // ESS-447 B2: include `public_host` in the SAN so real-device clients that
+  // resolve the Multica magic-workspace hostname also validate the cert.
+  // Loopback remains listed so the smoke itself keeps working from the same
+  // machine that runs the Gateway.
+  const sans = ['IP:127.0.0.1', 'DNS:localhost']
+  if (typeof CONFIG.public_host === 'string' && CONFIG.public_host.length > 0) {
+    sans.push('DNS:' + CONFIG.public_host)
+  }
+  const cn = typeof CONFIG.public_host === 'string' && CONFIG.public_host.length > 0
+    ? CONFIG.public_host : 'localhost'
   const r = spawnSync('openssl', [
     'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
     '-keyout', key, '-out', crt, '-days', '30',
-    '-subj', '/CN=localhost/O=ESS-423 smoke',
-    '-addext', 'subjectAltName=IP:127.0.0.1,DNS:localhost',
+    '-subj', `/CN=${cn}/O=ESS-423 smoke`,
+    '-addext', 'subjectAltName=' + sans.join(','),
   ], { encoding: 'utf8' })
   if (r.status !== 0) throw new Error('openssl failed: ' + (r.stderr || r.stdout))
   return { crt, key }

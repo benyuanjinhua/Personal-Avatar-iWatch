@@ -1,10 +1,11 @@
 {
   "port": 8444,
-  "bind": "127.0.0.1",
+  "bind": "0.0.0.0",
+  "public_host": "jackson-macmac-mini.magic.workspace.beer",
   "tls_cert": "./certs/gateway.crt",
   "tls_key": "./certs/gateway.key",
   "state_dir": "./state",
-  "allowed_peer_ips": [],
+  "allowed_peer_ips": ["100.64.0.0/10"],
   "dev_allow_plain_ws": false,
   "protocol_version": 1,
 
