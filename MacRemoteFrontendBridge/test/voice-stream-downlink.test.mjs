@@ -132,6 +132,20 @@ describe('VoiceStreamingNegotiator', () => {
     assert.equal(messages.length, 1)
   })
 
+  it('retains a completed background negotiation for delayed announcement audio', () => {
+    let expire
+    const gate = new VoiceStreamingNegotiator({
+      serverEnabled: true,
+      setTimer: fn => { expire = fn; return { unref() {} } },
+      clearTimer: () => {},
+    })
+    gate.negotiate({ requestId: 'req_late', streaming: compatible })
+    assert.equal(gate.releaseAfter('req_late', 60_000), true)
+    assert.equal(gate.decision('req_late').effective, true)
+    expire()
+    assert.equal(gate.decision('req_late').effective, false)
+  })
+
   it('returns stable reasons for capability, version, and server rejection', () => {
     const gate = new VoiceStreamingNegotiator({ serverEnabled: true })
     assert.equal(gate.negotiate({ requestId: 'missing', streaming: { requested: true, protocol_versions: [2] } }).fallback_reason, 'capability_missing')
