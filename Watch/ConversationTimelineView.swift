@@ -3,17 +3,14 @@ import SwiftUI
 /// 历史对话（ESS-317 / ESS-242 ②屏）：轮次列表 → 逐步处理日志 → 展开全文/重播 → 再次对话。
 ///
 /// 由 ESS-280 从主屏 NavigationLink 抬升为 `TabView` 第 2 屏（tag=1）。
-/// 本文件是 ESS-29 的原生实现升级版，新增：
-/// - F2.1 轮次列表（时间 + 摘要 + 状态图标）
-/// - F2.2 逐步处理日志（≤12 字/行、无 request_id、无裸错误码）
-/// - F2.3 结果展开（全文 + 重播）
-/// - F2.4 再次对话入口
 struct ConversationTimelineView: View {
     @ObservedObject var journal: VoiceTurnJournal
     /// ESS-307：iPhone 下行队列积压信息，用于标注「等待送达」状态。
     @ObservedObject var settings: WatchSettingsStore
-    /// 点击「再次对话」时通知父视图切回主屏并进入 listening。
-    var onContinueConversation: ((VoiceTurnRecord) -> Void)?
+    /// ESS-317：用于重播语音和「再次对话」上下文。
+    @ObservedObject var pushToTalk: PushToTalkController
+    /// 点击「再次对话」时通知父视图切回主屏。
+    @Binding var selectedTab: Int
 
     var body: some View {
         Group {
@@ -55,8 +52,8 @@ struct ConversationTimelineView: View {
                                 NavigationLink {
                                     TurnDetailView(
                                         turn: turn,
-                                        journal: journal,
-                                        onContinueConversation: onContinueConversation
+                                        pushToTalk: pushToTalk,
+                                        selectedTab: $selectedTab
                                     )
                                     .navigationTitle("对话详情")
                                 } label: {
@@ -111,22 +108,23 @@ struct TurnSummaryRow: View {
 // MARK: - F2.2 Turn Detail View
 
 /// 单轮对话详情：逐步处理日志 + 展开全文/重播 + 再次对话。
+/// ESS-317: 重播通过 PushToTalkController.playResult 接入 SpeechPlayer；
+/// 上下文通过 pushToTalk.prepareReChat 传递。
 struct TurnDetailView: View {
     let turn: VoiceTurnRecord
-    @ObservedObject var journal: VoiceTurnJournal
-    var onContinueConversation: ((VoiceTurnRecord) -> Void)?
+    @ObservedObject var pushToTalk: PushToTalkController
+    @Binding var selectedTab: Int
 
     @State private var showFullText = false
+    @State private var isReplaying = false
 
     var body: some View {
         List {
-            // 处理步骤流水
             Section("处理步骤") {
                 ForEach(Array(turn.events.enumerated()), id: \.offset) { index, event in
                     timelineRow(event: event, isLast: index == turn.events.count - 1)
                 }
 
-                // 权限确认
                 if let decision = turn.permissionApproved {
                     Label(
                         decision ? "你已允许，等待执行" : "你已拒绝",
@@ -136,14 +134,12 @@ struct TurnDetailView: View {
                     .foregroundStyle(decision ? .green : .orange)
                 }
 
-                // 打断标记
                 if turn.playbackInterruptedAt != nil {
                     Label("你打断了语音播放", systemImage: "hand.tap")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
 
-                // 语音降级
                 if turn.resultAudioErrorCode != nil {
                     Label("语音未播出，文字仍可查看", systemImage: "speaker.slash.fill")
                         .font(.caption2)
@@ -151,7 +147,6 @@ struct TurnDetailView: View {
                 }
             }
 
-            // 结果
             if let result = turn.result, !result.summary.isEmpty {
                 Section("结果") {
                     if showFullText {
@@ -168,23 +163,30 @@ struct TurnDetailView: View {
                         }
                     }
 
-                    // 重播按钮
                     if turn.speechFileName != nil {
                         Button {
-                            replayAudio()
+                            isReplaying = true
+                            pushToTalk.playResult(for: turn)
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                isReplaying = false
+                            }
                         } label: {
-                            Label("重新播放语音", systemImage: "speaker.wave.2.fill")
+                            Label(
+                                isReplaying ? "播放中…" : "重新播放语音",
+                                systemImage: isReplaying ? "speaker.wave.2.fill" : "play.circle.fill"
+                            )
                         }
                         .font(.caption)
+                        .disabled(isReplaying)
                     }
                 }
             }
 
-            // 再次对话
             if turn.currentState.isTerminal {
                 Section {
                     Button {
-                        onContinueConversation?(turn)
+                        pushToTalk.prepareReChat(from: turn)
+                        selectedTab = 0
                     } label: {
                         Label("再次对话", systemImage: "bubble.left.and.bubble.right.fill")
                     }
@@ -209,8 +211,7 @@ struct TurnDetailView: View {
                     .font(isLast ? .footnote.bold() : .footnote)
                     .foregroundStyle(isFailed ? .red : (isLast ? .primary : .secondary))
 
-                // F2.2 克制原则：每步最多一行 ≤12 字，不显示 request_id，不显示裸错误码
-                if let detail = sanitizedDetail(for: event), !detail.isEmpty {
+                if let detail = sanitizedDetail(event.detail), !detail.isEmpty {
                     Text(detail)
                         .font(.caption2)
                         .foregroundStyle(isFailed ? .red.opacity(0.7) : .secondary)
@@ -224,20 +225,45 @@ struct TurnDetailView: View {
         }
     }
 
-    /// F2.2：每步一行、最多 12 个字，剔除 request_id 和裸错误码。
+    /// 每步极简中文标签（≤12 字），不截断。
     private func stepTitle(for event: VoiceTurnEvent) -> String {
         if event.state == .failed, let stage = turn.failureStage {
-            return String(stage.displayName.prefix(12))
+            return stage.displayName
         }
-        return String(event.state.displayTitle.prefix(12))
+        switch event.state {
+        case .recorded:            return "已录音"
+        case .waitingForPhone:     return "等待手机"
+        case .waitingForMac:       return "已到手机"
+        case .accepted:            return "已受理"
+        case .realtimeProcessing:  return "实时处理中"
+        case .backgroundAccepted:  return "后台已受理"
+        case .backgroundProcessing:return "后台执行中"
+        case .permissionRequired:  return "需要确认"
+        case .completed:           return "结果就绪"
+        case .failed:              return "处理失败"
+        case .cancelled:           return "已取消"
+        }
     }
 
-    /// F2.2：过滤 request_id 和裸错误码（ERR_*），只保留用户可读的细节文本。
-    private func sanitizedDetail(for event: VoiceTurnEvent) -> String? {
-        guard let detail = event.detail, !detail.isEmpty else { return nil }
-        let trimmed = detail.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed == turn.requestId { return nil }
-        if trimmed.hasPrefix("ERR_") { return nil }
+    /// 过滤 detail 中的 request_id、ERR_* 错误码、裸数字码（如 -50、561145203）。
+    private func sanitizedDetail(_ raw: String?) -> String? {
+        guard let raw, !raw.isEmpty else { return nil }
+        var text = raw
+        if text.contains(turn.requestId) {
+            text = text.replacingOccurrences(of: turn.requestId, with: "")
+        }
+        text = text.replacingOccurrences(
+            of: #"ERR_[A-Z_]+"#,
+            with: "",
+            options: .regularExpression
+        )
+        text = text.replacingOccurrences(
+            of: #"\b-?\d{2,}\b"#,
+            with: "",
+            options: .regularExpression
+        )
+        let trimmed = text.trimmingCharacters(in: .whitespaces.union(.init(charactersIn: ",;: ")))
+        guard !trimmed.isEmpty else { return nil }
         return String(trimmed.prefix(12))
     }
 
@@ -250,10 +276,5 @@ struct TurnDetailView: View {
         case .waitingForPhone, .waitingForMac: return .teal
         default: return .cyan
         }
-    }
-
-    private func replayAudio() {
-        // TODO: ESS-317 — wire up to SpeechPlayer for replay from EncryptedAudioVault
-        WatchLog.info("history", "replay_tapped", detail: "request_id=\(turn.requestId)")
     }
 }

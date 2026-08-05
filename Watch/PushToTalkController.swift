@@ -99,6 +99,11 @@ final class PushToTalkController: ObservableObject {
     private let playbackLedger: ResultPlaybackLedger
     /// ESS-55：远端状态 → 触觉 cue 的映射与去重。
     private var cuePolicy = VoiceCuePolicy()
+    /// ESS-317：再次对话待用上下文。pressBegan 时消费，submit 后清空。
+    /// nil = 普通新请求，非 nil = 带上下文的再次对话请求。
+    private var pendingReChatContext: (parentRequestId: String, contextSummary: String)?
+    /// ESS-317：①屏球体旁「续：<摘要>」的展示文本。nil = 普通模式。
+    @Published private(set) var reChatContextText: String?
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -551,6 +556,18 @@ final class PushToTalkController: ObservableObject {
     /// `adapter.commit()` or the reliable full-file path.
     private func submit(recording: AudioRecorder.Recording) {
         let requestId = streamRequestId ?? UUIDv7.generate()
+        // ESS-317: consume re-chat context for parent_request_id + context_summary
+        let parentId: String?
+        let contextText: String?
+        if let ctx = pendingReChatContext {
+            parentId = ctx.parentRequestId
+            contextText = ctx.contextSummary
+            pendingReChatContext = nil
+            reChatContextText = nil
+        } else {
+            parentId = nil
+            contextText = nil
+        }
         let envelope = VoiceRequestEnvelope.voiceRequest(
             requestId: requestId,
             audio: VoiceAudioDescriptor(
@@ -560,7 +577,9 @@ final class PushToTalkController: ObservableObject {
                 durationMs: recording.durationMs,
                 sha256: VoiceDigest.sha256Hex(of: recording.data)
             ),
-            streamingRequested: voiceStreamingEnabled()
+            streamingRequested: voiceStreamingEnabled(),
+            parentRequestId: parentId,
+            contextSummary: contextText
         )
         retryStore.save(requestId: envelope.requestId, data: recording.data, durationMs: recording.durationMs)
 
@@ -748,6 +767,37 @@ final class PushToTalkController: ObservableObject {
         ))
     }
 
+    // MARK: - ESS-317 再次对话
+
+    /// 准备「再次对话」上下文：记录父轮次的 request_id 和问答摘要，
+    /// 下次 pressBegan → submit 时新轮次会自动携带 parent_request_id + contextSummary。
+    /// ①屏球体旁会显示「续：<摘要>」。
+    func prepareReChat(from turn: VoiceTurnRecord) {
+        let parentId = turn.requestId
+        let qText: String
+        if let result = turn.result, !result.displaySummary.isEmpty {
+            let firstLine = result.displaySummary
+                .components(separatedBy: .newlines)
+                .first ?? result.displaySummary
+            qText = String(firstLine.prefix(60))
+        } else {
+            qText = "历史对话"
+        }
+        let contextSummary = "用户问：\(qText)"
+        pendingReChatContext = (parentRequestId: parentId, contextSummary: contextSummary)
+        reChatContextText = "续：\(qText)"
+        WatchLog.info(
+            "turn", "rechat_prepared", requestId: parentId,
+            detail: "context_chars=\(contextSummary.count)"
+        )
+    }
+
+    /// 清空再次对话上下文（新请求提交后 / 用户取消）。
+    func clearReChatContext() {
+        pendingReChatContext = nil
+        reChatContextText = nil
+    }
+
     /// 打开 App/回前台时呈现未读结果（ESS-55 流程图节点 C）：
     /// 有语音未播则连播带看，只有文字则直接展示全文；配触觉提醒。
     @discardableResult
@@ -865,10 +915,9 @@ final class PushToTalkController: ObservableObject {
                 _ = self.journal.clearSpeech(requestId: requestId, matching: fileName)
             case .deliverFinal:
                 self.unfinishedPlaybackIds.remove(requestId)
-                self.speechVault?.remove(name: fileName)
-                if self.journal.clearSpeech(requestId: requestId, matching: fileName) {
-                    self.sessionKeeper.markDelivered(requestId: requestId)
-                }
+                // ESS-317 留存：播放成功不删音频，保留 24h/最近 10 轮供历史重播。
+                // 清理由 VoiceTurnJournal.trimAndSave + evictExpiredAudio 集中处理。
+                self.sessionKeeper.markDelivered(requestId: requestId)
             }
             // 播完整段视为已读（ESS-55 未读机制）：熄屏听完也算送达。
             if self.journal.turn(withId: requestId)?.currentState == .completed {

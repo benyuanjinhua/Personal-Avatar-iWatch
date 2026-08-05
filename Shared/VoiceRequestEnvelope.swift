@@ -33,6 +33,11 @@ struct VoiceRequestEnvelope: Codable, Equatable {
     /// ESS-358：客户端调试流式开关状态，随每回合信封装载；
     /// nil 时旧链路行为不变（上游向后兼容）。
     let streamingRequested: Bool?
+    /// ESS-317：再次对话时的父轮次 request_id。nil = 普通新请求。
+    let parentRequestId: String?
+    /// ESS-317：再次对话时携带的上下文（上一轮问 + 答文本），
+    /// Bridge 透传给 Mac 端用于保持对话连续性。
+    let contextSummary: String?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
@@ -41,13 +46,17 @@ struct VoiceRequestEnvelope: Codable, Equatable {
         case createdAt = "created_at"
         case audio
         case streamingRequested = "streaming_requested"
+        case parentRequestId = "parent_request_id"
+        case contextSummary = "context_summary"
     }
 
     static func voiceRequest(
         requestId: UUID = UUIDv7.generate(),
         createdAt: Date = Date(),
         audio: VoiceAudioDescriptor,
-        streamingRequested: Bool? = nil
+        streamingRequested: Bool? = nil,
+        parentRequestId: String? = nil,
+        contextSummary: String? = nil
     ) -> VoiceRequestEnvelope {
         VoiceRequestEnvelope(
             protocolVersion: currentProtocolVersion,
@@ -55,7 +64,9 @@ struct VoiceRequestEnvelope: Codable, Equatable {
             type: voiceRequestType,
             createdAt: createdAt,
             audio: audio,
-            streamingRequested: streamingRequested
+            streamingRequested: streamingRequested,
+            parentRequestId: parentRequestId,
+            contextSummary: contextSummary
         )
     }
 
