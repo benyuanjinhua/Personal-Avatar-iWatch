@@ -70,6 +70,11 @@ struct RealtimeDownlinkPlayback: Sendable {
         case waiting(missing: [Int], responseId: String?)
         case missingFinalSequence(nextSeqSeen: Int, responseId: String?)
         case droppedStaleGeneration(incoming: Int, active: Int)
+        /// ESS-442 B3: `audio.done` carried a generation strictly greater
+        /// than `activeGeneration`. Same posture as delta futures — Watch
+        /// refuses to self-promote — but distinct from stale so log routing
+        /// and diagnosis stay sharp.
+        case droppedFutureGeneration(incoming: Int, active: Int)
         case droppedPendingGeneration(incoming: Int?)
     }
 
@@ -220,10 +225,23 @@ struct RealtimeDownlinkPlayback: Sendable {
     /// from `.pending` or `.unset` to `.open(generation)`. Also clears
     /// per-turn barrier state so a new response can start under this
     /// generation. Idempotent for the same generation.
+    ///
+    /// **ESS-442 B2**: transitioning from `.open(g)` directly to `.open(g+1)`
+    /// (Gateway `cancel-generation` path — iPhone advances generation
+    /// without a Watch-initiated barge-in) must reset the sequence /
+    /// emitted-set / buffer bookkeeping. Otherwise the new generation's
+    /// `delta(0)` collides with `emittedSequences` from the previous
+    /// generation and gets rejected as `.duplicate`, silently dropping the
+    /// whole generation. `.pending → .open` already routes through
+    /// `bargeIn()`, which reset the buffer state; the reset is only
+    /// missing on `.open(g) → .open(g+1)`.
     @discardableResult
     mutating func openGeneration(_ generation: Int) -> Outcome {
         if case .open(let existing) = generationState, existing == generation {
             return .buffered
+        }
+        if case .open = generationState {
+            resetBufferState()
         }
         generationState = .open(generation)
         pendingFinalSequence = nil
@@ -341,11 +359,12 @@ struct RealtimeDownlinkPlayback: Sendable {
             case .pendingGeneration(let incoming):
                 return .droppedPendingGeneration(incoming: incoming)
             case .futureGeneration(let incoming, let active):
-                // Future generation on done — same posture as delta: refuse
-                // to self-promote. Signal via stale-generation surface so the
-                // caller logs `future_generation_dropped` and does not close
-                // the current session.
-                return .droppedStaleGeneration(incoming: incoming, active: active)
+                // ESS-442 B3: future generation on done — same posture as
+                // delta (`.futureGeneration`) but on its own surface so the
+                // adapter can log `future_generation_dropped kind=done`,
+                // not `stale_generation_dropped`. Watch refuses to
+                // self-promote either way; the current session stays open.
+                return .droppedFutureGeneration(incoming: incoming, active: active)
             default:
                 return .droppedPendingGeneration(incoming: generation)
             }
@@ -367,6 +386,14 @@ struct RealtimeDownlinkPlayback: Sendable {
         }
         pendingFinalSequence = target
         if allEmittedThrough(target) {
+            // ESS-442 B1: mirror `checkBarrierRelease()`. Without this, a
+            // late / duplicate downlink chunk arriving after the sync
+            // release re-triggers `checkBarrierRelease()` in the
+            // coordinator's `receiveDownlink` tail, producing a second
+            // `.doneBarrierReleased` event, a second `player.finish()`,
+            // and a second `done_barrier_released` log line under the
+            // same response_id.
+            pendingFinalSequence = nil
             return .barrierReleased(finalSequence: target, responseId: responseId)
         }
         return .waiting(missing: missingSequences(upTo: target), responseId: responseId)

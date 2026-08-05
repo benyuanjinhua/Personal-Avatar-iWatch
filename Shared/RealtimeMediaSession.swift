@@ -268,7 +268,10 @@ final class RealtimeMediaSession {
             // structured contract-violation log is what makes the error
             // visible so the Gateway side gets fixed.
             break
-        case .waiting, .droppedStaleGeneration, .droppedPendingGeneration:
+        case .waiting,
+             .droppedStaleGeneration,
+             .droppedFutureGeneration,
+             .droppedPendingGeneration:
             break
         }
     }

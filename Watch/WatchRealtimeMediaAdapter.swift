@@ -371,6 +371,15 @@ final class WatchRealtimeMediaAdapter {
                     requestId: currentTurn?.requestId,
                     detail: "incoming_gen=\(incoming) active_gen=\(active) kind=done"
                 )
+            case .droppedFutureGeneration(let incoming, let active):
+                // ESS-442 B3: mirror the delta-side `future_generation_dropped`
+                // log surface so a done carrying a generation the Watch has
+                // not yet been promoted to no longer masquerades as `stale`.
+                WatchLog.info(
+                    "realtime", "future_generation_dropped",
+                    requestId: currentTurn?.requestId,
+                    detail: "incoming_gen=\(incoming) active_gen=\(active) kind=done"
+                )
             case .droppedPendingGeneration(let incoming):
                 WatchLog.info(
                     "realtime", "generation_pending_dropped",
