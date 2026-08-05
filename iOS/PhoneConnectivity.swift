@@ -32,8 +32,13 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     /// ESS-391: cached Agent session — created once, reused across turns.
     /// The session is re-connected per turn with fresh token + requestId.
     private var agentSession: AudioRealtimeAgentSession?
-    /// ESS-391: cached token for current turn (ephemeral, memory-only).
+    /// ESS-446: ephemeral bearer token for the Agent WSS, obtained via
+    /// `POST /v1/realtime/session-token`. Memory-only; never persisted.
+    /// Each turn gets a fresh token via `fetchAndStoreAgentToken`.
     private var agentEphemeralToken: String?
+    /// ESS-446: in-flight token fetch task. Guards against concurrent
+    /// fetches — only one token request is in flight at a time.
+    private var agentFetchTask: Task<Void, Never>?
     private var pendingConfiguration: AgentConfiguration?
     private let historyStorageKey = "wristagent.phone.conversation.history"
     private let voiceInbox: VoiceRequestInbox?
@@ -212,10 +217,31 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
 
     /// ESS-321 real-time uplink dispatch. Called from `didReceiveMessage`
     /// when the payload carries a `RealtimeUplinkEnvelope`.
+    ///
+    /// **ESS-446**: when the Agent feature flag is enabled and no ephemeral
+    /// token has been fetched yet, kicks off an async token fetch. The first
+    /// turn may still use Bridge while the token request is in flight;
+    /// subsequent turns use the Agent direct path.
     @MainActor
     private func handleRealtimeUplink(data: Data) {
         guard let envelope = try? JSONDecoder().decode(RealtimeUplinkEnvelope.self, from: data),
               envelope.protocolVersion == RealtimeWireVersion.uplink else { return }
+
+        // ESS-446: pre-fetch session token if Agent path is enabled
+        if agentFlag.isDirectPathEnabled && agentEphemeralToken == nil && agentFetchTask == nil {
+            let sid = envelope.start?.sessionId ?? envelope.append?.streamId ??
+                      envelope.commit?.sessionId ?? ""
+            let rid = envelope.start?.requestId ?? envelope.append?.requestId ??
+                      envelope.commit?.requestId ?? ""
+            if !sid.isEmpty && !rid.isEmpty {
+                agentFetchTask = Task { [weak self] in
+                    await self?.fetchAndStoreAgentToken(
+                        sessionId: sid, requestId: rid, generation: 1
+                    )
+                }
+            }
+        }
+
         realtimeSession.forward(envelope)
     }
 
@@ -297,6 +323,56 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         let task = URLSession.shared.webSocketTask(with: request)
         realtimeSession.isAgentTransport = false
         return PhoneRealtimeWebSocketTransport(task: task)
+    }
+
+    // MARK: - ESS-446 Token fetch
+
+    /// Fetch a single-use WSS session token from the Agent Gateway, then
+    /// store it in `agentEphemeralToken` so the next `makeRealtimeTransport`
+    /// call uses the Agent direct path.
+    ///
+    /// The token is scoped to (deviceId, sessionId, requestId, generation).
+    /// On success, the token is retained in memory only — never persisted.
+    /// On failure, `agentEphemeralToken` stays nil and subsequent turns
+    /// continue to use the Bridge fallback.
+    @MainActor
+    private func fetchAndStoreAgentToken(
+        sessionId: String, requestId: String, generation: Int
+    ) async {
+        defer { agentFetchTask = nil }
+
+        guard let credentials = RelayCredentialsStore.read() else {
+            Self.logger.error("agent token fetch: not paired")
+            return
+        }
+        let urlString = agentFlag.gatewayURLString
+        guard !urlString.isEmpty, let baseURL = URL(string: urlString) else {
+            Self.logger.error("agent token fetch: no gateway URL configured")
+            return
+        }
+        let deviceId = agentFlag.deviceId.isEmpty ? credentials.deviceId : agentFlag.deviceId
+
+        let result = await SessionTokenProvider.fetch(
+            gatewayBaseURL: baseURL,
+            deviceId: deviceId,
+            sessionId: sessionId,
+            requestId: requestId,
+            generation: generation,
+            credentials: credentials
+        )
+
+        switch result {
+        case .success(let issued):
+            agentEphemeralToken = issued.token
+            Self.logger.info(
+                "agent token stored gen=\(issued.generation, privacy: .public) expires_ms=\(issued.expiresInMs, privacy: .public)"
+            )
+        case .failure(let error):
+            Self.logger.error(
+                "agent token fetch failed: \(String(describing: error), privacy: .public)"
+            )
+            // Token stays nil — Bridge path is used for this and subsequent turns
+        }
     }
 
     nonisolated func session(
