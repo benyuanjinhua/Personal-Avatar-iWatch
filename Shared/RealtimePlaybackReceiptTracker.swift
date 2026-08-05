@@ -1,0 +1,132 @@
+import Foundation
+
+/// ESS-335 receipt state machine, extracted from `RealtimePlaybackEngine`
+/// so the "when does `.started/.ended` fire?" logic is unit-testable without
+/// AVFoundation.
+///
+/// The real engine schedules PCM buffers on an `AVAudioPlayerNode` with a
+/// `.dataPlayedBack` completion callback; each callback pokes this tracker
+/// with `bufferCompleted(...)`. `.started` fires on the FIRST completion for
+/// a response (matching real playback beginning), `.ended` fires when the
+/// per-response drain flag is set AND every queued buffer has completed,
+/// and `bargeAll(...)` produces per-response barge-in receipts using
+/// completed bytes vs queued bytes so `bytes_played` stays honest.
+///
+/// Bixuan's ESS-335 acceptance: "started fires on real playback start, not
+/// on schedule; ended fires only when all buffers complete; bytes_played
+/// counts only completed bytes; barge-in bytes are not counted."
+struct RealtimePlaybackReceiptTracker: Sendable {
+    struct StartedReceipt: Equatable, Sendable { let responseId: String? }
+    struct EndedReceipt: Equatable, Sendable { let responseId: String?; let bytesPlayed: Int }
+    struct BargedInReceipt: Equatable, Sendable { let responseId: String?; let bytesDropped: Int }
+
+    private struct Response {
+        var queuedBuffers: Int = 0
+        var completedBuffers: Int = 0
+        var queuedBytes: Int = 0
+        var playedBytes: Int = 0
+        var startedEmitted = false
+        var drainRequested = false
+        var endedEmitted = false
+    }
+
+    /// Reserved key for chunks that carried no `response_id`.
+    static let anonymousKey = "\u{200B}anonymous\u{200B}"
+
+    private var byResponse: [String: Response] = [:]
+    private var order: [String] = []
+
+    /// Snapshot: outstanding responses in enqueue order.
+    var responseOrder: [String] { order }
+
+    var isEmpty: Bool { byResponse.isEmpty }
+
+    /// Called when a chunk is scheduled on the player. Increments queued
+    /// counters — does NOT emit `.started`; that waits for real completion.
+    mutating func enqueue(responseId: String?, bytes: Int) {
+        let key = responseId ?? Self.anonymousKey
+        var state = byResponse[key] ?? Response()
+        state.queuedBuffers += 1
+        state.queuedBytes += bytes
+        byResponse[key] = state
+        if !order.contains(key) { order.append(key) }
+    }
+
+    /// Called from the player's real completion callback (`.dataPlayedBack`).
+    /// Returns any receipts triggered by this completion.
+    mutating func bufferCompleted(responseId: String?, bytes: Int) -> (
+        started: StartedReceipt?, ended: EndedReceipt?
+    ) {
+        let key = responseId ?? Self.anonymousKey
+        guard var state = byResponse[key] else { return (nil, nil) }
+        state.completedBuffers += 1
+        state.playedBytes += bytes
+        var started: StartedReceipt?
+        if !state.startedEmitted {
+            state.startedEmitted = true
+            started = StartedReceipt(responseId: keyToResponseId(key))
+        }
+        var ended: EndedReceipt?
+        if !state.endedEmitted, state.completedBuffers == state.queuedBuffers {
+            // Emit .ended when drain has been requested OR this response has
+            // been superseded (a newer response is now the latest in order).
+            let superseded = order.last != key
+            if state.drainRequested || superseded {
+                state.endedEmitted = true
+                ended = EndedReceipt(
+                    responseId: keyToResponseId(key), bytesPlayed: state.playedBytes
+                )
+            }
+        }
+        byResponse[key] = state
+        return (started, ended)
+    }
+
+    /// Bridge sent `audio.done` — no more deltas coming for the latest
+    /// response. Emits `.ended` immediately if all queued buffers already
+    /// completed; otherwise flips the drain flag so the next completion
+    /// triggers `.ended` correctly.
+    mutating func requestDrain() -> EndedReceipt? {
+        guard let key = order.last else {
+            // Nothing was ever queued — emit an empty ended so Bridge sees a
+            // receipt for the response Bridge just closed.
+            return EndedReceipt(responseId: nil, bytesPlayed: 0)
+        }
+        guard var state = byResponse[key], !state.endedEmitted else { return nil }
+        state.drainRequested = true
+        var ended: EndedReceipt?
+        if state.completedBuffers == state.queuedBuffers {
+            state.endedEmitted = true
+            ended = EndedReceipt(
+                responseId: keyToResponseId(key), bytesPlayed: state.playedBytes
+            )
+        }
+        byResponse[key] = state
+        return ended
+    }
+
+    /// User barge-in / stop: emit per-response `.bargedIn(bytesDropped)` where
+    /// `bytesDropped = queuedBytes - playedBytes`. Empties the tracker.
+    mutating func bargeAll() -> [BargedInReceipt] {
+        var receipts: [BargedInReceipt] = []
+        for key in order {
+            guard let state = byResponse[key], !state.endedEmitted else { continue }
+            let dropped = max(0, state.queuedBytes - state.playedBytes)
+            receipts.append(BargedInReceipt(
+                responseId: keyToResponseId(key), bytesDropped: dropped
+            ))
+        }
+        byResponse.removeAll(keepingCapacity: false)
+        order.removeAll(keepingCapacity: false)
+        return receipts
+    }
+
+    mutating func reset() {
+        byResponse.removeAll(keepingCapacity: false)
+        order.removeAll(keepingCapacity: false)
+    }
+
+    private func keyToResponseId(_ key: String) -> String? {
+        key == Self.anonymousKey ? nil : key
+    }
+}
