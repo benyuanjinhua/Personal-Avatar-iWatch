@@ -14,6 +14,8 @@ struct ConversationTimelineView: View {
     @ObservedObject var settings: WatchSettingsStore
     /// 点击「再次对话」时通知父视图切回主屏并进入 listening。
     var onContinueConversation: ((VoiceTurnRecord) -> Void)?
+    /// ESS-459: 点击「重新播放语音」时通知父视图播放该轮结果语音。
+    var onReplaySpeech: ((VoiceTurnRecord) -> Void)?
 
     var body: some View {
         Group {
@@ -253,7 +255,7 @@ struct TurnDetailView: View {
     }
 
     private func replayAudio() {
-        // TODO: ESS-317 — wire up to SpeechPlayer for replay from EncryptedAudioVault
         WatchLog.info("history", "replay_tapped", detail: "request_id=\(turn.requestId)")
+        onReplaySpeech?(turn)
     }
 }

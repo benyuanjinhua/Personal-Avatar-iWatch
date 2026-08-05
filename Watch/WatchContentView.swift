@@ -53,12 +53,14 @@ struct WatchContentView: View {
                 .tag(0)
 
             NavigationStack {
-                ConversationTimelineView(journal: journal, settings: settings) { turn in
+                ConversationTimelineView(journal: journal, settings: settings, onContinueConversation: { turn in
                     // ESS-317 F2.4「再次对话」：跳回主屏并进入 listening，
                     // 携带上一轮的问 + 答文本（Q1=a 口径）。
                     selectedTab = 0
                     pushToTalk.continueConversation(from: turn)
-                }
+                }, onReplaySpeech: { turn in
+                    pushToTalk.playResult(for: turn)
+                })
             }
             .tag(1)
 
