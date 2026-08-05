@@ -640,6 +640,8 @@ extension PhoneConnectivity: WatchFeedbackChannel {
             downlinkLogger.error("downlink failed request_id=\(requestId, privacy: .public) kind=\(kind.rawValue, privacy: .public) item=\(itemId, privacy: .public) attempt=\(attempt) reason=\(reason, privacy: .public)")
         case .expired(let requestId, let kind, let itemId):
             downlinkLogger.error("downlink expired request_id=\(requestId, privacy: .public) kind=\(kind.rawValue, privacy: .public) item=\(itemId, privacy: .public)")
+        case .speechBacklogSuppressed(let suppressed, let kept, let requestId):
+            downlinkLogger.notice("downlink speech backlog suppressed request_id=\(requestId, privacy: .public) suppressed=\(suppressed) kept=\(kept, privacy: .public)")
         case .persistFailed(let operation, let reason):
             downlinkLogger.fault("downlink index persist failed operation=\(operation, privacy: .public) reason=\(reason, privacy: .public)")
         }
