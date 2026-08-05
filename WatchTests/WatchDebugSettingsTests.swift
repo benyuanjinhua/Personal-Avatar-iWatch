@@ -153,34 +153,35 @@ final class WatchDebugSettingsTests: XCTestCase {
         )
     }
 
-    // MARK: - 远程配置下发（ESS-356）
+    // MARK: - 本地 UserDefaults 键优先级（ESS-356）
 
-    /// 模拟 iPhone `AgentConfiguration` 下发链路：WatchSettingsStore 收到
-    /// 配置后持久化到 UserDefaults，后续实例化 WatchDebugSettings 时读取。
+    /// 验证 `WatchDebugSettings` 在本地 UserDefaults 键有值/无值时的行为。
+    /// **注：本测试直接写 UserDefaults，不经过 `WCSession → apply` 真实路径。
+    /// iPhone `AgentConfiguration` 下发覆盖下行 gate 拆到 ESS-357。**
     /// 覆盖：
     /// 1. 全新安装（无 key）→ 跟随 `VoiceStreamingGate.defaultEnabled`（ON）
-    /// 2. 远程显式下发 `false` → 本地 debug 开关降级为 OFF
-    /// 3. 远程下发 `true` → 恢复 ON
-    /// 4. 开关翻转后本机持久化不被远程下发静默覆盖（先本地 ON→OFF→远程 true→仍是 OFF 的 UserDefaults 值）
-    func testRemoteConfigDeliveryOverridesDefaultInPriorityOrder() {
-        let defaults = makeIsolatedDefaults("remote_config")
+    /// 2. 本地键显式 `false` → 降级为 OFF
+    /// 3. 本地键显式 `true` → 恢复 ON
+    /// 4. 开关翻转后持久化生效（重新实例化后保持最新值）
+    func testLocalDefaultsKeyOverridePriority() {
+        let defaults = makeIsolatedDefaults("local_key_priority")
 
         // 全新安装：无历史 key → VoiceStreamingGate.defaultEnabled（true）
         let fresh = WatchDebugSettings(defaults: defaults)
         XCTAssertTrue(fresh.streamingEnabled, "全新安装应默认 ON（跟随编译期 gate）")
         XCTAssertTrue(fresh.isStreamingActive)
 
-        // 模拟 iPhone 下发 voiceStreamingV2: false
+        // 本地键显式设为 false
         defaults.set(false, forKey: WatchDebugSettings.streamingEnabledDefaultsKey)
-        let afterRemoteOff = WatchDebugSettings(defaults: defaults)
-        XCTAssertFalse(afterRemoteOff.streamingEnabled, "远程下发 false 应覆盖默认值")
-        XCTAssertFalse(afterRemoteOff.isStreamingActive)
+        let afterOff = WatchDebugSettings(defaults: defaults)
+        XCTAssertFalse(afterOff.streamingEnabled, "本地键 false 应覆盖默认值")
+        XCTAssertFalse(afterOff.isStreamingActive)
 
-        // 模拟 iPhone 下发 voiceStreamingV2: true
+        // 本地键显式设为 true
         defaults.set(true, forKey: WatchDebugSettings.streamingEnabledDefaultsKey)
-        let afterRemoteOn = WatchDebugSettings(defaults: defaults)
-        XCTAssertTrue(afterRemoteOn.streamingEnabled, "远程下发 true 应生效")
-        XCTAssertTrue(afterRemoteOn.isStreamingActive)
+        let afterOn = WatchDebugSettings(defaults: defaults)
+        XCTAssertTrue(afterOn.streamingEnabled, "本地键 true 应生效")
+        XCTAssertTrue(afterOn.isStreamingActive)
 
         // 验证开关翻转后持久化的优先级：本地显式 OFF 后，UserDefaults 落的是 false
         let localSettings = WatchDebugSettings(defaults: defaults)
