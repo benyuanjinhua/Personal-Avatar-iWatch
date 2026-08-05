@@ -275,4 +275,119 @@ final class SessionTokenProviderTests: XCTestCase {
             SessionTokenProvider.FetchError.badResponse(502)
         )
     }
+
+    // MARK: - 8. Sync fetch (B1 regression)
+
+    func testFetchSyncReturnsTokenOn201() {
+        let tokenString = "rtk_sync_test"
+        MockProtocol.responseHandler = { _ in
+            let body: [String: Any] = [
+                "token": tokenString, "device_id": self.deviceId,
+                "generation": 5, "expires_in_ms": 30_000, "protocol_version": 1,
+            ]
+            let data = try! JSONSerialization.data(withJSONObject: body)
+            let response = HTTPURLResponse(
+                url: self.gatewayURL, statusCode: 201,
+                httpVersion: "HTTP/1.1", headerFields: nil
+            )!
+            return (data, response, nil)
+        }
+
+        let result = SessionTokenProvider.fetchSync(
+            gatewayBaseURL: gatewayURL,
+            deviceId: deviceId, sessionId: sessionId,
+            requestId: requestId, generation: 5,
+            credentials: credentials, session: mockSession
+        )
+
+        guard case .success(let issued) = result else {
+            return XCTFail("expected .success, got \(result)")
+        }
+        XCTAssertEqual(issued.token, tokenString)
+        XCTAssertEqual(issued.generation, 5)
+    }
+
+    func testFetchSyncFailsOnTransportError() {
+        MockProtocol.responseHandler = { _ in (nil, nil, URLError(.timedOut)) }
+
+        let result = SessionTokenProvider.fetchSync(
+            gatewayBaseURL: gatewayURL,
+            deviceId: deviceId, sessionId: sessionId,
+            requestId: requestId, generation: 1,
+            credentials: credentials, session: mockSession
+        )
+
+        guard case .failure(.transport) = result else {
+            return XCTFail("expected .transport, got \(result)")
+        }
+    }
+
+    // MARK: - 9. Token scope mismatch (scope fields match request)
+
+    func testTokenScopeFieldsMatchRequest() {
+        let expectedToken = "rtk_scope_match"
+        // Gateway echoes back the scope it received — verify it matches
+        MockProtocol.responseHandler = { _ in
+            let body: [String: Any] = [
+                "token": expectedToken,
+                "device_id": self.deviceId,
+                "session_id": self.sessionId,
+                "request_id": self.requestId,
+                "generation": 7,
+                "expires_in_ms": 30_000,
+                "protocol_version": 1,
+            ]
+            let data = try! JSONSerialization.data(withJSONObject: body)
+            let response = HTTPURLResponse(
+                url: self.gatewayURL, statusCode: 201,
+                httpVersion: "HTTP/1.1", headerFields: nil
+            )!
+            return (data, response, nil)
+        }
+
+        let result = SessionTokenProvider.fetchSync(
+            gatewayBaseURL: gatewayURL,
+            deviceId: deviceId, sessionId: sessionId,
+            requestId: requestId, generation: 7,
+            credentials: credentials, session: mockSession
+        )
+
+        guard case .success(let issued) = result else {
+            return XCTFail("expected .success")
+        }
+        // Scope must match what we sent
+        XCTAssertEqual(issued.deviceId, deviceId)
+        XCTAssertEqual(issued.sessionId, sessionId)
+        XCTAssertEqual(issued.requestId, requestId)
+        XCTAssertEqual(issued.generation, 7)
+    }
+
+    // MARK: - 10. Generation 2+ (non-default generation)
+
+    func testFetchWithNonDefaultGeneration() {
+        MockProtocol.responseHandler = { _ in
+            let body: [String: Any] = [
+                "token": "rtk_gen2", "device_id": self.deviceId,
+                "generation": 2, "expires_in_ms": 30_000, "protocol_version": 1,
+            ]
+            let data = try! JSONSerialization.data(withJSONObject: body)
+            let response = HTTPURLResponse(
+                url: self.gatewayURL, statusCode: 201,
+                httpVersion: "HTTP/1.1", headerFields: nil
+            )!
+            return (data, response, nil)
+        }
+
+        let result = SessionTokenProvider.fetchSync(
+            gatewayBaseURL: gatewayURL,
+            deviceId: deviceId, sessionId: sessionId,
+            requestId: requestId, generation: 2,
+            credentials: credentials, session: mockSession
+        )
+
+        guard case .success(let issued) = result else {
+            return XCTFail("expected .success for gen=2")
+        }
+        XCTAssertEqual(issued.generation, 2)
+    }
 }

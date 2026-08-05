@@ -30,15 +30,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     /// ESS-391: feature flag controlling the Agent direct path.
     private let agentFlag = AudioRealtimeAgentFeatureFlag()
     /// ESS-391: cached Agent session — created once, reused across turns.
-    /// The session is re-connected per turn with fresh token + requestId.
     private var agentSession: AudioRealtimeAgentSession?
-    /// ESS-446: ephemeral bearer token for the Agent WSS, obtained via
-    /// `POST /v1/realtime/session-token`. Memory-only; never persisted.
-    /// Cleared after each Agent transport creation — one token per turn.
-    private var agentEphemeralToken: String?
-    /// ESS-446: in-flight token fetch task. Guards against concurrent
-    /// fetches — only one token request is in flight at a time.
-    private var agentFetchTask: Task<Void, Never>?
     /// ESS-446: iPhone generation owner counter. Incremented on barge-in,
     /// passed to token fetch and Agent transport so scope always matches.
     private var agentGeneration: Int = 1
@@ -221,32 +213,21 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     /// ESS-321 real-time uplink dispatch. Called from `didReceiveMessage`
     /// when the payload carries a `RealtimeUplinkEnvelope`.
     ///
-    /// **ESS-446**: when the Agent feature flag is enabled, kicks off an
-    /// async token fetch **per turn** using the current scope (sessionId,
-    /// requestId, generation). Previous token is discarded so stale scope
-    /// never leaks across turns. Token fetch is best-effort — the current
-    /// turn uses Bridge while the fetch is in flight; the NEXT turn gets
-    /// the Agent path if the token arrived.
+    /// **ESS-446**: when a `bargein.request` arrives, increments the iPhone
+    /// generation owner counter. Token fetch happens synchronously inside
+    /// `makeRealtimeTransport` so scope always matches the WSS query params.
     @MainActor
     private func handleRealtimeUplink(data: Data) {
         guard let envelope = try? JSONDecoder().decode(RealtimeUplinkEnvelope.self, from: data),
               envelope.protocolVersion == RealtimeWireVersion.uplink else { return }
 
-        // ESS-446: start per-turn token fetch when Agent flag is enabled.
-        // Discard any cached token — it was scoped to a previous turn.
-        if agentFlag.isDirectPathEnabled && agentFetchTask == nil {
-            let sid = envelope.start?.sessionId ?? envelope.append?.streamId ??
-                      envelope.commit?.sessionId ?? ""
-            let rid = envelope.start?.requestId ?? envelope.append?.requestId ??
-                      envelope.commit?.requestId ?? ""
-            if !sid.isEmpty && !rid.isEmpty {
-                agentEphemeralToken = nil  // B1+B2: never reuse across turns
-                let gen = agentGeneration
-                agentFetchTask = Task { [weak self] in
-                    await self?.fetchAndStoreAgentToken(
-                        sessionId: sid, requestId: rid, generation: gen
-                    )
-                }
+        // ESS-446 B4: increment generation owner on barge-in
+        if envelope.kind == .bargeInRequest, let ask = envelope.bargeIn {
+            if ask.fromGeneration >= agentGeneration {
+                agentGeneration = ask.fromGeneration + 1
+                Self.logger.info(
+                    "agent generation advanced to \(self.agentGeneration, privacy: .public)"
+                )
             }
         }
 
@@ -272,44 +253,21 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     /// available (watch side treats that as a transport failure and falls
     /// back to the full-file relay flow).
     ///
-    /// **Agent path**: creates a `PhoneRealtimeAgentTransport` wrapping an
-    /// `AudioRealtimeAgentSession`. The token must already be obtained via
-    /// `POST /v1/realtime/session-token` (ESS-401 integration). Currently
-    /// the token is passed via `agentEphemeralToken` — a downstream
-    /// ESS-401 integration must refresh it per turn.
+    /// **Agent path (B1 fix)**: fetches a single-use session token
+    /// synchronously via `SessionTokenProvider.fetchSync`, scoped to the
+    /// EXACT same (deviceId, sessionId, requestId, generation) that the
+    /// WSS query params carry. This guarantees the Gateway never sees
+    /// a scope mismatch. On fetch failure, falls back to Bridge.
     ///
     /// **Bridge path**: the existing `PhoneRealtimeWebSocketTransport` using
     /// the relay's signed WSS endpoint (PR #113).
     @MainActor
     private func makeRealtimeTransport(requestId: String, sessionId: String) -> PhoneRealtimeSession.Transport? {
         // ESS-391: try Agent direct path first when feature flag is enabled.
-        if let agentConfig = agentFlag.resolveConfig(ephemeralToken: agentEphemeralToken ?? "") {
-            let session: AudioRealtimeAgentSession
-            if let existing = agentSession {
-                session = existing
-            } else {
-                session = AudioRealtimeAgentSession(config: agentConfig, sessionId: sessionId)
-                agentSession = session
+        if agentFlag.isDirectPathEnabled {
+            if let transport = tryMakeAgentTransport(requestId: requestId, sessionId: sessionId) {
+                return transport
             }
-            let transport = PhoneRealtimeAgentTransport(
-                config: agentConfig,
-                agentSession: session,
-                requestId: requestId,
-                sessionId: sessionId
-            )
-            transport.onDownlink = { [weak self] envelope in
-                self?.forwardRealtimeDownlink(envelope)
-            }
-            transport.onStateChange = { [weak self] state in
-                Self.logger.info("agent transport state → \\(String(describing: state), privacy: .public)")
-            }
-            realtimeSession.isAgentTransport = true
-            // B2: consume token — single-use, never reuse across turns
-            agentEphemeralToken = nil
-            Self.logger.info(
-                "agent transport created for rid=\\(requestId.prefix(8), privacy: .public) gen=\\(agentGeneration, privacy: .public)"
-            )
-            return transport
         }
 
         // Fallback to Bridge path
@@ -335,68 +293,74 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         return PhoneRealtimeWebSocketTransport(task: task)
     }
 
-    // MARK: - ESS-446 Token fetch
-
-    /// Fetch a single-use WSS session token from the Agent Gateway, then
-    /// store it in `agentEphemeralToken` so the next `makeRealtimeTransport`
-    /// call uses the Agent direct path.
-    ///
-    /// The token is scoped to (deviceId, sessionId, requestId, generation).
-    /// On success, the token is retained in memory only — never persisted.
-    /// On failure, `agentEphemeralToken` stays nil and subsequent turns
-    /// continue to use the Bridge fallback.
-    ///
-    /// **B3 fix**: the feature flag's `gatewayURLString` is a WSS media
-    /// endpoint (e.g. `wss://agent.example.com/api/realtime`). We derive the
-    /// **HTTPS control-plane** base URL by replacing `wss://` with `https://`
-    /// and dropping the path. The token endpoint is then
-    /// `https://agent.example.com/v1/realtime/session-token`.
+    /// Fetch a token and create an Agent transport — all synchronously so
+    /// the token scope matches the WSS query params exactly.
     @MainActor
-    private func fetchAndStoreAgentToken(
-        sessionId: String, requestId: String, generation: Int
-    ) async {
-        defer { agentFetchTask = nil }
-
+    private func tryMakeAgentTransport(
+        requestId: String, sessionId: String
+    ) -> PhoneRealtimeSession.Transport? {
         guard let credentials = RelayCredentialsStore.read() else {
-            Self.logger.error("agent token fetch: not paired")
-            return
+            Self.logger.error("agent transport: not paired")
+            return nil
         }
         let urlString = agentFlag.gatewayURLString
-        guard !urlString.isEmpty else {
-            Self.logger.error("agent token fetch: no gateway URL configured")
-            return
-        }
-        // B3: derive HTTPS control-plane base from WSS media endpoint
-        guard let controlBase = httpsControlBase(from: urlString) else {
-            Self.logger.error("agent token fetch: cannot derive HTTPS base from \(urlString, privacy: .public)")
-            return
+        guard !urlString.isEmpty, let controlBase = httpsControlBase(from: urlString) else {
+            Self.logger.error("agent transport: no gateway URL or cannot derive HTTPS base")
+            return nil
         }
         let deviceId = agentFlag.deviceId.isEmpty ? credentials.deviceId : agentFlag.deviceId
+        let gen = agentGeneration
 
-        let result = await SessionTokenProvider.fetch(
+        // B1 fix: synchronous token fetch with EXACT scope match
+        Self.logger.info(
+            "agent fetching token for rid=\(requestId.prefix(8), privacy: .public) gen=\(gen, privacy: .public)"
+        )
+        let tokenResult = SessionTokenProvider.fetchSync(
             gatewayBaseURL: controlBase,
             deviceId: deviceId,
             sessionId: sessionId,
             requestId: requestId,
-            generation: generation,
+            generation: gen,
             credentials: credentials
         )
-
-        switch result {
-        case .success(let issued):
-            agentEphemeralToken = issued.token
-            Self.logger.info(
-                "agent token stored gen=\(issued.generation, privacy: .public) expires_ms=\(issued.expiresInMs, privacy: .public)"
-            )
-        case .failure(let error):
-            Self.logger.error(
-                "agent token fetch failed: \(String(describing: error), privacy: .public)"
-            )
-            // Token stays nil — Bridge path is used for this and subsequent turns
+        guard case .success(let issued) = tokenResult else {
+            Self.logger.error("agent token fetch failed — falling back to Bridge")
+            return nil
         }
+
+        // Token fetched with matching scope — create Agent transport
+        guard let agentConfig = agentFlag.resolveConfig(ephemeralToken: issued.token) else {
+            Self.logger.error("agent config resolve failed")
+            return nil
+        }
+
+        let session: AudioRealtimeAgentSession
+        if let existing = agentSession {
+            session = existing
+        } else {
+            session = AudioRealtimeAgentSession(config: agentConfig, sessionId: sessionId)
+            agentSession = session
+        }
+        let transport = PhoneRealtimeAgentTransport(
+            config: agentConfig,
+            agentSession: session,
+            requestId: requestId,
+            sessionId: sessionId
+        )
+        transport.onDownlink = { [weak self] envelope in
+            self?.forwardRealtimeDownlink(envelope)
+        }
+        transport.onStateChange = { [weak self] state in
+            Self.logger.info("agent transport state → \(String(describing: state), privacy: .public)")
+        }
+        realtimeSession.isAgentTransport = true
+        Self.logger.info(
+            "agent transport created for rid=\(requestId.prefix(8), privacy: .public) gen=\(gen, privacy: .public)"
+        )
+        return transport
     }
 
-    /// Derive an HTTPS control-plane base URL from a WSS media endpoint URL.
+    // MARK: - URL helpers
     /// Example: `wss://agent.example.com/api/realtime` → `https://agent.example.com`
     private func httpsControlBase(from wssURLString: String) -> URL? {
         guard var components = URLComponents(string: wssURLString),

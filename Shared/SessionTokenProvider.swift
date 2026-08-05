@@ -214,6 +214,52 @@ enum SessionTokenProvider {
         Self.logger.error("session-token bad response status=\(http.statusCode)")
         return .failure(.badResponse(http.statusCode))
     }
+
+    // MARK: - Synchronous fetch (ESS-446 B1 fix)
+
+    /// Synchronous wrapper that blocks until the token fetch completes.
+    /// Used by `PhoneConnectivity.makeRealtimeTransport` so the token scope
+    /// (deviceId, sessionId, requestId, generation) is guaranteed to match
+    /// the WSS query params of the transport being created.
+    ///
+    /// Runs the actual `fetch` on a detached task to avoid deadlocking the
+    /// main actor; the semaphore blocks the calling thread until the fetch
+    /// returns.
+    static func fetchSync(
+        gatewayBaseURL: URL,
+        deviceId: String,
+        sessionId: String,
+        requestId: String,
+        generation: Int,
+        credentials: RelayDeviceCredentials,
+        session: URLSession = .shared,
+        timeout: TimeInterval = 10
+    ) -> Result<IssuedToken, FetchError> {
+        let semaphore = DispatchSemaphore(value: 0)
+        nonisolated(unsafe) var result: Result<IssuedToken, FetchError> = .failure(.transport(
+            NSError(domain: "SessionTokenProvider", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: "timeout"])
+        ))
+        let base = gatewayBaseURL
+        let dev = deviceId
+        let sid = sessionId
+        let rid = requestId
+        let gen = generation
+        let creds = credentials
+        let sess = session
+        Task.detached {
+            let r = await fetch(
+                gatewayBaseURL: base, deviceId: dev,
+                sessionId: sid, requestId: rid,
+                generation: gen, credentials: creds,
+                session: sess
+            )
+            result = r
+            semaphore.signal()
+        }
+        _ = semaphore.wait(timeout: .now() + timeout)
+        return result
+    }
 }
 
 private extension String {
