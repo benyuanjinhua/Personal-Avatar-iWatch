@@ -25,7 +25,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         private(set) var preparedFor: RealtimeMediaSession.TurnHandle?
         private(set) var enqueuedPlayables: [RealtimeDownlinkPlayback.PlayableChunk] = []
         private(set) var bargedInBytes: [Int] = []
-        private(set) var finished = false
+        private(set) var inputCompleteSignalled = false
         private(set) var stopped = false
 
         var enqueuedChunks: [VoiceStreamChunk] { enqueuedPlayables.map(\.chunk) }
@@ -35,7 +35,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
             enqueuedPlayables.append(contentsOf: playables)
         }
         func bargeIn(clearedBytes: Int) { bargedInBytes.append(clearedBytes) }
-        func finish() { finished = true }
+        func signalInputComplete() { inputCompleteSignalled = true }
         func stop(barge: Bool) { stopped = true }
     }
 
@@ -210,6 +210,43 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         XCTAssertEqual(transport.playbackStartEvents.first?.1, "resp-x")
         XCTAssertEqual(transport.playbackEndEvents.count, 1)
         XCTAssertEqual(transport.playbackEndEvents.first?.2, 2_048)
+    }
+
+    /// ESS-335: `markDownlinkComplete` (audio.done) must NOT close the
+    /// coordinator turn synchronously. The player still has buffers
+    /// draining; the turn only closes when the player's real `.ended`
+    /// receipt arrives back through `onPlaybackEvent`.
+    func testMarkDownlinkCompleteWaitsForRealEndedBeforeFinishingTurn() {
+        let requestId = "44444444-4444-4444-4444-444444444450"
+        let (adapter, _, player, transport, _) = makeAdapter(sessionIds: [
+            "55555555-5555-5555-5555-55555555abc0"
+        ])
+        let handle = adapter.beginTurn(requestId: requestId)
+        let chunk = VoiceStreamChunk(
+            requestId: handle.requestId, streamId: handle.sessionId,
+            direction: .downlink, sequence: 0, capturedAtMs: 1,
+            codec: "pcm_s16le", sampleRate: 24_000,
+            payload: Data(repeating: 0x11, count: 64)
+        )
+        adapter.ingestDownlink(chunk, responseId: "resp-1")
+
+        adapter.markDownlinkComplete()
+        XCTAssertTrue(player.inputCompleteSignalled,
+                      "adapter must forward audio.done as signalInputComplete, not finish()")
+        XCTAssertNotNil(adapter.currentTurn,
+                        "turn must stay open until the real .ended receipt arrives")
+        XCTAssertTrue(transport.playbackEndEvents.isEmpty,
+                      "playback.ended must not be sent before the player confirms drain")
+
+        // Player finishes draining and reports the real bytesPlayed.
+        player.onPlaybackEvent?(.ended(
+            requestId: handle.requestId, sessionId: handle.sessionId, bytesPlayed: 64
+        ))
+        XCTAssertEqual(transport.playbackEndEvents.count, 1)
+        XCTAssertEqual(transport.playbackEndEvents.first?.1, "resp-1")
+        XCTAssertEqual(transport.playbackEndEvents.first?.2, 64)
+        XCTAssertNil(adapter.currentTurn,
+                     "turn must be closed once the real .ended receipt arrives")
     }
 
     func testNewTurnBargesInAndPlayerClearsPriorPlayback() {
