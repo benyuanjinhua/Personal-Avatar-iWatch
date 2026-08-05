@@ -1,6 +1,22 @@
 import AVFoundation
 import Foundation
 
+/// Turn-scoped guard that keeps audio-session activation idempotent while
+/// leaving a failed activation retryable on the next playable chunk.
+struct RealtimePlaybackAudioSessionGate {
+    private(set) var isActivated = false
+
+    mutating func activate(using operation: () throws -> Void) throws {
+        guard !isActivated else { return }
+        try operation()
+        isActivated = true
+    }
+
+    mutating func reset() {
+        isActivated = false
+    }
+}
+
 /// ESS-321 real playback engine for streamed `audio.delta` chunks.
 ///
 /// The bridge/agent delivers 24 kHz mono PCM16 chunks. Rather than wait for
