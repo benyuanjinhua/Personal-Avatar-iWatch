@@ -196,13 +196,19 @@ export class RealtimeSession {
       return this.fail('ERR_PROTOCOL_VERSION')
     }
     this.started = true
-    this.agentTurn = this.agent.openTurn({
-      requestId: this.scope.request_id,
-      sessionId: this.scope.session_id,
-      generation: this.scope.generation,
-      responseId: this.responseId,
-      onEvent: e => this._handleAgentEvent(e),
-    })
+    try {
+      this.agentTurn = this.agent.openTurn({
+        requestId: this.scope.request_id,
+        sessionId: this.scope.session_id,
+        generation: this.scope.generation,
+        responseId: this.responseId,
+        onEvent: e => this._handleAgentEvent(e),
+      })
+    } catch (error) {
+      return this.fail('ERR_UPSTREAM_UNAVAILABLE', {
+        detail: String(error?.message ?? error), retriable: true,
+      })
+    }
     this._startHeartbeat()
     this._sendJson({
       type: 'ready',

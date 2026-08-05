@@ -21,5 +21,9 @@
   "max_uplink_bytes_per_second": 524288,
 
   "agent_transport": "mock",
-  "provider_key_env": "AUDIO_REALTIME_PROVIDER_KEY"
+  "provider_key_env": "AUDIO_REALTIME_PROVIDER_KEY",
+  "agent_upstream_url": "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+  "agent_model": "qwen-audio-3.0-realtime-plus",
+  "agent_voice": "longanqian",
+  "agent_instructions": "你是用户的数字分身助手。请自然、简洁地用中文回答。"
 }

@@ -252,8 +252,12 @@ Grepping a single `request_id` yields the whole turn:
 | `max_frame_bytes` | `65536` | Per-frame hard cap |
 | `max_events_per_second` | `200` | Per-connection rate limit |
 | `max_uplink_bytes_per_second` | `524288` | 512 KiB/s uplink cap |
-| `agent_transport` | `mock` | `mock` for tests; production loader is out of scope of ESS-403 (see ESS-401 integration). |
+| `agent_transport` | `mock` | `mock` for tests; `agent` connects each turn to Qwen-Audio Realtime. |
 | `provider_key_env` | `AUDIO_REALTIME_PROVIDER_KEY` | Env var to read the provider key from; not read from config file. |
+| `agent_upstream_url` | DashScope Beijing realtime endpoint | Provider WSS endpoint; workspace-specific endpoints are supported. |
+| `agent_model` | `qwen-audio-3.0-realtime-plus` | Added as the upstream `model` query parameter when absent. |
+| `agent_voice` | `longanqian` | Qwen output voice. |
+| `agent_instructions` | Chinese assistant prompt | Server-side system instructions for the model. |
 
 Relative paths in `tls_cert` / `tls_key` / `state_dir` are all resolved
 against the **module directory** (`AudioRealtimeGateway/`, i.e. the directory

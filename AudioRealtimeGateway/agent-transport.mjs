@@ -7,6 +7,8 @@
 // and honours cancel so the whole state machine can be exercised without a
 // live provider.
 
+import WebSocket from 'ws'
+
 export class MockAgentTransport {
   constructor({ log = () => {} } = {}) {
     this.log = log
@@ -109,4 +111,119 @@ export class ScriptedAgentTransport {
   }
 
   handle(requestId) { return this.handles.get(requestId) }
+}
+
+// Production adapter for DashScope's Qwen-Audio Realtime WebSocket API.
+// One provider socket is created per client turn, which keeps cancellation
+// and request_id ownership unambiguous. Audio received before the provider
+// handshake completes is queued in memory and flushed in order after
+// session.updated.
+export class QwenAgentTransport {
+  constructor({ providerKey, url, model = 'qwen-audio-3.0-realtime-plus',
+    voice = 'longanqian', instructions, log = () => {}, WebSocketImpl = WebSocket } = {}) {
+    if (!providerKey) throw new Error('provider key is required')
+    this.providerKey = providerKey
+    this.url = withModel(url ?? 'wss://dashscope.aliyuncs.com/api-ws/v1/realtime', model)
+    this.voice = voice
+    this.instructions = instructions
+    this.log = log
+    this.WebSocketImpl = WebSocketImpl
+  }
+
+  openTurn({ requestId, sessionId, generation, responseId, onEvent }) {
+    let state = 'connecting'
+    let sequence = 0
+    let done = false
+    const pending = []
+    const ws = new this.WebSocketImpl(this.url, {
+      headers: { Authorization: `Bearer ${this.providerKey}` },
+    })
+    const emitError = (code, detail, retriable = true) => {
+      if (done) return
+      done = true
+      onEvent({ type: 'agent.error', response_id: responseId, code, detail, retriable })
+    }
+    const send = message => {
+      const text = JSON.stringify(message)
+      if (state === 'ready') ws.send(text)
+      else if (state === 'connecting') pending.push(text)
+      else throw new Error('provider websocket is not available')
+    }
+    const flush = () => {
+      state = 'ready'
+      for (const text of pending.splice(0)) ws.send(text)
+    }
+
+    ws.on('open', () => {
+      this.log('agent_upstream_connected', { request_id: requestId, session_id: sessionId, generation })
+      ws.send(JSON.stringify({
+        type: 'session.update',
+        session: {
+          modalities: ['text', 'audio'], voice: this.voice,
+          input_audio_format: 'pcm', output_audio_format: 'pcm',
+          turn_detection: null,
+          ...(this.instructions ? { instructions: this.instructions } : {}),
+        },
+      }))
+    })
+    ws.on('message', raw => {
+      let event
+      try { event = JSON.parse(raw.toString('utf8')) }
+      catch { return emitError('ERR_UPSTREAM_PROTOCOL', 'provider returned invalid JSON', false) }
+      if (event.type === 'session.updated') {
+        if (state === 'connecting') flush()
+        return
+      }
+      if (event.type === 'response.audio.delta') {
+        const audio = event.delta ?? event.audio
+        if (typeof audio !== 'string') return emitError('ERR_UPSTREAM_PROTOCOL', 'audio delta missing payload', false)
+        onEvent({ type: 'agent.audio.delta', response_id: responseId, sequence: sequence++,
+          sample_rate: 24_000, codec: 'pcm_s16le', audio })
+        return
+      }
+      if (event.type === 'response.audio.done') {
+        if (done) return
+        done = true
+        onEvent({ type: 'agent.audio.done', response_id: responseId, final_sequence: sequence - 1 })
+        return
+      }
+      if (event.type === 'error') {
+        const providerCode = event.error?.code ?? event.code ?? 'provider_error'
+        const detail = event.error?.message ?? event.message ?? providerCode
+        this.log('agent_upstream_error', { request_id: requestId, session_id: sessionId,
+          generation, provider_code: String(providerCode).slice(0, 80) })
+        emitError('ERR_UPSTREAM_UNAVAILABLE', detail, event.error?.type !== 'invalid_request_error')
+      }
+    })
+    ws.on('error', error => {
+      this.log('agent_upstream_error', { request_id: requestId, session_id: sessionId,
+        generation, provider_code: error?.code ?? 'websocket_error' })
+      emitError('ERR_UPSTREAM_UNAVAILABLE', error?.message ?? 'provider websocket error')
+    })
+    ws.on('close', (code) => {
+      state = 'closed'
+      if (!done) emitError('ERR_UPSTREAM_UNAVAILABLE', `provider websocket closed (${code})`)
+    })
+
+    return {
+      appendAudio: ({ bytes }) => send({ type: 'input_audio_buffer.append', audio: bytes.toString('base64') }),
+      commit: () => {
+        send({ type: 'input_audio_buffer.commit' })
+        send({ type: 'response.create', response: { modalities: ['audio', 'text'] } })
+        this.log('agent_upstream_committed', { request_id: requestId, session_id: sessionId, generation })
+      },
+      cancel: () => {
+        if (state === 'ready') ws.send(JSON.stringify({ type: 'response.cancel' }))
+        done = true
+        ws.close(1000, 'cancelled')
+      },
+      close: () => { done = true; ws.close(1000, 'client_closed') },
+    }
+  }
+}
+
+function withModel(url, model) {
+  const parsed = new URL(url)
+  if (!parsed.searchParams.has('model')) parsed.searchParams.set('model', model)
+  return parsed.toString()
 }

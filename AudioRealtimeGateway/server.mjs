@@ -24,7 +24,7 @@ import { createLogger } from './logging.mjs'
 import { DeviceStore, AuthError } from './device-auth.mjs'
 import { TokenIssuer, IssuerError } from './token-issuer.mjs'
 import { RealtimeSession } from './realtime-session.mjs'
-import { MockAgentTransport } from './agent-transport.mjs'
+import { MockAgentTransport, QwenAgentTransport } from './agent-transport.mjs'
 
 const BASE = dirname(fileURLToPath(import.meta.url))
 
@@ -293,7 +293,14 @@ function createAgentTransport(CONFIG, { log, providerKey }) {
   // the mock by accident.
   if (kind === 'agent') {
     if (!providerKey) throw new Error('provider key missing for agent_transport=agent (set env: ' + (CONFIG.provider_key_env ?? 'AUDIO_REALTIME_PROVIDER_KEY') + ')')
-    throw new Error('agent_transport=agent is not wired in this module — implement in ESS-401 integration')
+    return new QwenAgentTransport({
+      providerKey,
+      url: CONFIG.agent_upstream_url,
+      model: CONFIG.agent_model,
+      voice: CONFIG.agent_voice,
+      instructions: CONFIG.agent_instructions,
+      log: (evt, extra) => log(evt, extra),
+    })
   }
   throw new Error('unknown agent_transport: ' + kind)
 }

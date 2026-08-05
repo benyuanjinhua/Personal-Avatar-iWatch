@@ -174,6 +174,21 @@ describe('RealtimeSession — happy path', () => {
   })
 })
 
+describe('RealtimeSession — upstream failure', () => {
+  it('turns a synchronous provider open failure into a structured session error', () => {
+    const { session, sent, logs, closes, scope } = harness({
+      agentTransport: { openTurn: () => { throw new Error('provider offline') } },
+    })
+    start(session, scope)
+    assert.equal(sent[0].type, 'error')
+    assert.equal(sent[0].code, 'ERR_UPSTREAM_UNAVAILABLE')
+    assert.equal(sent[0].retriable, true)
+    assert.equal(logs.find(record => record.evt === 'session_error').code,
+      'ERR_UPSTREAM_UNAVAILABLE')
+    assert.equal(closes[0].code, 1008)
+  })
+})
+
 describe('RealtimeSession — downlink ordering', () => {
   it('drops duplicate delta sequences and preserves the ordered set', () => {
     const { session, sent, agent, scope, logs } = harness()
