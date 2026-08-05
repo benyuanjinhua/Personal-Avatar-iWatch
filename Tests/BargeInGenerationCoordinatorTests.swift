@@ -19,4 +19,11 @@ final class BargeInGenerationCoordinatorTests: XCTestCase {
         XCTAssertEqual(gate.fail("upgrade_failed"), .ignore)
         XCTAssertEqual(gate.ready(generation: 2), .ignore)
     }
+
+    func testDuplicateCancelSettledDoesNotMintTwice() {
+        var gate = BargeInGenerationCoordinator(generation: 1)
+        XCTAssertEqual(gate.request(from: 1), .cancel(1))
+        XCTAssertEqual(gate.cancelSettled(generation: 1), .mintAndConnect(2))
+        XCTAssertEqual(gate.cancelSettled(generation: 1), .ignore)
+    }
 }

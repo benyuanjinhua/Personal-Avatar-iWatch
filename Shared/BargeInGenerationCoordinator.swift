@@ -25,7 +25,7 @@ struct BargeInGenerationCoordinator: Sendable {
     }
 
     mutating func cancelSettled(generation old: Int) -> Action {
-        guard let replacing, replacing.old == old, !fallbackIssued else { return .ignore }
+        guard let replacing, replacing.old == old, !replacementStarted, !fallbackIssued else { return .ignore }
         replacementStarted = true
         return .mintAndConnect(replacing.new)
     }
