@@ -1,44 +1,51 @@
 import Foundation
-import os
 
-/// ESS-402 configuration for the Audio Realtime Agent Gateway WSS direct connection.
+/// ESS-402 configuration for the Audio Realtime Agent Gateway WSS direct
+/// connection. Aligned with Gateway PR #159 contract.
 ///
-/// Validates the WSS URL (production requires `wss://`), reads the auth token from
-/// the Keychain (in-memory only, never logged), and exposes feature-flag state so
-/// callers can fall back to the existing Bridge path when the direct agent path is
-/// unavailable or disabled.
+/// ### Token semantics (F6 clarification)
+///
+/// - `authToken` is an **ephemeral** single-use bearer token with a TTL of
+///   ≤ 90 s, obtained via `POST /v1/realtime/session-token` (Gateway PR #159).
+///   It lives in memory only — never persisted to Keychain or UserDefaults.
+/// - The long-lived device credential (used to HMAC-sign the session-token
+///   request) lives in `SecureTokenStore` per the existing Bridge auth model.
+///   This module does NOT store ephemeral tokens to Keychain.
+///
+/// ### Reconnect posture (F4/F5 clarification)
+///
+/// - `maxReconnectAttempts` defaults to **0**: the Gateway issues single-use
+///   tokens. A disconnected WSS cannot be reconnected within the same turn
+///   without a fresh token from `POST /v1/realtime/session-token`. Token
+///   refresh is a downstream ESS-401 integration concern. When the socket
+///   drops, the session emits `.failed` and the caller falls back to the
+///   existing Bridge path.
+/// - No retransmission queue is maintained: reconnection is disallowed, so
+///   sequence continuity across sockets is moot.
 struct AudioRealtimeAgentConfig: Sendable, Equatable {
-    /// The Gateway WSS endpoint. Production must be `wss://`; development allows
-    /// `ws://` for local testing on trusted networks.
     let gatewayURL: URL
-
-    /// Auth token loaded from the Keychain. Never persisted to UserDefaults or
-    /// written to logs.
+    /// Ephemeral single-use bearer token (≤ 90 s TTL). Memory only.
     let authToken: String
-
-    /// How long the client waits for a `session.created` or `heartbeat_ack`
-    /// after connecting before declaring the socket dead.
+    /// Device identity for scope binding (sent as `device_id` URL query param).
+    let deviceId: String
     let connectionTimeout: TimeInterval
-
-    /// Heartbeat interval in seconds. The client sends `heartbeat` and expects
-    /// `heartbeat_ack` within `connectionTimeout`.
+    /// Default heartbeat interval matches Gateway's default (15 s).
     let heartbeatInterval: TimeInterval
-
-    /// Maximum number of reconnection attempts before declaring failure.
-    /// Per the acceptance criteria: one safe reconnection before first packet,
-    /// with deduplication to prevent double delivery.
+    /// 0 = no reconnect. Single-use tokens make reconnect structurally
+    /// impossible without a fresh token (F4).
     let maxReconnectAttempts: Int
 
-    /// Initializer with sensible production defaults.
     init(
         gatewayURL: URL,
         authToken: String,
+        deviceId: String,
         connectionTimeout: TimeInterval = 10.0,
-        heartbeatInterval: TimeInterval = 30.0,
-        maxReconnectAttempts: Int = 1
+        heartbeatInterval: TimeInterval = 15.0,
+        maxReconnectAttempts: Int = 0
     ) {
         self.gatewayURL = gatewayURL
         self.authToken = authToken
+        self.deviceId = deviceId
         self.connectionTimeout = connectionTimeout
         self.heartbeatInterval = heartbeatInterval
         self.maxReconnectAttempts = maxReconnectAttempts
@@ -63,15 +70,10 @@ struct AudioRealtimeAgentConfig: Sendable, Equatable {
         }
     }
 
-    /// Validate the gateway URL. Production (non-debug) rejects `ws://`; both
-    /// modes reject non-absolute URLs and URLs without a host.
-    ///
-    /// - Parameter allowInsecure: When `true`, `ws://` is accepted (debug builds
-    ///   on trusted LANs). Defaults to `false`.
-    /// - Returns: The validated config, or a `ValidationError`.
     static func validate(
         urlString: String,
         authToken: String,
+        deviceId: String,
         allowInsecure: Bool = false
     ) -> Result<AudioRealtimeAgentConfig, ValidationError> {
         guard let url = URL(string: urlString) else {
@@ -84,48 +86,20 @@ struct AudioRealtimeAgentConfig: Sendable, Equatable {
             return .failure(.invalidScheme("(none)"))
         }
         switch scheme {
-        case "wss":
-            break
+        case "wss": break
         case "ws":
-            guard allowInsecure else {
-                return .failure(.invalidScheme(scheme))
-            }
+            guard allowInsecure else { return .failure(.invalidScheme(scheme)) }
         default:
             return .failure(.invalidScheme(scheme))
         }
         guard !authToken.isEmpty else {
-            return .failure(.invalidScheme("missing auth token — cannot connect without credentials"))
+            return .failure(.invalidScheme("missing auth token"))
         }
-        return .success(AudioRealtimeAgentConfig(gatewayURL: url, authToken: authToken))
-    }
-
-    // MARK: - Keychain-backed token loading
-
-    /// Attempt to load a stored agent auth token from the Keychain. Returns
-    /// `nil` when no token has been saved or the read fails; callers should
-    /// treat this as "direct path unavailable" and fall back to Bridge.
-    static func loadTokenFromKeychain() -> String? {
-        let token = SecureTokenStore.read()
-        return token.isEmpty ? nil : token
-    }
-
-    /// Persist the agent auth token to the Keychain. The token is stored
-    /// `AfterFirstUnlockThisDeviceOnly` — it survives background but not
-    /// a device restore / full erase.
-    static func saveTokenToKeychain(_ token: String) {
-        SecureTokenStore.save(token)
-    }
-
-    /// Convenience: build a config from the Keychain-stored token. Returns
-    /// `nil` when the token is unavailable or the URL is malformed.
-    static func fromKeychain(
-        urlString: String,
-        allowInsecure: Bool = false
-    ) -> AudioRealtimeAgentConfig? {
-        guard let token = loadTokenFromKeychain(), !token.isEmpty else { return nil }
-        switch validate(urlString: urlString, authToken: token, allowInsecure: allowInsecure) {
-        case .success(let config): return config
-        case .failure: return nil
+        guard !deviceId.isEmpty else {
+            return .failure(.invalidScheme("missing device_id"))
         }
+        return .success(AudioRealtimeAgentConfig(
+            gatewayURL: url, authToken: authToken, deviceId: deviceId
+        ))
     }
 }

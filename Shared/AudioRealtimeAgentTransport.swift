@@ -4,15 +4,13 @@ import os
 /// ESS-402 WebSocket transport for the Audio Realtime Agent Gateway.
 ///
 /// Wraps a `URLSessionWebSocketTask` speaking the Agent Gateway protocol
-/// (see `AudioRealtimeAgentCodec`). The transport layer is deliberately minimal:
-/// open, send, receive loop, close — with auth via the `Authorization` header.
-/// Reconnection, heartbeat, and session lifecycle live in
-/// `AudioRealtimeAgentSession`.
+/// (see `AudioRealtimeAgentCodec`, aligned with Gateway PR #159
+/// `AudioRealtimeGateway/realtime-session.mjs`).
 ///
-/// This is NOT a drop-in replacement for `PhoneRealtimeWebSocketTransport` —
-/// the Agent Gateway protocol is distinct from the Bridge protocol, so the
-/// caller must route through `AudioRealtimeAgentSession` instead of
-/// `PhoneRealtimeSession` when the direct path is enabled.
+/// The transport layer is deliberately minimal: open, send, receive loop,
+/// close. Auth is via the HTTP `Authorization: Bearer <token>` header (token
+/// never appears in the JSON payload). Reconnection, heartbeat, and session
+/// lifecycle live in `AudioRealtimeAgentSession`.
 @MainActor
 final class AudioRealtimeAgentTransport {
     private static let logger = Logger(
@@ -20,7 +18,6 @@ final class AudioRealtimeAgentTransport {
         category: "AgentRealtimeTransport"
     )
 
-    /// Downlink event decoded from the Agent Gateway.
     enum DownlinkResult {
         case event(AudioRealtimeAgentCodec.DownlinkEvent)
         case unrecognised(type: String)
@@ -39,18 +36,27 @@ final class AudioRealtimeAgentTransport {
 
     // MARK: - Factory
 
-    /// Create a transport from an `AudioRealtimeAgentConfig`. The Gateway URL
-    /// is extended with `?session_id=<sessionId>` for routing, and the
-    /// `Authorization: Bearer <token>` header carries the auth token.
+    /// Create a transport from an `AudioRealtimeAgentConfig`.
+    ///
+    /// The Gateway URL is extended with `?device_id=&session_id=&request_id=
+    /// &generation=` query params for scope binding (Gateway PR #159 verifies
+    /// these against the token scope on upgrade). The `Authorization: Bearer
+    /// <token>` header carries the ephemeral auth token.
     static func create(
         config: AudioRealtimeAgentConfig,
-        sessionId: String
+        sessionId: String,
+        requestId: String,
+        generation: Int
     ) -> AudioRealtimeAgentTransport? {
         guard var components = URLComponents(
             url: config.gatewayURL, resolvingAgainstBaseURL: false
         ) else { return nil }
+        let deviceId = config.deviceId
         var queryItems = components.queryItems ?? []
+        queryItems.append(URLQueryItem(name: "device_id", value: deviceId))
         queryItems.append(URLQueryItem(name: "session_id", value: sessionId))
+        queryItems.append(URLQueryItem(name: "request_id", value: requestId))
+        queryItems.append(URLQueryItem(name: "generation", value: String(generation)))
         components.queryItems = queryItems
         guard let resolvedURL = components.url else { return nil }
 
@@ -68,7 +74,12 @@ final class AudioRealtimeAgentTransport {
 
     // MARK: - Send
 
-    /// Send an Agent uplink frame. The completion fires on `@MainActor`.
+    /// Send an Agent uplink frame.
+    ///
+    /// **F2 fix**: The log uses `AudioRealtimeAgentCodec.logTag(_:)` which
+    /// emits only type + identity fields — never the raw JSON payload. This
+    /// keeps token bytes, raw audio, and other sensitive data out of the
+    /// Apple unified log even at `.debug` level.
     func send(
         _ frame: AudioRealtimeAgentCodec.UplinkFrame,
         completion: @escaping @MainActor (Error?) -> Void
@@ -87,9 +98,8 @@ final class AudioRealtimeAgentTransport {
             ))
             return
         }
-        Self.logger.debug(
-            "agent uplink type=\(String(describing: text.prefix(80)), privacy: .public)"
-        )
+        // F2: structured log tag — type + identity only, no raw payload prefix
+        Self.logger.debug("\(AudioRealtimeAgentCodec.logTag(frame), privacy: .public)")
         task.send(.string(text)) { error in
             Task { @MainActor in completion(error) }
         }
@@ -97,10 +107,6 @@ final class AudioRealtimeAgentTransport {
 
     // MARK: - Receive
 
-    /// Start the receive loop. The handler is called with every decoded
-    /// downlink event; when the socket closes or errors, the handler receives
-    /// `.error(...)`. Unknown event types produce `.unrecognised(...)` — the
-    /// caller should log and keep receiving.
     func receive(handler: @escaping @MainActor (DownlinkResult) -> Void) {
         guard !isClosed else { return }
         task.receive { [weak self] result in
@@ -124,10 +130,7 @@ final class AudioRealtimeAgentTransport {
                     let outcome = AudioRealtimeAgentCodec.decodeOutcome(raw)
                     switch outcome {
                     case .event(let event):
-                        // Log key identifiers (no token, no raw audio)
-                        Self.logger.debug(
-                            "agent downlink type event session_id=\(String(describing: self.sessionId), privacy: .public)"
-                        )
+                        Self.logger.debug("RECV type event")
                         handler(.event(event))
                         self.receive(handler: handler)
                     case .unrecognised(let type):

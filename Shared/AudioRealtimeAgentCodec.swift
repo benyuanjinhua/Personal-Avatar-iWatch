@@ -1,72 +1,108 @@
 import Foundation
 
-/// ESS-402 native Audio Realtime Agent wire codec.
+/// ESS-402 native Audio Realtime Agent wire codec, aligned with Gateway PR #159
+/// (`AudioRealtimeGateway/realtime-session.mjs` ALLOWED_KEYS).
 ///
-/// Distinct from `RealtimeBridgeWireCodec`: the Agent Gateway speaks a different
-/// event vocabulary than the Mac Bridge, with its own session/turn/generation
-/// lifecycle. This codec does NOT reuse the Bridge's `start`/`audio.append`/
-/// `audio.delta` flat JSON shape — the Agent protocol carries `session_id`,
-/// `turn_id`, and `generation` identifiers inline, and auth is per-session
-/// rather than per-request HMAC-signed.
+/// Distinct from `RealtimeBridgeWireCodec`: the Agent Gateway enforces a strict
+/// JSON schema of its own with `session_id` / `request_id` / `generation`
+/// (Number) / `response_id` / `sequence`. Auth is per-WSS-upgrade via the HTTP
+/// `Authorization: Bearer <token>` header (not in the JSON payload), per ESS-388
+/// v_final A1.
 ///
-/// Wire schema (flat JSON, top-level `type` discriminator):
+/// ### Uplink (iPhone → Agent Gateway) — matched to ALLOWED_KEYS
 ///
-///   Uplink (iPhone → Agent Gateway):
-///     { "type": "session.update", "session_id": "...", "token": "..." }
-///     { "type": "input_audio.append", "session_id": "...", "turn_id": "...", "sequence": N,
-///       "sample_rate": 16000, "codec": "pcm_s16le", "audio": "<base64>" }
-///     { "type": "input_audio.commit", "session_id": "...", "turn_id": "...", "sequence": N }
-///     { "type": "heartbeat", "session_id": "...", "timestamp_ms": N }
+///   { "type": "session.start",      "session_id":"...","request_id":"...","generation":N,"protocol_version":1 }
+///   { "type": "audio.append",       "session_id":"...","request_id":"...","generation":N,"sequence":N,"audio":"<base64>" [,"sample_rate":16000,"codec":"pcm_s16le"] }
+///   { "type": "audio.commit",       "session_id":"...","request_id":"...","generation":N,"sequence":N }
+///   { "type": "cancel",             "session_id":"...","request_id":"...","generation":N [,"reason":"..."] }
+///   { "type": "playback.started",   "session_id":"...","request_id":"...","response_id":"..." }
+///   { "type": "playback.ended",     "session_id":"...","request_id":"...","response_id":"..." }
+///   { "type": "ping",               "nonce":"..." }
+///   { "type": "close"               [,"reason":"..."] }
 ///
-///   Downlink (Agent Gateway → iPhone):
-///     { "type": "session.created", "session_id": "...", "turn_id": "..." }
-///     { "type": "response.audio.delta", "session_id": "...", "turn_id": "...", "generation": "...",
-///       "sequence": N, "sample_rate": 24000, "codec": "pcm_s16le", "audio": "<base64>" }
-///     { "type": "response.audio.done", "session_id": "...", "turn_id": "...", "generation": "..." }
-///     { "type": "response.transcript.delta", "session_id": "...", "turn_id": "...", "text": "..." }
-///     { "type": "response.transcript.done", "session_id": "...", "turn_id": "..." }
-///     { "type": "heartbeat_ack", "session_id": "...", "timestamp_ms": N }
-///     { "type": "error", "session_id": "...", "code": "...", "message": "..." }
+/// ### Downlink (Agent Gateway → iPhone) — what the Gateway emits
+///
+///   { "type":"ready",           "session_id":"...","request_id":"...","generation":N,"response_id":"...","heartbeat_interval_ms":N,"protocol_version":1 }
+///   { "type":"audio.delta",     "session_id":"...","request_id":"...","response_id":"...","generation":N,"sequence":N,"sample_rate":24000,"codec":"pcm_s16le","audio":"<base64>" }
+///   { "type":"audio.done",      "session_id":"...","request_id":"...","response_id":"...","generation":N,"final_sequence":N }
+///   { "type":"cancel.ack",      "session_id":"...","request_id":"...","generation":N,"cancelled_response_id":"..." }
+///   { "type":"error",           "code":"...","session_id":"...","request_id":"...","generation":N,"retriable":bool [,"detail":"..."...] }
+///   { "type":"pong",            "nonce":"..." }
+///   { "type":"server_ping",     "at":N }
 enum AudioRealtimeAgentCodec {
 
-    // MARK: - Uplink frames
+    // MARK: - Uplink frames (matched to Gateway CLIENT_SCHEMAS)
 
     enum UplinkFrame {
-        case sessionUpdate(sessionId: String, token: String)
-        case inputAudioAppend(sessionId: String, turnId: String, sequence: Int,
-                              sampleRate: Int, codec: String, audioBase64: String, endOfStream: Bool)
-        case inputAudioCommit(sessionId: String, turnId: String, sequence: Int)
-        case heartbeat(sessionId: String, timestampMs: Int64)
+        /// Maps to Gateway `session.start`. Auth token is sent via HTTP header,
+        /// NOT in the JSON payload (ESS-388 A1: token never in JSON).
+        case sessionStart(sessionId: String, requestId: String, generation: Int, protocolVersion: Int)
+        /// Maps to Gateway `audio.append`.
+        case audioAppend(sessionId: String, requestId: String, generation: Int,
+                         sequence: Int, sampleRate: Int?, codec: String?, audioBase64: String)
+        /// Maps to Gateway `audio.commit`.
+        case audioCommit(sessionId: String, requestId: String, generation: Int, sequence: Int)
+        /// Maps to Gateway `cancel`.
+        case cancel(sessionId: String, requestId: String, generation: Int, reason: String?)
+        /// Maps to Gateway `playback.started`.
+        case playbackStarted(sessionId: String, requestId: String, responseId: String)
+        /// Maps to Gateway `playback.ended`.
+        case playbackEnded(sessionId: String, requestId: String, responseId: String)
+        /// Maps to Gateway `ping`.
+        case ping(nonce: String)
+        /// Maps to Gateway `close`.
+        case close(reason: String?)
     }
 
-    /// Encode an uplink frame into the flat JSON string the Agent Gateway
-    /// expects on the WSS socket. Returns `nil` on serialization failure.
+    /// Encode an uplink frame into the flat JSON string the Gateway expects.
+    /// Returns `nil` on serialization failure.
     static func encode(_ frame: UplinkFrame) -> String? {
         var payload: [String: Any] = [:]
         switch frame {
-        case .sessionUpdate(let sessionId, let token):
-            payload["type"] = "session.update"
+        case .sessionStart(let sessionId, let requestId, let generation, let protocolVersion):
+            payload["type"] = "session.start"
             payload["session_id"] = sessionId
-            payload["token"] = token
-        case .inputAudioAppend(let sessionId, let turnId, let sequence,
-                               let sampleRate, let codec, let audioBase64, let endOfStream):
-            payload["type"] = "input_audio.append"
+            payload["request_id"] = requestId
+            payload["generation"] = generation
+            payload["protocol_version"] = protocolVersion
+        case .audioAppend(let sessionId, let requestId, let generation,
+                          let sequence, let sampleRate, let codec, let audioBase64):
+            payload["type"] = "audio.append"
             payload["session_id"] = sessionId
-            payload["turn_id"] = turnId
+            payload["request_id"] = requestId
+            payload["generation"] = generation
             payload["sequence"] = sequence
-            payload["sample_rate"] = sampleRate
-            payload["codec"] = codec
             payload["audio"] = audioBase64
-            if endOfStream { payload["end_of_stream"] = true }
-        case .inputAudioCommit(let sessionId, let turnId, let sequence):
-            payload["type"] = "input_audio.commit"
+            if let sr = sampleRate { payload["sample_rate"] = sr }
+            if let c = codec { payload["codec"] = c }
+        case .audioCommit(let sessionId, let requestId, let generation, let sequence):
+            payload["type"] = "audio.commit"
             payload["session_id"] = sessionId
-            payload["turn_id"] = turnId
+            payload["request_id"] = requestId
+            payload["generation"] = generation
             payload["sequence"] = sequence
-        case .heartbeat(let sessionId, let timestampMs):
-            payload["type"] = "heartbeat"
+        case .cancel(let sessionId, let requestId, let generation, let reason):
+            payload["type"] = "cancel"
             payload["session_id"] = sessionId
-            payload["timestamp_ms"] = timestampMs
+            payload["request_id"] = requestId
+            payload["generation"] = generation
+            if let reason { payload["reason"] = reason }
+        case .playbackStarted(let sessionId, let requestId, let responseId):
+            payload["type"] = "playback.started"
+            payload["session_id"] = sessionId
+            payload["request_id"] = requestId
+            payload["response_id"] = responseId
+        case .playbackEnded(let sessionId, let requestId, let responseId):
+            payload["type"] = "playback.ended"
+            payload["session_id"] = sessionId
+            payload["request_id"] = requestId
+            payload["response_id"] = responseId
+        case .ping(let nonce):
+            payload["type"] = "ping"
+            payload["nonce"] = nonce
+        case .close(let reason):
+            payload["type"] = "close"
+            if let reason { payload["reason"] = reason }
         }
         guard let data = try? JSONSerialization.data(
             withJSONObject: payload,
@@ -75,128 +111,167 @@ enum AudioRealtimeAgentCodec {
         return String(data: data, encoding: .utf8)
     }
 
+    /// Structured log tag for an uplink frame — type + key identity fields
+    /// only. Never includes raw audio payload or token bytes. Safe to log
+    /// with `privacy: .public`.
+    static func logTag(_ frame: UplinkFrame) -> String {
+        switch frame {
+        case .sessionStart(let sid, let rid, let gen, _):
+            return "SEND type=session.start sid=\(sid.prefix(8)) rid=\(rid.prefix(8)) gen=\(gen)"
+        case .audioAppend(let sid, let rid, let gen, let seq, _, _, let audioB64):
+            return "SEND type=audio.append sid=\(sid.prefix(8)) rid=\(rid.prefix(8)) gen=\(gen) seq=\(seq) audio_bytes=\(audioB64.count)"
+        case .audioCommit(let sid, let rid, let gen, let seq):
+            return "SEND type=audio.commit sid=\(sid.prefix(8)) rid=\(rid.prefix(8)) gen=\(gen) seq=\(seq)"
+        case .cancel(let sid, let rid, let gen, _):
+            return "SEND type=cancel sid=\(sid.prefix(8)) rid=\(rid.prefix(8)) gen=\(gen)"
+        case .playbackStarted(let sid, let rid, let respId):
+            return "SEND type=playback.started sid=\(sid.prefix(8)) rid=\(rid.prefix(8)) resp=\(respId.prefix(8))"
+        case .playbackEnded(let sid, let rid, let respId):
+            return "SEND type=playback.ended sid=\(sid.prefix(8)) rid=\(rid.prefix(8)) resp=\(respId.prefix(8))"
+        case .ping(let nonce):
+            return "SEND type=ping nonce=\(nonce.prefix(8))"
+        case .close:
+            return "SEND type=close"
+        }
+    }
+
     // MARK: - Uplink convenience: VoiceStreamChunk → Agent frame
 
-    /// Encode a `VoiceStreamChunk` (the project-wide streaming chunk type) as
-    /// an Agent `input_audio.append` frame. This bridges the existing uplink
-    /// pipeline into the Agent wire without duplicating the chunk type.
-    static func encodeInputAudioAppend(
+    /// Encode a `VoiceStreamChunk` as an Agent `audio.append` frame.
+    static func encodeAudioAppend(
         chunk: VoiceStreamChunk,
-        turnId: String
+        requestId: String,
+        generation: Int
     ) -> String? {
-        return encode(.inputAudioAppend(
+        return encode(.audioAppend(
             sessionId: chunk.streamId,
-            turnId: turnId,
+            requestId: requestId,
+            generation: generation,
             sequence: chunk.sequence,
             sampleRate: chunk.sampleRate,
             codec: chunk.codec,
-            audioBase64: chunk.payload.base64EncodedString(),
-            endOfStream: chunk.endOfStream
+            audioBase64: chunk.payload.base64EncodedString()
         ))
     }
 
-    // MARK: - Downlink decode outcome
+    // MARK: - Downlink decode
 
-    /// Decode outcome for a received Agent Gateway frame. Distinguishes
-    /// "parsed and routable" from "well-formed but unknown type" from
-    /// "malformed bytes" — the transport logs unknown types and keeps
-    /// receiving so future frames still arrive.
     enum DecodeOutcome {
         case event(DownlinkEvent)
-        /// Well-formed JSON with a `type` field the codec does not recognise.
         case unrecognised(type: String)
-        /// Bytes were not decodable as an Agent Gateway frame.
         case malformed
     }
 
-    // MARK: - Downlink events
+    // MARK: - Downlink events (Gateway → iPhone)
 
     enum DownlinkEvent {
-        case sessionCreated(sessionId: String, turnId: String?)
-        case audioDelta(sessionId: String, turnId: String, generation: String?,
-                        sequence: Int, sampleRate: Int, codec: String,
-                        audioBytes: Data, endOfStream: Bool, capturedAtMs: Int64?)
-        case audioDone(sessionId: String, turnId: String, generation: String?)
-        case transcriptDelta(sessionId: String, turnId: String, text: String)
-        case transcriptDone(sessionId: String, turnId: String)
-        case heartbeatAck(sessionId: String, timestampMs: Int64)
-        case error(sessionId: String, code: String, message: String)
+        /// Gateway `ready` — response to `session.start`. Carries the
+        /// server-assigned `response_id` and heartbeat interval.
+        case ready(sessionId: String, requestId: String, generation: Int,
+                   responseId: String, heartbeatIntervalMs: Int, protocolVersion: Int)
+        /// Gateway `audio.delta`. `response_id` and `generation` are always
+        /// present; `sampleRate`/`codec` default to 24000/pcm_s16le.
+        case audioDelta(sessionId: String, requestId: String, responseId: String,
+                        generation: Int, sequence: Int, sampleRate: Int,
+                        codec: String, audioBytes: Data)
+        /// Gateway `audio.done`. `finalSequence` is the highest dense prefix
+        /// of downlink sequences the server delivered.
+        case audioDone(sessionId: String, requestId: String, responseId: String,
+                       generation: Int, finalSequence: Int)
+        /// Gateway `cancel.ack` — server-authoritative cancel confirmation.
+        case cancelAck(sessionId: String, requestId: String, generation: Int,
+                       cancelledResponseId: String)
+        /// Gateway `error` with structured code and optional detail.
+        case error(code: String, sessionId: String, requestId: String,
+                   generation: Int, retriable: Bool, detail: String?)
+        /// Gateway `pong` — response to client `ping`.
+        case pong(nonce: String)
+        /// Gateway `server_ping` — server-driven heartbeat.
+        case serverPing(at: Int64)
     }
 
-    /// Decode a raw JSON string into the decoded outcome.
     static func decodeOutcome(_ text: String) -> DecodeOutcome {
         guard let data = text.data(using: .utf8) else { return .malformed }
         return decodeOutcome(data)
     }
 
-    /// Decode raw bytes into the decoded outcome.
     static func decodeOutcome(_ data: Data) -> DecodeOutcome {
         guard let raw = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return .malformed
         }
         guard let type = raw["type"] as? String else { return .malformed }
-        let sessionId = raw["session_id"] as? String
 
         switch type {
-        case "session.created":
-            guard let sid = sessionId else { return .malformed }
-            return .event(.sessionCreated(
-                sessionId: sid,
-                turnId: raw["turn_id"] as? String
+        case "ready":
+            guard let sid = raw["session_id"] as? String,
+                  let rid = raw["request_id"] as? String,
+                  let gen = raw["generation"] as? Int,
+                  let respId = raw["response_id"] as? String else { return .malformed }
+            let hbMs = (raw["heartbeat_interval_ms"] as? Int) ?? 15_000
+            let pv = (raw["protocol_version"] as? Int) ?? 1
+            return .event(.ready(
+                sessionId: sid, requestId: rid, generation: gen,
+                responseId: respId, heartbeatIntervalMs: hbMs, protocolVersion: pv
             ))
 
-        case "response.audio.delta":
-            guard let sid = sessionId,
-                  let turnId = raw["turn_id"] as? String,
+        case "audio.delta":
+            guard let sid = raw["session_id"] as? String,
+                  let rid = raw["request_id"] as? String,
+                  let respId = raw["response_id"] as? String,
+                  let gen = raw["generation"] as? Int,
                   let sequence = raw["sequence"] as? Int,
                   let base64 = raw["audio"] as? String,
                   let audioBytes = Data(base64Encoded: base64) else { return .malformed }
             let sampleRate = (raw["sample_rate"] as? Int) ?? RealtimeMediaFormat.downlinkPCM16.sampleRate
             let codec = (raw["codec"] as? String) ?? RealtimeMediaFormat.downlinkPCM16.codec
-            let generation = raw["generation"] as? String
-            let endOfStream = (raw["end_of_stream"] as? Bool) ?? false
-            var capturedAtMs: Int64? = nil
-            if let ms = raw["captured_at_ms"] as? Int64 { capturedAtMs = ms }
-            else if let msInt = raw["captured_at_ms"] as? Int { capturedAtMs = Int64(msInt) }
             return .event(.audioDelta(
-                sessionId: sid, turnId: turnId, generation: generation,
-                sequence: sequence, sampleRate: sampleRate, codec: codec,
-                audioBytes: audioBytes, endOfStream: endOfStream, capturedAtMs: capturedAtMs
+                sessionId: sid, requestId: rid, responseId: respId,
+                generation: gen, sequence: sequence,
+                sampleRate: sampleRate, codec: codec, audioBytes: audioBytes
             ))
 
-        case "response.audio.done":
-            guard let sid = sessionId,
-                  let turnId = raw["turn_id"] as? String else { return .malformed }
+        case "audio.done":
+            guard let sid = raw["session_id"] as? String,
+                  let rid = raw["request_id"] as? String,
+                  let respId = raw["response_id"] as? String,
+                  let gen = raw["generation"] as? Int,
+                  let finalSeq = raw["final_sequence"] as? Int else { return .malformed }
             return .event(.audioDone(
-                sessionId: sid, turnId: turnId,
-                generation: raw["generation"] as? String
+                sessionId: sid, requestId: rid, responseId: respId,
+                generation: gen, finalSequence: finalSeq
             ))
 
-        case "response.transcript.delta":
-            guard let sid = sessionId,
-                  let turnId = raw["turn_id"] as? String else { return .malformed }
-            return .event(.transcriptDelta(
-                sessionId: sid, turnId: turnId,
-                text: (raw["text"] as? String) ?? ""
+        case "cancel.ack":
+            guard let sid = raw["session_id"] as? String,
+                  let rid = raw["request_id"] as? String,
+                  let gen = raw["generation"] as? Int,
+                  let cancelledRespId = raw["cancelled_response_id"] as? String else {
+                return .malformed
+            }
+            return .event(.cancelAck(
+                sessionId: sid, requestId: rid, generation: gen,
+                cancelledResponseId: cancelledRespId
             ))
-
-        case "response.transcript.done":
-            guard let sid = sessionId,
-                  let turnId = raw["turn_id"] as? String else { return .malformed }
-            return .event(.transcriptDone(sessionId: sid, turnId: turnId))
-
-        case "heartbeat_ack":
-            guard let sid = sessionId,
-                  let ts = raw["timestamp_ms"] as? Int64 else { return .malformed }
-            return .event(.heartbeatAck(sessionId: sid, timestampMs: ts))
 
         case "error":
-            guard let sid = sessionId else { return .malformed }
+            guard let code = raw["code"] as? String,
+                  let sid = raw["session_id"] as? String,
+                  let rid = raw["request_id"] as? String,
+                  let gen = raw["generation"] as? Int else { return .malformed }
+            let retriable = (raw["retriable"] as? Bool) ?? false
+            let detail = raw["detail"] as? String
             return .event(.error(
-                sessionId: sid,
-                code: (raw["code"] as? String) ?? "unknown",
-                message: (raw["message"] as? String) ?? ""
+                code: code, sessionId: sid, requestId: rid, generation: gen,
+                retriable: retriable, detail: detail
             ))
+
+        case "pong":
+            guard let nonce = raw["nonce"] as? String else { return .malformed }
+            return .event(.pong(nonce: nonce))
+
+        case "server_ping":
+            guard let at = raw["at"] as? Int64 else { return .malformed }
+            return .event(.serverPing(at: at))
 
         default:
             return .unrecognised(type: type)
@@ -206,12 +281,10 @@ enum AudioRealtimeAgentCodec {
     // MARK: - Downlink convenience: convert to existing types
 
     /// Convert an `audioDelta` event into the project-standard
-    /// `VoiceStreamChunk` for downstream playback. Returns `nil` if the
-    /// event is not an audio delta.
+    /// `VoiceStreamChunk` for downstream playback.
     static func toVoiceStreamChunk(_ event: DownlinkEvent, requestId: String) -> VoiceStreamChunk? {
-        guard case .audioDelta(let sessionId, _, _,
-                               let sequence, let sampleRate, let codec,
-                               let audioBytes, let endOfStream, let capturedAtMs) = event else {
+        guard case .audioDelta(let sessionId, _, _, _, let sequence,
+                               let sampleRate, let codec, let audioBytes) = event else {
             return nil
         }
         return VoiceStreamChunk(
@@ -219,11 +292,11 @@ enum AudioRealtimeAgentCodec {
             streamId: sessionId,
             direction: .downlink,
             sequence: sequence,
-            capturedAtMs: capturedAtMs ?? 1,
+            capturedAtMs: 1,
             codec: codec,
             sampleRate: sampleRate,
             payload: audioBytes,
-            endOfStream: endOfStream
+            endOfStream: false
         )
     }
 }

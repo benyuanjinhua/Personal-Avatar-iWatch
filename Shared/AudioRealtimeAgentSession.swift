@@ -1,26 +1,25 @@
 import Foundation
 import os
 
-/// ESS-402 Audio Realtime Agent session manager.
+/// ESS-402 Audio Realtime Agent session manager. Aligned with Gateway PR #159
+/// (`AudioRealtimeGateway/realtime-session.mjs`).
 ///
 /// Manages a direct WSS connection to the Audio Realtime Agent Gateway, handling
-/// session lifecycle (open → authenticate → streaming → close), heartbeat,
-/// connection state observability, and one safe reconnection before the first
-/// packet with deduplication.
+/// session lifecycle (open → session.start → ready → streaming → close),
+/// heartbeat (client `ping` / Gateway `pong` / `server_ping`), connection
+/// state observability, and structured logging with `session_id`/`request_id`/
+/// `generation`/`sequence` (no token or raw audio in logs).
 ///
-/// Responsibilities:
-///   - Open a WSS connection per turn via `AudioRealtimeAgentTransport`.
-///   - Send `session.update` with the auth token on connect.
-///   - Forward uplink `VoiceStreamChunk` frames as `input_audio.append`.
-///   - Decode downlink `response.audio.delta` events into `VoiceStreamChunk`
-///     and emit them for Watch playback.
-///   - Maintain a heartbeat (client sends `heartbeat`, Gateway acks with
-///     `heartbeat_ack`; missing ack within timeout triggers reconnect).
-///   - Provide at most one safe reconnection before the first audio packet
-///     lands, with deduplication to prevent double delivery.
-///   - Expose an observable `ConnectionState` for UI and logging.
-///   - Log `session_id`, `turn_id`, `generation`, and `seq` at each stage
-///     without recording the raw token or audio payloads in logs.
+/// ### Reconnect posture (F4/F5)
+///
+/// `maxReconnectAttempts` defaults to 0. The Gateway issues single-use tokens
+/// (TTL ≤ 90 s per ESS-388 A1). A disconnected WSS cannot reconnect within the
+/// same turn — a fresh token from `POST /v1/realtime/session-token` is required.
+/// Token refresh is an ESS-401 integration concern. When the socket drops, the
+/// session emits `.failed` and callers fall back to the Bridge path.
+///
+/// No retransmission queue: reconnection is disallowed, so sequence continuity
+/// across sockets is not applicable.
 @MainActor
 final class AudioRealtimeAgentSession {
     private static let logger = Logger(
@@ -33,9 +32,8 @@ final class AudioRealtimeAgentSession {
     enum ConnectionState: Equatable, CustomStringConvertible {
         case disconnected
         case connecting(sessionId: String)
-        case authenticating(sessionId: String)
-        case connected(sessionId: String, turnId: String?)
-        case reconnecting(sessionId: String, attempt: Int)
+        case waitingForReady(sessionId: String)
+        case connected(sessionId: String, requestId: String, generation: Int)
         case failed(sessionId: String, reason: String)
         case closed
 
@@ -43,11 +41,9 @@ final class AudioRealtimeAgentSession {
             switch self {
             case .disconnected: return "disconnected"
             case .connecting(let sid): return "connecting(session:\(sid.prefix(8)))"
-            case .authenticating(let sid): return "authenticating(session:\(sid.prefix(8)))"
-            case .connected(let sid, let tid):
-                return "connected(session:\(sid.prefix(8)),turn:\(tid?.prefix(8) ?? "none"))"
-            case .reconnecting(let sid, let n):
-                return "reconnecting(session:\(sid.prefix(8)),attempt:\(n))"
+            case .waitingForReady(let sid): return "waiting(session:\(sid.prefix(8)))"
+            case .connected(let sid, let rid, let gen):
+                return "connected(session:\(sid.prefix(8)),req:\(rid.prefix(8)),gen:\(gen))"
             case .failed(let sid, let reason):
                 return "failed(session:\(sid.prefix(8)),reason:\(reason))"
             case .closed: return "closed"
@@ -57,15 +53,18 @@ final class AudioRealtimeAgentSession {
 
     // MARK: - Turn identity
 
-    /// Turn identifiers for logging and deduplication.
+    /// Turn identifiers scoped to this session. Aligned with Gateway scope:
+    /// `session_id` + `request_id` + `generation` (Number).
     struct TurnIdentity: Equatable, Sendable {
         let sessionId: String
-        var turnId: String
-        /// Gateway-assigned `generation` from the first `response.audio.delta`.
-        /// Used in logs and for playback receipt tracking.
-        var generation: String?
-        /// Sequences we have already delivered to the Watch (dedup key).
+        let requestId: String
+        let generation: Int
+        /// Gateway-assigned `response_id` from the `ready` frame.
+        var responseId: String?
+        /// Sequences already delivered to the Watch (dedup).
         var deliveredSequences: Set<Int> = []
+        /// Max `final_sequence` from `audio.done` (for barrier).
+        var finalSequence: Int?
     }
 
     // MARK: - Configuration
@@ -78,29 +77,26 @@ final class AudioRealtimeAgentSession {
     private(set) var connectionState: ConnectionState = .disconnected
     private var transport: AudioRealtimeAgentTransport?
     private var currentTurn: TurnIdentity?
-    private var reconnectCount: Int = 0
     private var heartbeatTimer: Timer?
-    private var reconnectTimer: Timer?
     private var pendingUplink: [AudioRealtimeAgentCodec.UplinkFrame] = []
 
     /// Emitted on every `ConnectionState` transition.
     var onConnectionStateChange: ((ConnectionState) -> Void)?
 
-    /// Emitted when a downlink audio chunk is ready for Watch playback.
-    /// The `VoiceStreamChunk` carries the Agent's `session_id`/`generation`/`seq`.
-    var onAudioDelta: ((VoiceStreamChunk, String?) -> Void)?
+    /// Emitted when a downlink `audio.delta` chunk is ready for Watch playback.
+    /// Params: (VoiceStreamChunk, responseId, generation).
+    var onAudioDelta: ((VoiceStreamChunk, String?, Int) -> Void)?
 
-    /// Emitted when the Gateway signals the audio response is complete.
-    var onAudioDone: ((String, String?) -> Void)?
+    /// Emitted when the Gateway signals the audio response is complete (`audio.done`).
+    /// Params: (requestId, responseId, generation, finalSequence).
+    var onAudioDone: ((String, String?, Int, Int) -> Void)?
 
-    /// Emitted when a transcript delta arrives.
-    var onTranscriptDelta: ((String, String) -> Void)?
+    /// Emitted on Gateway `error`.
+    /// Params: (code, requestId, generation, retriable, detail).
+    var onError: ((String, String, Int, Bool, String?) -> Void)?
 
-    /// Emitted when the transcript is final.
-    var onTranscriptDone: ((String) -> Void)?
-
-    /// Emitted on Gateway error.
-    var onError: ((String, String) -> Void)?
+    /// Emitted when Gateway confirms cancel (`cancel.ack`).
+    var onCancelAck: ((String, Int, String) -> Void)?
 
     // MARK: - Init
 
@@ -111,30 +107,51 @@ final class AudioRealtimeAgentSession {
 
     // MARK: - Public API
 
-    /// Open the WSS connection and authenticate. Returns `true` if the
-    /// connection attempt started; calls `onConnectionStateChange` on
-    /// state transitions.
+    /// Open the WSS connection and send `session.start`.
     @discardableResult
-    func connect(turnId: String) -> Bool {
+    func connect(requestId: String, generation: Int) -> Bool {
         guard case .disconnected = connectionState else {
             Self.logger.warning("agent session already in state \(self.connectionState.description, privacy: .public)")
             return false
         }
-        self.currentTurn = TurnIdentity(sessionId: sessionId, turnId: turnId)
-        return openTransport(sessionId: sessionId)
+        self.currentTurn = TurnIdentity(
+            sessionId: sessionId, requestId: requestId, generation: generation
+        )
+        guard let transport = AudioRealtimeAgentTransport.create(
+            config: config, sessionId: sessionId,
+            requestId: requestId, generation: generation
+        ) else {
+            transition(to: .failed(sessionId: sessionId, reason: "no_transport"))
+            return false
+        }
+        self.transport = transport
+        transition(to: .connecting(sessionId: sessionId))
+        startReceiveLoop(transport)
+        transition(to: .waitingForReady(sessionId: sessionId))
+        // Send session.start — auth is in the HTTP header, not the JSON payload
+        let startFrame = AudioRealtimeAgentCodec.UplinkFrame.sessionStart(
+            sessionId: sessionId, requestId: requestId,
+            generation: generation, protocolVersion: 1
+        )
+        transport.send(startFrame) { [weak self] error in
+            if let error {
+                Self.logger.error("session.start send failed: \(String(describing: error), privacy: .public)")
+                self?.handleTransportFailure(reason: "start_failed")
+            }
+        }
+        Self.logger.info(
+            "agent session.start sid=\(self.sessionId.prefix(8), privacy: .public) rid=\(requestId.prefix(8), privacy: .public) gen=\(generation)"
+        )
+        return true
     }
 
-    /// Send an uplink audio chunk. If the session is not yet connected, the
-    /// frame is buffered and flushed on connect.
-    func sendAudioChunk(_ chunk: VoiceStreamChunk, turnId: String) {
-        let frame = AudioRealtimeAgentCodec.UplinkFrame.inputAudioAppend(
-            sessionId: sessionId,
-            turnId: turnId,
+    /// Send an uplink audio chunk.
+    func sendAudioChunk(_ chunk: VoiceStreamChunk, requestId: String, generation: Int) {
+        let frame = AudioRealtimeAgentCodec.UplinkFrame.audioAppend(
+            sessionId: sessionId, requestId: requestId, generation: generation,
             sequence: chunk.sequence,
-            sampleRate: chunk.sampleRate,
-            codec: chunk.codec,
-            audioBase64: chunk.payload.base64EncodedString(),
-            endOfStream: chunk.endOfStream
+            sampleRate: chunk.sampleRate, codec: chunk.codec,
+            audioBase64: chunk.payload.base64EncodedString()
         )
         guard let transport, case .connected = connectionState else {
             pendingUplink.append(frame)
@@ -148,11 +165,10 @@ final class AudioRealtimeAgentSession {
         }
     }
 
-    /// Commit the uplink audio buffer (user released the record button).
-    func commitUplink(turnId: String, finalSequence: Int) {
-        let frame = AudioRealtimeAgentCodec.UplinkFrame.inputAudioCommit(
-            sessionId: sessionId,
-            turnId: turnId,
+    /// Commit uplink.
+    func commitUplink(requestId: String, generation: Int, finalSequence: Int) {
+        let frame = AudioRealtimeAgentCodec.UplinkFrame.audioCommit(
+            sessionId: sessionId, requestId: requestId, generation: generation,
             sequence: finalSequence
         )
         guard let transport, case .connected = connectionState else {
@@ -167,49 +183,25 @@ final class AudioRealtimeAgentSession {
         }
     }
 
-    /// Tear down the session. Sends no further frames; the socket is closed.
+    /// Send cancel (user barge-in).
+    func cancel(requestId: String, generation: Int, reason: String? = nil) {
+        let frame = AudioRealtimeAgentCodec.UplinkFrame.cancel(
+            sessionId: sessionId, requestId: requestId, generation: generation, reason: reason
+        )
+        transport?.send(frame) { error in
+            if let error {
+                Self.logger.error("cancel send failed: \(String(describing: error), privacy: .public)")
+            }
+        }
+    }
+
+    /// Tear down.
     func disconnect(reason: String) {
         stopHeartbeat()
-        reconnectTimer?.invalidate()
-        reconnectTimer = nil
         transport?.close(reason: reason)
         transport = nil
         pendingUplink.removeAll(keepingCapacity: false)
         transition(to: .closed)
-    }
-
-    // MARK: - Transport lifecycle
-
-    private func openTransport(sessionId: String) -> Bool {
-        guard let newTransport = AudioRealtimeAgentTransport.create(
-            config: config, sessionId: sessionId
-        ) else {
-            transition(to: .failed(sessionId: sessionId, reason: "no_transport"))
-            return false
-        }
-        transport = newTransport
-        transition(to: .connecting(sessionId: sessionId))
-        startReceiveLoop(newTransport)
-        // Send session.update to authenticate
-        transition(to: .authenticating(sessionId: sessionId))
-        authenticate(transport: newTransport)
-        return true
-    }
-
-    private func authenticate(transport: AudioRealtimeAgentTransport) {
-        let authFrame = AudioRealtimeAgentCodec.UplinkFrame.sessionUpdate(
-            sessionId: sessionId, token: config.authToken
-        )
-        transport.send(authFrame) { [weak self] error in
-            guard let self else { return }
-            if let error {
-                Self.logger.error("agent auth send failed: \(String(describing: error), privacy: .public)")
-                self.handleTransportFailure(reason: "auth_failed")
-                return
-            }
-            // Wait for session.created from Gateway; if it doesn't arrive
-            // within connectionTimeout, the receive loop will trigger a failure.
-        }
     }
 
     // MARK: - Receive loop
@@ -219,7 +211,7 @@ final class AudioRealtimeAgentSession {
             guard let self, let transport, self.transport === transport else { return }
             switch result {
             case .event(let event):
-                self.handleDownlinkEvent(event, transport: transport)
+                self.handleDownlinkEvent(event)
             case .unrecognised(let type):
                 Self.logger.info("agent unrecognised downlink type=\(type, privacy: .public)")
             case .error(let error):
@@ -229,99 +221,88 @@ final class AudioRealtimeAgentSession {
         }
     }
 
-    private func handleDownlinkEvent(
-        _ event: AudioRealtimeAgentCodec.DownlinkEvent,
-        transport: AudioRealtimeAgentTransport
-    ) {
+    private func handleDownlinkEvent(_ event: AudioRealtimeAgentCodec.DownlinkEvent) {
         switch event {
-        case .sessionCreated(let sid, let turnId):
-            guard sid == sessionId else {
-                Self.logger.warning("session.created for unknown session \(sid, privacy: .public)")
+        case .ready(let sid, let rid, let gen, let respId, let hbMs, _):
+            guard sid == sessionId, let turn = currentTurn,
+                  turn.requestId == rid, turn.generation == gen else {
+                Self.logger.warning("ready scope mismatch")
                 return
             }
             Self.logger.info(
-                "agent session created session=\(sid.prefix(8), privacy: .public) turn=\(turnId?.prefix(8) ?? "nil", privacy: .public)"
+                "agent ready sid=\(sid.prefix(8), privacy: .public) rid=\(rid.prefix(8), privacy: .public) gen=\(gen) resp=\(respId.prefix(8), privacy: .public) hb=\(hbMs)ms"
             )
-            currentTurn?.turnId = turnId ?? currentTurn?.turnId ?? ""
-            transition(to: .connected(sessionId: sid, turnId: currentTurn?.turnId))
-            startHeartbeat()
+            currentTurn?.responseId = respId
+            transition(to: .connected(sessionId: sid, requestId: rid, generation: gen))
+            startHeartbeat(intervalMs: hbMs)
             flushPendingUplink()
-            reconnectCount = 0 // Reset reconnect counter on successful connection
 
-        case .audioDelta(let sid, let turnId, let generation, let sequence,
-                         let sampleRate, let codec, let audioBytes, let endOfStream, let capturedAtMs):
-            guard sid == sessionId else { return }
-            // Dedup: skip sequences we've already delivered
-            if currentTurn?.deliveredSequences.contains(sequence) == true {
-                Self.logger.debug("agent dup seq=\(sequence) session=\(sid.prefix(8)) — dropped")
+        case .audioDelta(let sid, let rid, let respId, let gen, let seq,
+                         let sampleRate, let codec, let audioBytes):
+            guard sid == sessionId, let turn = currentTurn,
+                  turn.requestId == rid else { return }
+            // Dedup
+            if turn.deliveredSequences.contains(seq) {
+                Self.logger.debug("agent dup seq=\(seq) — dropped")
                 return
             }
-            currentTurn?.generation = generation
-            currentTurn?.deliveredSequences.insert(sequence)
+            currentTurn?.deliveredSequences.insert(seq)
             Self.logger.info(
-                "agent audio.delta session=\(sid.prefix(8), privacy: .public) turn=\(turnId.prefix(8), privacy: .public) gen=\(generation?.prefix(8) ?? "nil", privacy: .public) seq=\(sequence) bytes=\(audioBytes.count)"
+                "agent audio.delta rid=\(rid.prefix(8), privacy: .public) gen=\(gen) resp=\(respId.prefix(8), privacy: .public) seq=\(seq) bytes=\(audioBytes.count)"
             )
             let chunk = VoiceStreamChunk(
-                requestId: turnId,
-                streamId: sid,
-                direction: .downlink,
-                sequence: sequence,
-                capturedAtMs: capturedAtMs ?? 1,
-                codec: codec,
-                sampleRate: sampleRate,
-                payload: audioBytes,
-                endOfStream: endOfStream
+                requestId: rid, streamId: sid, direction: .downlink,
+                sequence: seq, capturedAtMs: 1,
+                codec: codec, sampleRate: sampleRate,
+                payload: audioBytes, endOfStream: false
             )
-            onAudioDelta?(chunk, generation)
+            onAudioDelta?(chunk, respId, gen)
 
-        case .audioDone(let sid, let turnId, let generation):
+        case .audioDone(let sid, let rid, let respId, let gen, let finalSeq):
+            guard sid == sessionId, let turn = currentTurn,
+                  turn.requestId == rid else { return }
+            currentTurn?.finalSequence = finalSeq
+            Self.logger.info(
+                "agent audio.done rid=\(rid.prefix(8), privacy: .public) gen=\(gen) resp=\(respId.prefix(8), privacy: .public) final_seq=\(finalSeq)"
+            )
+            onAudioDone?(rid, respId, gen, finalSeq)
+
+        case .cancelAck(let sid, let rid, let gen, let cancelledRespId):
             guard sid == sessionId else { return }
             Self.logger.info(
-                "agent audio.done session=\(sid.prefix(8), privacy: .public) turn=\(turnId.prefix(8), privacy: .public) gen=\(generation?.prefix(8) ?? "nil", privacy: .public)"
+                "agent cancel.ack rid=\(rid.prefix(8), privacy: .public) gen=\(gen) cancelled_resp=\(cancelledRespId.prefix(8), privacy: .public)"
             )
-            onAudioDone?(turnId, generation)
+            onCancelAck?(rid, gen, cancelledRespId)
 
-        case .transcriptDelta(let sid, let turnId, let text):
-            guard sid == sessionId else { return }
-            Self.logger.info(
-                "agent transcript.delta session=\(sid.prefix(8), privacy: .public) turn=\(turnId.prefix(8), privacy: .public)"
-            )
-            onTranscriptDelta?(turnId, text)
-
-        case .transcriptDone(let sid, let turnId):
-            guard sid == sessionId else { return }
-            Self.logger.info(
-                "agent transcript.done session=\(sid.prefix(8), privacy: .public) turn=\(turnId.prefix(8), privacy: .public)"
-            )
-            onTranscriptDone?(turnId)
-
-        case .heartbeatAck(let sid, let timestampMs):
-            guard sid == sessionId else { return }
-            Self.logger.debug(
-                "agent heartbeat_ack session=\(sid.prefix(8), privacy: .public) ts=\(timestampMs)"
-            )
-
-        case .error(let sid, let code, let message):
+        case .error(let code, let sid, let rid, let gen, let retriable, let detail):
             guard sid == sessionId else { return }
             Self.logger.error(
-                "agent error session=\(sid.prefix(8), privacy: .public) code=\(code, privacy: .public) msg=\(message, privacy: .public)"
+                "agent error code=\(code, privacy: .public) rid=\(rid.prefix(8), privacy: .public) gen=\(gen) retriable=\(retriable) detail=\(detail ?? "nil", privacy: .public)"
             )
-            onError?(code, message)
-            if code == "SESSION_EXPIRED" || code == "AUTH_FAILED" {
+            onError?(code, rid, gen, retriable, detail)
+            // Hard errors close the session
+            if !retriable {
                 handleTransportFailure(reason: "gateway_error_\(code)")
             }
+
+        case .pong(let nonce):
+            Self.logger.debug("agent pong nonce=\(nonce.prefix(8))")
+
+        case .serverPing(let at):
+            Self.logger.debug("agent server_ping at=\(at)")
         }
     }
 
     // MARK: - Heartbeat
 
-    private func startHeartbeat() {
+    private func startHeartbeat(intervalMs: Int) {
         stopHeartbeat()
+        let interval = max(5.0, Double(intervalMs) / 1000.0)
         heartbeatTimer = Timer.scheduledTimer(
-            withTimeInterval: config.heartbeatInterval, repeats: true
+            withTimeInterval: interval, repeats: true
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.sendHeartbeat()
+                self?.sendPing()
             }
         }
     }
@@ -331,47 +312,26 @@ final class AudioRealtimeAgentSession {
         heartbeatTimer = nil
     }
 
-    private func sendHeartbeat() {
+    private func sendPing() {
         guard let transport, case .connected = connectionState else { return }
-        let frame = AudioRealtimeAgentCodec.UplinkFrame.heartbeat(
-            sessionId: sessionId,
-            timestampMs: Int64(Date().timeIntervalSince1970 * 1_000)
-        )
-        transport.send(frame) { [weak self] error in
+        let nonce = UUID().uuidString
+        transport.send(.ping(nonce: nonce)) { [weak self] error in
             if let error {
-                Self.logger.error("heartbeat send failed: \(String(describing: error), privacy: .public)")
-                self?.handleTransportFailure(reason: "heartbeat_failed")
+                Self.logger.error("ping failed: \(String(describing: error), privacy: .public)")
+                self?.handleTransportFailure(reason: "ping_failed")
             }
         }
     }
 
-    // MARK: - Reconnection
+    // MARK: - Failure
 
     private func handleTransportFailure(reason: String) {
         stopHeartbeat()
-        let currentAttempt = reconnectCount
-        guard currentAttempt < config.maxReconnectAttempts else {
-            transition(to: .failed(sessionId: sessionId, reason: reason))
-            return
-        }
-        reconnectCount += 1
-        transition(to: .reconnecting(sessionId: sessionId, attempt: reconnectCount))
+        // F4: maxReconnectAttempts = 0 — single-use tokens make reconnect
+        // impossible without a fresh token. Fail immediately.
+        transition(to: .failed(sessionId: sessionId, reason: reason))
         transport?.close(reason: reason)
         transport = nil
-
-        // Retry after a short delay
-        reconnectTimer?.invalidate()
-        reconnectTimer = Timer.scheduledTimer(
-            withTimeInterval: 1.0, repeats: false
-        ) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-                Self.logger.info(
-                    "agent reconnect attempt \(self.reconnectCount) session=\(self.sessionId.prefix(8), privacy: .public)"
-                )
-                _ = self.openTransport(sessionId: self.sessionId)
-            }
-        }
     }
 
     // MARK: - Pending uplink flush
@@ -381,10 +341,9 @@ final class AudioRealtimeAgentSession {
         let frames = pendingUplink
         pendingUplink.removeAll(keepingCapacity: false)
         for frame in frames {
-            transport.send(frame) { [weak self] error in
+            transport.send(frame) { error in
                 if let error {
                     Self.logger.error("pending uplink flush failed: \(String(describing: error), privacy: .public)")
-                    self?.handleTransportFailure(reason: "flush_failed")
                 }
             }
         }
