@@ -30,6 +30,11 @@ struct VoiceRequestEnvelope: Codable, Equatable {
     let type: String
     let createdAt: Date
     let audio: VoiceAudioDescriptor
+    /// ESS-317：再次对话时的父轮次 request_id。nil = 普通新请求。
+    let parentRequestId: String?
+    /// ESS-317：再次对话时携带的上下文（上一轮的问 + 答文本），
+    /// Bridge 收到后透传给 Mac 端用于保持对话连续性。
+    let contextSummary: String?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
@@ -37,19 +42,25 @@ struct VoiceRequestEnvelope: Codable, Equatable {
         case type
         case createdAt = "created_at"
         case audio
+        case parentRequestId = "parent_request_id"
+        case contextSummary = "context_summary"
     }
 
     static func voiceRequest(
         requestId: UUID = UUIDv7.generate(),
         createdAt: Date = Date(),
-        audio: VoiceAudioDescriptor
+        audio: VoiceAudioDescriptor,
+        parentRequestId: String? = nil,
+        contextSummary: String? = nil
     ) -> VoiceRequestEnvelope {
         VoiceRequestEnvelope(
             protocolVersion: currentProtocolVersion,
             requestId: requestId.uuidString.lowercased(),
             type: voiceRequestType,
             createdAt: createdAt,
-            audio: audio
+            audio: audio,
+            parentRequestId: parentRequestId,
+            contextSummary: contextSummary
         )
     }
 

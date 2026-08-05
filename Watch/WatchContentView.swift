@@ -19,9 +19,8 @@ struct WatchContentView: View {
     /// ESS-307：设置页配置 + 下行积压计数。
     @ObservedObject private var settings: WatchSettingsStore
     /// ESS-280 方案 A（PM Jackson Bai 2026-08-04 拍板；R-04.6 后一条覆盖前一条）：
-    /// 三屏结构 —— 0 = 主界面、1 = 状态时间线（原挂在主屏 NavigationLink 下的
-    /// `ConversationTimelineView` 抬升为独立屏）、2 = 设置。冷启动落 tag 0。
-    /// 白梦林原话「右滑第 3 屏设置」字面成立即靠这里的 tag 2。
+    /// 三屏结构 —— 0 = 主界面、1 = 历史对话（ESS-317 升级自原状态时间线）、
+    /// 2 = 设置。冷启动落 tag 0。
     @State private var selectedTab: Int = 0
 
     init(
@@ -53,7 +52,11 @@ struct WatchContentView: View {
                 .tag(0)
 
             NavigationStack {
-                ConversationTimelineView(journal: journal, settings: settings)
+                ConversationHistoryView(
+                    journal: journal,
+                    pushToTalk: pushToTalk,
+                    selectedTab: $selectedTab
+                )
             }
             .tag(1)
 
@@ -101,6 +104,16 @@ struct WatchContentView: View {
                                 }
                                 .onEnded { _ in pushToTalk.pressEnded() }
                         )
+
+                    // ESS-317：再次对话上下文提示（①屏球体旁「续：<摘要>」）
+                    if let reChatText = pushToTalk.reChatContextText {
+                        Label(reChatText, systemImage: "arrow.uturn.left.circle")
+                            .font(.caption2)
+                            .foregroundStyle(.cyan)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 2)
+                            .background(Color.cyan.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+                    }
 
                     if showWelcomeBanner {
                         welcomeBanner

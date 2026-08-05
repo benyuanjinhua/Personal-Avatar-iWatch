@@ -32,6 +32,13 @@ struct VoiceTurnRecord: Codable, Equatable, Identifiable {
     /// Watch 首次收到包含可展示文本的结果信封的本地时间（interim 或 final）。
     /// 必须与 createdAt 同属 Watch 时钟域，不能使用 Bridge 生成的 occurredAt。
     var firstResultAt: Date? = nil
+    /// ESS-317 历史对话：父轮次的 request_id（再次对话产生的新轮次）。
+    /// nil = 顶级轮次，非 nil = 从父轮次「再次对话」而来，在历史中缩进挂在父轮下。
+    var parentRequestId: String?
+    /// ESS-317 历史对话：再次对话时携带的上下文摘要（上一轮的问 + 答文本首行），
+    /// 展示在①屏球体旁「续：<摘要>」。非持久字段，由 PushToTalkController 在
+    /// begin 后注入；保存时编码进 voice-turns.json。
+    var contextText: String?
     /// ESS-55 未读机制：结果首次被查看/播放的时间；nil = 未读。
     /// 结果在用户未查看前不丢失，下次打开仍以未读态呈现。
     var resultViewedAt: Date?
@@ -89,7 +96,7 @@ final class VoiceTurnJournal: ObservableObject {
     private let fileManager = FileManager.default
     private let onStorageFailure: ((String) -> Void)?
 
-    init(directory: URL, maximumCount: Int = 20, onStorageFailure: ((String) -> Void)? = nil) {
+    init(directory: URL, maximumCount: Int = 10, onStorageFailure: ((String) -> Void)? = nil) {
         self.maximumCount = maximumCount
         self.onStorageFailure = onStorageFailure
         fileURL = directory.appendingPathComponent("voice-turns.json")
@@ -110,12 +117,14 @@ final class VoiceTurnJournal: ObservableObject {
     }
 
     /// 录音结束、生成信封后开一个新回合（初始状态 recorded）。同 request_id 已存在则忽略（幂等）。
-    func begin(requestId: String, at: Date = Date()) {
+    func begin(requestId: String, at: Date = Date(), parentRequestId: String? = nil, contextText: String? = nil) {
         guard !turns.contains(where: { $0.requestId == requestId }) else { return }
         let record = VoiceTurnRecord(
             requestId: requestId,
             createdAt: at,
-            events: [VoiceTurnEvent(state: .recorded, at: at)]
+            events: [VoiceTurnEvent(state: .recorded, at: at)],
+            parentRequestId: parentRequestId,
+            contextText: contextText
         )
         turns.insert(record, at: 0)
         trimAndSave()
@@ -324,9 +333,43 @@ final class VoiceTurnJournal: ObservableObject {
 
     private func trimAndSave() {
         if turns.count > maximumCount {
+            let removed = turns.suffix(turns.count - maximumCount)
             turns.removeLast(turns.count - maximumCount)
+            // ESS-317：trim 时通知调用方清理关联的加密音频文件
+            removed.forEach { turn in
+                onTurnEvicted?(turn)
+            }
         }
         save()
+    }
+
+    /// ESS-317 历史对话留存：轮次被 trim 时的回调（供 PushToTalkController
+    /// 清理 EncryptedAudioVault 中的对应语音文件）。
+    var onTurnEvicted: ((VoiceTurnRecord) -> Void)?
+
+    private static let retentionLogger = Logger(subsystem: "com.benyuan.wristagent.shared", category: "Retention")
+
+    /// ESS-317：清理超过 24 小时的轮次。调用方应传入 vault 用于同步清理
+    /// 加密音频文件。
+    func evictExpiredAudio(vault: EncryptedAudioVault?, maxAge: TimeInterval = 24 * 3600) {
+        let cutoff = Date().addingTimeInterval(-maxAge)
+        var toRemove: [VoiceTurnRecord] = []
+        turns = turns.filter { turn in
+            if turn.createdAt < cutoff {
+                toRemove.append(turn)
+                return false
+            }
+            return true
+        }
+        for turn in toRemove {
+            if let fileName = turn.speechFileName {
+                vault?.remove(name: fileName)
+                Self.retentionLogger.info("audio_expired_evicted request_id=\(turn.requestId, privacy: .public) age_hours=\(String(format: "%.1f", Date().timeIntervalSince(turn.createdAt) / 3600)) file=\(fileName, privacy: .public)")
+            }
+        }
+        if !toRemove.isEmpty {
+            save()
+        }
     }
 
     private func save() {

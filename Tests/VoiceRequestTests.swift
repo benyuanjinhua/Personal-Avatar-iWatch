@@ -55,7 +55,9 @@ final class VoiceRequestEnvelopeTests: XCTestCase {
             requestId: UUIDv7.generate().uuidString,
             type: VoiceRequestEnvelope.voiceRequestType,
             createdAt: Date(),
-            audio: makeEnvelope().audio
+            audio: makeEnvelope().audio,
+            parentRequestId: nil,
+            contextSummary: nil
         )
         XCTAssertEqual(envelope.validate(), .unsupportedProtocolVersion("9.9"))
     }
@@ -155,7 +157,9 @@ final class VoiceRequestInboxTests: XCTestCase {
                 channels: 1,
                 durationMs: 5_000,
                 sha256: VoiceDigest.sha256Hex(of: other)
-            )
+            ),
+            parentRequestId: nil,
+            contextSummary: nil
         )
         let outcome = inbox.ingest(envelope: conflicting, audioData: other)
         XCTAssertEqual(outcome, .rejected(.requestIdConflict(requestId: envelope.requestId)))
