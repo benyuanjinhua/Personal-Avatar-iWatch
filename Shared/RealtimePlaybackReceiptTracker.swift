@@ -86,11 +86,23 @@ struct RealtimePlaybackReceiptTracker: Sendable {
     /// response. Emits `.ended` immediately if all queued buffers already
     /// completed; otherwise flips the drain flag so the next completion
     /// triggers `.ended` correctly.
-    mutating func requestDrain() -> EndedReceipt? {
-        guard let key = order.last else {
-            // Nothing was ever queued — emit an empty ended so Bridge sees a
-            // receipt for the response Bridge just closed.
+    mutating func requestDrain(responseId: String? = nil) -> EndedReceipt? {
+        let requestedKey = responseId ?? order.last
+        guard let key = requestedKey else {
             return EndedReceipt(responseId: nil, bytesPlayed: 0)
+        }
+        // WCSession does not guarantee that independently enqueued downlink
+        // messages reach the Watch in the same order. If `audio.done` wins
+        // the race against its `audio.delta`, retain a drain placeholder
+        // instead of emitting a false zero-byte playback receipt. A later
+        // enqueue for this response inherits `drainRequested` and produces
+        // `.ended` only after the real buffer completion.
+        if byResponse[key] == nil {
+            var pending = Response()
+            pending.drainRequested = true
+            byResponse[key] = pending
+            if !order.contains(key) { order.append(key) }
+            return nil
         }
         guard var state = byResponse[key], !state.endedEmitted else { return nil }
         state.drainRequested = true

@@ -35,7 +35,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
             enqueuedPlayables.append(contentsOf: playables)
         }
         func bargeIn(clearedBytes: Int) { bargedInBytes.append(clearedBytes) }
-        func finish() { finished = true }
+        func finish(responseId: String?) { finished = true }
         func stop(barge: Bool) { stopped = true }
     }
 
@@ -210,6 +210,34 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         XCTAssertEqual(transport.playbackStartEvents.first?.1, "resp-x")
         XCTAssertEqual(transport.playbackEndEvents.count, 1)
         XCTAssertEqual(transport.playbackEndEvents.first?.2, 2_048)
+    }
+
+    func testAudioDoneKeepsSessionAliveUntilPlayerActuallyEnds() {
+        let requestId = "44444444-4444-4444-4444-444444444449"
+        let (adapter, _, player, _, _) = makeAdapter(sessionIds: [
+            "55555555-5555-5555-5555-555555555559"
+        ])
+        let handle = adapter.beginTurn(requestId: requestId)
+
+        adapter.markDownlinkComplete(responseId: "resp-late")
+        XCTAssertTrue(player.finished)
+        XCTAssertEqual(adapter.currentTurn, handle,
+                       "audio.done is only a drain marker; it must not clear the turn")
+
+        let lateChunk = VoiceStreamChunk(
+            requestId: handle.requestId, streamId: handle.sessionId,
+            direction: .downlink, sequence: 0, capturedAtMs: 1,
+            codec: "pcm_s16le", sampleRate: 24_000,
+            payload: Data(repeating: 0x33, count: 96)
+        )
+        adapter.ingestDownlink(lateChunk, responseId: "resp-late")
+        XCTAssertEqual(player.enqueuedChunks.map(\.sequence), [0])
+
+        player.onPlaybackEvent?(.ended(
+            requestId: handle.requestId, sessionId: handle.sessionId,
+            responseId: "resp-late", bytesPlayed: 96
+        ))
+        XCTAssertNil(adapter.currentTurn)
     }
 
     func testNewTurnBargesInAndPlayerClearsPriorPlayback() {
