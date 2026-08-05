@@ -295,9 +295,31 @@ function createAgentTransport(CONFIG, { log, providerKey }) {
 
 // Allow running as a standalone process.
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const gateway = createGateway()
-  gateway.start().catch(err => {
-    process.stderr.write(JSON.stringify({ ts: new Date().toISOString(), evt: 'startup_failed', detail: String(err?.message ?? err) }) + '\n')
+  // Every startup failure — thrown synchronously by createGateway() (cert
+  // load, dev_allow_plain_ws / agent_transport validation) or rejected by
+  // start() (bind errors) — surfaces as ONE structured startup_failed line,
+  // never a bare stack. The line goes to stdout (the JSONL stream the log
+  // collector consumes, same as every other gateway log) and is mirrored to
+  // stderr (fatal diagnostics). `detail` carries only err.message; the
+  // provider key / tokens never appear in these startup error messages —
+  // same redaction stance as logging.mjs.
+  const failStartup = err => {
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      evt: 'startup_failed',
+      detail: String(err?.message ?? err).slice(0, 512),
+    })
+    process.stdout.write(line + '\n')
+    process.stderr.write(line + '\n')
     process.exit(1)
-  })
+  }
+  try {
+    const overrides = process.env.GATEWAY_CONFIG_PATH
+      ? { config_path: process.env.GATEWAY_CONFIG_PATH }
+      : {}
+    const gateway = createGateway(overrides)
+    gateway.start().catch(failStartup)
+  } catch (err) {
+    failStartup(err)
+  }
 }
