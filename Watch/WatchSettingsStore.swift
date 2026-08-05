@@ -22,6 +22,10 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
     /// this when the streaming gate is on so `audio.delta` envelopes arriving
     /// from iPhone can be routed into the real playback engine.
     weak var realtimeAdapter: WatchRealtimeMediaAdapter?
+    /// ESS-324 B4：下行流式 chunk 接收器。
+    /// 与 `realtimeAdapter` 并存而非二选一：前者接 `audio.delta` 信封（ESS-321），
+    /// 后者接 `sendMessageData` 的分片快路径（ESS-324 B4），两条下行入口互不替代。
+    weak var streamReceiver: WatchStreamReceiver?
     private let defaults = UserDefaults.standard
     private let storageKey = "wristagent.watch.configuration"
 
@@ -128,6 +132,12 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         _ session: WCSession,
         didReceiveMessageData messageData: Data
     ) {
+        // ESS-324 B4：优先尝试 VoiceStreamChunk（downlink 方向）；命中后不进配置路径。
+        if let chunk = try? JSONDecoder().decode(VoiceStreamChunk.self, from: messageData),
+           chunk.direction == .downlink {
+            Task { @MainActor in self.streamReceiver?.receive(chunk: chunk) }
+            return
+        }
         Task { @MainActor in self.apply(messageData) }
     }
 

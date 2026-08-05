@@ -27,6 +27,10 @@ protocol WatchFeedbackChannel: AnyObject {
     /// Watch 端匹配后进探针分支——不入 vault、不入 journal、播完回 probe_ack。
     @discardableResult
     func transferProbe(fileURL: URL, envelope: VoiceStatusEnvelope) -> Bool
+    /// ESS-324 B4：转发 Bridge WSS downlink stream chunk 到 Watch。
+    /// 走 `sendMessageData` 即时通道；不可达时因 stream 本身是 best-effort，
+    /// 直接回退整段 m4a 路径，不排队。
+    func forwardStreamChunkToWatch(_ chunk: VoiceStreamChunk)
 }
 
 /// WristAgentPhoneRelay（ESS-28）：iPhone Companion Relay 编排器。
