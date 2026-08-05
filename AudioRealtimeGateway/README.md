@@ -277,11 +277,36 @@ workspace). `config.json` binds `0.0.0.0` and pins `public_host`; the
 source allowlist accepts loopback (for the smoke) plus Tailnet CGNAT
 (`100.64.0.0/10`) so real devices on the same magic workspace can connect.
 
-1. Provision a TLS cert + key on the Tailnet address the Gateway will bind.
-   The cert's SAN **must** include `DNS:jackson-macmac-mini.magic.workspace.beer`
-   or iOS `URLSession` will refuse the connection (self-signed with matching
-   SAN works only if the client trusts the CA; Multica magic-workspace
-   auto-provisioned certs are trusted out-of-the-box).
+1. Provision a **trusted** TLS cert + key. On the Multica magic-workspace
+   (Tailnet) the Tailscale daemon fronts Let's Encrypt for tailnet hostnames,
+   so a browser-trusted cert is a single command; iOS `URLSession` picks it
+   up without any client-side trust-store change. Run on the Mac mini:
+
+   ```bash
+   cd AudioRealtimeGateway
+   mkdir -p certs
+   tailscale cert \
+     --cert-file=certs/gateway.crt \
+     --key-file=certs/gateway.key \
+     jackson-macmac-mini.magic.workspace.beer
+   chmod 600 certs/gateway.key
+   ```
+
+   The issued cert's SAN is `DNS:jackson-macmac-mini.magic.workspace.beer`;
+   the issuer is `Let's Encrypt` (intermediate `YE2`). Self-signed with a
+   matching SAN would also work at the protocol layer but only if every
+   client trusts the CA — Tailscale-issued certs skip that entirely.
+
+   **Renewal.** Let's Encrypt certs are valid ~90 days; re-run the exact
+   `tailscale cert` command above to refresh. A launchd job that fires
+   every ~60 days keeps the cert well within the validity window
+   (persistent-service wrapper is ESS-458).
+
+   **Do not run `smoke/deploy-smoke.mjs` on top of the real cert.** The
+   deploy smoke deliberately generates a fresh self-signed cert into
+   `certs/gateway.crt` on every run (see `ensureCerts()` in that script),
+   clobbering the trusted cert. On the deployment host, either skip the
+   smoke or re-run the `tailscale cert` command above afterwards.
 2. Populate `state/devices.json` from Mac Bridge (or via a provisioning
    API); the two share the HMAC device format.
 3. Confirm qwen-audio-agent is healthy on `127.0.0.1:3101` with voice
@@ -290,12 +315,14 @@ source allowlist accepts loopback (for the smoke) plus Tailnet CGNAT
 4. `npm start`. The service logs `gateway_ready` when TLS + WSS + issuer
    are up; the log carries `bind`, `port`, and `public_host` so operators
    can grep the deployment address without reading config.
-5. Confirm from the target host:
-   `curl -k https://127.0.0.1:8444/v1/health` returns `{"ok": true, "service": "audio-realtime-gateway", "protocol_version": 1}`.
+5. Confirm from the target host **without `-k`** — this proves the trust
+   chain, not just that TLS is up:
+   `curl https://jackson-macmac-mini.magic.workspace.beer:8444/v1/health`
+   returns `{"ok": true, "service": "audio-realtime-gateway", "protocol_version": 1}`.
 6. Confirm from a real device (e.g. iPhone on the same Tailnet):
    `curl https://jackson-macmac-mini.magic.workspace.beer:8444/v1/health`
    returns the same body without `-k` — that proves both DNS routing and
-   the TLS trust chain.
+   the TLS trust chain end-to-end.
 7. Enable the client-side `audio_realtime_agent_direct_enabled` flag on
    iPhone; set `audio_realtime_agent_gateway_url` to
    `wss://jackson-macmac-mini.magic.workspace.beer:8444/api/realtime`
