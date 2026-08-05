@@ -640,6 +640,11 @@ extension PhoneConnectivity: WatchFeedbackChannel {
             downlinkLogger.error("downlink failed request_id=\(requestId, privacy: .public) kind=\(kind.rawValue, privacy: .public) item=\(itemId, privacy: .public) attempt=\(attempt) reason=\(reason, privacy: .public)")
         case .expired(let requestId, let kind, let itemId):
             downlinkLogger.error("downlink expired request_id=\(requestId, privacy: .public) kind=\(kind.rawValue, privacy: .public) item=\(itemId, privacy: .public)")
+        case .speechBacklogSuppressed(let suppressed, let kept, let requestId):
+            // ESS-306：下行语音积压超上限时抑制旧条目，只留最新一条。
+            // 抑制是有意为之而非故障，用 notice 级别——但必须可见，
+            // 否则用户会遇到「有几轮结果没播」而日志里查不到原因。
+            downlinkLogger.notice("downlink speech backlog suppressed request_id=\(requestId, privacy: .public) suppressed=\(suppressed) kept=\(kept, privacy: .public)")
         case .persistFailed(let operation, let reason):
             downlinkLogger.fault("downlink index persist failed operation=\(operation, privacy: .public) reason=\(reason, privacy: .public)")
         }
