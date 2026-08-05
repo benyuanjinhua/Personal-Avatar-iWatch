@@ -187,6 +187,7 @@ export class QwenRealtimeSessionSupervisor {
           clientLabel: CLIENT_LABEL,
           clientInstanceId: this.instanceId,
           voiceEnabled: true,
+          manualTurnDetection: true,
           takeover: takeover === true,
           timeZone: 'Asia/Shanghai',
           locale: 'zh-CN',
