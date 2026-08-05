@@ -222,6 +222,21 @@ final class PushToTalkController: ObservableObject {
             playing: player.$isPlaying.eraseToAnyPublisher(),
             recording: $state.map { $0 != .idle }.eraseToAnyPublisher()
         )
+
+        // ESS-317：trim 时清理被移除轮次的加密音频文件。
+        journal.onTurnEvicted = { [weak self] turn in
+            if let fileName = turn.speechFileName {
+                self?.speechVault?.remove(name: fileName)
+            }
+        }
+
+        // ESS-317：冷启动时清理超过 24h 的过期轮次与音频。
+        journal.evictExpiredAudio(vault: speechVault)
+    }
+
+    /// ESS-317：在前台激活时触发过期音频清理。
+    func evictExpiredAudio() {
+        journal.evictExpiredAudio(vault: speechVault)
     }
 
     /// 展示纯文本结果全文。录音期间不弹（打断按住说话手势），文字仍在结果卡片里可点开。
@@ -937,23 +952,6 @@ final class PushToTalkController: ObservableObject {
     }
 
     // MARK: - ESS-317 F2.4 再次对话
-
-    /// 从历史对话中发起新一轮对话，携带上一轮的问+答作为上下文。
-    /// Q1=a 口径（白梦林拍板）：只传上一轮的问 + 答文本，不传整条链、不建服务端会话。
-    ///
-    /// Bridge 侧需支持 `parent_request_id` 透传上下文（对应 F2.4 跨目录改动，
-    /// 落点归毕玄）。客户端侧此处只存储上下文并进入录音。
-    func continueConversation(from turn: VoiceTurnRecord) {
-        continuationContext = ContinuationContext(
-            parentRequestId: turn.requestId,
-            contextText: turn.result?.displaySummary ?? ""
-        )
-        WatchLog.info("history", "continue_conversation",
-                      detail: "parent_request_id=\(turn.requestId)")
-        // 跳转到 main screen 并进入录音状态由 WatchContentView 的
-        // selectedTab=0 + pressBegan 完成；这里只存上下文。
-        pressBegan()
-    }
 
     /// ESS-317 再次对话的上下文（Q1=a：只传上一轮问+答文本）。
     struct ContinuationContext {

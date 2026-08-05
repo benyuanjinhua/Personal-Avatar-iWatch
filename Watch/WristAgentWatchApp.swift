@@ -50,6 +50,8 @@ struct WristAgentWatchApp: App {
                         services.pushToTalk.sessionKeeper.appDidBecomeActive()
                         WatchLogShipper.shared.ship(reason: "foreground")
                         services.pushToTalk.presentUnreadIfAny()
+                        // ESS-317：前台激活时清理超过 24h 的过期音频。
+                        services.pushToTalk.evictExpiredAudio()
                     case .background:
                         WatchLogShipper.shared.ship(reason: "background")
                     default: break
