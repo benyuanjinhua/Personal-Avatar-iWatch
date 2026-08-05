@@ -2,12 +2,12 @@ import XCTest
 
 @testable import WristAgent_Watch_App
 
-/// ESS-280：设置页流式开关的**回退契约**运行时断言（R1 生效版）。
+/// ESS-280 / ESS-356：设置页流式开关的**回退契约**运行时断言（R4 生效版）。
 ///
 /// 与验收标准的对齐：
-/// 1. 默认 OFF —— 首次实例化、无历史 key 的情况下 `isStreamingActive`
-///    必须为 false，保证不装机默认走旧链路；
-/// 2. 打开开关 → 门禁 API 返回 true，供未来 ESS-279 / R4 wire-up 分支进入流式；
+/// 1. 默认 ON —— 首次实例化、无历史 key 的情况下 `isStreamingActive`
+///    必须为 true，保证全新安装默认走流式通路；
+/// 2. 打开开关 → 门禁 API 返回 true，供未来 wire-up 分支进入流式；
 /// 3. 关掉开关 → 门禁 API 立刻返回 false，且**同步**触发已注册的回退回调，
 ///    以及 `streamingGeneration` 单调递增（在途流式回合据此发现自己已过期）；
 /// 4. 每条用例使用独立 UserDefaults suite，避免残留污染。
@@ -28,12 +28,12 @@ final class WatchDebugSettingsTests: XCTestCase {
         return defaults
     }
 
-    // MARK: - 默认 OFF
+    // MARK: - 默认 ON（ESS-356）
 
-    func testDefaultsToOffWhenNoStoredValue() {
-        let settings = WatchDebugSettings(defaults: makeIsolatedDefaults("default_off"))
-        XCTAssertFalse(settings.streamingEnabled, "无历史 key 时必须默认 OFF")
-        XCTAssertFalse(settings.isStreamingActive, "门禁 API 默认返回 false")
+    func testDefaultsToOnWhenNoStoredValue() {
+        let settings = WatchDebugSettings(defaults: makeIsolatedDefaults("default_on"))
+        XCTAssertTrue(settings.streamingEnabled, "无历史 key 时必须默认 ON（跟随 VoiceStreamingGate.defaultEnabled）")
+        XCTAssertTrue(settings.isStreamingActive, "门禁 API 默认返回 true")
         XCTAssertEqual(settings.streamingGeneration, 0, "无翻转时 generation 保持 0")
     }
 
@@ -58,17 +58,19 @@ final class WatchDebugSettingsTests: XCTestCase {
         let defaults = makeIsolatedDefaults("gate_follows_toggle")
         let settings = WatchDebugSettings(defaults: defaults)
 
+        // ESS-356: 默认现在是 ON，先关掉才能测试持久化写入
+        settings.setStreamingEnabled(false)
+        XCTAssertFalse(settings.isStreamingActive, "关掉后门禁必须立刻返回 false（下一回合走旧链路）")
+        XCTAssertFalse(
+            defaults.bool(forKey: WatchDebugSettings.streamingEnabledDefaultsKey)
+        )
+
+        // 重新打开，验证持久化
         settings.setStreamingEnabled(true)
         XCTAssertTrue(settings.isStreamingActive, "开关 ON → 门禁走流式分支")
         XCTAssertTrue(
             defaults.bool(forKey: WatchDebugSettings.streamingEnabledDefaultsKey),
             "开关翻转必须同步持久化，避免重启后失忆"
-        )
-
-        settings.setStreamingEnabled(false)
-        XCTAssertFalse(settings.isStreamingActive, "关掉后门禁必须立刻返回 false（下一回合走旧链路）")
-        XCTAssertFalse(
-            defaults.bool(forKey: WatchDebugSettings.streamingEnabledDefaultsKey)
         )
     }
 
@@ -149,5 +151,43 @@ final class WatchDebugSettingsTests: XCTestCase {
             settings.isStreamingActive,
             "OFF 之后门禁必须立即为 false，下一回合直接走旧链路"
         )
+    }
+
+    // MARK: - 本地 UserDefaults 键优先级（ESS-356）
+
+    /// 验证 `WatchDebugSettings` 在本地 UserDefaults 键有值/无值时的行为。
+    /// **注：本测试直接写 UserDefaults，不经过 `WCSession → apply` 真实路径。
+    /// iPhone `AgentConfiguration` 下发覆盖下行 gate 拆到 ESS-357。**
+    /// 覆盖：
+    /// 1. 全新安装（无 key）→ 跟随 `VoiceStreamingGate.defaultEnabled`（ON）
+    /// 2. 本地键显式 `false` → 降级为 OFF
+    /// 3. 本地键显式 `true` → 恢复 ON
+    /// 4. 开关翻转后持久化生效（重新实例化后保持最新值）
+    func testLocalDefaultsKeyOverridePriority() {
+        let defaults = makeIsolatedDefaults("local_key_priority")
+
+        // 全新安装：无历史 key → VoiceStreamingGate.defaultEnabled（true）
+        let fresh = WatchDebugSettings(defaults: defaults)
+        XCTAssertTrue(fresh.streamingEnabled, "全新安装应默认 ON（跟随编译期 gate）")
+        XCTAssertTrue(fresh.isStreamingActive)
+
+        // 本地键显式设为 false
+        defaults.set(false, forKey: WatchDebugSettings.streamingEnabledDefaultsKey)
+        let afterOff = WatchDebugSettings(defaults: defaults)
+        XCTAssertFalse(afterOff.streamingEnabled, "本地键 false 应覆盖默认值")
+        XCTAssertFalse(afterOff.isStreamingActive)
+
+        // 本地键显式设为 true
+        defaults.set(true, forKey: WatchDebugSettings.streamingEnabledDefaultsKey)
+        let afterOn = WatchDebugSettings(defaults: defaults)
+        XCTAssertTrue(afterOn.streamingEnabled, "本地键 true 应生效")
+        XCTAssertTrue(afterOn.isStreamingActive)
+
+        // 验证开关翻转后持久化的优先级：本地显式 OFF 后，UserDefaults 落的是 false
+        let localSettings = WatchDebugSettings(defaults: defaults)
+        localSettings.setStreamingEnabled(false) // 用户在 Watch 本机关掉
+        XCTAssertFalse(localSettings.streamingEnabled)
+        let reloaded = WatchDebugSettings(defaults: defaults)
+        XCTAssertFalse(reloaded.streamingEnabled, "本机关掉后重新实例化必须保持 OFF")
     }
 }

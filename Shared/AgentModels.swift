@@ -89,8 +89,9 @@ struct AgentConfiguration: Codable, Equatable {
     var hapticsEnabled: Bool
     var conciseReply: Bool
     /// Shared uplink/downlink L1 gate. Missing values decode as false so an
-    /// upgrade can never silently enable streaming.
-    var voiceStreamingV2: Bool = false
+    /// upgrade can never silently enable streaming. The struct-level default
+    /// is true (ESS-356) so fresh-install AgentConfigurations enable streaming.
+    var voiceStreamingV2: Bool = true
 
     enum CodingKeys: String, CodingKey {
         case mode, endpoint, bearerToken, autoListen, hapticsEnabled, conciseReply, voiceStreamingV2
@@ -98,7 +99,7 @@ struct AgentConfiguration: Codable, Equatable {
 
     init(
         mode: ConnectionMode, endpoint: String, bearerToken: String, autoListen: Bool,
-        hapticsEnabled: Bool, conciseReply: Bool, voiceStreamingV2: Bool = false
+        hapticsEnabled: Bool, conciseReply: Bool, voiceStreamingV2: Bool = true
     ) {
         self.mode = mode
         self.endpoint = endpoint
@@ -127,7 +128,7 @@ struct AgentConfiguration: Codable, Equatable {
         autoListen: false,
         hapticsEnabled: true,
         conciseReply: true,
-        voiceStreamingV2: false
+        voiceStreamingV2: true
     )
 }
 

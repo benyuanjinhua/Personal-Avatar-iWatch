@@ -26,8 +26,8 @@ final class VoiceStreamProtocolTests: XCTestCase {
         )
     }
 
-    func testStreamingIsCompileTimeDefaultOffAndTransportIsBestEffort() {
-        XCTAssertFalse(VoiceStreamingGate.defaultEnabled)
+    func testStreamingIsCompileTimeDefaultOnAndTransportIsBestEffort() {
+        XCTAssertTrue(VoiceStreamingGate.defaultEnabled)
         let semantics: VoiceStreamTransportSemantics = .reachableBestEffort
         XCTAssertNotEqual(semantics, .reliableCompleteFileFallback)
     }
