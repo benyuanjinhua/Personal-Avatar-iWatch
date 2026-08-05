@@ -112,6 +112,7 @@
 		960483A1ACBF2697522E5597 /* PhoneRealtimeAgentTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47E5A851D917B87AF55B3340 /* PhoneRealtimeAgentTransport.swift */; };
 		97AFD9059AF401EBE72670D9 /* PersistHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 827B4FDF631BEBEFA13118A9 /* PersistHelper.swift */; };
 		9907DDC5D22A3F0DF92F6985 /* VoiceStreamProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = E86C631B9730FD0A3CB91448 /* VoiceStreamProtocol.swift */; };
+		9A74E38D11FFA15ECA305770 /* AgentTokenMintState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31098EE20AABA70A378A11DB /* AgentTokenMintState.swift */; };
 		9C4B6375FC6A420DF38989E9 /* VoiceStreamProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = E86C631B9730FD0A3CB91448 /* VoiceStreamProtocol.swift */; };
 		9CC8DFCBBBA03E71A76FA9BB /* RealtimePlaybackReceiptTracker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 716B2884D666AEE57BA6AB37 /* RealtimePlaybackReceiptTracker.swift */; };
 		9FCAF92E7F4BAF6D75258EC3 /* AvatarErrorCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38CFFC49761BA3D8F3C402C8 /* AvatarErrorCardView.swift */; };
@@ -168,6 +169,7 @@
 		EA4EC5A5A00C3979DE06947E /* AudioRealtimeAgentCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFCE4F8E6894C97A571F6634 /* AudioRealtimeAgentCodec.swift */; };
 		ECA89E26FFC474C089D1802D /* RealtimeMediaWireFormat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 63B4FAFE429B15682CA5E9F8 /* RealtimeMediaWireFormat.swift */; };
 		ECB4DA3B894FC346061B54D4 /* ErrorCue_TextOnly.m4a in Resources */ = {isa = PBXBuildFile; fileRef = 57F64DE4D4F59AFD226CD234 /* ErrorCue_TextOnly.m4a */; };
+		ED45A8794F8C51556761CF42 /* AgentTokenMintState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31098EE20AABA70A378A11DB /* AgentTokenMintState.swift */; };
 		EFF14C832245DFFF4D10E97F /* VoiceRelayWire.swift in Sources */ = {isa = PBXBuildFile; fileRef = 035DF4EEFBF9F540A0B791F7 /* VoiceRelayWire.swift */; };
 		F085E299171F674D4D155E09 /* SecureTokenStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC28E8D4A89C399924568EEB /* SecureTokenStore.swift */; };
 		F0F7837AE17D55F9D65F291C /* VoiceInteractionCue.swift in Sources */ = {isa = PBXBuildFile; fileRef = D70795CA9CC1B496467FE2B8 /* VoiceInteractionCue.swift */; };
@@ -241,6 +243,7 @@
 		2E4C7D8E5213EE0C04CA8BEC /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		2E88D71F4696224E69D652E8 /* WristAgent Watch App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "WristAgent Watch App.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		2F07106FBFCBFC4FE539B6E5 /* PushToTalkDeferredFallbackTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushToTalkDeferredFallbackTests.swift; sourceTree = "<group>"; };
+		31098EE20AABA70A378A11DB /* AgentTokenMintState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentTokenMintState.swift; sourceTree = "<group>"; };
 		32C8DAF30CCFE15F09A5351A /* BuildFingerprint.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BuildFingerprint.swift; sourceTree = "<group>"; };
 		36A3DD675D9E3E4CDC7C7C5A /* WristAgentApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WristAgentApp.swift; sourceTree = "<group>"; };
 		385A7BF623716F8B230FD7E7 /* SubtitlePlaybackView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubtitlePlaybackView.swift; sourceTree = "<group>"; };
@@ -354,6 +357,7 @@
 				CB1D464D47EC34B55A8C8411 /* AgentModels.swift */,
 				76F4CA04541733B7F630C774 /* AgentSessionTokenClient.swift */,
 				E3E3EF41FD4D1B3D4ACB250F /* AgentTokenFallbackReason.swift */,
+				31098EE20AABA70A378A11DB /* AgentTokenMintState.swift */,
 				CFCE4F8E6894C97A571F6634 /* AudioRealtimeAgentCodec.swift */,
 				5CA20270A3348D748D8929F4 /* AudioRealtimeAgentConfig.swift */,
 				27F5CF3965DA28F8FC440CB9 /* AudioRealtimeAgentFeatureFlag.swift */,
@@ -674,6 +678,7 @@
 				E0C092AAB8EB860FC6D5A0B7 /* AgentModels.swift in Sources */,
 				3B097323AAC96A65CCD390AD /* AgentSessionTokenClient.swift in Sources */,
 				95A55A82D2C0789533165275 /* AgentTokenFallbackReason.swift in Sources */,
+				ED45A8794F8C51556761CF42 /* AgentTokenMintState.swift in Sources */,
 				EA4EC5A5A00C3979DE06947E /* AudioRealtimeAgentCodec.swift in Sources */,
 				A652F6C5B6F5B21BBF4854E1 /* AudioRealtimeAgentConfig.swift in Sources */,
 				F7A70D9808E8E50020AFE5D7 /* AudioRealtimeAgentFeatureFlag.swift in Sources */,
@@ -740,6 +745,7 @@
 				AC284F28E28E5427A577455B /* AgentModels.swift in Sources */,
 				5F2C4158D75D2FD0FC814B50 /* AgentSessionTokenClient.swift in Sources */,
 				C46BB1D490E314A5F2FD6696 /* AgentTokenFallbackReason.swift in Sources */,
+				9A74E38D11FFA15ECA305770 /* AgentTokenMintState.swift in Sources */,
 				C0C2D4425ABBD56621171848 /* AudioRealtimeAgentCodec.swift in Sources */,
 				3E6F2C7B9E450DAF123DEF71 /* AudioRealtimeAgentConfig.swift in Sources */,
 				4ED9C5BD14C4BFD599B5E4BF /* AudioRealtimeAgentFeatureFlag.swift in Sources */,
