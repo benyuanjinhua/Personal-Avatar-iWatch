@@ -23,13 +23,17 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
     private final class MockPlayer: WatchRealtimeMediaAdapter.Player {
         var onPlaybackEvent: ((RealtimePlaybackEngine.PlaybackEvent) -> Void)?
         private(set) var preparedFor: RealtimeMediaSession.TurnHandle?
-        private(set) var enqueuedChunks: [VoiceStreamChunk] = []
+        private(set) var enqueuedPlayables: [RealtimeDownlinkPlayback.PlayableChunk] = []
         private(set) var bargedInBytes: [Int] = []
         private(set) var finished = false
         private(set) var stopped = false
 
+        var enqueuedChunks: [VoiceStreamChunk] { enqueuedPlayables.map(\.chunk) }
+
         func prepare(for turn: RealtimeMediaSession.TurnHandle) throws { preparedFor = turn }
-        func enqueue(chunks: [VoiceStreamChunk]) { enqueuedChunks.append(contentsOf: chunks) }
+        func enqueue(playables: [RealtimeDownlinkPlayback.PlayableChunk]) {
+            enqueuedPlayables.append(contentsOf: playables)
+        }
         func bargeIn(clearedBytes: Int) { bargedInBytes.append(clearedBytes) }
         func finish() { finished = true }
         func stop(barge: Bool) { stopped = true }
@@ -157,22 +161,28 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
             payload: Data(repeating: 0x11, count: 48)
         )
         adapter.ingestDownlink(chunkA, responseId: "resp-alpha")
-        player.onPlaybackEvent?(.started(requestId: handle.requestId, sessionId: handle.sessionId))
+        player.onPlaybackEvent?(.started(
+            requestId: handle.requestId, sessionId: handle.sessionId, responseId: "resp-alpha"
+        ))
         player.onPlaybackEvent?(.ended(
-            requestId: handle.requestId, sessionId: handle.sessionId, bytesPlayed: 48
+            requestId: handle.requestId, sessionId: handle.sessionId,
+            responseId: "resp-alpha", bytesPlayed: 48
         ))
 
-        // Second response — barge-in and different response_id.
+        // Second response with different response_id.
         let chunkB = VoiceStreamChunk(
             requestId: handle.requestId, streamId: handle.sessionId,
-            direction: .downlink, sequence: 0, capturedAtMs: 2,
+            direction: .downlink, sequence: 1, capturedAtMs: 2,
             codec: "pcm_s16le", sampleRate: 24_000,
             payload: Data(repeating: 0x22, count: 48)
         )
         adapter.ingestDownlink(chunkB, responseId: "resp-beta")
-        player.onPlaybackEvent?(.started(requestId: handle.requestId, sessionId: handle.sessionId))
+        player.onPlaybackEvent?(.started(
+            requestId: handle.requestId, sessionId: handle.sessionId, responseId: "resp-beta"
+        ))
         player.onPlaybackEvent?(.ended(
-            requestId: handle.requestId, sessionId: handle.sessionId, bytesPlayed: 48
+            requestId: handle.requestId, sessionId: handle.sessionId,
+            responseId: "resp-beta", bytesPlayed: 48
         ))
 
         XCTAssertEqual(transport.playbackStartEvents.map(\.1), ["resp-alpha", "resp-beta"])
@@ -187,13 +197,17 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
             "55555555-5555-5555-5555-555555555559"
         ])
         let handle = adapter.beginTurn(requestId: requestId)
-        // Simulate the player firing real started/ended receipts.
-        player.onPlaybackEvent?(.started(requestId: handle.requestId, sessionId: handle.sessionId))
+        // Simulate the player firing real started/ended receipts with a real
+        // response_id — nil ids no longer produce receipts (ESS-330 v3).
+        player.onPlaybackEvent?(.started(
+            requestId: handle.requestId, sessionId: handle.sessionId, responseId: "resp-x"
+        ))
         player.onPlaybackEvent?(.ended(
-            requestId: handle.requestId, sessionId: handle.sessionId, bytesPlayed: 2_048
+            requestId: handle.requestId, sessionId: handle.sessionId,
+            responseId: "resp-x", bytesPlayed: 2_048
         ))
         XCTAssertEqual(transport.playbackStartEvents.count, 1)
-        XCTAssertEqual(transport.playbackStartEvents.first?.1, handle.sessionId)
+        XCTAssertEqual(transport.playbackStartEvents.first?.1, "resp-x")
         XCTAssertEqual(transport.playbackEndEvents.count, 1)
         XCTAssertEqual(transport.playbackEndEvents.first?.2, 2_048)
     }

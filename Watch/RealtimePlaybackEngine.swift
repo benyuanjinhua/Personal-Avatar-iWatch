@@ -6,9 +6,25 @@ import Foundation
 /// The bridge/agent delivers 24 kHz mono PCM16 chunks. Rather than wait for
 /// the whole M4A the way ESS-58 did (full-file `SpeechPlayer.play(data:)`),
 /// we schedule each PCM chunk on an `AVAudioPlayerNode` as soon as the
-/// `RealtimeDownlinkPlayback` buffer releases it. `playback.started` fires
-/// on the first scheduled buffer, `playback.ended` fires when the queue
-/// drains and the coordinator confirms `audio.done`.
+/// `RealtimeDownlinkPlayback` buffer releases it.
+///
+/// **ESS-335 (this file, second revision)**: playback receipts now derive
+/// from **real** buffer render completions, not from "we queued the buffer".
+///
+///   * `.started(responseId)` fires when the first buffer for that response
+///     finishes rendering (or `.dataConsumed`, whichever happens first).
+///   * `.ended(responseId, bytesPlayed)` fires when **every** queued buffer
+///     for that response has rendered, AND either `audio.done` has been
+///     acknowledged for the response OR the response boundary has moved on.
+///   * `bytes_played` counts only the bytes whose completion callback fired.
+///     Bytes dropped by barge-in/stop are excluded, so the Bridge sees the
+///     truth instead of a fabricated "success".
+///   * `finish()` no longer stops or resets the player — it flags the current
+///     response as "no more buffers coming"; the queued tail keeps rendering.
+///
+/// **ESS-330 v3**: each queued chunk carries its own `response_id`; the
+/// engine keeps per-response counters so multi-response sessions route
+/// receipts correctly across out-of-order releases.
 ///
 /// Real-device acceptance (P95 latency, lock-screen resume, etc.) is scoped
 /// to ESS-265. Here we deliver deterministic client code the coordinator can
@@ -16,10 +32,16 @@ import Foundation
 @MainActor
 final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
     enum PlaybackEvent: Equatable {
-        case started(requestId: String, sessionId: String)
-        case ended(requestId: String, sessionId: String, bytesPlayed: Int)
-        case bargedIn(requestId: String, sessionId: String, bytesDropped: Int)
-        case failed(requestId: String, sessionId: String, code: String)
+        /// ESS-335: fires only after the first buffer for `responseId` has
+        /// actually started rendering — receiving/queueing a delta does not
+        /// count as playback success.
+        case started(requestId: String, sessionId: String, responseId: String?)
+        /// ESS-335: fires when the LAST queued buffer for `responseId` has
+        /// rendered. `bytesPlayed` counts only the bytes whose completion
+        /// callback fired; bytes discarded by barge-in / stop are excluded.
+        case ended(requestId: String, sessionId: String, responseId: String?, bytesPlayed: Int)
+        case bargedIn(requestId: String, sessionId: String, responseId: String?, bytesDropped: Int)
+        case failed(requestId: String, sessionId: String, responseId: String?, code: String)
     }
 
     private let audioEngine: AVAudioEngine
@@ -27,9 +49,12 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
     private let format: AVAudioFormat
 
     private(set) var currentTurn: RealtimeMediaSession.TurnHandle?
-    private(set) var hasStartedPlayback = false
-    private(set) var bytesQueued = 0
     private(set) var isRunning = false
+    /// ESS-335 receipt state machine lives in Shared/ for unit testability
+    /// without AVFoundation. Every real completion callback pokes it; the
+    /// tracker's returned receipts become the `.started/.ended` events we
+    /// forward through `onPlaybackEvent`.
+    private var tracker = RealtimePlaybackReceiptTracker()
 
     /// Coordinator subscribes here so the session can turn playback receipts
     /// into `playback.started` / `playback.ended` on the wire.
@@ -56,8 +81,7 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
     func prepare(for turn: RealtimeMediaSession.TurnHandle) throws {
         stop(barge: false)
         currentTurn = turn
-        hasStartedPlayback = false
-        bytesQueued = 0
+        tracker.reset()
         if !isRunning {
             audioEngine.prepare()
             try audioEngine.start()
@@ -66,55 +90,70 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         playerNode.play()
     }
 
-    func enqueue(chunks: [VoiceStreamChunk]) {
+    func enqueue(playables: [RealtimeDownlinkPlayback.PlayableChunk]) {
         guard let turn = currentTurn else { return }
-        for chunk in chunks where chunk.requestId == turn.requestId && chunk.streamId == turn.sessionId {
-            guard let pcmBuffer = buffer(for: chunk.payload) else { continue }
-            let payloadBytes = chunk.payload.count
-            playerNode.scheduleBuffer(pcmBuffer, at: nil, options: []) { [weak self] in
-                Task { @MainActor in self?.didFinishBuffer(bytes: payloadBytes) }
-            }
-            bytesQueued += payloadBytes
-            if !hasStartedPlayback {
-                hasStartedPlayback = true
-                onPlaybackEvent?(.started(requestId: turn.requestId, sessionId: turn.sessionId))
+        for playable in playables where
+            playable.chunk.requestId == turn.requestId &&
+            playable.chunk.streamId == turn.sessionId {
+            guard let pcmBuffer = buffer(for: playable.chunk.payload) else { continue }
+            let payloadBytes = playable.chunk.payload.count
+            let responseId = playable.responseId
+            tracker.enqueue(responseId: responseId, bytes: payloadBytes)
+
+            // `.dataPlayedBack` fires once the buffer has actually been played
+            // through the output. This is the "real" completion Bixuan
+            // required in ESS-335, not the "we queued it" pseudo-event.
+            playerNode.scheduleBuffer(
+                pcmBuffer, at: nil,
+                completionCallbackType: .dataPlayedBack
+            ) { [weak self] _ in
+                Task { @MainActor in
+                    self?.didCompleteBuffer(responseId: responseId, bytes: payloadBytes)
+                }
             }
         }
     }
 
     /// Called by the coordinator when the user talks over the response — dump
-    /// every queued buffer and emit the barge-in receipt.
+    /// every queued buffer and emit the barge-in receipt PER response with
+    /// their real not-yet-played bytes so Bridge sees an honest number.
     func bargeIn(clearedBytes: Int) {
         guard let turn = currentTurn else { return }
         playerNode.stop()
         playerNode.reset()
-        hasStartedPlayback = false
-        onPlaybackEvent?(.bargedIn(requestId: turn.requestId, sessionId: turn.sessionId, bytesDropped: clearedBytes))
+        for receipt in tracker.bargeAll() {
+            onPlaybackEvent?(.bargedIn(
+                requestId: turn.requestId, sessionId: turn.sessionId,
+                responseId: receipt.responseId, bytesDropped: receipt.bytesDropped
+            ))
+        }
+        _ = clearedBytes // reorder-buffer clear count — informational only
     }
 
-    /// Called by the coordinator when the bridge signalled `audio.done` and
-    /// the buffer has drained. Emits `playback.ended`.
+    /// ESS-335: `audio.done` from Bridge means "no more deltas coming for
+    /// the current response". It does NOT mean "stop the player and drop
+    /// queued buffers". We flag the current response as drain-requested;
+    /// `.ended` fires from `bufferCompleted` when its queue empties.
     func finish() {
         guard let turn = currentTurn else { return }
-        playerNode.stop()
-        playerNode.reset()
-        onPlaybackEvent?(.ended(requestId: turn.requestId, sessionId: turn.sessionId, bytesPlayed: bytesQueued))
-        currentTurn = nil
-        hasStartedPlayback = false
-        bytesQueued = 0
+        if let ended = tracker.requestDrain() {
+            onPlaybackEvent?(.ended(
+                requestId: turn.requestId, sessionId: turn.sessionId,
+                responseId: ended.responseId, bytesPlayed: ended.bytesPlayed
+            ))
+        }
     }
 
     func stop(barge: Bool) {
         guard currentTurn != nil else { return }
         if barge {
-            bargeIn(clearedBytes: bytesQueued)
+            bargeIn(clearedBytes: 0)
         } else {
             playerNode.stop()
             playerNode.reset()
         }
         currentTurn = nil
-        hasStartedPlayback = false
-        bytesQueued = 0
+        tracker.reset()
     }
 
     func shutdown() {
@@ -124,10 +163,21 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         isRunning = false
     }
 
-    private func didFinishBuffer(bytes: Int) {
-        // Individual buffer callbacks are informational; `.ended` fires when
-        // the coordinator calls `finish()`. We track completion by accounting.
-        _ = bytes
+    private func didCompleteBuffer(responseId: String?, bytes: Int) {
+        guard let turn = currentTurn else { return }
+        let receipts = tracker.bufferCompleted(responseId: responseId, bytes: bytes)
+        if let started = receipts.started {
+            onPlaybackEvent?(.started(
+                requestId: turn.requestId, sessionId: turn.sessionId,
+                responseId: started.responseId
+            ))
+        }
+        if let ended = receipts.ended {
+            onPlaybackEvent?(.ended(
+                requestId: turn.requestId, sessionId: turn.sessionId,
+                responseId: ended.responseId, bytesPlayed: ended.bytesPlayed
+            ))
+        }
     }
 
     private func buffer(for payload: Data) -> AVAudioPCMBuffer? {

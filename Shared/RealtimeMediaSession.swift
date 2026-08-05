@@ -49,7 +49,9 @@ final class RealtimeMediaSession {
         case uplinkAppend(VoiceStreamChunk)
         case uplinkCommit(RealtimeStreamCommit)
         case uplinkFallback(RealtimeUplinkStream.FallbackReason, RealtimeMediaSession.TurnHandle)
-        case playbackReady([VoiceStreamChunk])
+        /// ESS-330 v3: playable chunks carry their own response_id so late
+        /// contiguous releases don't inherit a globally-latest id.
+        case playbackReady([RealtimeDownlinkPlayback.PlayableChunk])
         case playbackCleared(bytesDropped: Int)
         case playbackFallback(RealtimeDownlinkPlayback.FallbackReason, RealtimeMediaSession.TurnHandle)
         case downlinkDropped(RealtimeDownlinkPlayback.DropReason)
@@ -179,14 +181,17 @@ final class RealtimeMediaSession {
     /// Feed a downlink `audio.delta` chunk into the playback buffer. The
     /// coordinator publishes `.playbackReady([...])` when contiguous frames
     /// have accumulated and are ready for the playback engine.
-    func receiveDownlink(_ chunk: VoiceStreamChunk) {
+    /// `responseId` is the Bridge `audio.delta.response_id` for this chunk;
+    /// the reorder buffer keeps the pairing intact across out-of-order
+    /// releases so playback receipts route to the correct response.
+    func receiveDownlink(_ chunk: VoiceStreamChunk, responseId: String? = nil) {
         guard let handle = currentTurn else {
             onEvent?(.downlinkDropped(.staleSession(
                 RealtimeDownlinkPlayback.SessionKey(requestId: chunk.requestId, sessionId: chunk.streamId)
             )))
             return
         }
-        let outcome = downlink.ingest(chunk)
+        let outcome = downlink.ingest(chunk, responseId: responseId)
         switch outcome {
         case .ready(let frames):
             onEvent?(.playbackReady(frames))

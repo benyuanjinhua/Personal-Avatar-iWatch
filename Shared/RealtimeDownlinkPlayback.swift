@@ -44,9 +44,18 @@ struct RealtimeDownlinkPlayback: Sendable {
         case invalidChunk(VoiceStreamValidationError)
     }
 
+    /// ESS-330 v3: a chunk released for playback is paired with the exact
+    /// Bridge `response_id` it arrived with — not a global "most recent" id.
+    /// Bixuan's counter-example proved the global version misroutes when
+    /// frames arrive out of order (`resp-B/seq1` first, `resp-A/seq0` later).
+    struct PlayableChunk: Equatable, Sendable {
+        let chunk: VoiceStreamChunk
+        let responseId: String?
+    }
+
     enum Outcome: Equatable, Sendable {
         case buffered
-        case ready([VoiceStreamChunk])
+        case ready([PlayableChunk])
         case dropped(DropReason)
         case fallback(FallbackReason)
         case alreadyFellBack
@@ -64,6 +73,9 @@ struct RealtimeDownlinkPlayback: Sendable {
     private(set) var nextSequence: Int = 0
     private(set) var bufferedBytes: Int = 0
     private var pending: [Int: VoiceStreamChunk] = [:]
+    /// ESS-330 v3: response_id per pending chunk, drained in lock-step with
+    /// `pending`. Absent when Bridge omits `response_id` on a delta.
+    private var pendingResponseIds: [Int: String?] = [:]
     private var emittedSequences: Set<Int> = []
 
     init(
@@ -89,6 +101,7 @@ struct RealtimeDownlinkPlayback: Sendable {
     mutating func attach(session: SessionKey) -> Outcome {
         let previousBytes = bufferedBytes
         pending.removeAll(keepingCapacity: false)
+        pendingResponseIds.removeAll(keepingCapacity: false)
         emittedSequences.removeAll(keepingCapacity: false)
         bufferedBytes = 0
         nextSequence = 0
@@ -106,6 +119,7 @@ struct RealtimeDownlinkPlayback: Sendable {
     mutating func bargeIn() -> Outcome {
         let previousBytes = bufferedBytes
         pending.removeAll(keepingCapacity: false)
+        pendingResponseIds.removeAll(keepingCapacity: false)
         emittedSequences.removeAll(keepingCapacity: false)
         bufferedBytes = 0
         nextSequence = 0
@@ -121,8 +135,11 @@ struct RealtimeDownlinkPlayback: Sendable {
         return .buffered
     }
 
-    /// Feed the next `audio.delta` chunk into the buffer.
-    mutating func ingest(_ chunk: VoiceStreamChunk) -> Outcome {
+    /// Feed the next `audio.delta` chunk into the buffer. `responseId` carries
+    /// the Bridge `audio.delta.response_id` for THIS chunk — the reorder
+    /// buffer keeps the pairing intact so a chunk that had to wait for a
+    /// contiguous predecessor still emerges with its original response id.
+    mutating func ingest(_ chunk: VoiceStreamChunk, responseId: String? = nil) -> Outcome {
         guard let session = currentSession else {
             return .dropped(.staleSession(SessionKey(requestId: chunk.requestId, streamId: chunk.streamId)))
         }
@@ -150,13 +167,15 @@ struct RealtimeDownlinkPlayback: Sendable {
         }
 
         pending[chunk.sequence] = chunk
+        pendingResponseIds[chunk.sequence] = responseId
         bufferedBytes += chunk.payload.count
 
-        var ready: [VoiceStreamChunk] = []
+        var ready: [PlayableChunk] = []
         while let contiguous = pending.removeValue(forKey: nextSequence) {
+            let releasedResponseId = pendingResponseIds.removeValue(forKey: nextSequence) ?? nil
             bufferedBytes -= contiguous.payload.count
             emittedSequences.insert(nextSequence)
-            ready.append(contiguous)
+            ready.append(PlayableChunk(chunk: contiguous, responseId: releasedResponseId))
             nextSequence += 1
         }
         return ready.isEmpty ? .buffered : .ready(ready)

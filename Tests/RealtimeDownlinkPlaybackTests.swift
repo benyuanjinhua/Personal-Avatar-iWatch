@@ -48,7 +48,7 @@ final class RealtimeDownlinkPlaybackTests: XCTestCase {
         for i in 0..<3 {
             switch buffer.ingest(chunk(i, bytes: 128)) {
             case .ready(let frames):
-                XCTAssertEqual(frames.map(\.sequence), [i])
+                XCTAssertEqual(frames.map(\.chunk.sequence), [i])
             default:
                 XCTFail("expected ready single frame at seq=\(i)")
             }
@@ -61,7 +61,7 @@ final class RealtimeDownlinkPlaybackTests: XCTestCase {
         guard case .ready(let frames) = buffer.ingest(chunk(0, bytes: 64)) else {
             return XCTFail("expected fill to release 0,1")
         }
-        XCTAssertEqual(frames.map(\.sequence), [0, 1])
+        XCTAssertEqual(frames.map(\.chunk.sequence), [0, 1])
     }
 
     func testDuplicateIsRejected() {

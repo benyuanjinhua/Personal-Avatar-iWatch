@@ -30,8 +30,14 @@ final class WatchRealtimeMediaAdapter {
     protocol Player: AnyObject {
         var onPlaybackEvent: ((RealtimePlaybackEngine.PlaybackEvent) -> Void)? { get set }
         func prepare(for turn: RealtimeMediaSession.TurnHandle) throws
-        func enqueue(chunks: [VoiceStreamChunk])
+        /// ESS-330 v3: each playable carries its own response_id so per-response
+        /// bookkeeping stays intact across out-of-order releases.
+        func enqueue(playables: [RealtimeDownlinkPlayback.PlayableChunk])
         func bargeIn(clearedBytes: Int)
+        /// ESS-335: audio.done from Bridge no longer means "stop and drop
+        /// queued buffers". `finish()` marks the response drain-requested;
+        /// the player emits `.ended` only after the last queued buffer has
+        /// actually rendered.
         func finish()
         func stop(barge: Bool)
     }
@@ -100,24 +106,22 @@ final class WatchRealtimeMediaAdapter {
         player.onPlaybackEvent = { [weak self] event in
             guard let self else { return }
             switch event {
-            case .started(let requestId, let sessionId):
+            case .started(let requestId, let sessionId, let responseId):
+                // ESS-330 v3: forward the response_id the player emitted
+                // (which was preserved per chunk through the reorder buffer).
+                // No session_id substitution — Bixuan's acceptance criteria
+                // explicitly forbids that.
+                guard let handle = self.currentTurn,
+                      handle.requestId == requestId, handle.sessionId == sessionId,
+                      let responseId else { break }
+                self.transport.sendPlaybackStarted(handle: handle, responseId: responseId)
+            case .ended(let requestId, let sessionId, let responseId, let bytesPlayed):
                 if let handle = self.currentTurn,
-                   handle.requestId == requestId, handle.sessionId == sessionId {
-                    // ESS-330: stamp the real Bridge response_id if we saw
-                    // one on an audio.delta; else fall through to sessionId
-                    // as a legacy hint (Bridge treats unknown ids as
-                    // "unmapped", still better than absent).
-                    self.transport.sendPlaybackStarted(
-                        handle: handle,
-                        responseId: self.currentResponseId ?? sessionId
-                    )
-                }
-            case .ended(let requestId, let sessionId, let bytesPlayed):
-                if let handle = self.currentTurn,
-                   handle.requestId == requestId, handle.sessionId == sessionId {
+                   handle.requestId == requestId, handle.sessionId == sessionId,
+                   let responseId {
                     self.transport.sendPlaybackEnded(
                         handle: handle,
-                        responseId: self.currentResponseId ?? sessionId,
+                        responseId: responseId,
                         bytesPlayed: bytesPlayed
                     )
                 }
@@ -172,21 +176,18 @@ final class WatchRealtimeMediaAdapter {
     /// Feed a downlink chunk received from the iPhone. Called by
     /// `PhoneConnectivity` after WSS parses the `audio.delta` off the wire.
     ///
-    /// `responseId` (ESS-330) is the real Bridge `response_id` extracted from
-    /// the flat `audio.delta` frame. When the current turn's response_id
-    /// changes (multi-response session), the coordinator's playback buffer
-    /// is barged in so late frames from the prior response cannot bleed into
-    /// the new one, matching Bridge's per-response boundary.
+    /// `responseId` (ESS-330 v3) is the real Bridge `response_id` for THIS
+    /// chunk. The reorder buffer keeps the pairing intact per-chunk, so
+    /// out-of-order releases still route to the correct response. The player
+    /// then emits started/ended per response_id.
+    ///
+    /// The adapter no longer clears the buffer on response boundaries — the
+    /// per-chunk association survives release, so mixing responses in the
+    /// buffer is safe. Barge-in remains an explicit user action, not an
+    /// implicit response-id switch.
     func ingestDownlink(_ chunk: VoiceStreamChunk, responseId: String? = nil) {
-        if let newResponseId = responseId,
-           let previous = currentResponseId,
-           newResponseId != previous {
-            // Response boundary within the same session — clear the buffer so
-            // the new response's audio plays cleanly.
-            session.bargeInDownlink()
-        }
         if let newResponseId = responseId { currentResponseId = newResponseId }
-        session.receiveDownlink(chunk)
+        session.receiveDownlink(chunk, responseId: responseId)
     }
 
     /// Bridge told the watch (via iPhone) that the downlink fast channel is
@@ -225,8 +226,8 @@ final class WatchRealtimeMediaAdapter {
                 fullFileFallback(handle, reason)
                 logger("uplink_fallback reason=\(reason) request=\(handle.requestId)")
             }
-        case .playbackReady(let frames):
-            player.enqueue(chunks: frames)
+        case .playbackReady(let playables):
+            player.enqueue(playables: playables)
         case .playbackCleared(let bytesDropped):
             player.bargeIn(clearedBytes: bytesDropped)
         case .playbackFallback(let reason, _):

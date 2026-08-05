@@ -595,6 +595,7 @@ final class PushToTalkController: ObservableObject {
             durationMs: recording.durationMs
         )
         transport.send(envelope: envelope, recording: recording)
+        submittedFullFileFallbackCount += 1
         WatchLog.info(
             "realtime", "fallback_full_file_submitted",
             requestId: requestId,
@@ -613,6 +614,24 @@ final class PushToTalkController: ObservableObject {
     /// request id. Production paths do not read this.
     var deferredFallbackReasons: [String: RealtimeUplinkStream.FallbackReason] {
         pendingFallbackReason
+    }
+
+    /// ESS-331 seam for tests: count of `transport.send(envelope:recording:)`
+    /// invocations that came in through the fallback path (both immediate
+    /// and deferred). Tests assert this equals exactly 1 to prove the
+    /// reliable path fired exactly once per failed turn.
+    private(set) var submittedFullFileFallbackCount = 0
+
+    /// ESS-331 test seam: mimics `submit(recording:)`'s drain-of-deferred
+    /// codepath without needing an AVFoundation-backed recorder round-trip.
+    /// Only intended for the deferred-fallback WatchTests.
+    func simulateDeferredFallbackDrainForTests(
+        requestId: String,
+        reason: RealtimeUplinkStream.FallbackReason
+    ) {
+        guard let recording = pendingRealtimeRecording.removeValue(forKey: requestId) else { return }
+        pendingFallbackReason.removeValue(forKey: requestId)
+        submitFullFileFallback(recording: recording, requestId: requestId, reason: reason)
     }
 
     /// 一键重试（ESS-55）：用缓存的录音换新 request_id 重发，不需要重新说话。

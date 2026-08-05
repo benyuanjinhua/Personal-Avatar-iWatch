@@ -98,10 +98,10 @@ final class RealtimeMediaSessionClosedLoopTests: XCTestCase {
 
         // Assert downlink playback receipts: each in-order chunk releases one
         // playbackReady event with a single chunk.
-        let readyFrames = events.compactMap { event -> [VoiceStreamChunk]? in
+        let readyFrames = events.compactMap { event -> [RealtimeDownlinkPlayback.PlayableChunk]? in
             if case .playbackReady(let frames) = event { return frames }; return nil
         }.flatMap { $0 }
-        XCTAssertEqual(readyFrames.map(\.sequence), [0, 1, 2, 3])
+        XCTAssertEqual(readyFrames.map(\.chunk.sequence), [0, 1, 2, 3])
     }
 
     func testBargeInDropsPriorDownlink() {
@@ -139,10 +139,10 @@ final class RealtimeMediaSessionClosedLoopTests: XCTestCase {
 
         // The new session's chunk plays back normally.
         session.receiveDownlink(downlink(0, forHandle: second))
-        let ready = events.compactMap { event -> [VoiceStreamChunk]? in
+        let ready = events.compactMap { event -> [RealtimeDownlinkPlayback.PlayableChunk]? in
             if case .playbackReady(let frames) = event { return frames }; return nil
         }.flatMap { $0 }
-        XCTAssertTrue(ready.contains(where: { $0.streamId == second.sessionId }))
+        XCTAssertTrue(ready.contains(where: { $0.chunk.streamId == second.sessionId }))
     }
 
     func testUplinkTransportFailureFallsBackExactlyOnce() {
