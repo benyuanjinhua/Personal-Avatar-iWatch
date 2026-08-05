@@ -139,6 +139,7 @@
 		D9B1A7DECC44E46204E0FFF3 /* UUIDv7.swift in Sources */ = {isa = PBXBuildFile; fileRef = E36424AC38F0A8BB28751248 /* UUIDv7.swift */; };
 		DADA85367CAACD55C3514A81 /* CompanionSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0DFA30C0EEFD46DDC835A5B6 /* CompanionSettings.swift */; };
 		DB80EDC167861AB3B3CBA4A3 /* ErrorCue_ManualConfirm.m4a in Resources */ = {isa = PBXBuildFile; fileRef = F14D22D8B591237BDD4F6527 /* ErrorCue_ManualConfirm.m4a */; };
+		DBB557451505CF70C8CAEE41 /* PushToTalkStreamingGateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52E1C676ADCA9D6C63FF73AD /* PushToTalkStreamingGateTests.swift */; };
 		DBE963FE2EC46A5678CC5122 /* AudioRecorderDurationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 24DF76CA9FD4F1F5347735D9 /* AudioRecorderDurationTests.swift */; };
 		E0C092AAB8EB860FC6D5A0B7 /* AgentModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB1D464D47EC34B55A8C8411 /* AgentModels.swift */; };
 		E1EB77C2B2AFD2E3C00EC110 /* VoiceSessionKeeper.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0E2B5FAE82F1D44C2C36616 /* VoiceSessionKeeper.swift */; };
@@ -231,6 +232,7 @@
 		4C41457A27FD24A41133AFFE /* RealtimeDownlinkPlayback.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeDownlinkPlayback.swift; sourceTree = "<group>"; };
 		50DEF68818AC545EED28B44F /* WatchDebugSettingsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchDebugSettingsTests.swift; sourceTree = "<group>"; };
 		52E037554E3E0CDA3ACF1D0B /* ResultPlaybackLedger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResultPlaybackLedger.swift; sourceTree = "<group>"; };
+		52E1C676ADCA9D6C63FF73AD /* PushToTalkStreamingGateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushToTalkStreamingGateTests.swift; sourceTree = "<group>"; };
 		53B51BD6D2B825F5E3E2A727 /* WristAgent Watch Tests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "WristAgent Watch Tests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		559D5444BA1268D4BD66556B /* RelayFailureProjectionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayFailureProjectionTests.swift; sourceTree = "<group>"; };
 		5781515B605FE09873311309 /* SelfCheckPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfCheckPolicy.swift; sourceTree = "<group>"; };
@@ -458,6 +460,7 @@
 				5CAC488B088EEC6542FF5CAB /* PlaybackEndgameChainTests.swift */,
 				0FA650F428590FCA9FAA371A /* ProcessingCopyThresholdTests.swift */,
 				2F07106FBFCBFC4FE539B6E5 /* PushToTalkDeferredFallbackTests.swift */,
+				52E1C676ADCA9D6C63FF73AD /* PushToTalkStreamingGateTests.swift */,
 				DD573B88FBB9CCE341ED1513 /* RecorderErrorCopyTests.swift */,
 				559D5444BA1268D4BD66556B /* RelayFailureProjectionTests.swift */,
 				10796288EEC2915673662B9E /* SelfCheckLatestOutcomeTests.swift */,
@@ -762,6 +765,7 @@
 				5DE908AEFD1FB51FD79565BA /* PlaybackEndgameChainTests.swift in Sources */,
 				2FF25EEB3BCA3688BCB58468 /* ProcessingCopyThresholdTests.swift in Sources */,
 				6430DBD9D8E4A5E8D6567B0D /* PushToTalkDeferredFallbackTests.swift in Sources */,
+				DBB557451505CF70C8CAEE41 /* PushToTalkStreamingGateTests.swift in Sources */,
 				707A59AAF2C9619F3909A162 /* RecorderErrorCopyTests.swift in Sources */,
 				8F4051EBF66E54755D3D60AA /* RelayFailureProjectionTests.swift in Sources */,
 				AFAD025D181738E8D93753BB /* SelfCheckLatestOutcomeTests.swift in Sources */,
