@@ -88,7 +88,10 @@ prefix, 8 hex chars) and burns any matching unused token.
 ### WSS `/api/realtime`
 
 Client sends the token in `Authorization: Bearer rtk_...` and pins scope in
-query string (`?request_id=...&session_id=...&generation=...`).
+query string (`?device_id=...&session_id=...&request_id=...&generation=...`).
+All four fields are required; the server reads them verbatim from the URL and
+rejects the upgrade with `ERR_TOKEN_INVALID` if any of the four disagrees with
+the token's pinned scope (see `server.mjs` `presentedScope`).
 
 Server verifies token scope matches the URL, burns the token, then upgrades.
 
