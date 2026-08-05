@@ -227,14 +227,25 @@ struct RealtimeDownlinkPlayback: Sendable {
     /// generation. Idempotent for the same generation.
     ///
     /// **ESS-442 B2**: transitioning from `.open(g)` directly to `.open(g+1)`
-    /// (Gateway `cancel-generation` path — iPhone advances generation
-    /// without a Watch-initiated barge-in) must reset the sequence /
-    /// emitted-set / buffer bookkeeping. Otherwise the new generation's
-    /// `delta(0)` collides with `emittedSequences` from the previous
-    /// generation and gets rejected as `.duplicate`, silently dropping the
-    /// whole generation. `.pending → .open` already routes through
-    /// `bargeIn()`, which reset the buffer state; the reset is only
-    /// missing on `.open(g) → .open(g+1)`.
+    /// must reset the sequence / emitted-set / buffer bookkeeping.
+    /// Otherwise the new generation's `delta(0)` collides with
+    /// `emittedSequences` from the previous generation and gets rejected
+    /// as `.duplicate`, silently dropping the whole generation.
+    /// `.pending → .open` already routes through `bargeIn()`, which reset
+    /// the buffer state; the reset is only missing on `.open(g) → .open(g+1)`.
+    ///
+    /// **Reachability today (main, verified by Jackson Bai in ESS-442
+    /// thread 6ab9c363)**: unreachable, but only because the SENDER of
+    /// `generation.open` is not yet implemented. The receive-side is
+    /// fully wired (`Shared/RealtimeMediaWireFormat.swift:210` enum,
+    /// `Shared/RealtimeBridgeWireCodec.swift:252-254` decoder,
+    /// `Watch/WatchSettingsStore.swift:340-343` unguarded route to
+    /// `adapter.openGeneration(_)`), and NO iPhone-side sender wires it
+    /// yet — `iOS/PhoneRealtimeSession.swift:87` notes ESS-402 is the
+    /// ticket that will land it. So this reset is a proactively-planted
+    /// guard, NOT a "contract forbids iPhone from self-advancing" —
+    /// current status is defensive; auto-upgrades to P0 the moment ESS-402
+    /// (or any other work) wires a `generation.open` sender.
     @discardableResult
     mutating func openGeneration(_ generation: Int) -> Outcome {
         if case .open(let existing) = generationState, existing == generation {

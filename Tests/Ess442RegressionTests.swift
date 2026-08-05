@@ -152,8 +152,13 @@ final class Ess442RegressionTests: XCTestCase {
         }
         XCTAssertEqual(buffer.nextSequence, 3, "sanity: emitted seq 0..2 under gen 1")
 
-        // iPhone advances the generation (Gateway `cancel-generation` path)
-        // without the Watch ever calling bargeIn().
+        // Directly promote from `.open(1)` to `.open(2)` without the Watch
+        // calling `bargeIn()` first. This transition is UNREACHABLE on
+        // main today (no `generation.open` sender exists in the codebase —
+        // ESS-402 will land the iPhone-side sender), so the test guards a
+        // defensive fix; it auto-covers a real regression path the moment
+        // that sender ships. Verified reachability trail: L2 evidence in
+        // ESS-442 thread 6ab9c363.
         _ = buffer.openGeneration(2)
         XCTAssertEqual(buffer.nextSequence, 0, "new generation must start at seq 0 again")
 
