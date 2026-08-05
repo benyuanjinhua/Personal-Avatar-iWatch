@@ -42,8 +42,9 @@ final class WatchStreamReceiverTests: XCTestCase {
     }
 
     private func makeSettings(enabled: Bool = true) -> WatchDebugSettings {
-        let defaults = UserDefaults(suiteName: "wristagent.tests.ess324.\(UUID().uuidString)")!
-        defaults.removePersistentDomain(forName: defaults.suiteName!)
+        let suiteName = "wristagent.tests.ess324.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
         if enabled {
             defaults.set(true, forKey: WatchDebugSettings.streamingEnabledDefaultsKey)
         }
@@ -132,42 +133,25 @@ final class WatchStreamReceiverTests: XCTestCase {
             fallbackCalls.append((id, reason))
         }
 
-        // maxBufferedBytes 默认 256KB → 发 4 个 64KB chunks
-        let largePayload = Data(repeating: 0, count: 64 * 1024)
-        for seq in 0..<3 {
-            let c = VoiceStreamChunk(
+        // 背压只在 chunk 滞留 pending 时成立：seq 0 永不到达，后续 chunk 全部
+        // 挂在缓冲里累加。maxBufferedBytes 默认 256KB，maxPayloadBytes 默认 64KB，
+        // 所以 seq 1..4 恰好填满 256KB（accepted），seq 5 越界触发 backpressure。
+        let payload = Data(repeating: 7, count: 64 * 1024)
+        for seq in 1...5 {
+            receiver.receive(chunk: VoiceStreamChunk(
                 requestId: requestId, streamId: streamId,
                 direction: .downlink, sequence: seq,
                 capturedAtMs: 1_785_810_000_000,
                 codec: "pcm_s16le", sampleRate: 24_000,
-                payload: largePayload
-            )
-            receiver.receive(chunk: c)
+                payload: payload
+            ))
         }
-        // 3 × 64K = 192K < 256K, 但第 4 个会超
-        // Wait, actually each chunk also goes into the contiguous release,
-        // so they won't accumulate. Let me test differently - use out-of-order.
-        let c0 = VoiceStreamChunk(
-            requestId: requestId, streamId: streamId,
-            direction: .downlink, sequence: 1,
-            capturedAtMs: 1_785_810_000_000,
-            codec: "pcm_s16le", sampleRate: 24_000,
-            payload: largePayload
-        )
-        let c1 = VoiceStreamChunk(
-            requestId: requestId, streamId: streamId,
-            direction: .downlink, sequence: 2,
-            capturedAtMs: 1_785_810_000_000,
-            codec: "pcm_s16le", sampleRate: 24_000,
-            payload: largePayload
-        )
-        receiver.receive(chunk: c0)
-        receiver.receive(chunk: c1)
-        // maxBufferedBytes=256KB default, but our receiver creates new VRRB each time.
-        // Test with the VRRB directly for backpressure, not through receiver.
-        // Let me skip this specific test as it's more of a unit test for VoiceStreamReorderBuffer.
-        XCTAssertFalse(fallbackCalls.isEmpty || fallbackCalls.allSatisfy({ $0.1 != .backpressure }),
-                       "backpressure should trigger fallback or not (depends on buffer state)")
+
+        XCTAssertEqual(fallbackCalls.count, 1, "背压应触发 1 次回退")
+        if let call = fallbackCalls.first {
+            XCTAssertEqual(call.0, requestId)
+            XCTAssertEqual(call.1, .backpressure)
+        }
     }
 
     func testGapTimeoutTriggersFallback() async {
