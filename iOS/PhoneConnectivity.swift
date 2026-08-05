@@ -15,7 +15,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     @Published private(set) var pendingDownlinkCount = 0
     /// ESS-28：加密 outbox + Tailscale 上送 + 结果回传编排器。
     let relay: WristAgentPhoneRelay
-    /// ESS-321 real-time media session (Watch ↔ iPhone ↔ Bridge). Lazily
+    /// ESS-321 real-time media session (Watch ↔ iPhone ↔ Bridge/Agent). Lazily
     /// constructed on the first uplink envelope so households that never
     /// enable streaming do not pay for the WSS setup.
     private lazy var realtimeSession: PhoneRealtimeSession = {
@@ -27,6 +27,13 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         }
         return session
     }()
+    /// ESS-391: feature flag controlling the Agent direct path.
+    private let agentFlag = AudioRealtimeAgentFeatureFlag()
+    /// ESS-391: cached Agent session — created once, reused across turns.
+    /// The session is re-connected per turn with fresh token + requestId.
+    private var agentSession: AudioRealtimeAgentSession?
+    /// ESS-391: cached token for current turn (ephemeral, memory-only).
+    private var agentEphemeralToken: String?
     private var pendingConfiguration: AgentConfiguration?
     private let historyStorageKey = "wristagent.phone.conversation.history"
     private let voiceInbox: VoiceRequestInbox?
@@ -226,18 +233,50 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         )
     }
 
-    /// URLSessionWebSocketTask factory bound to the relay's credentials and
-    /// bridge URL. Returns `nil` if the phone is not paired yet (the watch
-    /// side will treat that as a transport failure and fall back to the
-    /// existing full-file relay flow).
+    /// Transport factory that selects Bridge or Agent path based on the
+    /// `AudioRealtimeAgentFeatureFlag`. Returns `nil` if neither path is
+    /// available (watch side treats that as a transport failure and falls
+    /// back to the full-file relay flow).
     ///
-    /// Bridge PR #113 `server.mjs` requires `?request_id=` + `?session_id=`
-    /// on the WSS handshake AND the signed request-id to equal the URL's
-    /// `request_id`, otherwise the socket closes with `ERR_STREAM_OWNERSHIP`.
-    /// The factory therefore signs with the turn's request id (not a fresh
-    /// UUID) and stamps both ids on the URL query.
+    /// **Agent path**: creates a `PhoneRealtimeAgentTransport` wrapping an
+    /// `AudioRealtimeAgentSession`. The token must already be obtained via
+    /// `POST /v1/realtime/session-token` (ESS-401 integration). Currently
+    /// the token is passed via `agentEphemeralToken` — a downstream
+    /// ESS-401 integration must refresh it per turn.
+    ///
+    /// **Bridge path**: the existing `PhoneRealtimeWebSocketTransport` using
+    /// the relay's signed WSS endpoint (PR #113).
     @MainActor
     private func makeRealtimeTransport(requestId: String, sessionId: String) -> PhoneRealtimeSession.Transport? {
+        // ESS-391: try Agent direct path first when feature flag is enabled.
+        if let agentConfig = agentFlag.resolveConfig(ephemeralToken: agentEphemeralToken ?? "") {
+            let session: AudioRealtimeAgentSession
+            if let existing = agentSession {
+                session = existing
+            } else {
+                session = AudioRealtimeAgentSession(config: agentConfig, sessionId: sessionId)
+                agentSession = session
+            }
+            let transport = PhoneRealtimeAgentTransport(
+                config: agentConfig,
+                agentSession: session,
+                requestId: requestId,
+                sessionId: sessionId
+            )
+            transport.onDownlink = { [weak self] envelope in
+                self?.forwardRealtimeDownlink(envelope)
+            }
+            transport.onStateChange = { [weak self] state in
+                Self.logger.info("agent transport state → \(String(describing: state), privacy: .public)")
+            }
+            realtimeSession.isAgentTransport = true
+            Self.logger.info(
+                "agent transport created for rid=\(requestId.prefix(8), privacy: .public)"
+            )
+            return transport
+        }
+
+        // Fallback to Bridge path
         guard let credentials = RelayCredentialsStore.read(),
               var components = URLComponents(string: relay.bridgeURLString) else { return nil }
         components.scheme = "wss"
@@ -256,6 +295,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         )
         request.url = url
         let task = URLSession.shared.webSocketTask(with: request)
+        realtimeSession.isAgentTransport = false
         return PhoneRealtimeWebSocketTransport(task: task)
     }
 
