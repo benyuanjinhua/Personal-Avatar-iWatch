@@ -264,16 +264,43 @@ under launchd / systemd / a deploy script — behaves identically to `npm start`
 
 ## Deployment (quickstart)
 
+Target host for ESS-447 dev cluster:
+**`jackson-macmac-mini.magic.workspace.beer:8444`** — Jackson's Mac mini,
+Tailnet-only (accessible from any device on the same Multica magic
+workspace). `config.json` binds `0.0.0.0` and pins `public_host`; the
+source allowlist accepts loopback (for the smoke) plus Tailnet CGNAT
+(`100.64.0.0/10`) so real devices on the same magic workspace can connect.
+
 1. Provision a TLS cert + key on the Tailnet address the Gateway will bind.
+   The cert's SAN **must** include `DNS:jackson-macmac-mini.magic.workspace.beer`
+   or iOS `URLSession` will refuse the connection (self-signed with matching
+   SAN works only if the client trusts the CA; Multica magic-workspace
+   auto-provisioned certs are trusted out-of-the-box).
 2. Populate `state/devices.json` from Mac Bridge (or via a provisioning
    API); the two share the HMAC device format.
 3. Store the upstream provider key in the environment:
    `export AUDIO_REALTIME_PROVIDER_KEY=...` — do **not** put it in
    `config.json` (the code refuses to read it from there).
-4. `npm start`. The service logs `ready` when TLS + WSS + issuer are up.
-5. Confirm `curl -k https://<host>:8444/v1/health` returns `{"ok": true}`.
-6. Enable the client-side `realtime_direct_v1` feature flag on iPhone; keep
-   the Mac Bridge `realtime_media_v1` flag as a fallback (per ESS-388).
+4. `npm start`. The service logs `gateway_ready` when TLS + WSS + issuer
+   are up; the log carries `bind`, `port`, and `public_host` so operators
+   can grep the deployment address without reading config.
+5. Confirm from the target host:
+   `curl -k https://127.0.0.1:8444/v1/health` returns `{"ok": true, "service": "audio-realtime-gateway", "protocol_version": 1}`.
+6. Confirm from a real device (e.g. iPhone on the same Tailnet):
+   `curl https://jackson-macmac-mini.magic.workspace.beer:8444/v1/health`
+   returns the same body without `-k` — that proves both DNS routing and
+   the TLS trust chain.
+7. Enable the client-side `audio_realtime_agent_direct_enabled` flag on
+   iPhone; set `audio_realtime_agent_gateway_url` to
+   `wss://jackson-macmac-mini.magic.workspace.beer:8444/api/realtime`
+   (matches `AudioRealtimeAgentFeatureFlag.devDefaultGatewayURLString`).
+   Keep the Mac Bridge `realtime_media_v1` flag as a fallback (per ESS-388).
+
+For a persistent deployment on the Mac mini, wrap step 4 in a launchd
+service (`~/Library/LaunchAgents/dev.wristagent.gateway.plist`) with
+`WorkingDirectory` set to the module directory, `KeepAlive: true`, and
+stdout / stderr redirected to a rotating log — the structured stdout
+records are the operator's diagnostic surface.
 
 ## Fallback and rollback
 

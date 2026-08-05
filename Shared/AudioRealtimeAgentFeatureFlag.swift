@@ -23,6 +23,14 @@ struct AudioRealtimeAgentFeatureFlag {
         static let deviceId = "audio_realtime_agent_device_id"
     }
 
+    /// ESS-447 dev-cluster Gateway URL: Jackson's Mac mini exposed via the
+    /// Multica magic-workspace DNS. Real devices on the same Tailnet resolve
+    /// this hostname to the Mac mini's LAN address; the TLS cert served by
+    /// the Gateway is signed for this exact CN. Callers may still override
+    /// via `setGatewayURLString(_:)` (e.g. staging / prod deployments).
+    static let devDefaultGatewayURLString =
+        "wss://jackson-macmac-mini.magic.workspace.beer:8444/api/realtime"
+
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {
