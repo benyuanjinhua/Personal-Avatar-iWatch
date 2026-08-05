@@ -125,7 +125,11 @@ final class WatchRealtimeMediaAdapter {
                         bytesPlayed: bytesPlayed
                     )
                 }
-                self.session.markDownlinkFinished()
+                // A playback `.ended` event closes only this response. One
+                // realtime session may carry multiple responses, so ending
+                // the downlink here would reject the next response's chunks
+                // as `.sessionEnded`. The session itself is closed by the
+                // explicit audio.done / turn-finish path.
             case .bargedIn, .failed:
                 break
             }
