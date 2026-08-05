@@ -134,6 +134,7 @@ struct RealtimeUplinkStream: Sendable {
         return .emitted([.audioCommit(RealtimeStreamCommit(
             requestId: requestId,
             sessionId: sessionId,
+            sequence: nextSequence - 1,
             capturedAtMs: capturedAtMs
         ))])
     }
@@ -198,17 +199,22 @@ struct RealtimeStreamStart: Equatable, Sendable, Codable {
 struct RealtimeStreamCommit: Equatable, Sendable, Codable {
     let requestId: String
     let sessionId: String
+    /// Sequence of the final `audio.append` frame. The Agent Gateway rejects
+    /// a commit whose sequence does not equal its last accepted uplink frame.
+    let sequence: Int
     let capturedAtMs: Int64
 
-    init(requestId: String, sessionId: String, capturedAtMs: Int64) {
+    init(requestId: String, sessionId: String, sequence: Int, capturedAtMs: Int64) {
         self.requestId = requestId
         self.sessionId = sessionId
+        self.sequence = sequence
         self.capturedAtMs = capturedAtMs
     }
 
     enum CodingKeys: String, CodingKey {
         case requestId = "request_id"
         case sessionId = "session_id"
+        case sequence
         case capturedAtMs = "captured_at_ms"
     }
 }

@@ -66,7 +66,7 @@ final class RealtimeBridgeWireCodecTests: XCTestCase {
 
     func testAudioCommitIsFlat() throws {
         let commit = RealtimeStreamCommit(
-            requestId: requestId, sessionId: sessionId, capturedAtMs: 1
+            requestId: requestId, sessionId: sessionId, sequence: 0, capturedAtMs: 1
         )
         let text = try XCTUnwrap(RealtimeBridgeWireCodec.encode(RealtimeBridgeWireCodec.UplinkFlatFrame.audioCommit(commit)))
         guard let obj = decodedJSON(text) else { return XCTFail("invalid json") }
