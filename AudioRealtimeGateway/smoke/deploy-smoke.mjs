@@ -438,20 +438,33 @@ try {
     !leakedAudio, `${logLines.length} log records scanned`)
 
   // --- 10. 部署面观察（advisory：issue 未列、README 未承诺，但属部署坑）------
-  // README 的 quickstart 是 `npm start`（cwd = 模块目录）。从别的 cwd 启动时
-  // state_dir 按模块目录解析、tls_cert/tls_key 按 process.cwd() 解析，两者
-  // 不一致 —— 部署脚本用绝对路径调 server.mjs 就会起不来。
+  // README 的 quickstart 是 `npm start`（cwd = 模块目录）。server.mjs 现在把
+  // state_dir 和 tls_cert/tls_key 统一按模块目录解析（ESS-428）——部署脚本
+  // 用绝对路径从任意 cwd 拉起进程也必须能起来。
+  //
+  // 探针用的是同一份 config.json（同一个 bind:port），所以必须先把主 gateway
+  // 停掉再探，否则探针只会撞上 EADDRINUSE——证书修复前错误先发生在读证书，
+  // 修复后这个端口冲突才会暴露出来。
+  gateway.flush()
+  gateway.child.kill('SIGTERM')
+  await sleep(500)
+  gateway.child.kill('SIGKILL')
   const fromRepoRoot = spawnSync(process.execPath, [join(GW_DIR, 'server.mjs')], {
     cwd: resolve(GW_DIR, '..'), encoding: 'utf8', timeout: 8_000,
     env: { ...process.env, [CONFIG.provider_key_env]: PROVIDER_KEY_SENTINEL },
   })
+  // spawnSync timeout kills a healthy (still-listening) server => status null.
+  // A clean exit (0) also counts; only a crash exit is a failure.
   const startedFromOtherCwd = fromRepoRoot.status === null || fromRepoRoot.status === 0
-  advise('S10a', '从模块目录以外的 cwd 启动 server.mjs 也能起来（tls 路径按 cwd 解析）',
+  advise('S10a', '从模块目录以外的 cwd 启动 server.mjs 也能起来（tls 路径按模块目录解析）',
     startedFromOtherCwd,
-    `status=${fromRepoRoot.status} ${(fromRepoRoot.stderr || '').split('\n').find(l => l.includes('Error:')) ?? ''}`)
+    `status=${fromRepoRoot.status} ${(fromRepoRoot.stderr || '').split('\n').find(l => l.includes('Error:') || l.includes('startup_failed')) ?? ''}`)
+  // startup_failed 打在 stderr（见 server.mjs 末尾），合并两路输出再判。
+  const probeOutput = (fromRepoRoot.stdout || '') + (fromRepoRoot.stderr || '')
   advise('S10b', '启动失败走结构化 startup_failed 日志而非裸栈',
-    startedFromOtherCwd || (fromRepoRoot.stdout || '').includes('startup_failed'),
+    startedFromOtherCwd || probeOutput.includes('startup_failed'),
     startedFromOtherCwd ? 'n/a' : 'createGateway() 的抛错未被 server.mjs 末尾的 .catch 覆盖，输出是裸 stack')
+  gateway = null  // 已停，finally 不再重复 kill
 } catch (error) {
   check('S0', 'smoke harness', false, String(error?.stack ?? error))
 } finally {

@@ -177,8 +177,11 @@ function createHttpListener(CONFIG, { devices, issuer, log, protocolVersion }) {
     }
     return http.createServer(requestHandler)
   }
-  const cert = readFileSync(resolve(CONFIG.tls_cert))
-  const key = readFileSync(resolve(CONFIG.tls_key))
+  // Resolve against the module directory, NOT process.cwd() — same base as
+  // `state_dir` above. A deployment script that launches `node <abs>/server.mjs`
+  // from another cwd must find the same cert files as `npm start` (ESS-428).
+  const cert = readFileSync(resolve(BASE, CONFIG.tls_cert))
+  const key = readFileSync(resolve(BASE, CONFIG.tls_key))
   return https.createServer({ cert, key }, requestHandler)
 }
 
