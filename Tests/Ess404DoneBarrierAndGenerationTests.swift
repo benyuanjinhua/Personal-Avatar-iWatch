@@ -303,4 +303,126 @@ final class Ess404DoneBarrierAndGenerationTests: XCTestCase {
         // Barrier timer fires second: absorbed, no double-execution.
         XCTAssertEqual(buffer.doneBarrierTimedOut(), .alreadyFellBack)
     }
+
+    // MARK: - U16 (ESS-442 B1): synchronous release + late chunk → no second release
+
+    /// Reproduces ESS-442 B1: `markDone`'s synchronous release path retained
+    /// `pendingFinalSequence`, so a late / duplicate downlink chunk arriving
+    /// after `endSession()` re-satisfied `checkBarrierRelease()` and produced
+    /// a second `.barrierReleased` — leading to a duplicate
+    /// `done_barrier_released` log entry and a second `player.finish(...)`.
+    func testU16_SyncReleaseThenLateChunkDoesNotDoubleRelease() {
+        var buffer = attached()
+        _ = buffer.openGeneration(1)
+        _ = buffer.ingest(delta(0), responseId: "r-late", generation: 1)
+        _ = buffer.ingest(delta(1), responseId: "r-late", generation: 1)
+        _ = buffer.ingest(delta(2), responseId: "r-late", generation: 1)
+
+        // Barrier arms + releases synchronously because 0..2 are already in.
+        let arrival = buffer.markDone(finalSequence: 2, responseId: "r-late", generation: 1)
+        guard case .barrierReleased(let final, let rid) = arrival else {
+            return XCTFail("expected synchronous barrier release, got \(arrival)")
+        }
+        XCTAssertEqual(final, 2)
+        XCTAssertEqual(rid, "r-late")
+
+        // Coordinator closes the session after synchronous release.
+        _ = buffer.endSession()
+
+        // Late / duplicate delta comes in through the reorder buffer — it is
+        // dropped as .sessionEnded / .duplicate. Either way the coordinator
+        // then polls `checkBarrierRelease()` and it MUST NOT fire again.
+        _ = buffer.ingest(delta(2), responseId: "r-late", generation: 1)
+        XCTAssertNil(
+            buffer.checkBarrierRelease(),
+            "barrier must not release a second time after sync release + endSession"
+        )
+        // Barrier state is also cleared — sanity check on the invariant.
+        XCTAssertEqual(buffer.barrierState, .notArmed)
+    }
+
+    // MARK: - U17 (ESS-442 B2): openGeneration `.open(g) → .open(g+1)` accepts new seq 0
+
+    /// Reproduces ESS-442 B2: `openGeneration` did not reset the buffer state
+    /// on `.open(g) → .open(g+1)`, so the new generation's seq 0 fell into the
+    /// old `emittedSequences` set and was dropped as `.duplicate`. iPhone can
+    /// legitimately advance the generation via the wire `generation.open`
+    /// envelope (`Shared/RealtimeMediaWireFormat.swift` +
+    /// `Watch/WatchSettingsStore.swift`), so this path IS reachable without a
+    /// Watch-initiated `bargeIn()`.
+    func testU17_OpenGenerationOpenToOpenAcceptsNewFirstDelta() {
+        var buffer = attached()
+        _ = buffer.openGeneration(1)
+        _ = buffer.ingest(delta(0), responseId: "r-g1", generation: 1)
+        _ = buffer.ingest(delta(1), responseId: "r-g1", generation: 1)
+        _ = buffer.ingest(delta(2), responseId: "r-g1", generation: 1)
+
+        // iPhone-driven direct promotion — Watch never called `bargeIn()`.
+        _ = buffer.openGeneration(2)
+
+        XCTAssertEqual(buffer.activeGeneration, 2)
+        XCTAssertEqual(buffer.nextSequence, 0, "sequence counter must reset for new gen")
+
+        // New generation's seq 0 must be released, not dropped as duplicate.
+        let outcome = buffer.ingest(delta(0), responseId: "r-g2", generation: 2)
+        guard case .ready(let released) = outcome else {
+            return XCTFail(
+                "gen-2 seq 0 must be accepted after direct .open(g)->.open(g+1), got \(outcome)"
+            )
+        }
+        XCTAssertEqual(released.map(\.chunk.sequence), [0])
+        XCTAssertEqual(released.first?.responseId, "r-g2")
+
+        // The old generation's emitted set must not leak into the new one.
+        let secondFrame = buffer.ingest(delta(1), responseId: "r-g2", generation: 2)
+        if case .dropped = secondFrame {
+            XCTFail("gen-2 seq 1 must not inherit gen-1 emitted state, got \(secondFrame)")
+        }
+    }
+
+    /// Complementary to U17: the idempotent path (`openGeneration(g)` when
+    /// already `.open(g)`) must NOT wipe emitted state and reject in-flight
+    /// deltas — that would be a regression of its own.
+    func testU17b_OpenGenerationSameGenIsStillIdempotent() {
+        var buffer = attached()
+        _ = buffer.openGeneration(1)
+        _ = buffer.ingest(delta(0), responseId: "r", generation: 1)
+        _ = buffer.ingest(delta(1), responseId: "r", generation: 1)
+
+        _ = buffer.openGeneration(1) // no-op
+
+        XCTAssertEqual(buffer.nextSequence, 2, "same-gen open must not reset counters")
+        XCTAssertEqual(
+            buffer.ingest(delta(1), responseId: "r", generation: 1),
+            .dropped(.duplicate),
+            "already-emitted seq must still dedupe after idempotent open"
+        )
+    }
+
+    // MARK: - U18 (ESS-442 B3): future generation on done routes to its own outcome
+
+    /// Reproduces ESS-442 B3: `markDone` folded `.futureGeneration` into
+    /// `.droppedStaleGeneration`, so the adapter logged
+    /// `stale_generation_dropped kind=done` for a done that Watch had not yet
+    /// seen `generation.open` for. Diagnosis-critical: stale means "old frame
+    /// arrived late"; future means "we missed a `generation.open` downlink" —
+    /// they route to different fixes.
+    func testU18_FutureGenerationDoneRoutesToFutureOutcome() {
+        var buffer = attached()
+        _ = buffer.openGeneration(3)
+
+        let outcome = buffer.markDone(finalSequence: 2, responseId: "r-future", generation: 5)
+        guard case .droppedFutureGeneration(let incoming, let active) = outcome else {
+            return XCTFail("expected .droppedFutureGeneration, got \(outcome)")
+        }
+        XCTAssertEqual(incoming, 5)
+        XCTAssertEqual(active, 3)
+
+        // Session must remain open under the current generation — a future
+        // done must not close it.
+        let admitted = buffer.ingest(delta(0), responseId: "r-now", generation: 3)
+        if case .dropped(.sessionEnded) = admitted {
+            XCTFail("future-generation done closed the current session")
+        }
+    }
 }

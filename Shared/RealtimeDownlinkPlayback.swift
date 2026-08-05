@@ -70,6 +70,13 @@ struct RealtimeDownlinkPlayback: Sendable {
         case waiting(missing: [Int], responseId: String?)
         case missingFinalSequence(nextSeqSeen: Int, responseId: String?)
         case droppedStaleGeneration(incoming: Int, active: Int)
+        /// ESS-442 B3: `audio.done` for a strictly-future generation. The
+        /// delta path already routes futures to `future_generation_dropped`;
+        /// done was previously folded into `.droppedStaleGeneration`, which
+        /// misdirects diagnosis (stale = "we're behind, drop the frame",
+        /// future = "we're missing a `generation.open`, WCSession contract
+        /// violation").
+        case droppedFutureGeneration(incoming: Int, active: Int)
         case droppedPendingGeneration(incoming: Int?)
     }
 
@@ -216,18 +223,28 @@ struct RealtimeDownlinkPlayback: Sendable {
         return .buffered
     }
 
-    /// ESS-404 §3.5: iPhone announced the new generation. Promotes the gate
-    /// from `.pending` or `.unset` to `.open(generation)`. Also clears
-    /// per-turn barrier state so a new response can start under this
-    /// generation. Idempotent for the same generation.
+    /// ESS-404 §3.5: iPhone announced a new generation. Promotes the gate
+    /// from `.pending` or `.unset` to `.open(generation)`. Idempotent for
+    /// the same generation.
+    ///
+    /// **ESS-442 B2**: also handles `.open(g) → .open(g+1)` directly. The
+    /// wire path allows iPhone to advance the generation on its own (see
+    /// `Shared/RealtimeMediaWireFormat.swift:210` `generation.open` +
+    /// `Watch/WatchSettingsStore.swift:340` routing) — per ESS-403 the
+    /// iPhone owns the generation counter and does not require a Watch
+    /// `bargein.request` first. When the generation actually changes, the
+    /// sequence counters, emitted set, pending reorder buffer, and barrier
+    /// state ALL belong to the old generation and must be reset — otherwise
+    /// new-generation deltas (which restart at seq 0) would be dropped as
+    /// `.duplicate` against the old `emittedSequences`, silently losing an
+    /// entire generation of audio.
     @discardableResult
     mutating func openGeneration(_ generation: Int) -> Outcome {
         if case .open(let existing) = generationState, existing == generation {
             return .buffered
         }
+        resetBufferState()
         generationState = .open(generation)
-        pendingFinalSequence = nil
-        pendingDoneResponseId = nil
         didSessionEnd = false
         return .buffered
     }
@@ -341,11 +358,12 @@ struct RealtimeDownlinkPlayback: Sendable {
             case .pendingGeneration(let incoming):
                 return .droppedPendingGeneration(incoming: incoming)
             case .futureGeneration(let incoming, let active):
-                // Future generation on done — same posture as delta: refuse
-                // to self-promote. Signal via stale-generation surface so the
-                // caller logs `future_generation_dropped` and does not close
-                // the current session.
-                return .droppedStaleGeneration(incoming: incoming, active: active)
+                // ESS-442 B3: future generation on done — refuse to
+                // self-promote (same posture as delta) and route through
+                // its own outcome so the caller logs
+                // `future_generation_dropped` instead of the misleading
+                // `stale_generation_dropped`.
+                return .droppedFutureGeneration(incoming: incoming, active: active)
             default:
                 return .droppedPendingGeneration(incoming: generation)
             }
@@ -365,10 +383,18 @@ struct RealtimeDownlinkPlayback: Sendable {
             pendingFinalSequence = -1
             return .zeroAudio(responseId: responseId)
         }
-        pendingFinalSequence = target
         if allEmittedThrough(target) {
+            // ESS-442 B1: symmetric with `checkBarrierRelease()` — clear
+            // barrier state on synchronous release so a late duplicate /
+            // out-of-order chunk arriving after `endSession()` cannot make
+            // `checkBarrierRelease()` fire a second `.barrierReleased`
+            // (which would emit a duplicate `done_barrier_released` log
+            // line and double-invoke `player.finish(...)`).
+            pendingFinalSequence = nil
+            pendingDoneResponseId = nil
             return .barrierReleased(finalSequence: target, responseId: responseId)
         }
+        pendingFinalSequence = target
         return .waiting(missing: missingSequences(upTo: target), responseId: responseId)
     }
 

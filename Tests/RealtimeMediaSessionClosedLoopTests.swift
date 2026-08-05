@@ -249,6 +249,44 @@ final class RealtimeMediaSessionClosedLoopTests: XCTestCase {
         XCTAssertEqual(decoded.kind, .audioDelta)
     }
 
+    // MARK: - ESS-442 B1 (coordinator level)
+
+    /// After the synchronous done barrier release fires and `endSession()`
+    /// closes the downlink session, a late / duplicate downlink chunk must
+    /// NOT cause `receiveDownlink` to emit a second `.doneBarrierReleased`
+    /// event — which is what the adapter turns into a duplicate
+    /// `done_barrier_released` WatchLog line and a second
+    /// `player.finish(...)` call.
+    func testDoneBarrierSyncReleaseThenLateChunkEmitsExactlyOneEvent() {
+        let handle = session.beginTurn(requestId: requestId(1))
+        session.openGeneration(1)
+
+        for i in 0...2 {
+            session.receiveDownlink(downlink(i, forHandle: handle), responseId: "r", generation: 1)
+        }
+        // done arrives after 0..2 are already emitted — synchronous release.
+        session.receiveDone(finalSequence: 2, responseId: "r", generation: 1)
+
+        let syncReleases = events.compactMap { event -> RealtimeDownlinkPlayback.DoneOutcome? in
+            if case .doneArrived(_, let outcome) = event { return outcome }; return nil
+        }.filter {
+            if case .barrierReleased = $0 { return true }; return false
+        }
+        XCTAssertEqual(syncReleases.count, 1, "one synchronous barrierReleased expected")
+
+        // A late/duplicate chunk after endSession() must not re-trigger a
+        // .doneBarrierReleased event through checkBarrierRelease().
+        session.receiveDownlink(downlink(2, forHandle: handle), responseId: "r", generation: 1)
+
+        let asyncReleases = events.filter {
+            if case .doneBarrierReleased = $0 { return true }; return false
+        }
+        XCTAssertTrue(
+            asyncReleases.isEmpty,
+            "async .doneBarrierReleased must not fire after sync release + late chunk"
+        )
+    }
+
     func testDisconnectMidTurnPreservesSingleFallbackContract() {
         let handle = session.beginTurn(requestId: requestId(1))
         session.pushMicrophonePCM(Data(repeating: 0x11, count: 128 * 2))

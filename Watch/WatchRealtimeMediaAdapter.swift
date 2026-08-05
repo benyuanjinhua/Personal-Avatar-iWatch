@@ -371,6 +371,16 @@ final class WatchRealtimeMediaAdapter {
                     requestId: currentTurn?.requestId,
                     detail: "incoming_gen=\(incoming) active_gen=\(active) kind=done"
                 )
+            case .droppedFutureGeneration(let incoming, let active):
+                // ESS-442 B3: done for a strictly-future generation. Watch
+                // never received `generation.open` for this one — surface as
+                // a distinct log event so diagnosis routes to the missing
+                // downlink `generation.open`, not to a stale-frame drop.
+                WatchLog.info(
+                    "realtime", "future_generation_dropped",
+                    requestId: currentTurn?.requestId,
+                    detail: "incoming_gen=\(incoming) active_gen=\(active) kind=done"
+                )
             case .droppedPendingGeneration(let incoming):
                 WatchLog.info(
                     "realtime", "generation_pending_dropped",
