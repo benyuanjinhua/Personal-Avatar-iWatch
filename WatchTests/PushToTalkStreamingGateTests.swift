@@ -23,9 +23,11 @@ final class PushToTalkStreamingGateTests: XCTestCase {
         let suite = "wristagent.tests.ess354.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)
-        if enabled {
-            defaults.set(true, forKey: WatchDebugSettings.streamingEnabledDefaultsKey)
-        }
+        // ESS-356 之后 `WatchDebugSettings.init` 缺 key 时会回落到
+        // `VoiceStreamingGate.defaultEnabled`（当前为 ON）。本用例要精确
+        // 验证「上行门禁跟随 debug 开关」的语义，两个方向都必须显式落 key，
+        // 否则 OFF 分支会被编译期默认顶掉。
+        defaults.set(enabled, forKey: WatchDebugSettings.streamingEnabledDefaultsKey)
         return WatchDebugSettings(defaults: defaults)
     }
 
