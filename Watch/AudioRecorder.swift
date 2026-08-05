@@ -202,16 +202,29 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
             throw RecorderError.noRecording
         }
 
-        // ESS-375: 录音从未真正开始 → 抛出专用错误，触发 PushToTalkController
-        // 显示「按住时间太短，请按住不放再说」这一可行动提示。
+        // ESS-375: 录音从未真正开始 → 清理无效 M4A 文件后抛出专用错误。
         // 判定条件（OR）：① stop() 前 recorder.isRecording 为 false，或
         // ② 文件字节数 ≤ M4A 容器头近似值（24,588B），双重兜底确保不误判。
+        //
+        // bytes=24588 来源说明（R-04.3 待验证）：
+        // 08-04/08-05 四次真机取证均得此值（跨两天、跨录音一字节不差），
+        // 推断为 AVAudioRecorder 在 record(forDuration:) 时预分配的 M4A
+        // 容器结构（ftyp+moov+空 mdat）。由于样本在手表上不可导出做 ffprobe
+        // box dump，此结论当前属实证推断（empirical, 4/4 consistent），
+        // 需真机验证时补充 ffprobe 取证。代码层用双重守卫（isRecording +
+        // 字节数 ≤ 容器开销阈值）兜底，即使该值随系统版本变化也不漏判。
         if !wasRecording || data.count <= Self.m4aContainerOverheadApprox {
             WatchLog.error(
                 "recorder", "recording_never_started",
                 detail: "wall_clock_ms=\(wallClockMs) bytes=\(data.count) was_recording=\(wasRecording) container_overhead=\(Self.m4aContainerOverheadApprox)",
                 code: "ERR_AUDIO_TOO_SHORT"
             )
+            // ESS-375 L2 fix: 无效 M4A 文件必须在 throw 前清理。
+            // 此前 currentURL/recorder 置 nil 在 throw 之后（不可达），
+            // temp 文件泄漏、recorder 引用悬空。
+            try? FileManager.default.removeItem(at: url)
+            currentURL = nil
+            recorder = nil
             throw RecorderError.recordingNeverStarted
         }
 
