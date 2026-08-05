@@ -134,9 +134,9 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
     /// the current response". It does NOT mean "stop the player and drop
     /// queued buffers". We flag the current response as drain-requested;
     /// `.ended` fires from `bufferCompleted` when its queue empties.
-    func finish() {
+    func finish(responseId: String?) {
         guard let turn = currentTurn else { return }
-        if let ended = tracker.requestDrain() {
+        if let ended = tracker.requestDrain(responseId: responseId) {
             onPlaybackEvent?(.ended(
                 requestId: turn.requestId, sessionId: turn.sessionId,
                 responseId: ended.responseId, bytesPlayed: ended.bytesPlayed

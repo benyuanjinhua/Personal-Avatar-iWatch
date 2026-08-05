@@ -35,7 +35,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
             enqueuedPlayables.append(contentsOf: playables)
         }
         func bargeIn(clearedBytes: Int) { bargedInBytes.append(clearedBytes) }
-        func finish() { finished = true }
+        func finish(responseId: String?) { finished = true }
         func stop(barge: Bool) { stopped = true }
     }
 
@@ -212,6 +212,66 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         XCTAssertEqual(transport.playbackEndEvents.first?.2, 2_048)
     }
 
+    func testAudioDoneAndPlayerEndedKeepRealtimeTurnAliveForNextResponse() {
+        let requestId = "44444444-4444-4444-4444-444444444449"
+        let (adapter, _, player, _, _) = makeAdapter(sessionIds: [
+            "55555555-5555-5555-5555-555555555559"
+        ])
+        let handle = adapter.beginTurn(requestId: requestId)
+
+        adapter.markDownlinkComplete(responseId: "resp-late")
+        XCTAssertTrue(player.finished)
+        XCTAssertEqual(adapter.currentTurn, handle,
+                       "audio.done is only a drain marker; it must not clear the turn")
+
+        let lateChunk = VoiceStreamChunk(
+            requestId: handle.requestId, streamId: handle.sessionId,
+            direction: .downlink, sequence: 0, capturedAtMs: 1,
+            codec: "pcm_s16le", sampleRate: 24_000,
+            payload: Data(repeating: 0x33, count: 96)
+        )
+        adapter.ingestDownlink(lateChunk, responseId: "resp-late")
+        XCTAssertEqual(player.enqueuedChunks.map(\.sequence), [0])
+
+        player.onPlaybackEvent?(.ended(
+            requestId: handle.requestId, sessionId: handle.sessionId,
+            responseId: "resp-late", bytesPlayed: 96
+        ))
+        XCTAssertEqual(adapter.currentTurn, handle,
+                       "response ended must not close a multi-response realtime turn")
+
+        let nextResponseChunk = VoiceStreamChunk(
+            requestId: handle.requestId, streamId: handle.sessionId,
+            direction: .downlink, sequence: 1, capturedAtMs: 2,
+            codec: "pcm_s16le", sampleRate: 24_000,
+            payload: Data(repeating: 0x44, count: 96)
+        )
+        adapter.ingestDownlink(nextResponseChunk, responseId: "resp-next")
+        XCTAssertEqual(player.enqueuedChunks.map(\.sequence), [0, 1])
+    }
+
+    func testExplicitCancelClosesTurnAndRejectsLateChunks() {
+        let requestId = "44444444-4444-4444-4444-444444444450"
+        let (adapter, _, player, _, _) = makeAdapter(sessionIds: [
+            "55555555-5555-5555-5555-555555555560"
+        ])
+        let handle = adapter.beginTurn(requestId: requestId)
+
+        adapter.cancel()
+
+        XCTAssertNil(adapter.currentTurn)
+        XCTAssertTrue(player.stopped)
+
+        let lateChunk = VoiceStreamChunk(
+            requestId: handle.requestId, streamId: handle.sessionId,
+            direction: .downlink, sequence: 0, capturedAtMs: 1,
+            codec: "pcm_s16le", sampleRate: 24_000,
+            payload: Data(repeating: 0x55, count: 96)
+        )
+        adapter.ingestDownlink(lateChunk, responseId: "resp-cancelled")
+        XCTAssertTrue(player.enqueuedChunks.isEmpty)
+    }
+
     func testNewTurnBargesInAndPlayerClearsPriorPlayback() {
         let (adapter, recorder, player, _, _) = makeAdapter(sessionIds: [
             "55555555-5555-5555-5555-555555555555",
@@ -230,5 +290,14 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         // The player must have been asked to prepare for the new turn AND to
         // stop (barge) the prior playback via the coordinator.
         XCTAssertEqual(player.preparedFor, second)
+
+        let staleChunk = VoiceStreamChunk(
+            requestId: first.requestId, streamId: first.sessionId,
+            direction: .downlink, sequence: 1, capturedAtMs: 2, codec: "pcm_s16le",
+            sampleRate: 24_000, payload: Data(repeating: 0x33, count: 96)
+        )
+        adapter.ingestDownlink(staleChunk, responseId: "resp-stale")
+        XCTAssertEqual(player.enqueuedChunks.map(\.sequence), [0],
+                       "a new turn must reject late chunks from the replaced turn")
     }
 }

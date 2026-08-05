@@ -320,7 +320,7 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
                 adapter.ingestDownlink(chunk, responseId: envelope.responseId)
             }
         case .audioDone:
-            adapter.markDownlinkComplete()
+            adapter.markDownlinkComplete(responseId: envelope.responseId)
         case .playbackClear, .responseInterrupted:
             adapter.bargeIn()
         case .bridgeFallback:

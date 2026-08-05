@@ -141,6 +141,22 @@ final class RealtimeResponseIdAndPlaybackTests: XCTestCase {
         ))
     }
 
+    func testIdentifiedDrainBeforeDeltaWaitsForRealPlayback() {
+        var tracker = RealtimePlaybackReceiptTracker()
+
+        XCTAssertNil(
+            tracker.requestDrain(responseId: "resp-late"),
+            "identified audio.done must not fabricate a zero-byte receipt before its delta arrives"
+        )
+        tracker.enqueue(responseId: "resp-late", bytes: 192)
+        let completed = tracker.bufferCompleted(responseId: "resp-late", bytes: 192)
+
+        XCTAssertEqual(completed.started?.responseId, "resp-late")
+        XCTAssertEqual(completed.ended, RealtimePlaybackReceiptTracker.EndedReceipt(
+            responseId: "resp-late", bytesPlayed: 192
+        ))
+    }
+
     func testAnonymousResponseTracksIndependentlyButEmitsNilId() {
         var tracker = RealtimePlaybackReceiptTracker()
         tracker.enqueue(responseId: nil, bytes: 128)

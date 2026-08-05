@@ -38,7 +38,7 @@ final class WatchRealtimeMediaAdapter {
         /// queued buffers". `finish()` marks the response drain-requested;
         /// the player emits `.ended` only after the last queued buffer has
         /// actually rendered.
-        func finish()
+        func finish(responseId: String?)
         func stop(barge: Bool)
     }
 
@@ -125,7 +125,11 @@ final class WatchRealtimeMediaAdapter {
                         bytesPlayed: bytesPlayed
                     )
                 }
-                self.session.markDownlinkFinished()
+                // A playback `.ended` event closes only this response. One
+                // realtime session may carry multiple responses, so ending
+                // the downlink here would reject the next response's chunks
+                // as `.sessionEnded`. Explicit cancel, interruption, or the
+                // next turn remains responsible for closing/replacing it.
             case .bargedIn, .failed:
                 break
             }
@@ -197,9 +201,13 @@ final class WatchRealtimeMediaAdapter {
     }
 
     /// Bridge signalled `audio.done` for the current turn.
-    func markDownlinkComplete() {
-        player.finish()
-        session.finishTurn(reason: .audioDone)
+    func markDownlinkComplete(responseId: String? = nil) {
+        // `audio.done` is a drain marker for the response, not proof that the
+        // Watch player has rendered it. Keep the coordinator session alive
+        // until the player emits its real `.ended` receipt; otherwise an
+        // out-of-order WCSession delivery can clear the turn before the
+        // preceding `audio.delta` frames are dispatched.
+        player.finish(responseId: responseId)
     }
 
     private func handle(_ event: RealtimeMediaSession.Event) {

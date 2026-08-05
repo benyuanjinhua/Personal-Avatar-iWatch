@@ -213,12 +213,6 @@ final class RealtimeMediaSession {
         if case .bargedIn(let bytes) = cleared { onEvent?(.playbackCleared(bytesDropped: bytes)) }
     }
 
-    /// Downlink playback receipt: the real audio engine reported it finished
-    /// playing the last frame. Marks the session ended so late frames drop.
-    func markDownlinkFinished() {
-        _ = downlink.endSession()
-    }
-
     /// Bridge WSS reported the downlink fast channel died — collapse to the
     /// existing full-file fallback exactly once per turn.
     func markDownlinkBridgeFallback() {
