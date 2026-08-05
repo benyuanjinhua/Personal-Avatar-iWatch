@@ -170,7 +170,11 @@ final class WatchVoiceTransport: ObservableObject {
     }
 
     func send(envelope: VoiceRequestEnvelope, recording: AudioRecorder.Recording) {
-        journal?.begin(requestId: envelope.requestId)
+        journal?.begin(
+            requestId: envelope.requestId,
+            parentRequestId: envelope.parentRequestId,
+            contextText: envelope.contextSummary
+        )
         WatchLog.info(
             "transport", "send_begin", requestId: envelope.requestId,
             detail: "duration_ms=\(recording.durationMs) bytes=\(recording.data.count)"

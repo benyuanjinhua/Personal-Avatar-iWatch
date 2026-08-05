@@ -56,6 +56,7 @@
 		4EACD0A9A1C336AA8BCB6677 /* VoiceTurnState.swift in Sources */ = {isa = PBXBuildFile; fileRef = F928ACBF6FA59402D5EB1275 /* VoiceTurnState.swift */; };
 		4FBE2499075E0DDE72FFA982 /* PushToTalkStreamingStartupTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6E45BED5CAC55818D04A8EB /* PushToTalkStreamingStartupTests.swift */; };
 		54817C157F20C92848363962 /* ConversationHistory.swift in Sources */ = {isa = PBXBuildFile; fileRef = E92A4F28175D63C6FBD62D7E /* ConversationHistory.swift */; };
+		54CB4ADA3D45DF730F3BD340 /* ConversationHistoryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 155476C623681A28FDAE4D5D /* ConversationHistoryView.swift */; };
 		59EF7588E503BBA5DF84681B /* UUIDv7.swift in Sources */ = {isa = PBXBuildFile; fileRef = E36424AC38F0A8BB28751248 /* UUIDv7.swift */; };
 		5B434395A63D5C4B37CCFD72 /* VoiceTurnJournal.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6F558DCDF4B9CA8F0BA2E2D /* VoiceTurnJournal.swift */; };
 		5DE908AEFD1FB51FD79565BA /* PlaybackEndgameChainTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CAC488B088EEC6542FF5CAB /* PlaybackEndgameChainTests.swift */; };
@@ -102,6 +103,7 @@
 		9FCAF92E7F4BAF6D75258EC3 /* AvatarErrorCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38CFFC49761BA3D8F3C402C8 /* AvatarErrorCardView.swift */; };
 		9FE3E5082197E2851CD75F30 /* WatchVoiceTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = F16E394DC77EF14BAE142B32 /* WatchVoiceTransport.swift */; };
 		A3BFF832F44C4739239AB662 /* WatchDebugSettingsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 50DEF68818AC545EED28B44F /* WatchDebugSettingsTests.swift */; };
+		A5D9C8D8CCA1F952FC72A7F3 /* TurnDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9151956ED1FBB381E500E114 /* TurnDetailView.swift */; };
 		A74A27941BC416F02C965D17 /* BuildFingerprint.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32C8DAF30CCFE15F09A5351A /* BuildFingerprint.swift */; };
 		A766A36C146CEA01CE487911 /* WatchStreamReceiverTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B3297717E736F5BC5E44F85 /* WatchStreamReceiverTests.swift */; };
 		A7E57A17426B0BB822699784 /* PCMFrameRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE8FF24E8524ECAAAF5021D9 /* PCMFrameRecorder.swift */; };
@@ -206,6 +208,7 @@
 		10796288EEC2915673662B9E /* SelfCheckLatestOutcomeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfCheckLatestOutcomeTests.swift; sourceTree = "<group>"; };
 		13475F099EA8ADC39FB4651D /* ResultNotificationPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResultNotificationPolicy.swift; sourceTree = "<group>"; };
 		13F51C6DCBABB59C404B307D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		155476C623681A28FDAE4D5D /* ConversationHistoryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationHistoryView.swift; sourceTree = "<group>"; };
 		16A065FFB735532D201B2183 /* VoiceRequestEnvelope.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRequestEnvelope.swift; sourceTree = "<group>"; };
 		1AB8CD6D695437D845CE87AF /* VoiceRequestInbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRequestInbox.swift; sourceTree = "<group>"; };
 		1B1609E87036B6E0CEFB8C95 /* RealtimeBridgeWireCodec.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeBridgeWireCodec.swift; sourceTree = "<group>"; };
@@ -261,6 +264,7 @@
 		8D4D9B7BAB821EF5BEF00394 /* ConversationTimelineView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationTimelineView.swift; sourceTree = "<group>"; };
 		8F9C01710FDC8C90D754460F /* OpenWristAgentIntent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenWristAgentIntent.swift; sourceTree = "<group>"; };
 		905294A59B10050708A50FBF /* PlaybackRecoveryPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackRecoveryPolicy.swift; sourceTree = "<group>"; };
+		9151956ED1FBB381E500E114 /* TurnDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TurnDetailView.swift; sourceTree = "<group>"; };
 		937C17EC6A16413E34C276A2 /* WatchContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchContentView.swift; sourceTree = "<group>"; };
 		96150E5C8428B98CF5C6765B /* ErrorCue_Retryable.m4a */ = {isa = PBXFileReference; path = ErrorCue_Retryable.m4a; sourceTree = "<group>"; };
 		98840DEEAC5DA7B6F8FCC628 /* AudioRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRecorder.swift; sourceTree = "<group>"; };
@@ -407,6 +411,7 @@
 				98840DEEAC5DA7B6F8FCC628 /* AudioRecorder.swift */,
 				38CFFC49761BA3D8F3C402C8 /* AvatarErrorCardView.swift */,
 				448AA6286D0C4ACA51DC8ADD /* AvatarErrorPresenter.swift */,
+				155476C623681A28FDAE4D5D /* ConversationHistoryView.swift */,
 				8D4D9B7BAB821EF5BEF00394 /* ConversationTimelineView.swift */,
 				13F51C6DCBABB59C404B307D /* Info.plist */,
 				8F9C01710FDC8C90D754460F /* OpenWristAgentIntent.swift */,
@@ -418,6 +423,7 @@
 				B9D95B86CF79B5796D5EA9DC /* SelfCheck.swift */,
 				7669A09014913EDDEC887BBE /* SpeechPlayer.swift */,
 				385A7BF623716F8B230FD7E7 /* SubtitlePlaybackView.swift */,
+				9151956ED1FBB381E500E114 /* TurnDetailView.swift */,
 				8CA853AA557CCC08A3446DED /* VoiceOrbView.swift */,
 				D0E2B5FAE82F1D44C2C36616 /* VoiceSessionKeeper.swift */,
 				B1CE1503A0D6F97C52A835D5 /* WatchAppDelegate.swift */,
@@ -691,6 +697,7 @@
 				1EF906148F17573C9B7D948E /* BuildFingerprint.swift in Sources */,
 				74339B1DE6A6C27DBE1885DD /* ClientLog.swift in Sources */,
 				54817C157F20C92848363962 /* ConversationHistory.swift in Sources */,
+				54CB4ADA3D45DF730F3BD340 /* ConversationHistoryView.swift in Sources */,
 				2600C4D0F1086887A7E1B04A /* ConversationTimelineView.swift in Sources */,
 				34140BE278C262CF0BACEABE /* EncryptedAudioVault.swift in Sources */,
 				1B82F586343739AA4F419D21 /* ErrorCueCatalog.swift in Sources */,
@@ -721,6 +728,7 @@
 				2BE4825B9DE1357E0469CED7 /* SpeechPlayer.swift in Sources */,
 				91EA78B6C755DACBB9576676 /* SubtitlePlaybackView.swift in Sources */,
 				26780BEBF601751525AE9BDD /* SubtitleScript.swift in Sources */,
+				A5D9C8D8CCA1F952FC72A7F3 /* TurnDetailView.swift in Sources */,
 				D9B1A7DECC44E46204E0FFF3 /* UUIDv7.swift in Sources */,
 				F0F7837AE17D55F9D65F291C /* VoiceInteractionCue.swift in Sources */,
 				2AFB7EE475338CDAB23D6E85 /* VoiceOrbView.swift in Sources */,
