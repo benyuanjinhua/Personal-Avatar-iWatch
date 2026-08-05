@@ -232,13 +232,6 @@ final class PushToTalkController: ObservableObject {
             recording: $state.map { $0 != .idle }.eraseToAnyPublisher()
         )
 
-        // ESS-317：trim 时清理被移除轮次的加密音频文件。
-        journal.onTurnEvicted = { [weak self] turn in
-            if let fileName = turn.speechFileName {
-                self?.speechVault?.remove(name: fileName)
-            }
-        }
-
         // ESS-317：冷启动时清理超过 24h 的过期轮次与音频。
         journal.evictExpiredAudio(vault: speechVault)
     }
