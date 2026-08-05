@@ -14,6 +14,8 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
     weak var voiceJournal: VoiceTurnJournal?
     /// 结果语音的加密落盘仓（ESS-29）。
     weak var speechVault: EncryptedAudioVault?
+    /// ESS-324 B4：下行流式 chunk 接收器。
+    weak var streamReceiver: WatchStreamReceiver?
     private let defaults = UserDefaults.standard
     private let storageKey = "wristagent.watch.configuration"
 
@@ -106,6 +108,12 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         _ session: WCSession,
         didReceiveMessageData messageData: Data
     ) {
+        // ESS-324 B4：优先尝试 VoiceStreamChunk（downlink 方向）；命中后不进配置路径。
+        if let chunk = try? JSONDecoder().decode(VoiceStreamChunk.self, from: messageData),
+           chunk.direction == .downlink {
+            Task { @MainActor in self.streamReceiver?.receive(chunk: chunk) }
+            return
+        }
         Task { @MainActor in self.apply(messageData) }
     }
 
