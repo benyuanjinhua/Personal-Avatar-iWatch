@@ -43,7 +43,14 @@ final class WatchAppServices {
         // ESS-321: pre-warm the adapter so the settings store's downlink
         // dispatch has somewhere to send `audio.delta` payloads even before
         // the first press has fired.
-        settings.realtimeAdapter = pushToTalk.ensureRealtimeAdapter()
+        // ESS-366 DEMO ONLY (DO NOT MERGE): skip realtime adapter init when
+        // running under XCTest — on Xcode 26.3 watch simulator, AVAudioEngine.
+        // connect throws -10868 during app launch and kills the test host
+        // before any test runs. This lets the demo reach xctest execution so
+        // the ESS-360 form (Failing tests: non-empty) is actually produced.
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
+            settings.realtimeAdapter = pushToTalk.ensureRealtimeAdapter()
+        }
         // ESS-349 接缝：接上 B4 接收器。降级只记事件——整段 m4a 走的是
         // transferSpeech 可靠通道，与 chunk 流并行，不依赖这里回信。
         let receiver = WatchStreamReceiver(debugSettings: debugSettings) { requestId, reason in
