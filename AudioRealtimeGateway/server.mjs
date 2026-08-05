@@ -54,7 +54,7 @@ export function createGateway(overrides = {}) {
   const wss = new WebSocketServer({ noServer: true })
 
   const server = createHttpListener(CONFIG, {
-    devices, issuer, log, protocolVersion: CONFIG.protocol_version,
+    devices, issuer, log, protocolVersion: CONFIG.protocol_version, baseDir: BASE,
   })
 
   server.on('upgrade', (req, socket, head) => {
@@ -83,6 +83,9 @@ export function createGateway(overrides = {}) {
       log('ws_upgrade_rejected', {
         code: error.code ?? 'ERR_TOKEN_INVALID',
         request_id: presentedScope.request_id || null,
+        session_id: presentedScope.session_id || null,
+        generation: Number.isFinite(presentedScope.generation) ? presentedScope.generation : null,
+        device_id: presentedScope.device_id || null,
       })
       return refuseUpgrade(socket, error.status ?? 401, error.code ?? 'ERR_TOKEN_INVALID')
     }
@@ -115,8 +118,12 @@ export function createGateway(overrides = {}) {
 
   async function start() {
     return new Promise((resolveStart, rejectStart) => {
-      server.listen({ host: CONFIG.bind, port: CONFIG.port }, err => {
-        if (err) return rejectStart(err)
+      const onListenError = err => {
+        server.off('listening', onListening)
+        rejectStart(err)
+      }
+      const onListening = () => {
+        server.off('error', onListenError)
         log('gateway_ready', {
           bind: CONFIG.bind, port: server.address().port,
           tls: !CONFIG.dev_allow_plain_ws,
@@ -124,7 +131,10 @@ export function createGateway(overrides = {}) {
           provider_key_present: Boolean(providerKey),
         })
         resolveStart(server)
-      })
+      }
+      server.once('error', onListenError)
+      server.once('listening', onListening)
+      server.listen({ host: CONFIG.bind, port: CONFIG.port })
     })
   }
   async function stop() {
@@ -140,7 +150,7 @@ function readConfig(path) {
   try { return JSON.parse(readFileSync(path, 'utf8')) } catch { return {} }
 }
 
-function createHttpListener(CONFIG, { devices, issuer, log, protocolVersion }) {
+function createHttpListener(CONFIG, { devices, issuer, log, protocolVersion, baseDir }) {
   const requestHandler = (req, res) => {
     const ip = peerIp(req.socket)
     if (!sourceAllowed(CONFIG, req.socket)) {
@@ -176,8 +186,8 @@ function createHttpListener(CONFIG, { devices, issuer, log, protocolVersion }) {
     }
     return http.createServer(requestHandler)
   }
-  const cert = readFileSync(resolve(CONFIG.tls_cert))
-  const key = readFileSync(resolve(CONFIG.tls_key))
+  const cert = readFileSync(resolve(baseDir ?? '.', CONFIG.tls_cert))
+  const key = readFileSync(resolve(baseDir ?? '.', CONFIG.tls_key))
   return https.createServer({ cert, key }, requestHandler)
 }
 
@@ -295,9 +305,14 @@ function createAgentTransport(CONFIG, { log, providerKey }) {
 
 // Allow running as a standalone process.
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const gateway = createGateway()
-  gateway.start().catch(err => {
-    process.stderr.write(JSON.stringify({ ts: new Date().toISOString(), evt: 'startup_failed', detail: String(err?.message ?? err) }) + '\n')
+  const emitStartupFailed = err => {
+    process.stdout.write(JSON.stringify({ ts: new Date().toISOString(), evt: 'startup_failed', detail: String(err?.message ?? err) }) + '\n')
     process.exit(1)
-  })
+  }
+  try {
+    const gateway = createGateway()
+    gateway.start().catch(emitStartupFailed)
+  } catch (err) {
+    emitStartupFailed(err)
+  }
 }

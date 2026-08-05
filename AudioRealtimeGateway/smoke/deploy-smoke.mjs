@@ -438,20 +438,33 @@ try {
     !leakedAudio, `${logLines.length} log records scanned`)
 
   // --- 10. 部署面观察（advisory：issue 未列、README 未承诺，但属部署坑）------
-  // README 的 quickstart 是 `npm start`（cwd = 模块目录）。从别的 cwd 启动时
-  // state_dir 按模块目录解析、tls_cert/tls_key 按 process.cwd() 解析，两者
-  // 不一致 —— 部署脚本用绝对路径调 server.mjs 就会起不来。
+  // README 的 quickstart 是 `npm start`（cwd = 模块目录）。历史行为下 state_dir
+  // 按模块目录解析、tls_cert/tls_key 按 process.cwd() 解析，从别的 cwd 起进程
+  // 会 ENOENT。此处从仓库根目录派生一个子进程复核该行为：
+  //   * 主 gateway 仍占用 CONFIG.port，因此 EADDRINUSE 视为 "已越过 TLS 载入
+  //     阶段" — 判定 cwd 处理正确。
+  //   * 只有当 stderr 提到 gateway.crt/key 时才判定为 cwd 处理错误。
+  //   * S10b 检查 startup_failed 是否走 stdout 结构化事件（logger 白名单）
+  //     而非裸 stack。
   const fromRepoRoot = spawnSync(process.execPath, [join(GW_DIR, 'server.mjs')], {
     cwd: resolve(GW_DIR, '..'), encoding: 'utf8', timeout: 8_000,
     env: { ...process.env, [CONFIG.provider_key_env]: PROVIDER_KEY_SENTINEL },
   })
-  const startedFromOtherCwd = fromRepoRoot.status === null || fromRepoRoot.status === 0
-  advise('S10a', '从模块目录以外的 cwd 启动 server.mjs 也能起来（tls 路径按 cwd 解析）',
-    startedFromOtherCwd,
-    `status=${fromRepoRoot.status} ${(fromRepoRoot.stderr || '').split('\n').find(l => l.includes('Error:')) ?? ''}`)
+  const stderrOut = fromRepoRoot.stderr || ''
+  const stdoutOut = fromRepoRoot.stdout || ''
+  const tlsPathError = /gateway\.(crt|key)/.test(stderrOut) || /gateway\.(crt|key)/.test(stdoutOut)
+  advise('S10a', '从模块目录以外的 cwd 启动 server.mjs 时 TLS 路径按模块目录解析',
+    !tlsPathError,
+    tlsPathError
+      ? (stderrOut + stdoutOut).split('\n').find(l => /gateway\.(crt|key)/.test(l)) ?? 'tls path error'
+      : `status=${fromRepoRoot.status} 未出现 gateway.crt/key 相关 ENOENT（EADDRINUSE 属主 gateway 占用端口，非 cwd 问题）`)
+  const startupFailedLogged = stdoutOut.includes('"evt":"startup_failed"') || stderrOut.includes('"evt":"startup_failed"')
+  const startedCleanly = fromRepoRoot.status === null || fromRepoRoot.status === 0
   advise('S10b', '启动失败走结构化 startup_failed 日志而非裸栈',
-    startedFromOtherCwd || (fromRepoRoot.stdout || '').includes('startup_failed'),
-    startedFromOtherCwd ? 'n/a' : 'createGateway() 的抛错未被 server.mjs 末尾的 .catch 覆盖，输出是裸 stack')
+    startupFailedLogged || startedCleanly,
+    startupFailedLogged
+      ? 'structured startup_failed emitted'
+      : 'createGateway() 的抛错未被 server.mjs 末尾的 .catch 覆盖，输出是裸 stack')
 } catch (error) {
   check('S0', 'smoke harness', false, String(error?.stack ?? error))
 } finally {
