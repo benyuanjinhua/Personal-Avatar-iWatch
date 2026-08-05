@@ -201,7 +201,14 @@ describe('ESS-41 B4: queued task ownership and delayed announcement rebinding', 
         events.ws.once('error', reject)
       })
       const id = rid()
-      await ctx.client.createTurn(id, noisePcm())
+      await ctx.client.createTurn(id, noisePcm(), {
+        sessionId: 'session_stream_test',
+        streaming: {
+          requested: true,
+          capabilities: ['voice_stream_downlink_v2'],
+          protocol_versions: [2],
+        },
+      })
       await waitFor(async () => (await ctx.client.getTurn(id)).json.task_id === 'task_queued')
       const announcementChunks = await waitFor(() => {
         const chunks = events.received.filter(event =>

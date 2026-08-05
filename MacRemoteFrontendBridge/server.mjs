@@ -33,7 +33,7 @@ import { AudioPipeline } from './audio.mjs'
 import { ResultAudioStore } from './result-audio.mjs'
 import { QwenRealtimeSessionSupervisor } from './supervisor.mjs'
 import { prepareDownlinkMessage } from './audio-policy.mjs'
-import { VoiceStreamDownlink } from './voice-stream-downlink.mjs'
+import { VoiceStreamDownlink, VoiceStreamingNegotiator } from './voice-stream-downlink.mjs'
 import { VoiceStreamUplink } from './voice-stream-uplink.mjs'
 import { PendingAnnouncementStreams } from './pending-announcement-streams.mjs'
 import { RealtimeMediaSession } from './realtime-media-session.mjs'
@@ -110,6 +110,10 @@ export function createBridge(overrides = {}) {
   // （网关只下发 sessionId 匹配的任务权限事件），写开关关闭时定向 reject。
   supervisor.onPermissionRequested = task => watcher.denyRealtimePermission(task)
   let streamDownlink = null
+  const streamNegotiator = new VoiceStreamingNegotiator({
+    serverEnabled: CONFIG.voice_streaming_v2 === true,
+    log,
+  })
   const streamUplink = new VoiceStreamUplink({
     enabled: CONFIG.voice_streaming_v2 === true,
     maxPayloadBytes: CONFIG.voice_stream_max_payload_bytes ?? 64 * 1024,
@@ -612,7 +616,14 @@ export function createBridge(overrides = {}) {
     if (existing) {
       if (existing.body_sha256 !== bodySha) throw new ApiError(ERR.IDEMPOTENCY_CONFLICT)
       log({ evt: 'turn_replayed', request_id: requestId })
-      return { status: 202, body: { ...ledger.projection(existing), idempotent_replay: true } }
+      return {
+        status: 202,
+        body: {
+          ...ledger.projection(existing),
+          streaming: streamNegotiator.decision(requestId),
+          idempotent_replay: true,
+        },
+      }
     }
 
     // Validate the payload BEFORE the ledger entry exists — a rejected request
@@ -631,10 +642,15 @@ export function createBridge(overrides = {}) {
       sessionId: supervisor.sessionId,
       watchCreatedAt: body.created_at,
     })
+    const streaming = streamNegotiator.negotiate({
+      requestId,
+      sessionId: typeof body.session_id === 'string' ? body.session_id : supervisor.sessionId,
+      streaming: body.streaming,
+    })
     log({ evt: 'turn_accepted', request_id: requestId, device_id: authInfo.deviceId, audio_bytes: audioBuf.length })
     // Snapshot the `accepted` receipt before processing starts mutating state;
     // the 202 returns immediately, execution continues asynchronously.
-    const receipt = ledger.projection(turn)
+    const receipt = { ...ledger.projection(turn), streaming }
     processTurn(requestId, audioBuf, meta, { parentRequestId, contextSummary }).catch(err =>
       log({ evt: 'process_turn_crashed', request_id: requestId, err: String(err) }))
     return { status: 202, body: receipt }
@@ -1117,6 +1133,7 @@ export function createBridge(overrides = {}) {
     maxBufferedBytes: CONFIG.voice_stream_max_buffered_bytes ?? 256 * 1024,
     maxSequenceWindow: CONFIG.voice_stream_max_sequence_window ?? 32,
     gapTimeoutMs: CONFIG.voice_stream_gap_timeout_ms ?? 1_500,
+    isAllowed: requestId => streamNegotiator.decision(requestId),
     send: (requestId, message) => {
       const turn = ledger.get(requestId)
       if (!turn) return false
@@ -1212,6 +1229,7 @@ export function createBridge(overrides = {}) {
       const client = clients[0]
       const turn = ledger.get(projection.request_id)
       if (client && turn) sendTerminalDelivery(turn, client, 'state_change')
+      streamNegotiator.release(projection.request_id)
       return
     }
     for (const client of clients) {
