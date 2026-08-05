@@ -29,8 +29,15 @@ final class WatchAppServices {
         settings.voiceTransport = pushToTalk.transport
         settings.voiceJournal = pushToTalk.journal
         settings.speechVault = pushToTalk.speechVault
-        pushToTalk.voiceStreamingEnabled = { [weak settings] in
-            settings?.configuration.voiceStreamingV2 ?? VoiceStreamingGate.defaultEnabled
+        // ESS-354: uplink gate must read the same knob that gates the downlink
+        // receiver — `WatchDebugSettings.isStreamingActive` (Debug 直连/流式).
+        // The old wiring pointed at `AgentConfiguration.voiceStreamingV2`, an
+        // iPhone-synced field that no UI ever sets, so turning the Watch debug
+        // toggle ON opened only the downlink gate; the uplink adapter never
+        // started, no `stream.start` reached iPhone, no realtime WSS was built,
+        // and every turn ended with `result_synthesized_from_realtime` (m4a).
+        pushToTalk.voiceStreamingEnabled = { [weak debugSettings] in
+            debugSettings?.isStreamingActive ?? VoiceStreamingGate.defaultEnabled
         }
         pushToTalk.onAutoPlayStarted = { [welcome] in welcome.interrupt() }
         // ESS-321: pre-warm the adapter so the settings store's downlink
