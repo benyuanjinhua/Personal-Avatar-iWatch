@@ -236,11 +236,6 @@ final class PushToTalkController: ObservableObject {
         journal.evictExpiredAudio(vault: speechVault)
     }
 
-    /// ESS-317：在前台激活时触发过期音频清理。
-    func evictExpiredAudio() {
-        journal.evictExpiredAudio(vault: speechVault)
-    }
-
     /// 展示纯文本结果全文。录音期间不弹（打断按住说话手势），文字仍在结果卡片里可点开。
     private func presentTranscriptOnly(requestId: String) {
         guard state == .idle else { return }
