@@ -478,9 +478,16 @@ extension PhoneConnectivity: WatchFeedbackChannel {
         return true
     }
 
-    /// ESS-324 B2/B4：Bridge WSS downlink stream chunk → Watch `sendMessageData`。
-    /// stream 走即时通道（best-effort）；不可达/编码失败时返回 false，
-    /// 调用方（WristAgentPhoneRelay）回退整段 m4a 路径。
+    /// ESS-324 B4：Bridge WSS downlink stream chunk → Watch `sendMessageData`。
+    ///
+    /// **返回值语义（ESS-351）**：
+    /// - `true` = `sendMessageData` 已提交至 WCSession 发送队列，**不等于 chunk 已送达 Watch**；
+    /// - `false` = 同步守卫未通过（方向非 downlink、会话未激活/不可达、编码失败）。
+    ///
+    /// `WCSession.sendMessageData` 的失败经由异步 `errorHandler` 回调抵达；
+    /// 此时函数早已返回 `true`。异步失败时 `errorHandler` 通过
+    /// `relay.handleStreamChunkDeliveryFailed` 补偿降级信号，调用方不得仅凭
+    /// 返回值决定是否回退整段 m4a（ESS-351）。
     @discardableResult
     func forwardStreamChunkToWatch(_ chunk: VoiceStreamChunk) -> Bool {
         guard chunk.direction == .downlink else {
@@ -496,8 +503,11 @@ extension PhoneConnectivity: WatchFeedbackChannel {
             Self.downlinkLogger.error("forwardStreamChunkToWatch: encode failed")
             return false
         }
-        session.sendMessageData(data, replyHandler: nil) { error in
+        session.sendMessageData(data, replyHandler: nil) { [weak self] error in
             Self.downlinkLogger.error("forwardStreamChunkToWatch: send failed error=\(error.localizedDescription)")
+            // ESS-351：异步投递失败——补偿降级信号，让 relay 将此 request_id
+            // 标记为需要整段 m4a 降级。不在此处自建重试/对账链路。
+            self?.relay.handleStreamChunkDeliveryFailed(requestId: chunk.requestId)
         }
         Self.downlinkLogger.debug("forwardStreamChunkToWatch: sent seq=\(chunk.sequence) request_id=\(chunk.requestId)")
         return true

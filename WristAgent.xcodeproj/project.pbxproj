@@ -16,6 +16,7 @@
 		16999EF5199C5B5E800A83B8 /* VoiceRequestEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16A065FFB735532D201B2183 /* VoiceRequestEnvelope.swift */; };
 		18C00E8A4DDBDF394954DE30 /* WatchStreamReceiver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 825EC2CED4ACE4E583D94864 /* WatchStreamReceiver.swift */; };
 		1B71100DEDD4B210D28AE0A1 /* DownlinkBacklogHintTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1FE6DCDF59808F848A03798D /* DownlinkBacklogHintTests.swift */; };
+		E351DDDDD0WNL1NKF4LLB4CK /* DownlinkStreamFallbackTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E351FFFFD0WNL1NKF4LLB4CK /* DownlinkStreamFallbackTests.swift */; };
 		1B82F586343739AA4F419D21 /* ErrorCueCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A74603EEEBF6327940BB0BE /* ErrorCueCatalog.swift */; };
 		1D8114C1A144A1E06C7938A4 /* ErrorCue_Generic.m4a in Resources */ = {isa = PBXBuildFile; fileRef = 082465840BA4F405D5850B27 /* ErrorCue_Generic.m4a */; };
 		1DEEC7DB7C45672A9EE48707 /* RealtimeMediaSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49D1CFEB2C03FAA07DA192C1 /* RealtimeMediaSession.swift */; };
@@ -210,6 +211,7 @@
 		1CEDAB5F3CD7B29B993F0FA2 /* RealtimeMediaFormat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeMediaFormat.swift; sourceTree = "<group>"; };
 		1DAF03C2F2C11D4CBC8D9587 /* WatchSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchSettingsView.swift; sourceTree = "<group>"; };
 		1FE6DCDF59808F848A03798D /* DownlinkBacklogHintTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownlinkBacklogHintTests.swift; sourceTree = "<group>"; };
+		E351FFFFD0WNL1NKF4LLB4CK /* DownlinkStreamFallbackTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownlinkStreamFallbackTests.swift; sourceTree = "<group>"; };
 		234EBF336FF2F9724F289524 /* ClientLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientLog.swift; sourceTree = "<group>"; };
 		24DF76CA9FD4F1F5347735D9 /* AudioRecorderDurationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRecorderDurationTests.swift; sourceTree = "<group>"; };
 		2B644F4BEAE260E21C555E9E /* RuntimeSessionPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RuntimeSessionPolicy.swift; sourceTree = "<group>"; };
@@ -451,6 +453,7 @@
 				0DAD45847A8F17F8D430ACB9 /* AudioRecorderHandoverTests.swift */,
 				CA9DA8A923948AE9124C19F9 /* AvatarErrorPresenterTests.swift */,
 				1FE6DCDF59808F848A03798D /* DownlinkBacklogHintTests.swift */,
+				E351FFFFD0WNL1NKF4LLB4CK /* DownlinkStreamFallbackTests.swift */,
 				7C39EB1E56AB7E26A9E4F72C /* IphoneRelayStuckHintTests.swift */,
 				5CAC488B088EEC6542FF5CAB /* PlaybackEndgameChainTests.swift */,
 				0FA650F428590FCA9FAA371A /* ProcessingCopyThresholdTests.swift */,
@@ -754,6 +757,7 @@
 				95171100A79B4FD51C92AF73 /* AudioRecorderHandoverTests.swift in Sources */,
 				BD58016CCCEA3B35C68B307A /* AvatarErrorPresenterTests.swift in Sources */,
 				1B71100DEDD4B210D28AE0A1 /* DownlinkBacklogHintTests.swift in Sources */,
+				E351DDDDD0WNL1NKF4LLB4CK /* DownlinkStreamFallbackTests.swift in Sources */,
 				FB1CEDBA1C036BC17C6BEF2C /* IphoneRelayStuckHintTests.swift in Sources */,
 				5DE908AEFD1FB51FD79565BA /* PlaybackEndgameChainTests.swift in Sources */,
 				2FF25EEB3BCA3688BCB58468 /* ProcessingCopyThresholdTests.swift in Sources */,
