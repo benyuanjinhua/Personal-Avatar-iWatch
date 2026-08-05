@@ -117,7 +117,7 @@ verifiable).
 | type | Body | Notes |
 |---|---|---|
 | `session.start` | scope + `protocol_version` | Must be first message. Establishes the session. Server replies `ready` on success. |
-| `audio.append` | `sequence`, `audio` (base64 PCM16LE 16 kHz), `sample_rate?`, `codec?` | Sequences must be monotone and dense (no gaps within a turn). |
+| `audio.append` | `sequence`, `audio` (base64 PCM16LE 16 kHz mono), `codec?` (must be `"pcm_s16le"` if present), `sample_rate?` (must be `16000` if present) | Sequences must be monotone and dense (no gaps within a turn). `codec` and `sample_rate` are optional — omitting them selects the same defaults. A different literal is rejected with `ERR_UNSUPPORTED_CODEC` / `ERR_UNSUPPORTED_SAMPLE_RATE`. |
 | `audio.commit` | `sequence` (last accepted) | Ends the uplink for the current turn. |
 | `cancel` | `reason?` | Cancels the current `generation`. Server responds with `cancel.ack` and stops emitting deltas for the cancelled generation. |
 | `playback.started` | `response_id` | Client reports first sample rendered. |
@@ -186,6 +186,8 @@ late frames arriving on the previous connection are dropped (`stale_generation`)
 | `ERR_SCOPE_MISMATCH` | 400 / 1008 | URL scope / event scope disagrees with token. |
 | `ERR_STREAM_SEQUENCE` | — / 1008 | Client uplink sequence gap or reversal. |
 | `ERR_STREAM_FRAME_SIZE` | — / 1009 | Frame exceeds `max_frame_bytes`. |
+| `ERR_UNSUPPORTED_CODEC` | — / 1008 | `audio.append.codec` present and not equal to `"pcm_s16le"`. |
+| `ERR_UNSUPPORTED_SAMPLE_RATE` | — / 1008 | `audio.append.sample_rate` present and not equal to `16000`. |
 | `ERR_RATE_LIMIT` | — / 1008 | Event-per-second / bytes-per-second cap tripped. |
 | `ERR_IDLE_TIMEOUT` | — / 1001 | No traffic within `idle_disconnect_ms`. |
 | `ERR_GENERATION_STALE` | — / 1008 | Event tagged with a generation the server no longer accepts. |
