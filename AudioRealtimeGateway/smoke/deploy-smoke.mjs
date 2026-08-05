@@ -131,14 +131,59 @@ function startGateway(logPath) {
   }
 }
 
-async function waitForHealth(timeoutMs = 10_000) {
+// Race the health probe against the child process dying. Without this, a
+// child that fails to bind (e.g. EADDRINUSE because a stale gateway holds
+// the port) goes unnoticed and the probe ends up talking to WHATEVER else is
+// on the port — every downstream check then fails for the wrong reason
+// (ESS-444: the bogus 401 at token mint).
+async function waitForHealth(child, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs
   let last = null
+  let exited = null
+  child.once('exit', (code, signal) => { exited = { code, signal } })
   while (Date.now() < deadline) {
+    if (exited) {
+      throw new Error(
+        `gateway process exited during startup (code=${exited.code} signal=${exited.signal}) — `
+        + `refusing to probe whatever else is on ${HOST}:${PORT}. Child output:\n`
+        + gateway.dump().slice(0, 800))
+    }
     try { return await httpsJson('/v1/health') }
     catch (e) { last = e; await sleep(150) }
   }
   throw new Error('gateway never became healthy: ' + String(last?.message ?? last))
+}
+
+// A smoke run killed with Ctrl-C never reaches the finally block, leaving a
+// gateway bound to the port that holds the PREVIOUS run's device secret in
+// memory (DeviceStore loads devices.json once at startup). The next run's
+// health probe then succeeds against the stale process while token mints
+// fail 401 SIGNATURE_INVALID — the exact mystery failure from ESS-444.
+// Detect that up front and say so, instead of misattributing it downstream.
+async function assertNoStaleGateway() {
+  let answered = null
+  try { answered = await httpsJson('/v1/health') } catch { return /* port closed: good */ }
+  throw new Error(
+    `${HOST}:${PORT} already answers GET /v1/health (status=${answered.status}) — `
+    + 'a stale gateway from an interrupted run is still bound to the port. '
+    + 'Kill it (e.g. `pkill -f "node server.mjs"`) before re-running the smoke.')
+}
+
+// The health probe returning 200 and Node delivering the child's stdout
+// chunks are two independent async events with no ordering guarantee, so a
+// one-shot read of the captured output can legitimately miss gateway_ready
+// (ESS-444 S1b). Poll until the event shows up or the deadline passes —
+// gateway_ready is emitted synchronously on listen(), so this settles well
+// within the timeout on a healthy boot.
+async function waitForBootEvent(evtName, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const found = gateway.dump().split('\n').filter(Boolean).map(safeParse).filter(Boolean)
+      .find(l => l.evt === evtName)
+    if (found) return found
+    await sleep(50)
+  }
+  return null
 }
 
 // -------------------------------------------------------------- helpers ----
@@ -265,19 +310,20 @@ try {
     + `# tls ${certs.crt}  bind ${HOST}:${PORT}  transport ${CONFIG.agent_transport}\n\n`,
   )
 
+  await assertNoStaleGateway()
   gateway = startGateway(logPath)
 
   // --- 1. process starts + health ------------------------------------------
-  const health = await waitForHealth()
+  const health = await waitForHealth(gateway.child)
   check('S1', 'server.mjs 起进程 + GET /v1/health 200',
     health.status === 200 && health.body?.ok === true,
     `status=${health.status} body=${JSON.stringify(health.body)}`)
 
-  const bootLog = gateway.dump().split('\n').filter(Boolean).map(safeParse).filter(Boolean)
-  const ready = bootLog.find(l => l.evt === 'gateway_ready')
+  const ready = await waitForBootEvent('gateway_ready')
   check('S1b', 'gateway_ready 日志：TLS 生效、provider key 从 env 读入',
     Boolean(ready) && ready.tls === true && ready.provider_key_present === true,
-    JSON.stringify(ready ?? null))
+    ready ? JSON.stringify(ready)
+      : `gateway_ready not captured within timeout; output so far: ${gateway.dump().slice(0, 400)}`)
 
   // --- 2. token 签发 --------------------------------------------------------
   const t1 = { requestId: 'req_ess423_a_' + crypto.randomBytes(3).toString('hex'), generation: 1 }
@@ -288,7 +334,7 @@ try {
       && mint1.body.scope?.request_id === t1.requestId
       && mint1.body.scope?.generation === 1
       && mint1.body.ttl_ms <= CONFIG.max_token_ttl_ms,
-    `status=${mint1.status} jti=${mint1.body.jti} ttl_ms=${mint1.body.ttl_ms} scope=${JSON.stringify(mint1.body.scope)}`)
+    `status=${mint1.status} err=${mint1.body.error ?? 'n/a'} jti=${mint1.body.jti} ttl_ms=${mint1.body.ttl_ms} scope=${JSON.stringify(mint1.body.scope)}`)
 
   // --- 3. WSS 升级 + token 单次使用 -----------------------------------------
   const c1 = connect(mint1.body.token, t1)
@@ -412,7 +458,11 @@ try {
 
   // 冒烟项 9 的另一半：request 级日志必须同时带 session_id，否则按 session 聚合
   // 一轮 barge-in（同 session、多 request/generation）会漏掉记录。
-  const unscoped = turn.filter(l => typeof l.session_id !== 'string')
+  // 例外：ws_upgrade_rejected 发生在 session 建立之前（S3b 的重放探测必然
+  // 产生一条），README 的日志契约也写明 id 是 "when applicable" 才携带，
+  // 因此它不属于「session 内事件缺 session_id」这个不变式的约束对象。
+  const PRE_SESSION_EVENTS = new Set(['ws_upgrade_rejected'])
+  const unscoped = turn.filter(l => typeof l.session_id !== 'string' && !PRE_SESSION_EVENTS.has(l.evt))
   check('S9f', '每条带 request_id 的日志同时带 session_id',
     unscoped.length === 0,
     unscoped.length
