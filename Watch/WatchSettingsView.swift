@@ -21,12 +21,23 @@ struct WatchSettingsView: View {
     @ObservedObject var debugSettings: WatchDebugSettings
     /// ESS-307：iPhone 下行队列积压计数。
     @ObservedObject var settings: WatchSettingsStore
+    /// ESS-419：语音回合日志（清除历史语音用）。
+    @ObservedObject var journal: VoiceTurnJournal
+    /// ESS-419：加密语音仓（清除历史语音用）。
+    var speechVault: EncryptedAudioVault?
+    /// ESS-419：语音播放器（清除前先停播）。
+    var player: SpeechPlayer
+
+    @State private var showClearConfirmation = false
+    @State private var clearResultMessage: String?
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
+                connectionStatusSection
                 downlinkBacklogSection
                 streamingSection
+                privacySection
                 selfCheckSection
                 buildSection
                 logsHintSection
@@ -35,6 +46,60 @@ struct WatchSettingsView: View {
             .padding(.vertical, 4)
         }
         .navigationTitle("设置")
+        .confirmationDialog(
+            "确认清除历史语音",
+            isPresented: $showClearConfirmation
+        ) {
+            Button("清除", role: .destructive) {
+                performClearHistorySpeech()
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("将删除所有已保存的结果语音文件，文字记录与处理日志保留。此操作不可撤销。")
+        }
+        .alert("清除结果", isPresented: Binding(
+            get: { clearResultMessage != nil },
+            set: { if !$0 { clearResultMessage = nil } }
+        )) {
+            Button("知道了", role: .cancel) {}
+        } message: {
+            if let message = clearResultMessage {
+                Text(message)
+            }
+        }
+    }
+
+    // MARK: - 当前链路（ESS-419 F2）
+
+    private var connectionStatusSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            sectionHeader("当前链路")
+            HStack(spacing: 4) {
+                Circle()
+                    .fill(connectionStatusColor)
+                    .frame(width: 6, height: 6)
+                Text(connectionStatusText)
+                    .font(.caption2)
+                    .foregroundStyle(.primary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(9)
+        .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var connectionStatusColor: Color {
+        guard settings.wcSessionActivationState == .activated else { return .gray }
+        return settings.wcIsReachable ? .green : .orange
+    }
+
+    private var connectionStatusText: String {
+        guard settings.wcSessionActivationState == .activated else {
+            return "会话未激活"
+        }
+        return settings.wcIsReachable
+            ? "已连接 iPhone"
+            : "iPhone 未连接（回合将排队等待）"
     }
 
     // MARK: - 下行队列积压（ESS-307）
@@ -85,6 +150,31 @@ struct WatchSettingsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(9)
         .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    // MARK: - 隐私（ESS-419 F1）
+
+    private var privacySection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            sectionHeader("隐私")
+
+            Button(role: .destructive) {
+                showClearConfirmation = true
+            } label: {
+                Label("清除历史语音", systemImage: "trash")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .tint(.red)
+            .font(.caption2)
+
+            Text("清除所有已保存的结果语音文件；文字记录与处理日志不受影响。")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(9)
+        .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
     }
 
     // MARK: - 自检（从旧 DebugPanelView 平移）
@@ -176,6 +266,77 @@ struct WatchSettingsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(9)
         .background(Color.gray.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    // MARK: - 清除历史语音（ESS-419 F1）
+
+    /// 手动一键清空结果语音：停播 → 遍历 journal turns 逐一删除 vault 文件并
+    /// 清 journal speechFileName → 扫描 vault 目录清残留 → 落日志并反馈结果。
+    private func performClearHistorySpeech() {
+        // 先停播，防止「文件已删但播放器仍在读」
+        player.stop(reason: "clear_history_speech")
+
+        guard let vault = speechVault else {
+            clearResultMessage = "本机语音仓不可用"
+            WatchLog.info("settings", "speech_vault_cleared", detail: "vault_unavailable")
+            return
+        }
+
+        let turns = journal.turns
+        guard !turns.isEmpty else {
+            clearResultMessage = "没有可清除的语音"
+            WatchLog.info("settings", "speech_vault_cleared", detail: "removed=0 failed=0 orphan=0 turns_empty=true")
+            return
+        }
+
+        var removed = 0
+        var failed = 0
+
+        // 1. 遍历 turns，清除有 speechFileName 的语音
+        for turn in turns {
+            guard let fileName = turn.speechFileName else { continue }
+            vault.remove(name: fileName)
+            // remove 是 best-effort（吞了 throws），文件不存在也视为已清
+            if journal.clearSpeech(requestId: turn.requestId, matching: fileName) {
+                removed += 1
+            } else {
+                failed += 1
+            }
+        }
+
+        // 2. 扫描 vault 目录清 journal 已不引用的残留
+        var orphanCount = 0
+        let referencedNames = Set(turns.compactMap { $0.speechFileName })
+        let vaultDir = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask
+        )[0].appendingPathComponent("SpeechVault", isDirectory: true)
+        if let contents = try? FileManager.default.contentsOfDirectory(
+            at: vaultDir, includingPropertiesForKeys: nil
+        ) {
+            for url in contents {
+                let name = url.deletingPathExtension().lastPathComponent
+                guard url.pathExtension == "sealed", !referencedNames.contains(name) else { continue }
+                try? FileManager.default.removeItem(at: url)
+                orphanCount += 1
+            }
+        }
+
+        // 3. 汇总
+        if removed == 0, failed == 0 {
+            clearResultMessage = "没有可清除的语音"
+        } else if failed == 0 {
+            clearResultMessage = "已清除 \(removed) 条结果语音"
+        } else {
+            clearResultMessage = "\(removed) 条已清，\(failed) 条失败"
+        }
+        if orphanCount > 0 {
+            clearResultMessage! += "（另清理 \(orphanCount) 个残留文件）"
+        }
+
+        WatchLog.info(
+            "settings", "speech_vault_cleared",
+            detail: "removed=\(removed) failed=\(failed) orphan=\(orphanCount)"
+        )
     }
 
     // MARK: - 组件
