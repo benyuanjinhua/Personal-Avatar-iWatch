@@ -133,12 +133,15 @@ final class RealtimeResponseIdAndPlaybackTests: XCTestCase {
         ))
     }
 
-    func testDrainWithNoQueueEmitsEmptyEnded() {
+    func testDrainWithNoQueueEmitsNoReceipt() {
+        // ESS-404 G3: drain arriving before any delta must NOT produce a
+        // zero-byte `.ended`. The done-barrier layer covers the two legit
+        // outcomes (`-1` zero-audio contract → no receipt; delta never
+        // arrives → structured failure via `AvatarErrorPresenter`), so
+        // fabricating `.ended(bytesPlayed: 0)` here silently short-circuits
+        // both. Before ESS-404 this returned `EndedReceipt(nil, 0)`.
         var tracker = RealtimePlaybackReceiptTracker()
-        let ended = tracker.requestDrain()
-        XCTAssertEqual(ended, RealtimePlaybackReceiptTracker.EndedReceipt(
-            responseId: nil, bytesPlayed: 0
-        ))
+        XCTAssertNil(tracker.requestDrain())
     }
 
     func testIdentifiedDrainBeforeDeltaWaitsForRealPlayback() {

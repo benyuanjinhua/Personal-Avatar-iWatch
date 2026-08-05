@@ -317,10 +317,18 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             break
         case .audioDelta:
             if let chunk = envelope.audio {
-                adapter.ingestDownlink(chunk, responseId: envelope.responseId)
+                adapter.ingestDownlink(
+                    chunk,
+                    responseId: envelope.responseId,
+                    generation: envelope.generation
+                )
             }
         case .audioDone:
-            adapter.markDownlinkComplete(responseId: envelope.responseId)
+            adapter.markDownlinkComplete(
+                responseId: envelope.responseId,
+                generation: envelope.generation,
+                finalSequence: envelope.finalSequence
+            )
         case .playbackClear, .responseInterrupted:
             adapter.bargeIn()
         case .bridgeFallback:
@@ -329,6 +337,12 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             // Text-only events are handled by the transcript layer, not the
             // playback engine — leave them to `applyVoiceStatus` for now.
             break
+        case .generationOpen:
+            if let generation = envelope.generation {
+                adapter.openGeneration(generation)
+            }
+        case .bargeInFailed:
+            adapter.markBargeInFailed(reason: envelope.reason ?? "unspecified")
         }
     }
 

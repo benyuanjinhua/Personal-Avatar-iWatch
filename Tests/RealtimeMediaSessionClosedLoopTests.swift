@@ -229,6 +229,8 @@ final class RealtimeMediaSessionClosedLoopTests: XCTestCase {
             case .playbackStarted, .playbackEnded:
                 XCTFail("no playback receipt envelope expected on happy path")
             case .fallback: XCTFail("no fallback envelope expected on happy path")
+            case .bargeInRequest:
+                XCTFail("no barge-in request envelope expected on happy path")
             }
         }
     }

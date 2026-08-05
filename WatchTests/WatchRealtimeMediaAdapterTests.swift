@@ -79,6 +79,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         private(set) var playbackEndEvents: [(RealtimeMediaSession.TurnHandle, String, Int)] = []
         private(set) var fallbackEvents: [(RealtimeMediaSession.TurnHandle,
                                           RealtimeUplinkStream.FallbackReason)] = []
+        private(set) var bargeInRequests: [RealtimeBargeInRequest] = []
 
         func sendStreamStart(_ start: RealtimeStreamStart) { startEvents.append(start) }
         func sendAudioAppend(_ chunk: VoiceStreamChunk) { appendEvents.append(chunk) }
@@ -93,6 +94,9 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         func fallbackToCompleteFile(handle: RealtimeMediaSession.TurnHandle,
                                     reason: RealtimeUplinkStream.FallbackReason) {
             fallbackEvents.append((handle, reason))
+        }
+        func sendBargeInRequest(_ request: RealtimeBargeInRequest) {
+            bargeInRequests.append(request)
         }
     }
 
