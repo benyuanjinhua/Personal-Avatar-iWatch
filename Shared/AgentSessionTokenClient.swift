@@ -35,6 +35,19 @@ enum AgentSessionTokenError: Error, Equatable {
     case scopeMismatch
 }
 
+/// Hard memory bound while a turn waits for its ephemeral token.
+enum AgentTokenEnvelopeBufferBudget {
+    static let maxEnvelopeCount = 256
+    static let maxEncodedBytes = 2 * 1_024 * 1_024
+
+    static func allows(currentCount: Int, currentBytes: Int, addingBytes: Int) -> Bool {
+        currentCount >= 0 && currentBytes >= 0 && addingBytes >= 0
+            && currentCount < maxEnvelopeCount
+            && addingBytes <= maxEncodedBytes
+            && currentBytes <= maxEncodedBytes - addingBytes
+    }
+}
+
 /// Mints one short-lived, single-upgrade Gateway token for a realtime turn.
 /// The returned token is never persisted; callers retain it only until the
 /// WSS transport consumes it.
