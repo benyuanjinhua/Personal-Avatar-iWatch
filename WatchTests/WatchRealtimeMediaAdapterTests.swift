@@ -212,6 +212,66 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         XCTAssertEqual(transport.playbackEndEvents.first?.2, 2_048)
     }
 
+    func testAudioDoneKeepsSessionAliveForNextResponse() {
+        let requestId = "44444444-4444-4444-4444-444444444450"
+        let sessionId = "55555555-5555-5555-5555-555555555550"
+        let (adapter, _, player, transport, _) = makeAdapter(sessionIds: [sessionId])
+        let handle = adapter.beginTurn(requestId: requestId)
+
+        func chunk(sequence: Int, byte: UInt8) -> VoiceStreamChunk {
+            VoiceStreamChunk(
+                requestId: handle.requestId, streamId: handle.sessionId,
+                direction: .downlink, sequence: sequence, capturedAtMs: Int64(sequence + 1),
+                codec: "pcm_s16le", sampleRate: 24_000,
+                payload: Data(repeating: byte, count: 48)
+            )
+        }
+
+        adapter.ingestDownlink(chunk(sequence: 0, byte: 0x11), responseId: "resp-a")
+        adapter.markDownlinkComplete()
+        XCTAssertTrue(player.finished)
+        XCTAssertEqual(adapter.currentTurn, handle)
+
+        player.onPlaybackEvent?(.ended(
+            requestId: handle.requestId, sessionId: handle.sessionId,
+            responseId: "resp-a", bytesPlayed: 48
+        ))
+        adapter.ingestDownlink(chunk(sequence: 1, byte: 0x22), responseId: "resp-b")
+
+        XCTAssertEqual(player.enqueuedChunks.map(\.sequence), [0, 1])
+        XCTAssertEqual(transport.playbackEndEvents.map(\.1), ["resp-a"])
+        XCTAssertEqual(adapter.currentTurn, handle)
+    }
+
+    func testCancelAfterAudioDoneRejectsLateChunk() {
+        let requestId = "44444444-4444-4444-4444-444444444451"
+        let sessionId = "55555555-5555-5555-5555-555555555551"
+        var logs: [String] = []
+        let recorder = MockRecorder()
+        let player = MockPlayer()
+        let transport = MockTransport()
+        let session = RealtimeMediaSession(sessionIdFactory: { sessionId })
+        let adapter = WatchRealtimeMediaAdapter(
+            session: session, recorder: recorder, player: player, transport: transport,
+            logger: { logs.append($0) }
+        )
+        let handle = adapter.beginTurn(requestId: requestId)
+        adapter.markDownlinkComplete()
+        adapter.cancel()
+
+        let lateChunk = VoiceStreamChunk(
+            requestId: handle.requestId, streamId: handle.sessionId,
+            direction: .downlink, sequence: 0, capturedAtMs: 1,
+            codec: "pcm_s16le", sampleRate: 24_000,
+            payload: Data(repeating: 0x33, count: 48)
+        )
+        adapter.ingestDownlink(lateChunk, responseId: "resp-late")
+
+        XCTAssertTrue(player.enqueuedChunks.isEmpty)
+        XCTAssertNil(adapter.currentTurn)
+        XCTAssertTrue(logs.contains(where: { $0.contains("downlink_drop reason=staleSession") }))
+    }
+
     func testNewTurnBargesInAndPlayerClearsPriorPlayback() {
         let (adapter, recorder, player, _, _) = makeAdapter(sessionIds: [
             "55555555-5555-5555-5555-555555555555",

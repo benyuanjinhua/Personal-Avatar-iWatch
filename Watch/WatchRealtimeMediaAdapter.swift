@@ -125,7 +125,6 @@ final class WatchRealtimeMediaAdapter {
                         bytesPlayed: bytesPlayed
                     )
                 }
-                self.session.markDownlinkFinished()
             case .bargedIn, .failed:
                 break
             }
@@ -196,10 +195,14 @@ final class WatchRealtimeMediaAdapter {
         session.markDownlinkBridgeFallback()
     }
 
-    /// Bridge signalled `audio.done` for the current turn.
+    /// Bridge signalled `audio.done` for the current response.
+    ///
+    /// A realtime turn may contain more than one Agent response. Keep the
+    /// turn/session attached until an explicit cancel, interruption, or a new
+    /// turn replaces it; otherwise the next legal `audio.delta` is rejected
+    /// as a stale session before the player can enqueue it.
     func markDownlinkComplete() {
         player.finish()
-        session.finishTurn(reason: .audioDone)
     }
 
     private func handle(_ event: RealtimeMediaSession.Event) {
