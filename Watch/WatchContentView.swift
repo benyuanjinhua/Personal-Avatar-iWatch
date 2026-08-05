@@ -118,14 +118,11 @@ struct WatchContentView: View {
                         welcomeBanner
                     }
 
-                    // ESS-317：「再次对话」的上下文提示 —— ①屏球体旁显示「续：<上一轮问>」
                     if let reChatText = pushToTalk.reChatContextText {
                         Text(reChatText)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .font(.caption2.bold())
+                            .foregroundStyle(.blue)
                             .lineLimit(1)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 4)
                     }
 
                     // ESS-163：装机自检的过程/结果不再默认铺在首屏；

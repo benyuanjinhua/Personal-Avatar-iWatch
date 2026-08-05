@@ -121,6 +121,15 @@ final class PushToTalkController: ObservableObject {
                 detail: "count=\(staleIds.count) holds=[\(holdReasons)] scene_phase=\(phase)"
             )
         }
+        // ESS-317 历史对话留存：轮次被 trim 时同步清理关联的加密音频文件，
+        // 防止磁盘泄漏（超过最大保留数后旧轮次语音必须释放）。
+        journal.onTurnEvicted = { [weak self] turn in
+            if let fileName = turn.speechFileName {
+                self?.speechVault?.remove(name: fileName)
+                WatchLog.info("retention", "trim_evicted",
+                              detail: "request_id=\(turn.requestId) file=\(fileName)")
+            }
+        }
         speechVault = try? EncryptedAudioVault(directory: base.appendingPathComponent("SpeechVault", isDirectory: true))
         transport = WatchVoiceTransport(journal: journal)
         retryStore = RetryRecordingStore(
@@ -811,6 +820,12 @@ final class PushToTalkController: ObservableObject {
     func clearReChatContext() {
         pendingReChatContext = nil
         reChatContextText = nil
+    }
+
+    /// ESS-317 历史对话留存：前台时触发 24h 过期清理。
+    /// 调用 journal.evictExpiredAudio 清理超期轮次及关联加密音频。
+    func evictStaleAudio() {
+        journal.evictExpiredAudio(vault: speechVault)
     }
 
     /// 打开 App/回前台时呈现未读结果（ESS-55 流程图节点 C）：
