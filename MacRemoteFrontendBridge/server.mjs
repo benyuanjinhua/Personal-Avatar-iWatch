@@ -1258,7 +1258,10 @@ export function createBridge(overrides = {}) {
           return refuse(400, 'ERR_STREAM_OWNERSHIP')
         }
         return wss.handleUpgrade(req, socket, head, ws => {
-          const client = { ws, deviceId, requestId, sessionId, media: null, opened: false }
+          const client = {
+            ws, deviceId, requestId, sessionId, media: null, opened: false,
+            accepted: false, pendingResult: null, disconnected: false,
+          }
           mediaClients.add(client)
           const maxBuffered = CONFIG.realtime_media_max_buffered_bytes ?? 256 * 1024
           const sendDownstream = event => {
@@ -1273,6 +1276,53 @@ export function createBridge(overrides = {}) {
             ws.close(1008, String(code).slice(0, 123))
           }
           let chain = Promise.resolve()
+          const completeRealtimeTurn = result => {
+            if (!client.accepted) {
+              client.pendingResult = result
+              return
+            }
+            const turn = ledger.get(requestId)
+            if (!turn || ['completed', 'failed', 'cancelled'].includes(turn.state)) return
+            if (result.taskId) {
+              ledger.update(requestId, {
+                task_id: result.taskId,
+                path: 'background',
+                state: 'processing',
+                detail: 'background_accepted',
+              })
+              watcher.watch(requestId).catch(error => {
+                log({ evt: 'realtime_media_taskwatch_failed', request_id: requestId, err: String(error) })
+                if (!['completed', 'failed', 'cancelled'].includes(ledger.get(requestId)?.state)) {
+                  ledger.fail(requestId, 'ERR_PROCESSING_FAILED')
+                }
+              })
+              return
+            }
+            ledger.update(requestId, { path: 'direct' })
+            ledger.setResult(requestId, {
+              text: result.assistantTranscript || null,
+              extra: { source: 'realtime_media', response_id: result.responseId },
+            }, 'completed')
+          }
+          const acceptRealtimeTurn = () => {
+            if (client.accepted) return
+            const existing = ledger.get(requestId)
+            if (!existing) {
+              ledger.create({
+                requestId,
+                deviceId,
+                bodySha256: sha256hex(Buffer.from(`realtime:${sessionId}`)),
+                sessionId: supervisor.sessionId,
+              })
+              log({
+                evt: 'turn_accepted', request_id: requestId, device_id: deviceId,
+                transport: 'realtime_media', audio_frames: client.media?.nextInputSequence ?? 0,
+              })
+            }
+            ledger.update(requestId, { state: 'processing', detail: 'realtime_processing' })
+            client.accepted = true
+            if (client.pendingResult) completeRealtimeTurn(client.pendingResult)
+          }
           ws.on('message', raw => {
             chain = chain.then(async () => {
               let message
@@ -1288,6 +1338,11 @@ export function createBridge(overrides = {}) {
                   sendDownstream,
                   maxFrameBytes: CONFIG.realtime_media_max_frame_bytes ?? 64 * 1024,
                   log: item => log({ evt: 'realtime_media', device_id: deviceId, ...item }),
+                  onFirstAudio: ({ responseId, bytes }) => log({
+                    evt: 'voice_stream_first_chunk', request_id: requestId,
+                    response_id: responseId, bytes, source: 'realtime_media',
+                  }),
+                  onResponseComplete: completeRealtimeTurn,
                 })
                 await supervisor.openMediaSession({ label: requestId, onEvent: event => client.media?.handleAgentEvent(event) })
                 client.opened = true
@@ -1297,7 +1352,10 @@ export function createBridge(overrides = {}) {
               if (message.request_id && message.request_id !== requestId) throw Object.assign(new Error('request ownership mismatch'), { code: 'ERR_STREAM_OWNERSHIP' })
               if (message.session_id && message.session_id !== sessionId) throw Object.assign(new Error('session ownership mismatch'), { code: 'ERR_STREAM_OWNERSHIP' })
               if (message.type === 'audio.append') client.media.appendInput(message)
-              else if (message.type === 'audio.commit') client.media.endInput()
+              else if (message.type === 'audio.commit') {
+                client.media.endInput()
+                acceptRealtimeTurn()
+              }
               else if (message.type === 'playback.started') client.media.playbackStarted(message.response_id)
               else if (message.type === 'playback.ended') client.media.playbackEnded(message.response_id)
               else if (message.type === 'barge_in') client.media.bargeIn()
@@ -1305,14 +1363,19 @@ export function createBridge(overrides = {}) {
               else throw Object.assign(new Error('unknown media event'), { code: 'ERR_STREAM_PROTOCOL' })
             }).catch(fail)
           })
-          const cleanup = () => {
+          const cleanup = (reason, code = null) => {
+            if (client.disconnected) return
+            client.disconnected = true
             mediaClients.delete(client)
             client.media?.close('cancelled')
             supervisor.closeMediaSession(requestId, { cancel: client.opened })
-            log({ evt: 'realtime_media_disconnected', request_id: requestId, device_id: deviceId })
+            log({
+              evt: 'realtime_media_disconnected', request_id: requestId, device_id: deviceId,
+              reason, ...(code === null ? {} : { close_code: code }),
+            })
           }
-          ws.once('close', cleanup)
-          ws.once('error', cleanup)
+          ws.once('close', (code, reason) => cleanup(reason?.toString() || 'peer_closed', code))
+          ws.once('error', error => cleanup(`socket_error:${error.message}`))
         })
       }
       wss.handleUpgrade(req, socket, head, ws => {
