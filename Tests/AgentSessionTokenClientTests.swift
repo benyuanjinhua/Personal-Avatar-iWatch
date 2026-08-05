@@ -31,6 +31,20 @@ final class AgentSessionTokenClientTests: XCTestCase {
         super.tearDown()
     }
 
+    func testPendingEnvelopeBudgetBoundsCountAndBytes() {
+        XCTAssertTrue(AgentTokenEnvelopeBufferBudget.allows(
+            currentCount: 255, currentBytes: 1_000, addingBytes: 1_000
+        ))
+        XCTAssertFalse(AgentTokenEnvelopeBufferBudget.allows(
+            currentCount: 256, currentBytes: 0, addingBytes: 1
+        ))
+        XCTAssertFalse(AgentTokenEnvelopeBufferBudget.allows(
+            currentCount: 1,
+            currentBytes: AgentTokenEnvelopeBufferBudget.maxEncodedBytes,
+            addingBytes: 1
+        ))
+    }
+
     func testMintSignsExactBodyAndReturnsScopedToken() async throws {
         URLProtocolStub.handler = { request in
             XCTAssertEqual(request.url?.absoluteString, "https://gateway.example/v1/realtime/session-token")

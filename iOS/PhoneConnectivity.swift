@@ -37,6 +37,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     /// Envelopes are held only while the per-turn token request is in flight.
     /// A failed mint drains them through the legacy Bridge exactly once.
     private var pendingAgentEnvelopes: [RealtimeUplinkEnvelope] = []
+    private var pendingAgentEnvelopeBytes = 0
     private var agentTokenTask: Task<Void, Never>?
     private var agentTokenTurn: (requestId: String, sessionId: String)?
     private var agentTokenFailedTurn: (requestId: String, sessionId: String)?
@@ -251,9 +252,25 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
             agentEphemeralToken = nil
             agentTokenFailedTurn = nil
             pendingAgentEnvelopes.removeAll(keepingCapacity: false)
+            pendingAgentEnvelopeBytes = 0
             agentTokenTurn = identity
         }
+        let encodedBytes = (try? JSONEncoder().encode(envelope).count)
+            ?? AgentTokenEnvelopeBufferBudget.maxEncodedBytes
+        guard AgentTokenEnvelopeBufferBudget.allows(
+            currentCount: pendingAgentEnvelopes.count,
+            currentBytes: pendingAgentEnvelopeBytes,
+            addingBytes: encodedBytes
+        ) else {
+            agentTokenTask?.cancel()
+            agentTokenTask = nil
+            drainPendingAgentEnvelopesToBridge(
+                reason: "token_buffer_limit", additional: envelope
+            )
+            return
+        }
         pendingAgentEnvelopes.append(envelope)
+        pendingAgentEnvelopeBytes += encodedBytes
         guard agentTokenTask == nil else { return }
         agentTokenTask = Task { [weak self] in
             await self?.mintAgentTokenAndDrain(requestId: identity.requestId, sessionId: identity.sessionId)
@@ -288,18 +305,21 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         do {
             let issued = try await AgentSessionTokenClient(
                 gatewayURL: gatewayURL,
-                credentials: credentials
+                credentials: credentials,
+                session: Self.agentTokenURLSession()
             ).mint(requestId: requestId, sessionId: sessionId, generation: 1)
             guard agentTokenTurn?.requestId == requestId,
                   agentTokenTurn?.sessionId == sessionId else { return }
             agentEphemeralToken = issued.token
             let buffered = pendingAgentEnvelopes
             pendingAgentEnvelopes.removeAll(keepingCapacity: false)
+            pendingAgentEnvelopeBytes = 0
             Self.logger.info(
                 "agent ephemeral token minted request=\(requestId.prefix(8), privacy: .public) session=\(sessionId.prefix(8), privacy: .public) ttl_ms=\(issued.ttlMs, privacy: .public)"
             )
             for envelope in buffered { realtimeSession.forward(envelope) }
         } catch {
+            guard !Task.isCancelled else { return }
             Self.logger.error(
                 "agent token mint failed request=\(requestId.prefix(8), privacy: .public) error=\(String(describing: error), privacy: .public)"
             )
@@ -307,13 +327,25 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         }
     }
 
-    private func drainPendingAgentEnvelopesToBridge(reason: String) {
+    private func drainPendingAgentEnvelopesToBridge(
+        reason: String,
+        additional: RealtimeUplinkEnvelope? = nil
+    ) {
         agentEphemeralToken = nil
         agentTokenFailedTurn = agentTokenTurn
         let buffered = pendingAgentEnvelopes
         pendingAgentEnvelopes.removeAll(keepingCapacity: false)
+        pendingAgentEnvelopeBytes = 0
         Self.logger.notice("agent direct fallback reason=\(reason, privacy: .public)")
         for envelope in buffered { realtimeSession.forward(envelope) }
+        if let additional { realtimeSession.forward(additional) }
+    }
+
+    private static func agentTokenURLSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 5
+        configuration.timeoutIntervalForResource = 5
+        return URLSession(configuration: configuration)
     }
 
     /// Bridge → iPhone → Watch: enqueue a decoded downlink envelope onto the
@@ -364,7 +396,8 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
                         throw AgentSessionTokenError.invalidGatewayURL
                     }
                     let issued = try await AgentSessionTokenClient(
-                        gatewayURL: gatewayURL, credentials: credentials
+                        gatewayURL: gatewayURL, credentials: credentials,
+                        session: Self.agentTokenURLSession()
                     ).mint(requestId: requestId, sessionId: sessionId, generation: generation)
                     guard let freshConfig = agentFlag.resolveConfig(ephemeralToken: issued.token) else {
                         throw AgentSessionTokenError.invalidGatewayURL
