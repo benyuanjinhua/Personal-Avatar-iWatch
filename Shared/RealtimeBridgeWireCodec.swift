@@ -75,6 +75,12 @@ enum RealtimeBridgeWireCodec {
                 sessionId: descriptor.sessionId,
                 reason: descriptor.reason
             ))
+        case .bargeInRequest:
+            // ESS-404 §5: Watch → iPhone barge-in request is NOT bridged to
+            // WSS. iPhone owns the generation counter and issues `cancel(g)`
+            // on the WSS itself. Returning `nil` keeps this envelope in the
+            // iPhone-hop lane, exactly like `.fallback` is coordinator-local.
+            return nil
         }
     }
 
@@ -186,6 +192,7 @@ enum RealtimeBridgeWireCodec {
                 ?? Int64((raw["captured_at_ms"] as? Int) ?? 0)
             let endOfStream = (raw["end_of_stream"] as? Bool) ?? false
             let responseId = raw["response_id"] as? String
+            let generation = raw["generation"] as? Int
             let chunk = VoiceStreamChunk(
                 requestId: requestId, streamId: sessionId, direction: .downlink,
                 sequence: sequence, capturedAtMs: capturedAt > 0 ? capturedAt : 1,
@@ -194,6 +201,8 @@ enum RealtimeBridgeWireCodec {
             )
             // ESS-330: preserve Bridge's real response_id on the envelope so
             // the adapter can stamp playback receipts with it.
+            // ESS-404: forward `generation` when Gateway supplies it; nil
+            // triggers the legacy admit path in RealtimeDownlinkPlayback.
             return .envelope(RealtimeDownlinkEnvelope(
                 protocolVersion: RealtimeWireVersion.downlink,
                 kind: .audioDelta,
@@ -202,7 +211,8 @@ enum RealtimeBridgeWireCodec {
                 audio: chunk,
                 transcript: nil,
                 reason: nil,
-                responseId: responseId
+                responseId: responseId,
+                generation: generation
             ))
         case "transcript.delta":
             return .envelope(.transcriptDelta(
@@ -216,12 +226,16 @@ enum RealtimeBridgeWireCodec {
             ))
         case "audio.done":
             let responseId = raw["response_id"] as? String
+            let generation = raw["generation"] as? Int
+            let finalSequence = raw["final_sequence"] as? Int
             return .envelope(RealtimeDownlinkEnvelope(
                 protocolVersion: RealtimeWireVersion.downlink,
                 kind: .audioDone,
                 requestId: requestId, sessionId: sessionId,
                 sequence: nil, audio: nil, transcript: nil, reason: nil,
-                responseId: responseId
+                responseId: responseId,
+                generation: generation,
+                finalSequence: finalSequence
             ))
         case "playback.clear":
             return .envelope(.playbackClear(requestId: requestId, sessionId: sessionId))
@@ -234,6 +248,18 @@ enum RealtimeBridgeWireCodec {
             return .envelope(.bridgeFallback(
                 requestId: requestId, sessionId: sessionId,
                 reason: (raw["reason"] as? String) ?? "unspecified"
+            ))
+        case "generation.open":
+            guard let generation = raw["generation"] as? Int else { return .malformed }
+            return .envelope(.generationOpen(
+                requestId: requestId, sessionId: sessionId, generation: generation
+            ))
+        case "bargein.failed":
+            let fromGeneration = raw["generation"] as? Int ?? -1
+            let reason = (raw["reason"] as? String) ?? "unspecified"
+            return .envelope(.bargeInFailed(
+                requestId: requestId, sessionId: sessionId,
+                fromGeneration: fromGeneration, reason: reason
             ))
         default:
             return .unrecognised(type: type)

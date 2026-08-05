@@ -86,10 +86,23 @@ struct RealtimePlaybackReceiptTracker: Sendable {
     /// response. Emits `.ended` immediately if all queued buffers already
     /// completed; otherwise flips the drain flag so the next completion
     /// triggers `.ended` correctly.
+    ///
+    /// **ESS-404 G3 fix**: when `responseId` is nil AND no delta has ever
+    /// been queued (`order.last == nil`), this method previously returned a
+    /// zero-byte `.ended` receipt. That short-circuit forced `playback.ended`
+    /// with `bytes_played = 0` for the "done before any delta" race — the
+    /// exact silent-finish path the spec forbids. Post-fix: no receipt is
+    /// emitted; the done-barrier layer decides whether this is the legit
+    /// `-1` zero-audio case (no receipt expected) or a barrier timeout
+    /// (structured failure via `AvatarErrorPresenter`).
     mutating func requestDrain(responseId: String? = nil) -> EndedReceipt? {
         let requestedKey = responseId ?? order.last
         guard let key = requestedKey else {
-            return EndedReceipt(responseId: nil, bytesPlayed: 0)
+            // G3 core fix: no response known, no delta seen. Do NOT emit a
+            // zero-byte `.ended`. The receipt was semantically meaningless
+            // (nothing was played) and the barrier layer covers the real
+            // completion decision.
+            return nil
         }
         // WCSession does not guarantee that independently enqueued downlink
         // messages reach the Watch in the same order. If `audio.done` wins

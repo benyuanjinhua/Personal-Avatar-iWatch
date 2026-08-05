@@ -82,6 +82,17 @@ final class PhoneRealtimeSession {
             currentTransport?.close(reason: descriptor.reason)
             currentTransport = nil
             return
+        case .bargeInRequest:
+            // ESS-404 §5: Watch → iPhone barge-in ask. Real iPhone-side
+            // ownership (advance generation, issue `cancel(g)` on WSS,
+            // reply with `generation.open(g+1)`) lands with ESS-402.
+            // Until then the phone session simply logs the event so it
+            // shows up in the ESS-404 evidence trail; no WSS send.
+            guard let ask = envelope.bargeIn else { return }
+            Self.logger.info(
+                "realtime bargein.request request=\(ask.requestId, privacy: .public) from_gen=\(ask.fromGeneration, privacy: .public)"
+            )
+            return
         }
         guard let transport = currentTransport else { return }
         transport.send(envelope) { [weak self] error in
