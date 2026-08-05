@@ -227,17 +227,26 @@ struct RealtimeDownlinkPlayback: Sendable {
     /// from `.pending` or `.unset` to `.open(generation)`. Idempotent for
     /// the same generation.
     ///
-    /// **ESS-442 B2**: also handles `.open(g) → .open(g+1)` directly. The
-    /// wire path allows iPhone to advance the generation on its own (see
-    /// `Shared/RealtimeMediaWireFormat.swift:210` `generation.open` +
-    /// `Watch/WatchSettingsStore.swift:340` routing) — per ESS-403 the
-    /// iPhone owns the generation counter and does not require a Watch
-    /// `bargein.request` first. When the generation actually changes, the
-    /// sequence counters, emitted set, pending reorder buffer, and barrier
-    /// state ALL belong to the old generation and must be reset — otherwise
-    /// new-generation deltas (which restart at seq 0) would be dropped as
-    /// `.duplicate` against the old `emittedSequences`, silently losing an
-    /// entire generation of audio.
+    /// **ESS-442 B2**: also handles `.open(g) → .open(g+1)` directly. When
+    /// the generation actually changes, the sequence counters, emitted set,
+    /// pending reorder buffer, and barrier state ALL belong to the old
+    /// generation and must be reset — otherwise new-generation deltas
+    /// (which restart at seq 0) would be dropped as `.duplicate` against
+    /// the old `emittedSequences`, silently losing an entire generation of
+    /// audio.
+    ///
+    /// **Reachability today (main @ 89c87c8, verified by Jackson Bai in
+    /// ESS-442 thread 6ab9c363)**: unreachable, but only because the
+    /// SENDER is not yet implemented. The full wire receive-side exists
+    /// (`Shared/RealtimeMediaWireFormat.swift:210` enum,
+    /// `Shared/RealtimeBridgeWireCodec.swift:252-254` decoder,
+    /// `Watch/WatchSettingsStore.swift:340-343` unguarded route to
+    /// `adapter.openGeneration(_)`), and NO `generation.open` sender is
+    /// wired on the iPhone side yet — `iOS/PhoneRealtimeSession.swift:87`
+    /// notes ESS-402 is the ticket that will land it. So this is NOT
+    /// "contract forbids iPhone from self-advancing"; it is "the fuse is
+    /// set, we're planting the guard before ESS-402 lights it".
+    /// Auto-upgrades from defensive to P0 the moment a sender lands.
     @discardableResult
     mutating func openGeneration(_ generation: Int) -> Outcome {
         if case .open(let existing) = generationState, existing == generation {
