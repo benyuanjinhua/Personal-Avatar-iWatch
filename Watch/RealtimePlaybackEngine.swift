@@ -1,25 +1,6 @@
 import AVFoundation
 import Foundation
 
-/// Turn-scoped guard around the process-wide AVAudioSession. `prepare()` runs
-/// while recording still owns an active session; `AudioRecorder.finish()`
-/// deactivates it before the first downlink arrives. The gate therefore starts
-/// closed for every turn and opens exactly when the first playable chunk is
-/// ready. Failed activation remains retryable on the next chunk.
-struct RealtimePlaybackAudioSessionGate {
-    private(set) var isActivated = false
-
-    mutating func activate(using operation: () throws -> Void) throws {
-        guard !isActivated else { return }
-        try operation()
-        isActivated = true
-    }
-
-    mutating func reset() {
-        isActivated = false
-    }
-}
-
 /// ESS-321 real playback engine for streamed `audio.delta` chunks.
 ///
 /// The bridge/agent delivers 24 kHz mono PCM16 chunks. Rather than wait for
@@ -66,9 +47,6 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
     private let audioEngine: AVAudioEngine
     private let playerNode: AVAudioPlayerNode
     private let format: AVAudioFormat
-    private let activateAudioSession: () throws -> Void
-    private let deactivateAudioSession: () throws -> Void
-    private var audioSessionGate = RealtimePlaybackAudioSessionGate()
 
     private(set) var currentTurn: RealtimeMediaSession.TurnHandle?
     private(set) var isRunning = false
@@ -82,18 +60,7 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
     /// into `playback.started` / `playback.ended` on the wire.
     var onPlaybackEvent: ((PlaybackEvent) -> Void)?
 
-    init(
-        format: RealtimeMediaFormat = .downlinkPCM16,
-        audioEngine: AVAudioEngine = AVAudioEngine(),
-        activateAudioSession: @escaping () throws -> Void = {
-            try AVAudioSession.sharedInstance().setActive(true)
-        },
-        deactivateAudioSession: @escaping () throws -> Void = {
-            try AVAudioSession.sharedInstance().setActive(
-                false, options: .notifyOthersOnDeactivation
-            )
-        }
-    ) {
+    init(format: RealtimeMediaFormat = .downlinkPCM16, audioEngine: AVAudioEngine = AVAudioEngine()) {
         guard let audioFormat = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
             sampleRate: Double(format.sampleRate),
@@ -106,8 +73,6 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         }
         self.format = audioFormat
         self.audioEngine = audioEngine
-        self.activateAudioSession = activateAudioSession
-        self.deactivateAudioSession = deactivateAudioSession
         self.playerNode = AVAudioPlayerNode()
         audioEngine.attach(playerNode)
         audioEngine.connect(playerNode, to: audioEngine.mainMixerNode, format: audioFormat)
@@ -117,7 +82,6 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         stop(barge: false)
         currentTurn = turn
         tracker.reset()
-        audioSessionGate.reset()
         if !isRunning {
             audioEngine.prepare()
             try audioEngine.start()
@@ -128,50 +92,9 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
 
     func enqueue(playables: [RealtimeDownlinkPlayback.PlayableChunk]) {
         guard let turn = currentTurn else { return }
-        let accepted = playables.filter {
-            $0.chunk.requestId == turn.requestId && $0.chunk.streamId == turn.sessionId
-        }
-        guard !accepted.isEmpty else { return }
-
-        if !audioSessionGate.isActivated {
-            WatchLog.info(
-                "realtime", "playback_session_activation_requested",
-                requestId: turn.requestId,
-                detail: "chunks=\(accepted.count)"
-            )
-            do {
-                try audioSessionGate.activate(using: activateAudioSession)
-                // The player node may have been paused by the recording session's
-                // deactivation even though AVAudioEngine still reports running.
-                if !playerNode.isPlaying { playerNode.play() }
-                let route = AVAudioSession.sharedInstance().currentRoute.outputs
-                    .map { "\($0.portType.rawValue)(\($0.portName))" }
-                    .joined(separator: ",")
-                WatchLog.info(
-                    "realtime", "playback_session_activated",
-                    requestId: turn.requestId,
-                    detail: "route=\(route.isEmpty ? "none" : route)"
-                )
-            } catch {
-                WatchLog.error(
-                    "realtime", "playback_session_activation_failed",
-                    requestId: turn.requestId, detail: error.localizedDescription,
-                    code: "ERR_REALTIME_PLAYBACK_SESSION"
-                )
-                onPlaybackEvent?(.failed(
-                    requestId: turn.requestId, sessionId: turn.sessionId,
-                    responseId: accepted.first?.responseId,
-                    code: "ERR_REALTIME_PLAYBACK_SESSION"
-                ))
-                return
-            }
-        } else if !playerNode.isPlaying {
-            // The player node may have been paused by the recording session's
-            // deactivation even though AVAudioEngine still reports running.
-            playerNode.play()
-        }
-
-        for playable in accepted {
+        for playable in playables where
+            playable.chunk.requestId == turn.requestId &&
+            playable.chunk.streamId == turn.sessionId {
             guard let pcmBuffer = buffer(for: playable.chunk.payload) else { continue }
             let payloadBytes = playable.chunk.payload.count
             let responseId = playable.responseId
@@ -231,23 +154,12 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         }
         currentTurn = nil
         tracker.reset()
-        audioSessionGate.reset()
     }
 
     func shutdown() {
         playerNode.stop()
         audioEngine.stop()
         audioEngine.detach(playerNode)
-        do {
-            try deactivateAudioSession()
-        } catch {
-            WatchLog.error(
-                "realtime", "playback_session_release_failed",
-                detail: error.localizedDescription,
-                code: "ERR_REALTIME_PLAYBACK_SESSION_RELEASE"
-            )
-        }
-        audioSessionGate.reset()
         isRunning = false
     }
 
