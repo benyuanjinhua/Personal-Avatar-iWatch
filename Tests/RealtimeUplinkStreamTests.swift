@@ -72,6 +72,15 @@ final class RealtimeUplinkStreamTests: XCTestCase {
         }
     }
 
+    func testCommitWithoutAudioFallsBackInsteadOfSendingEmptyBuffer() {
+        var stream = makeStream()
+        _ = stream.start(capturedAtMs: 100)
+
+        XCTAssertEqual(stream.commit(capturedAtMs: 200), .fallback(.noAudioFrames))
+        XCTAssertTrue(stream.didFallback)
+        XCTAssertFalse(stream.didCommit)
+    }
+
     func testAppendBeforeStartFallsBack() {
         var stream = makeStream()
         let payload = Data(repeating: 0x11, count: 64)

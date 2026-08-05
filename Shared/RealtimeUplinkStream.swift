@@ -21,6 +21,10 @@ struct RealtimeUplinkStream: Sendable {
         case transportFailed
         case backpressure
         case sequenceOverflow
+        /// The microphone tap started but produced no PCM before commit.
+        /// Committing an empty upstream buffer is guaranteed to fail, so use
+        /// the retained complete-file recording instead of silently ending.
+        case noAudioFrames
         case invalidPayload(VoiceStreamValidationError)
     }
 
@@ -125,6 +129,7 @@ struct RealtimeUplinkStream: Sendable {
         guard !didFallback else { return .ignoredAfterFallback }
         guard didStart else { return trigger(fallback: .cancelled) }
         guard !didCommit else { return .emitted([]) }
+        guard nextSequence > 0 else { return trigger(fallback: .noAudioFrames) }
         didCommit = true
         return .emitted([.audioCommit(RealtimeStreamCommit(
             requestId: requestId,
