@@ -79,7 +79,7 @@ final class PushToTalkController: ObservableObject {
     /// ESS-383: set when the streaming path aborted before `submit()` could consume
     /// `streamRequestId`. When true, `submit()` still uses `streamRequestId` but
     /// routes through the complete-file path instead of `adapter.commit()`.
-    private var streamAborted = false (fix(ESS-383): keep streamRequestId alive through streaming abort for unified request_id)
+    private var streamAborted = false
     /// ESS-321 real-time adapter. Lazily created on first press when the
     /// streaming gate is on. Wiring lives in `ensureRealtimeAdapter()`.
     private(set) var realtimeAdapter: WatchRealtimeMediaAdapter?
@@ -410,7 +410,7 @@ final class PushToTalkController: ObservableObject {
         streamRequestId = streaming ? UUIDv7.generate() : nil
         streamId = streaming ? UUID() : nil
         streamSequence = 0
-        streamAborted = false (fix(ESS-383): keep streamRequestId alive through streaming abort for unified request_id)
+        streamAborted = false
         WatchHaptics.play(.recordingStarted)
         Task {
             do {
@@ -487,7 +487,7 @@ final class PushToTalkController: ObservableObject {
     /// sees the same UUID on both paths. Only `streamId` and `streamSequence`
     /// are reset; `streamAborted` signals `submit()` to skip `adapter.commit()`.
     private func clearStreamStateAfterAbort() {
-        streamAborted = true (fix(ESS-383): keep streamRequestId alive through streaming abort for unified request_id)
+        streamAborted = true
         streamId = nil
         streamSequence = 0
     }
@@ -531,7 +531,16 @@ final class PushToTalkController: ObservableObject {
             submit(recording: recording)
         } catch {
             errorMessage = Self.recordingErrorDescription(error)
-            presentAvatarError(code: "ERR_RECORDER_FINISH", requestId: nil)
+            // ESS-375: recordingNeverStarted 走 ERR_AUDIO_TOO_SHORT cue
+            // （与 too-short guard 统一），让手表看到可行动中文提示而非
+            // 通用"录音器错误"卡片。
+            let code: String
+            if case RecorderError.recordingNeverStarted = error {
+                code = "ERR_AUDIO_TOO_SHORT"
+            } else {
+                code = "ERR_RECORDER_FINISH"
+            }
+            presentAvatarError(code: code, requestId: nil)
         }
     }
 
@@ -566,7 +575,7 @@ final class PushToTalkController: ObservableObject {
                 recording: recording, requestId: requestIdStr, reason: deferredReason
             )
         } else if !streamAborted,
-                  let adapter = realtimeAdapter, (fix(ESS-383): keep streamRequestId alive through streaming abort for unified request_id)
+                  let adapter = realtimeAdapter,
                   adapter.currentTurn?.requestId == requestIdStr {
             // ESS-321: streaming path is live. Retain the m4a so a fast-channel
             // failure can invoke the single-shot fallback with the real body;
@@ -585,7 +594,7 @@ final class PushToTalkController: ObservableObject {
         WatchHaptics.play(.requestSubmitted)
         streamRequestId = nil
         streamId = nil
-        streamAborted = false (fix(ESS-383): keep streamRequestId alive through streaming abort for unified request_id)
+        streamAborted = false
     }
 
     private func emitUplinkChunk(payload: Data, end: Bool) {
@@ -877,4 +886,32 @@ final class PushToTalkController: ObservableObject {
             subtitleSession = SubtitleSession(requestId: requestId, text: text, hasAudio: false)
         }
     }
+
+    // MARK: - ESS-317 F2.4 再次对话
+
+    /// 从历史对话中发起新一轮对话，携带上一轮的问+答作为上下文。
+    /// Q1=a 口径（白梦林拍板）：只传上一轮的问 + 答文本，不传整条链、不建服务端会话。
+    ///
+    /// Bridge 侧需支持 `parent_request_id` 透传上下文（对应 F2.4 跨目录改动，
+    /// 落点归毕玄）。客户端侧此处只存储上下文并进入录音。
+    func continueConversation(from turn: VoiceTurnRecord) {
+        continuationContext = ContinuationContext(
+            parentRequestId: turn.requestId,
+            contextText: turn.result?.displaySummary ?? ""
+        )
+        WatchLog.info("history", "continue_conversation",
+                      detail: "parent_request_id=\(turn.requestId)")
+        // 跳转到 main screen 并进入录音状态由 WatchContentView 的
+        // selectedTab=0 + pressBegan 完成；这里只存上下文。
+        pressBegan()
+    }
+
+    /// ESS-317 再次对话的上下文（Q1=a：只传上一轮问+答文本）。
+    struct ContinuationContext {
+        let parentRequestId: String
+        let contextText: String
+    }
+
+    /// 当前续聊上下文，供提交语音请求时附加 `parent_request_id`。
+    private(set) var continuationContext: ContinuationContext?
 }

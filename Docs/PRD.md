@@ -1,7 +1,7 @@
 # Jackson Avatar 产品需求文档
 
-> 状态：MVP 已完成；iPhone Relay 网络改造待实现  
-> 更新日期：2026-07-30  
+> 状态：MVP 已完成；iPhone Relay 网络改造待实现
+> 更新日期：2026-08-05
 > 适用端：Apple Watch + iPhone Companion App
 
 ## 01 / WHY：为什么必须经过 iPhone
@@ -218,4 +218,35 @@ Watch 只表达用户意图；iPhone Relay 发出网络请求；Gateway 负责�
 - [ ] Endpoint 和 Token 改为只存 iPhone，不再同步到 Watch。
 - [ ] 增加 Tailscale/Gateway 健康检查和明确错误码。
 - [ ] 增加请求幂等、异步状态回传及音频文件回传。
+
+## 11 / ESS-388：Audio Realtime Agent 直连（v_final，2026-08-05）
+
+白梦林批准 Mac Bridge 退出 realtime 媒体面，只保留控制、日志汇聚和旧链路回退。实时媒体链路固定为 `Watch ⇄ iPhone ⇄ Audio Realtime Agent Gateway`，验收锚点是缩短链路、提升双工流式稳定/性能、提升 chunk 保序稳定性。
+
+### 终态决策
+
+1. iPhone 是设备侧唯一 WSS owner，Gateway 是服务端唯一媒体 owner；事件绑定 `request_id/session_id/response_id/generation/sequence`，done 必带 `final_sequence`。
+2. Gateway 独立 token API 校验逐设备凭据，签发最长 90 秒、绑定单设备/请求/session/generation/单次握手的 token；token 只驻 iPhone 内存，provider key 只在服务端。Mac Bridge 停止不得影响 token 签发。
+3. iOS lifecycle 与主链同 PR：`scenePhase → PhoneConnectivity → lifecycleInterrupted`；活跃 turn 仅用 `beginBackgroundTask` 短时排空，expiration 明确 cancel 和单次 fail-closed 回退。BGTaskScheduler 不用于维持 WSS。
+4. `playback.started` 只由首个真实输出样本的 render 证据产生，enqueue/schedule 返回不算；`playback.ended` 只在 done barrier 已到且末样本由 stop/data-played-back callback 消费完成后产生，收到 done 不算。
+5. 真机收口日志字段固定为 `playback_render_started(outputHostTime=...)` 与 `playback_stop_callback_fired(sampleCount=...)`。
+6. MVP barge-in 仅由按键触发，不启用 VAD。iPhone 同步生成 `generation+1`，同一串行 WSS 必须先完成旧 response cancel 的 send，再发送新 `stream.start` 和首个 mic 帧；旧 generation 晚帧一律丢弃。
+7. 轨道 B 的 PCM16 采集、WCSession envelope、上行分帧/backpressure、下行首包播放/reorder/去重、AVAudioPlayerNode 与真实播放回执全部复用。替换范围仅为 Bridge URL/HMAC/codec/relay；新增 Agent codec、token、generation gate 和生命周期接线。
+8. 旧 Bridge 完整文件链路保留一个版本窗口，iPhone 单点 feature flag 按 turn 选路；direct 已产生 `response.started` 后不得再执行旧链路。
+9. WCSession 三态（reachable / temporarily unreachable / background-resume）真机基准是 GA 前置，不阻断编码开工。必须记录每态样本量、窗口、丢帧/重复/乱序、TTFT 与 lifecycle 日志；未完成不得宣称 GA。
+10. 直连新增失败态必须映射结构化 error code、文字/语音 cue 与正确 recovery family；Gateway 故障文案不得再引导用户检查 Mac。done barrier 期间维持 thinking，超时不得静默结束。
+
+### 关键事件序
+
+`token.issue → ws.open → generation.open → stream.start → audio.append(seq)* → audio.commit → response.started → audio.delta(seq)* → audio.done(final_sequence) → playback_render_started → playback_stop_callback_fired`
+
+Gateway 仅在 `0...final_sequence` 齐全后释放 done；重复 sequence 幂等丢弃，gap 超时只触发一次逐回合回退。barge-in 序为本地停播/清 buffer → iPhone generation+1 → 旧 response cancel send 完成 → 新 start → 新首帧。
+
+### GA 验收
+
+- 连续 10 轮无 done-before-delta、重复播放或跨 generation/request 串线。
+- 播放×录音双向、录音×结果到达并发冒烟按 R-02.2 通过。
+- scenePhase、background expiration、断网恢复均有明确事件且无双执行。
+- 停止 Mac Bridge 后 token 和 realtime 主链可用；旧链回退另验。
+- 合入前 Swift、Watch 模拟器与 Gateway 测试全绿；合入 main 后按 R-02.5 用真机 WatchLog 收口。
 - [ ] 增加断连、锁屏、Tailscale 关闭和重复请求真机测试。
