@@ -305,6 +305,26 @@ final class VoiceTurnJournal: ObservableObject {
         return true
     }
 
+    /// ESS-319 ③屏「清除历史语音」：把所有回合的 `speechFileName` 置空，返回受影响条数。
+    ///
+    /// **只清语音引用，保留回合本身**——②屏的历史列表（问题、答案文本、每步
+    /// 处理日志）不受影响。白梦林要的是「清除历史语音」，不是「清空历史」；
+    /// 把整条回合删掉会让他连自己问过什么都查不到。
+    ///
+    /// 调用方负责删除 vault 里的密文文件；先删文件还是先清引用都可以——
+    /// 引用还在而文件已删，播放时走 `ERR_VAULT_LOAD` 分支（已有处理），
+    /// 不会崩。
+    @discardableResult
+    func clearAllSpeech() -> Int {
+        var cleared = 0
+        for index in turns.indices where turns[index].speechFileName != nil {
+            turns[index].speechFileName = nil
+            cleared += 1
+        }
+        if cleared > 0 { save() }
+        return cleared
+    }
+
     func clear() {
         turns = []
         try? fileManager.removeItem(at: fileURL)

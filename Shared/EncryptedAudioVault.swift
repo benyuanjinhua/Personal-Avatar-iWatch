@@ -58,6 +58,22 @@ final class EncryptedAudioVault {
         try? fileManager.removeItem(at: fileURL(for: name))
     }
 
+    /// ESS-319 ③屏「清除历史语音」：删除仓内全部密文，返回实际删除的条数。
+    ///
+    /// 按扩展名过滤而不是无差别清目录——目录由本类独占，但一旦将来有人
+    /// 往里放别的东西（临时文件、索引），无差别删除会连带清掉，
+    /// 而这个入口是用户手动触发的，误删没有第二次机会。
+    @discardableResult
+    func removeAll() -> Int {
+        guard let names = try? fileManager.contentsOfDirectory(atPath: directory.path) else { return 0 }
+        var removed = 0
+        for name in names where (name as NSString).pathExtension == "sealed" {
+            let url = directory.appendingPathComponent(name)
+            if (try? fileManager.removeItem(at: url)) != nil { removed += 1 }
+        }
+        return removed
+    }
+
     private func fileURL(for name: String) -> URL {
         directory.appendingPathComponent(name).appendingPathExtension("sealed")
     }

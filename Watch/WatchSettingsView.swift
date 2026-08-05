@@ -21,12 +21,24 @@ struct WatchSettingsView: View {
     @ObservedObject var debugSettings: WatchDebugSettings
     /// ESS-307：iPhone 下行队列积压计数。
     @ObservedObject var settings: WatchSettingsStore
+    /// ESS-319「清除历史语音」：清空语音引用的落点。
+    @ObservedObject var journal: VoiceTurnJournal
+    /// ESS-319「清除历史语音」：删除密文文件的落点。可为 nil（仓初始化失败），
+    /// 此时入口置灰而不是假装成功——ESS-342 的教训：不留「点了不生效」的控件。
+    let speechVault: EncryptedAudioVault?
+
+    /// 二次确认：清除不可撤销，watchOS 上误触概率高。
+    @State private var showClearSpeechConfirm = false
+    /// 清除结果回执，给用户一个「确实做了」的确认。
+    @State private var clearSpeechResult: String?
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 downlinkBacklogSection
+                channelSection
                 streamingSection
+                clearSpeechSection
                 selfCheckSection
                 buildSection
                 logsHintSection
@@ -35,6 +47,116 @@ struct WatchSettingsView: View {
             .padding(.vertical, 4)
         }
         .navigationTitle("设置")
+    }
+
+    // MARK: - 通道（ESS-242 ③屏）
+
+    /// ESS-242 冻结设计：「③屏的通道切换依赖 ESS-172（直连）。若它起不来，
+    /// ③先只落「经 iPhone」单选 + 灰掉直连，不要自己去实现直连。」
+    ///
+    /// 复核 2026-08-05：`Shared/` `Watch/` 全仓无直连实现（`grep directConnect|
+    /// transportMode|DirectBridge` 无命中），ESS-172 仍 blocked。因此本节按
+    /// 冻结设计落「单选 + 灰掉」，**不做假开关**。
+    private var channelSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            sectionHeader("通道")
+
+            channelRow(
+                title: "经 iPhone",
+                detail: "Watch → iPhone → Mac Bridge，当前唯一通路",
+                selected: true,
+                enabled: true
+            )
+            channelRow(
+                title: "直连 Bridge",
+                detail: "需办公网 WiFi；直连能力未实现（ESS-172）",
+                selected: false,
+                enabled: false
+            )
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(9)
+        .background(Color.blue.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func channelRow(title: String, detail: String, selected: Bool, enabled: Bool) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: selected ? "largecircle.fill.circle" : "circle")
+                .font(.system(size: 12))
+                .foregroundStyle(enabled ? (selected ? Color.blue : Color.secondary) : Color.secondary.opacity(0.4))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.caption2)
+                    .foregroundStyle(enabled ? .primary : .secondary)
+                Text(detail)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .opacity(enabled ? 1 : 0.55)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // MARK: - 清除历史语音（ESS-242 Q2 拍板项）
+
+    /// 白梦林 2026-08-04 拍板：「Q2 的『清除历史语音』入口保留。」
+    ///
+    /// 只清语音，不清回合——②屏的问答文本与处理日志全部保留。
+    /// 删除顺序：先删密文文件，再清 journal 引用；反过来若中途失败会留下
+    /// 「引用没了但文件还在」的孤儿密文，用户以为清干净了其实没有。
+    private var clearSpeechSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            sectionHeader("历史语音")
+
+            Text("保留最近 24 小时 / 10 轮（取先到者），到期自动清理。")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Button(role: .destructive) {
+                showClearSpeechConfirm = true
+            } label: {
+                Text(speechVault == nil ? "清除历史语音（不可用）" : "立即清除历史语音")
+                    .font(.caption2)
+                    .frame(maxWidth: .infinity)
+            }
+            .disabled(speechVault == nil)
+
+            if let clearSpeechResult {
+                Text(clearSpeechResult)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+
+            Text("只删语音，历史对话的文字与处理日志保留。")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(9)
+        .background(Color.red.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
+        .confirmationDialog(
+            "清除全部历史语音？",
+            isPresented: $showClearSpeechConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("清除", role: .destructive) { performClearSpeech() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("语音删除后无法恢复；历史对话的文字会保留。")
+        }
+    }
+
+    private func performClearSpeech() {
+        let files = speechVault?.removeAll() ?? 0
+        let refs = journal.clearAllSpeech()
+        clearSpeechResult = "已清除 \(files) 条语音"
+        WatchLog.info(
+            "settings", "history_speech_cleared",
+            detail: "files=\(files) journal_refs=\(refs)"
+        )
     }
 
     // MARK: - 下行队列积压（ESS-307）
