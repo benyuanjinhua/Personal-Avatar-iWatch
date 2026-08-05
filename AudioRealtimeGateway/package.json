@@ -1,0 +1,17 @@
+{
+  "name": "audio-realtime-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Audio Realtime Agent Gateway — secure WSS entry for iPhone/Watch direct realtime audio (ESS-403).",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test test/token-issuer.test.mjs test/realtime-session.test.mjs test/cancel-generation.test.mjs test/heartbeat-rate-limit.test.mjs test/structured-logs.test.mjs test/wss-e2e.test.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.21.1"
+  }
+}
