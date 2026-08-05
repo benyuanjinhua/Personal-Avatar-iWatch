@@ -28,6 +28,48 @@ final class VoiceRelayWireTests: XCTestCase {
         }
     }
 
+    // MARK: - ESS-358 流式能力协商
+
+    func testStreamingCapabilityEncodedWhenRequested() throws {
+        let upload = VoiceTurnUpload(envelope: makeEnvelope(), audioData: audio, streamingRequested: true)
+        XCTAssertNotNil(upload.streaming, "streamingRequested=true 时 streaming 必须非 nil")
+        XCTAssertEqual(upload.streaming?.requested, true)
+        XCTAssertEqual(upload.streaming?.protocolVersions, [2])
+        XCTAssertEqual(upload.streaming?.capabilities, ["voice_stream_downlink_v2"])
+
+        let json = String(data: try JSONEncoder().encode(upload), encoding: .utf8)!
+        XCTAssertTrue(json.contains("\"streaming\""), "streaming 键必须存在于 JSON 中")
+        XCTAssertTrue(json.contains("\"requested\":true"), "streaming.requested 必须为 true")
+        XCTAssertTrue(json.contains("\"protocol_versions\":[2]"), "protocol_versions 必须为 [2]")
+        XCTAssertTrue(json.contains("\"capabilities\":[\"voice_stream_downlink_v2\"]"), "capabilities 必须声明 voice_stream_downlink_v2")
+    }
+
+    func testStreamingCapabilityOmittedWhenNotRequested() throws {
+        let upload = VoiceTurnUpload(envelope: makeEnvelope(), audioData: audio, streamingRequested: false)
+        XCTAssertNil(upload.streaming, "streamingRequested=false 时 streaming 必须为 nil")
+
+        let json = String(data: try JSONEncoder().encode(upload), encoding: .utf8)!
+        XCTAssertFalse(json.contains("\"streaming\""), "streaming 键不得存在于 JSON 中（旧链路不受影响）")
+    }
+
+    func testStreamingCapabilityDefaultsToOmitted() throws {
+        let upload = VoiceTurnUpload(envelope: makeEnvelope(), audioData: audio)
+        XCTAssertNil(upload.streaming, "默认 streamingRequested=false 时 streaming 必须为 nil")
+
+        let json = String(data: try JSONEncoder().encode(upload), encoding: .utf8)!
+        XCTAssertFalse(json.contains("\"streaming\""), "默认不请求时 streaming 键不得存在")
+    }
+
+    func testStreamingCapabilityRoundTrip() throws {
+        let cap = VoiceStreamingCapability.requested
+        let data = try JSONEncoder().encode(cap)
+        let decoded = try JSONDecoder().decode(VoiceStreamingCapability.self, from: data)
+        XCTAssertEqual(decoded, cap)
+        XCTAssertEqual(decoded.requested, true)
+        XCTAssertEqual(decoded.protocolVersions, [2])
+        XCTAssertEqual(decoded.capabilities, ["voice_stream_downlink_v2"])
+    }
+
     func testCanonicalStringLayout() {
         let canonical = RelayWire.canonicalString(
             deviceId: "dev-123", method: "POST", path: "/v1/voice/turns",

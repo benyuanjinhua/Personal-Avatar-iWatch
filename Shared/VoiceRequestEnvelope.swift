@@ -30,6 +30,9 @@ struct VoiceRequestEnvelope: Codable, Equatable {
     let type: String
     let createdAt: Date
     let audio: VoiceAudioDescriptor
+    /// ESS-358：客户端调试流式开关状态，随每回合信封装载；
+    /// nil 时旧链路行为不变（上游向后兼容）。
+    let streamingRequested: Bool?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
@@ -37,19 +40,22 @@ struct VoiceRequestEnvelope: Codable, Equatable {
         case type
         case createdAt = "created_at"
         case audio
+        case streamingRequested = "streaming_requested"
     }
 
     static func voiceRequest(
         requestId: UUID = UUIDv7.generate(),
         createdAt: Date = Date(),
-        audio: VoiceAudioDescriptor
+        audio: VoiceAudioDescriptor,
+        streamingRequested: Bool? = nil
     ) -> VoiceRequestEnvelope {
         VoiceRequestEnvelope(
             protocolVersion: currentProtocolVersion,
             requestId: requestId.uuidString.lowercased(),
             type: voiceRequestType,
             createdAt: createdAt,
-            audio: audio
+            audio: audio,
+            streamingRequested: streamingRequested
         )
     }
 
