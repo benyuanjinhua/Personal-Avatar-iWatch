@@ -27,9 +27,21 @@ protocol WatchFeedbackChannel: AnyObject {
     /// Watch 端匹配后进探针分支——不入 vault、不入 journal、播完回 probe_ack。
     @discardableResult
     func transferProbe(fileURL: URL, envelope: VoiceStatusEnvelope) -> Bool
-    /// ESS-324 B2/B4：转发 Bridge WSS downlink stream chunk 到 Watch。
-    /// 走 `sendMessageData` 即时通道（reachable-only、best-effort，不排队）；
-    /// 不可达 / 非 downlink / 编码失败时返回 false，调用方走整段 m4a 降级。
+    /// ESS-324 B2/B4：下行 stream chunk → Watch。reachable 时走 `sendMessageData`
+    /// 快路径（best-effort，无送达确认）；不可达/编码失败时返回 false，
+    /// 由实现方（`PhoneConnectivity`）经 `relay.handleStreamChunkDeliveryFailed`
+    /// 补偿降级信号（ESS-351）。
+    ///
+    /// ESS-349：B2（#125）与 B4（#121）各自独立声明过这个方法，签名不一致——
+    /// B4 返回 `Void`，B2 返回 `Bool`。统一取 `Bool`。
+    ///
+    /// **返回值语义**：`true` = `sendMessageData` 已提交至 WCSession 发送队列，
+    /// **不等于 chunk 已送达 Watch**。`WCSession.sendMessageData` 的失败经由
+    /// 异步 `errorHandler` 回调抵达，此时函数早已返回。
+    ///
+    /// 调用方不得将 `true` 等同于「已投递成功」；异步失败时由实现方
+    /// （`PhoneConnectivity`）经 `relay.handleStreamChunkDeliveryFailed`
+    /// 补偿降级信号（ESS-351）。
     @discardableResult
     func forwardStreamChunkToWatch(_ chunk: VoiceStreamChunk) -> Bool
 }
@@ -84,6 +96,11 @@ final class WristAgentPhoneRelay: ObservableObject {
     /// Absorbing per-turn failure set: a stream failure never retries chunks;
     /// the already-persisted complete m4a path remains the single fallback.
     private var failedUplinkStreams: Set<String> = []
+    /// ESS-351：下行流式分片投递失败集合。`forwardStreamChunkToWatch` 的
+    /// `sendMessageData` errorHandler 触发或同步返回 false 时写入；
+    /// `process(projection:)` 据此确保该 `request_id` 的整段 m4a 走
+    /// `WatchDownlinkOutbox` 降级，绝不自建重试/对账链路。
+    private var failedDownlinkStreams: Set<String> = []
 
     private static let bridgeURLKey = "wristagent.relay.bridge_url"
     /// 连续失败到该次数时提醒用户打开 App（后台网络受限时人工兜底）。
@@ -213,6 +230,18 @@ final class WristAgentPhoneRelay: ObservableObject {
                 self.relayLog("上行流失败，保留完整包降级 request_id=\(chunk.requestId)")
             }
         }
+    }
+
+    /// ESS-351：下行流式分片投递失败回调。
+    /// `PhoneConnectivity.forwardStreamChunkToWatch` 的 `sendMessageData`
+    /// errorHandler 触发或同步守卫返回 false 时调用。将 `request_id` 写入
+    /// `failedDownlinkStreams`，`process(projection:)` 据此确保整段 m4a
+    /// 经 `WatchDownlinkOutbox` 降级——绝不另建重试/对账链路。
+    func handleStreamChunkDeliveryFailed(requestId: String) {
+        guard failedDownlinkStreams.insert(requestId).inserted else { return }
+        Self.downlinkLogger.error(
+            "voice.stream.chunk delivery failed, marking for m4a fallback request_id=\(requestId, privacy: .public)"
+        )
     }
 
     /// 结果音频 transferFile 完成后删除本地临时文件（成功交付即删，§8）。
@@ -484,8 +513,10 @@ final class WristAgentPhoneRelay: ObservableObject {
     // MARK: - ESS-324 B2 流式下行分片处理
 
     /// Bridge → iPhone → Watch 下行流式分片转发。
-    /// 校验 sha256 后经 WCSession sendMessageData 快路径投递；
-    /// 不可达或 payload 超阈值时返回 false，调用方走整段 m4a 降级。
+    /// 校验 sha256 后经 WCSession sendMessageData 快路径投递（best-effort）；
+    /// 同步守卫失败（不可达/超阈值）或异步 `errorHandler` 触发时，
+    /// 经 `handleStreamChunkDeliveryFailed` 将 `request_id` 标记为需要
+    /// 整段 m4a 降级（ESS-351）。
     private func process(streamChunk chunk: VoiceStreamChunk) {
         let computed = VoiceStreamChunk.sha256(chunk.payload)
         guard computed == chunk.payloadSha256.lowercased() else {
@@ -497,9 +528,11 @@ final class WristAgentPhoneRelay: ObservableObject {
         let sent = watchChannel?.forwardStreamChunkToWatch(chunk) ?? false
         if sent {
             Self.downlinkLogger.info(
-                "voice.stream.chunk forwarded request_id=\(chunk.requestId, privacy: .public) seq=\(chunk.sequence) bytes=\(chunk.payload.count)"
+                "voice.stream.chunk submitted request_id=\(chunk.requestId, privacy: .public) seq=\(chunk.sequence) bytes=\(chunk.payload.count)"
             )
         } else {
+            // ESS-351：同步守卫失败——立即标记降级，不等异步 errorHandler。
+            handleStreamChunkDeliveryFailed(requestId: chunk.requestId)
             Self.downlinkLogger.info(
                 "voice.stream.chunk fallback request_id=\(chunk.requestId, privacy: .public) seq=\(chunk.sequence) reason=watch_unreachable_or_oversize"
             )
@@ -535,6 +568,13 @@ final class WristAgentPhoneRelay: ObservableObject {
         ))
         relayStatus = "已回传结果 \(projection.requestId.prefix(8))…"
         deliverResultAudio(projection: projection)
+        // ESS-351：下行流式分片曾失败——记录可检索的降级事件，确认整段 m4a
+        // 已走 WatchDownlinkOutbox 降级。事件含 request_id 供 bridge.log 回溯。
+        if failedDownlinkStreams.remove(projection.requestId) != nil {
+            Self.downlinkLogger.error(
+                "voice.stream.chunk fallback to full m4a request_id=\(projection.requestId, privacy: .public) status=completed"
+            )
+        }
     }
 
     // MARK: - 结果语音下行（ESS-38）
