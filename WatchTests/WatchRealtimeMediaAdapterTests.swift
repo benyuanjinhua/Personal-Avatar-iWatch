@@ -181,6 +181,20 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         XCTAssertEqual(counter.invocations.first?.0.requestId, requestId)
     }
 
+    func testZeroPCMFramesFallsBackToCompleteFileOnCommit() {
+        let requestId = "44444444-4444-4444-4444-444444444444"
+        let (adapter, _, _, transport, counter) = makeAdapter(sessionIds: [
+            "55555555-5555-5555-5555-555555555555"
+        ])
+        _ = adapter.beginTurn(requestId: requestId)
+
+        adapter.commit()
+
+        XCTAssertTrue(transport.commitEvents.isEmpty)
+        XCTAssertEqual(transport.fallbackEvents.map(\.1), [.noAudioFrames])
+        XCTAssertEqual(counter.invocations.map(\.1), [.noAudioFrames])
+    }
+
     func testAdapterStampsRealBridgeResponseIdOnReceipts() {
         // ESS-330: two responses arrive within the same session; playback
         // receipts must echo the actual response_id observed on delta, not
