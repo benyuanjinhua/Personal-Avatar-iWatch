@@ -168,4 +168,106 @@ final class BridgeTurnProjectionTests: XCTestCase {
         XCTAssertEqual(envelope.permission?.id, "perm_1")
         XCTAssertEqual(envelope.permission?.target, "允许修改 README.md？")
     }
+
+    // MARK: - ESS-336 / ESS-324 B3: 新增覆盖（只追加，不改动上方既有用例）
+
+    // ESS-336：progress.kind 非法值必须判为 invalid，不得静默当成有效进度
+    func testProgressRejectsInvalidKind() {
+        let json = """
+        {"type":"turn.progress","progress":{
+          "kind":"bad","request_id":"\(requestId)","sequence":1,
+          "text":"bad","occurred_at":"2026-08-04T10:00:00.000Z"
+        }}
+        """
+        let progress = BridgeEventMessage.decode(from: Data(json.utf8))?.progress
+        XCTAssertNotNil(progress)
+        XCTAssertFalse(progress?.isValid ?? true)
+    }
+
+    // ESS-336：failed 回合的 errorCode 访问器（envelope 之外的直读路径）
+    func testFailedTurnExposesErrorCode() throws {
+        let turn = try XCTUnwrap(projection(
+            status: "failed",
+            detail: "background_processing",
+            extra: """
+            "error":"ERR_VOICE_BUSY"
+            """
+        ))
+        XCTAssertEqual(turn.status, "failed")
+        XCTAssertEqual(turn.errorCode, "ERR_VOICE_BUSY")
+        XCTAssertEqual(turn.turnState, .failed)
+    }
+
+    // ESS-336：cancelled 回合不得携带 errorCode
+    func testCancelledTurnState() throws {
+        let turn = try XCTUnwrap(projection(status: "cancelled"))
+        XCTAssertEqual(turn.turnState, .cancelled)
+        XCTAssertNil(turn.errorCode)
+    }
+
+    func testDecodesVoiceStreamChunkDownlink() throws {
+        let payload = Data(repeating: 0xAB, count: 240)
+        let sha = VoiceStreamChunk.sha256(payload)
+        let json = """
+        {"type":"voice.stream.chunk","chunk":{
+            "protocol_version":2,
+            "request_id":"\(requestId)",
+            "stream_id":"019fcd76-0000-7000-8000-000000000001",
+            "direction":"downlink",
+            "sequence":0,
+            "captured_at_ms":1722786540000,
+            "codec":"pcm_s16le",
+            "sample_rate":24000,
+            "payload":"\(payload.base64EncodedString())",
+            "payload_sha256":"\(sha)",
+            "end_of_stream":false
+        }}
+        """
+        let message = try XCTUnwrap(BridgeEventMessage.decode(from: Data(json.utf8)))
+        XCTAssertEqual(message.type, "voice.stream.chunk")
+        let chunk = try XCTUnwrap(message.chunk)
+        XCTAssertEqual(chunk.protocolVersion, 2)
+        XCTAssertEqual(chunk.requestId, requestId)
+        XCTAssertEqual(chunk.direction, .downlink)
+        XCTAssertEqual(chunk.sequence, 0)
+        XCTAssertEqual(chunk.codec, "pcm_s16le")
+        XCTAssertEqual(chunk.sampleRate, 24000)
+        XCTAssertEqual(chunk.payload, payload)
+        XCTAssertEqual(chunk.payloadSha256.lowercased(), sha.lowercased())
+        XCTAssertFalse(chunk.endOfStream)
+    }
+
+    func testDecodesVoiceStreamChunkEndOfStream() throws {
+        let payload = Data([0x00, 0x00])
+        let sha = VoiceStreamChunk.sha256(payload)
+        let json = """
+        {"type":"voice.stream.chunk","chunk":{
+            "protocol_version":2,
+            "request_id":"\(requestId)",
+            "stream_id":"019fcd76-0000-7000-8000-000000000002",
+            "direction":"downlink",
+            "sequence":42,
+            "captured_at_ms":1722786541000,
+            "codec":"pcm_s16le",
+            "sample_rate":24000,
+            "payload":"\(payload.base64EncodedString())",
+            "payload_sha256":"\(sha)",
+            "end_of_stream":true
+        }}
+        """
+        let message = try XCTUnwrap(BridgeEventMessage.decode(from: Data(json.utf8)))
+        let chunk = try XCTUnwrap(message.chunk)
+        XCTAssertEqual(chunk.sequence, 42)
+        XCTAssertTrue(chunk.endOfStream)
+    }
+
+    func testNonStreamEventHasNilChunk() throws {
+        let json = """
+        {"type":"turn.state","turn":{"request_id":"\(requestId)","status":"accepted"}}
+        """
+        let message = try XCTUnwrap(BridgeEventMessage.decode(from: Data(json.utf8)))
+        XCTAssertEqual(message.type, "turn.state")
+        XCTAssertNotNil(message.turn)
+        XCTAssertNil(message.chunk, "非流式事件 chunk 应为 nil")
+    }
 }

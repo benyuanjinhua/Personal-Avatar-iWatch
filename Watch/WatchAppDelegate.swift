@@ -16,6 +16,10 @@ final class WatchAppServices {
     /// ESS-280 Debug 灰度：只在 Watch 本机生效，与 `settings`（会同步给
     /// iPhone 的用户配置）严格分开，避免最终用户被开发者态污染。
     let debugSettings = WatchDebugSettings()
+    /// ESS-349 接缝：B4 的下行 chunk 接收器。`WatchSettingsStore.streamReceiver`
+    /// 是 weak，服务图必须自己持有强引用，否则 `didReceiveMessageData` 解出
+    /// chunk 时接收器已经被释放，链路静默断在最后一跳。
+    private(set) var streamReceiver: WatchStreamReceiver?
     private var bootstrapped = false
 
     /// 幂等接线 + WCSession 激活；前台启动与后台唤醒共用。
@@ -33,6 +37,16 @@ final class WatchAppServices {
         // dispatch has somewhere to send `audio.delta` payloads even before
         // the first press has fired.
         settings.realtimeAdapter = pushToTalk.ensureRealtimeAdapter()
+        // ESS-349 接缝：接上 B4 接收器。降级只记事件——整段 m4a 走的是
+        // transferSpeech 可靠通道，与 chunk 流并行，不依赖这里回信。
+        let receiver = WatchStreamReceiver(debugSettings: debugSettings) { requestId, reason in
+            WatchLog.info(
+                "stream_downlink", "stream_fallback",
+                requestId: requestId, detail: "\(reason)"
+            )
+        }
+        streamReceiver = receiver
+        settings.streamReceiver = receiver
         settings.activate()
         WatchLog.info("lifecycle", "services_bootstrapped", detail: reason)
     }
