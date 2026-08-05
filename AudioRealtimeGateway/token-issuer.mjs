@@ -124,7 +124,10 @@ export class TokenIssuer {
     const entry = this.tokens.get(sha)
     if (!entry) throw new IssuerError(ISSUER_ERR.TOKEN_INVALID, 'unknown')
     if (entry.consumed) {
-      this.log('token_rejected', { jti: entry.jti, reason: 'consumed' })
+      this.log('token_rejected', {
+        jti: entry.jti, reason: 'consumed',
+        request_id: entry.scope.request_id, session_id: entry.scope.session_id,
+      })
       throw new IssuerError(ISSUER_ERR.TOKEN_CONSUMED)
     }
     const now = this.now()
@@ -136,7 +139,7 @@ export class TokenIssuer {
       if (entry.scope[field] !== presentedScope[field]) {
         this.log('token_rejected', {
           jti: entry.jti, reason: 'scope_mismatch', field,
-          request_id: entry.scope.request_id,
+          request_id: entry.scope.request_id, session_id: entry.scope.session_id,
         })
         throw new IssuerError(ISSUER_ERR.TOKEN_INVALID, 'scope')
       }

@@ -83,6 +83,7 @@ export function createGateway(overrides = {}) {
       log('ws_upgrade_rejected', {
         code: error.code ?? 'ERR_TOKEN_INVALID',
         request_id: presentedScope.request_id || null,
+        session_id: presentedScope.session_id || null,
       })
       return refuseUpgrade(socket, error.status ?? 401, error.code ?? 'ERR_TOKEN_INVALID')
     }
