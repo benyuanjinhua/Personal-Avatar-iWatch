@@ -125,7 +125,11 @@ final class WatchRealtimeMediaAdapter {
                         bytesPlayed: bytesPlayed
                     )
                 }
-                self.session.finishTurn(reason: .audioDone)
+                // A playback `.ended` event closes only this response. One
+                // realtime session may carry multiple responses, so ending
+                // the downlink here would reject the next response's chunks
+                // as `.sessionEnded`. Explicit cancel, interruption, or the
+                // next turn remains responsible for closing/replacing it.
             case .bargedIn, .failed:
                 break
             }
