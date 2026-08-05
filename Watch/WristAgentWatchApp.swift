@@ -15,7 +15,8 @@ struct WristAgentWatchApp: App {
                 pushToTalk: services.pushToTalk,
                 welcome: services.welcome,
                 selfCheck: services.selfCheck,
-                debugSettings: services.debugSettings
+                debugSettings: services.debugSettings,
+                settings: services.settings
             )
                 .task {
                     // ESS-56：版本号在本工程恒为 0.1.0/1，分不出新旧安装——R3 就是
