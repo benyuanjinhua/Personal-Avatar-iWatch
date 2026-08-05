@@ -102,4 +102,21 @@ describe('turn reconstruction', () => {
     const serialised = JSON.stringify(records)
     assert.ok(!serialised.includes(issued.token), 'raw token must not appear in any log')
   })
+
+  it('a consumed-token replay logs token_rejected with request_id + session_id', () => {
+    const records = []
+    const log = (evt, extra = {}) => records.push({ evt, ...extra })
+    const issuer = new TokenIssuer({ log, now: () => 1_000_000 })
+    const issued = issuer.issue({
+      protocol_version: 1, device_id: 'jackson-iphone',
+      session_id: 's-1', request_id: 'r-1', generation: 1, ttl_ms: 30_000,
+    }, { authDeviceId: 'jackson-iphone' })
+    issuer.consume(issued.token, issued.scope)
+    assert.throws(() => issuer.consume(issued.token, issued.scope), /ERR_TOKEN_CONSUMED/)
+    const rejected = records.find(r => r.evt === 'token_rejected' && r.reason === 'consumed')
+    assert.ok(rejected, 'expected token_rejected(reason=consumed)')
+    assert.equal(rejected.request_id, 'r-1')
+    assert.equal(rejected.session_id, 's-1')
+    assert.ok(rejected.jti, 'token_rejected must keep jti')
+  })
 })

@@ -159,12 +159,30 @@ describe('Gateway end-to-end', () => {
     await new Promise((resolve, reject) => { first.once('open', resolve); first.once('error', reject) })
     first.close()
     await new Promise(resolve => first.once('close', resolve))
-    const second = upgrade()
-    const status = await new Promise(resolve => {
-      second.on('unexpected-response', (_, response) => resolve(response.statusCode))
-      second.on('error', () => resolve(null))
-    })
+    const captured = collectLogs()
+    let status
+    try {
+      const second = upgrade()
+      status = await new Promise(resolve => {
+        second.on('unexpected-response', (_, response) => resolve(response.statusCode))
+        second.on('error', () => resolve(null))
+      })
+    } finally {
+      captured.restore()
+    }
     assert.equal(status, 401, 'replay of a consumed token must be rejected')
+    // ESS-427: rejection logs must carry request_id + session_id so a
+    // session-scoped grep reconstructs the failed turn (smoke S9f).
+    const rejected = captured.lines.find(l => l.evt === 'token_rejected' && l.reason === 'consumed')
+    assert.ok(rejected, 'expected a token_rejected(reason=consumed) log')
+    assert.equal(rejected.request_id, body.request_id)
+    assert.equal(rejected.session_id, body.session_id)
+    assert.ok(rejected.jti, 'token_rejected must keep jti')
+    const upgradeRejected = captured.lines.find(l => l.evt === 'ws_upgrade_rejected')
+    assert.ok(upgradeRejected, 'expected a ws_upgrade_rejected log')
+    assert.equal(upgradeRejected.code, 'ERR_TOKEN_CONSUMED')
+    assert.equal(upgradeRejected.request_id, body.request_id)
+    assert.equal(upgradeRejected.session_id, body.session_id)
   })
 
   it('rejects a WSS upgrade whose URL scope disagrees with the token', async () => {
