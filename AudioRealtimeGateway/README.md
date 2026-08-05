@@ -241,8 +241,8 @@ Grepping a single `request_id` yields the whole turn:
 |---|---|---|
 | `port` | `8444` | TLS bind port |
 | `bind` | `127.0.0.1` | Bind address |
-| `tls_cert` / `tls_key` | `./certs/gateway.crt` / `.key` | PEM paths |
-| `state_dir` | `./state` | Device registrations + nonce store |
+| `tls_cert` / `tls_key` | `./certs/gateway.crt` / `.key` | PEM paths, resolved against the module directory (see below) |
+| `state_dir` | `./state` | Device registrations + nonce store, resolved against the module directory |
 | `allowed_peer_ips` | `[]` | Extra allowlist entries (Tailnet CIDRs) |
 | `dev_allow_plain_ws` | `false` | Only for local integration |
 | `max_token_ttl_ms` | `90000` | ESS-388 A1 ceiling |
@@ -254,6 +254,13 @@ Grepping a single `request_id` yields the whole turn:
 | `max_uplink_bytes_per_second` | `524288` | 512 KiB/s uplink cap |
 | `agent_transport` | `mock` | `mock` for tests; production loader is out of scope of ESS-403 (see ESS-401 integration). |
 | `provider_key_env` | `AUDIO_REALTIME_PROVIDER_KEY` | Env var to read the provider key from; not read from config file. |
+
+Relative paths in `tls_cert` / `tls_key` / `state_dir` are all resolved
+against the **module directory** (`AudioRealtimeGateway/`, i.e. the directory
+containing `server.mjs`), never against `process.cwd()`. Launching the server
+from any working directory — e.g. `node /abs/path/AudioRealtimeGateway/server.mjs`
+under launchd / systemd / a deploy script — behaves identically to `npm start`
+(ESS-428). Absolute paths in `config.json` are honored as-is.
 
 ## Deployment (quickstart)
 
