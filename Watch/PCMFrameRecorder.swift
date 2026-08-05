@@ -52,6 +52,37 @@ final class PCMFrameRecorder: WatchRealtimeMediaAdapter.Recorder {
         configuration.format.bytes(forMilliseconds: configuration.frameDurationMs)
     }
 
+    /// ESS-362: `installTap(onBus:bufferSize:format:)` throws an uncatchable
+    /// Objective-C exception when the input format is invalid — most commonly
+    /// when the shared `AVAudioSession` hasn't been configured for
+    /// `.playAndRecord`. `inputNode.outputFormat` then reports a 0-channel /
+    /// 0-Hz format, `bufferSize` computes to 0, and the ObjC precondition
+    /// terminates the app before any Swift `throw`/`catch` can save it. This
+    /// helper converts the invalid state into a real Swift error the adapter
+    /// can catch and fall back on. The check is deliberately conservative
+    /// (channels + sample rate + non-zero buffer size) — every failure mode we
+    /// observed on device passes at least one of the three.
+    static func inputFormatValidationError(
+        format: AVAudioFormat, bufferSize: AVAudioFrameCount
+    ) -> Error? {
+        if format.channelCount == 0 {
+            return NSError(domain: "PCMFrameRecorder", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "Input node reports 0 channels — audio session not configured for recording"
+            ])
+        }
+        if format.sampleRate <= 0 {
+            return NSError(domain: "PCMFrameRecorder", code: 3, userInfo: [
+                NSLocalizedDescriptionKey: "Input node reports invalid sample rate \(format.sampleRate)"
+            ])
+        }
+        if bufferSize == 0 {
+            return NSError(domain: "PCMFrameRecorder", code: 4, userInfo: [
+                NSLocalizedDescriptionKey: "Computed tap buffer size is 0"
+            ])
+        }
+        return nil
+    }
+
     func start() throws {
         guard !isRunning else { return }
         let inputNode = audioEngine.inputNode
@@ -66,9 +97,12 @@ final class PCMFrameRecorder: WatchRealtimeMediaAdapter.Recorder {
                 NSLocalizedDescriptionKey: "Unable to build target format"
             ])
         }
+        let bufferSize = AVAudioFrameCount(inputFormat.sampleRate / 10) // ~100 ms
+        if let error = Self.inputFormatValidationError(format: inputFormat, bufferSize: bufferSize) {
+            throw error
+        }
         converter = AVAudioConverter(from: inputFormat, to: targetFormat)
 
-        let bufferSize = AVAudioFrameCount(inputFormat.sampleRate / 10) // ~100 ms
         inputNode.installTap(onBus: tapBus, bufferSize: bufferSize, format: inputFormat) { [weak self] buffer, _ in
             Task { @MainActor in self?.consume(buffer: buffer, targetFormat: targetFormat) }
         }

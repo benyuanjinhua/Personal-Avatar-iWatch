@@ -88,6 +88,9 @@ final class VoiceTurnJournal: ObservableObject {
     private let maximumCount: Int
     private let fileManager = FileManager.default
     private let onStorageFailure: ((String) -> Void)?
+    private static let logger = Logger(
+        subsystem: "com.benyuan.wristagent.shared", category: "VoiceTurnJournal"
+    )
 
     init(directory: URL, maximumCount: Int = 20, onStorageFailure: ((String) -> Void)? = nil) {
         self.maximumCount = maximumCount
@@ -98,7 +101,15 @@ final class VoiceTurnJournal: ObservableObject {
             let data = try? Data(contentsOf: fileURL),
             let saved = try? VoiceProtocolJSON.decoder.decode([VoiceTurnRecord].self, from: data)
         {
-            turns = saved
+            // ESS-363：冷启动时清理超期活跃回合（跨进程重启存活的陈旧 hold），
+            // 防止其反复触发 session_start_requested 并导致非 active 时 start() 崩溃。
+            let (cleaned, staleIds) = Self.cleanupStaleTurns(saved)
+            turns = cleaned
+            if !staleIds.isEmpty {
+                DispatchQueue.main.async { [staleIds] in
+                    self.onStaleTurnsCleaned?(staleIds, "cold_start")
+                }
+            }
         } else {
             turns = []
         }
@@ -222,6 +233,9 @@ final class VoiceTurnJournal: ObservableObject {
     /// completed 信封被状态机拒绝时不会触发（幂等第一层；通知记账是第二层）。
     var onResultRecorded: ((String) -> Void)?
     var onResultAudioDegraded: ((String, String) -> Void)?
+    /// ESS-363：冷启动时清理了超期活跃回合；参数为被清理的 request_id 列表 +
+    /// 清理时的 scene_phase。供 Watch 层落冷启动可观测事件。
+    var onStaleTurnsCleaned: (([String], String) -> Void)?
 
     @discardableResult
     func recordAudioDegradation(requestId: String, errorCode: String) -> Bool {
@@ -320,6 +334,34 @@ final class VoiceTurnJournal: ObservableObject {
         save()
         onStateApplied?(requestId, state)
         return true
+    }
+
+    /// ESS-363：冷启动时清理超期活跃回合（阈值 10 分钟）。
+    /// 跨进程重启存活的陈旧 hold 会在每次启动时被重新加载为 isActive 回合，
+    /// 导致 RuntimeSessionPolicy 反复输出 turn_active hold → 非 active 时
+    /// start() 崩溃。这里将其推进到 .cancelled 终态，同时回调供 Watch 层
+    /// 落可观测日志（含被清理的 request_id 列表 + 当前 scene_phase）。
+    /// 静态方法，因为 init 时必须完成清理才能给 turns 赋值。
+    /// 返回 (cleanedTurns, staleIds)。
+    private static func cleanupStaleTurns(_ loaded: [VoiceTurnRecord]) -> ([VoiceTurnRecord], [String]) {
+        let staleThreshold: TimeInterval = 600 // 10 min
+        let now = Date()
+        var cleaned = loaded
+        var staleIds: [String] = []
+        for i in cleaned.indices where cleaned[i].isActive {
+            if now.timeIntervalSince(cleaned[i].createdAt) > staleThreshold {
+                cleaned[i].events.append(
+                    VoiceTurnEvent(state: .cancelled, at: now, detail: "stale_turn_cleaned_on_cold_start")
+                )
+                staleIds.append(cleaned[i].requestId)
+            }
+        }
+        if !staleIds.isEmpty {
+            logger.info(
+                "ESS-363 cleaned \(staleIds.count) stale active turns on cold start (threshold > \(Int(staleThreshold))s): \(staleIds.joined(separator: ","))"
+            )
+        }
+        return (cleaned, staleIds)
     }
 
     private func trimAndSave() {

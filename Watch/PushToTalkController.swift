@@ -99,6 +99,14 @@ final class PushToTalkController: ObservableObject {
                 WatchLog.error("journal", "persist_failed", detail: detail)
             }
         )
+        // ESS-363：冷启动时清理超期活跃回合的观测日志（诊断上次是否异常退出）。
+        journal.onStaleTurnsCleaned = { [weak self] staleIds, phase in
+            let holdReasons = staleIds.map { "turn_active:\($0)" }.joined(separator: ",")
+            WatchLog.info(
+                "lifecycle", "stale_turns_cleaned",
+                detail: "count=\(staleIds.count) holds=[\(holdReasons)] scene_phase=\(phase)"
+            )
+        }
         speechVault = try? EncryptedAudioVault(directory: base.appendingPathComponent("SpeechVault", isDirectory: true))
         transport = WatchVoiceTransport(journal: journal)
         retryStore = RetryRecordingStore(
@@ -393,10 +401,6 @@ final class PushToTalkController: ObservableObject {
         streamRequestId = streaming ? UUIDv7.generate() : nil
         streamId = streaming ? UUID() : nil
         streamSequence = 0
-        if streaming, let requestId = streamRequestId {
-            let adapter = ensureRealtimeAdapter()
-            _ = adapter.beginTurn(requestId: requestId.uuidString.lowercased())
-        }
         WatchHaptics.play(.recordingStarted)
         Task {
             do {
@@ -406,7 +410,20 @@ final class PushToTalkController: ObservableObject {
                 guard state == .recording else {
                     WatchLog.info("recorder", "late_start_cancelled", detail: "state=\(String(describing: state))")
                     recorder.cancel()
+                    clearStreamStateAfterAbort()
                     return
+                }
+                // ESS-362: bring up the realtime PCM tap only AFTER
+                // `AudioRecorder.start()` has configured `.playAndRecord` and
+                // the mic permission has been granted. Calling
+                // `adapter.beginTurn()` synchronously in `pressBegan()` (the
+                // old ordering) reached `PCMFrameRecorder.start()` while the
+                // shared session was still in `.soloAmbient` — `installTap`
+                // on the invalid input format then threw an uncatchable
+                // Objective-C exception and terminated the app on the very
+                // first press, so we never even logged `record_started`.
+                if streaming, let requestId = streamRequestId {
+                    startRealtimeTurnIfPossible(requestId: requestId)
                 }
                 if releaseRequestedWhileStarting {
                     WatchLog.info("recorder", "deferred_release_applied")
@@ -414,12 +431,54 @@ final class PushToTalkController: ObservableObject {
                 }
             } catch {
                 state = .idle
+                clearStreamStateAfterAbort()
                 errorMessage = Self.recordingErrorDescription(error)
                 // ESS-180：录音启动失败也是一次「秒失败」，走分身卡片 + 触觉，
                 // 不让手表只有底部一行灰字，然后就没了。
                 presentAvatarError(code: "ERR_RECORDER_START", requestId: nil)
             }
         }
+    }
+
+    /// ESS-362: stand up the realtime coordinator turn once the audio session
+    /// is safely `.playAndRecord`. Any failure (invalid input format, engine
+    /// start refused, etc.) is downgraded to a clean fallback: we cancel the
+    /// half-brought-up adapter turn, clear the stream identifiers so
+    /// `submit(recording:)` takes the reliable full-file branch, and the m4a
+    /// we're already recording still goes out. Nothing here is allowed to
+    /// throw — the goal is "no crash, no silent half-configured stream,
+    /// always deliverable."
+    private func startRealtimeTurnIfPossible(requestId: UUID) {
+        let adapter = ensureRealtimeAdapter()
+        let requestIdString = requestId.uuidString.lowercased()
+        _ = adapter.beginTurn(requestId: requestIdString)
+        // The adapter catches its own recorder/player errors internally and
+        // marks the uplink transport-failed — that trips
+        // `didTriggerCompleteFileFallback` before `beginTurn` returns. If it
+        // ever does, we're now in a half-alive state (a currentTurn that
+        // won't produce frames); cancel it and fall back to the reliable
+        // upload path for this turn.
+        if adapter.didTriggerCompleteFileFallback {
+            WatchLog.error(
+                "realtime", "adapter_start_fell_back",
+                requestId: requestIdString,
+                detail: "reason=recorder_or_player_failed",
+                code: "ERR_REALTIME_START"
+            )
+            adapter.cancel(reason: .fallback)
+            pendingFallbackReason.removeValue(forKey: requestIdString)
+            clearStreamStateAfterAbort()
+        }
+    }
+
+    /// ESS-362: reset the streaming identifiers after any streaming start
+    /// abort. `submit(recording:)` keys off `streamRequestId != nil` to decide
+    /// between the realtime commit branch and the reliable full-file branch;
+    /// leaving stale ids around would strand the turn on a dead adapter.
+    private func clearStreamStateAfterAbort() {
+        streamRequestId = nil
+        streamId = nil
+        streamSequence = 0
     }
 
     func pressEnded() {
