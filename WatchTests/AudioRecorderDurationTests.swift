@@ -76,6 +76,11 @@ final class AudioRecorderDurationTests: XCTestCase {
         } catch RecorderError.cannotCreateRecorder {
             // 模拟器 headless 限制：起录失败。start() 里 recordingStartUptime 未落，
             // 走 cancel 分支验证 sanitize 逻辑不至于把未初始化状态放大成天文数字。
+        } catch RecorderError.sessionActivationFailed {
+            // ESS-360：首跑 xcodebuild 时宿主欢迎语可能仍占着共享 AVAudioSession，
+            // 录音尝试序列（resetRoutePolicy → minimal）全部失败，抛此错误。
+            // 走 cancel 分支验证不会误报成天文数字——与 cannotCreateRecorder
+            // 同路径、不同根因；分开捕获便于取证时区分。
         }
 
         if captured {
@@ -190,6 +195,9 @@ final class AudioRecorderDurationTests: XCTestCase {
         } catch RecorderError.cannotCreateRecorder {
             recorder.cancel()
             throw XCTSkip("当前环境无法真实采集（headless 模拟器），本用例真机跑 G9")
+        } catch RecorderError.sessionActivationFailed {
+            recorder.cancel()
+            throw XCTSkip("当前环境音频会话被占用（首跑欢迎语未播完），本用例真机跑 G9")
         }
         try await Task.sleep(for: .milliseconds(700))
         let recording = try recorder.finish()
