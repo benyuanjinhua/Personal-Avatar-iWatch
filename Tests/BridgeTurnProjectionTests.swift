@@ -172,11 +172,15 @@ final class BridgeTurnProjectionTests: XCTestCase {
     // MARK: - ESS-336 / ESS-324 B3: 新增覆盖（只追加，不改动上方既有用例）
 
     // ESS-336：progress.kind 非法值必须判为 invalid，不得静默当成有效进度
+    // ESS-368：occurred_at 用不带小数秒的 ISO8601，与 VoiceProtocolJSON.decoder 的
+    // `.iso8601` 默认策略（ISO8601DateFormatter 无 .withFractionalSeconds）对齐；
+    // 否则 CI（macos-15 / 旧 SDK）会在解码时静默返回 nil，用例焦点被日期格式抢走。
+    // Bridge 实际发送 `.000Z` 与 Swift 端解码策略的不匹配另建单跟踪，不在本单夹带。
     func testProgressRejectsInvalidKind() {
         let json = """
         {"type":"turn.progress","progress":{
           "kind":"bad","request_id":"\(requestId)","sequence":1,
-          "text":"bad","occurred_at":"2026-08-04T10:00:00.000Z"
+          "text":"bad","occurred_at":"2026-08-04T10:00:00Z"
         }}
         """
         let progress = BridgeEventMessage.decode(from: Data(json.utf8))?.progress
