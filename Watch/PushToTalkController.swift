@@ -476,7 +476,8 @@ final class PushToTalkController: ObservableObject {
                 channels: AudioRecorder.channels,
                 durationMs: recording.durationMs,
                 sha256: VoiceDigest.sha256Hex(of: recording.data)
-            )
+            ),
+            streamingRequested: voiceStreamingEnabled()
         )
         retryStore.save(requestId: envelope.requestId, data: recording.data, durationMs: recording.durationMs)
 
@@ -587,7 +588,8 @@ final class PushToTalkController: ObservableObject {
                 channels: AudioRecorder.channels,
                 durationMs: recording.durationMs,
                 sha256: VoiceDigest.sha256Hex(of: recording.data)
-            )
+            ),
+            streamingRequested: voiceStreamingEnabled()
         )
         retryStore.save(
             requestId: envelope.requestId,

@@ -43,6 +43,29 @@ struct RelayDeviceCredentials: Codable, Equatable {
     }
 }
 
+/// ESS-358: 客户端 streaming 能力协商结构，随 POST /v1/voice/turns 上送。
+/// Bridge 的 fail-closed gate（PR #119）读出 `body.streaming` 联合计算
+/// `streaming.effective`：仅 `requested == true` 且协议版本/能力集匹配时
+/// 才走 `voice.stream.chunk` 下行；缺省或不匹配时走可靠完整文件链路（旧链路）。
+struct VoiceStreamingCapability: Codable, Equatable {
+    let requested: Bool
+    let protocolVersions: [Int]
+    let capabilities: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case requested
+        case protocolVersions = "protocol_versions"
+        case capabilities
+    }
+
+    /// 客户端请求下行 v2 流式语音并声明兼容能力。
+    static let requested = VoiceStreamingCapability(
+        requested: true,
+        protocolVersions: [2],
+        capabilities: ["voice_stream_downlink_v2"]
+    )
+}
+
 /// POST /v1/voice/turns 请求体：ESS-22 信封元数据 + base64 音频。
 struct VoiceTurnUpload: Codable {
     let protocolVersion: Int
@@ -51,6 +74,8 @@ struct VoiceTurnUpload: Codable {
     let createdAt: String
     let audio: VoiceAudioDescriptor
     let audioBase64: String
+    /// ESS-358：可选流式协商；nil 时 JSONEncoder 不编码该键，旧链路完全不受影响。
+    let streaming: VoiceStreamingCapability?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
@@ -59,15 +84,17 @@ struct VoiceTurnUpload: Codable {
         case createdAt = "created_at"
         case audio
         case audioBase64 = "audio_base64"
+        case streaming
     }
 
-    init(envelope: VoiceRequestEnvelope, audioData: Data) {
+    init(envelope: VoiceRequestEnvelope, audioData: Data, streamingRequested: Bool = false) {
         protocolVersion = RelayWire.protocolVersion
         requestId = envelope.requestId
         type = "audio_request"
         createdAt = ISO8601DateFormatter().string(from: envelope.createdAt)
         audio = envelope.audio
         audioBase64 = audioData.base64EncodedString()
+        streaming = streamingRequested ? .requested : nil
     }
 }
 
@@ -277,8 +304,10 @@ final class RelayClient {
     }
 
     /// 上送一个 turn；重试时以同一 request_id 重新调用（新 nonce/签名），Bridge 幂等去重。
-    func upload(envelope: VoiceRequestEnvelope, audioData: Data) async throws -> VoiceTurnResponse {
-        let body = try JSONEncoder().encode(VoiceTurnUpload(envelope: envelope, audioData: audioData))
+    func upload(envelope: VoiceRequestEnvelope, audioData: Data, streamingRequested: Bool = false) async throws -> VoiceTurnResponse {
+        let body = try JSONEncoder().encode(
+            VoiceTurnUpload(envelope: envelope, audioData: audioData, streamingRequested: streamingRequested)
+        )
         let request = RelaySignedRequestBuilder(baseURL: baseURL, credentials: credentials)
             .request(method: "POST", path: "/v1/voice/turns", requestId: envelope.requestId, body: body)
         let (data, response): (Data, URLResponse)

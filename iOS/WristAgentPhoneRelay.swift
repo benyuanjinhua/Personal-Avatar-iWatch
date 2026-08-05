@@ -267,7 +267,10 @@ final class WristAgentPhoneRelay: ObservableObject {
             return
         }
         do {
-            _ = try await client.upload(envelope: entry.envelope, audioData: audioData)
+            _ = try await client.upload(
+                envelope: entry.envelope, audioData: audioData,
+                streamingRequested: entry.envelope.streamingRequested ?? false
+            )
             outbox.markDelivered(requestId: entry.requestId)
             notifiedStuckRequestIds.remove(entry.requestId)
             relayStatus = "已上送 \(entry.requestId.prefix(8))…"
