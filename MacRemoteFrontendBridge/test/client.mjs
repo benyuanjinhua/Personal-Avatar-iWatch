@@ -69,12 +69,17 @@ export class BridgeClient {
     })
   }
 
-  createTurn(requestId, audioBuf, { codec = 'pcm16le_16k', durationMs = 1000, protocolVersion = 1, sha256 = null } = {}) {
+  createTurn(requestId, audioBuf, {
+    codec = 'pcm16le_16k', durationMs = 1000, protocolVersion = 1, sha256 = null,
+    sessionId = null, streaming = null,
+  } = {}) {
     return this.signed('POST', '/v1/voice/turns', {
       requestId,
       json: {
         protocol_version: protocolVersion,
         request_id: requestId,
+        ...(sessionId ? { session_id: sessionId } : {}),
+        ...(streaming ? { streaming } : {}),
         audio: {
           codec,
           sample_rate: 16000,

@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { VoiceStreamDownlink } from '../voice-stream-downlink.mjs'
+import { VoiceStreamDownlink, VoiceStreamingNegotiator } from '../voice-stream-downlink.mjs'
 import { QwenRealtimeSessionSupervisor } from '../supervisor.mjs'
 import { PendingAnnouncementStreams } from '../pending-announcement-streams.mjs'
 
@@ -97,6 +97,55 @@ describe('VoiceStreamDownlink', () => {
     assert.equal(stream.append({ requestId, sequence: 0, audio: delta(0) }).sent, 2)
     assert.equal(cleared, 1)
     assert.deepEqual(messages.map(m => m.chunk.sequence), [0, 1])
+  })
+})
+
+describe('VoiceStreamingNegotiator', () => {
+  const compatible = {
+    requested: true,
+    capabilities: ['voice_stream_downlink_v2'],
+    protocol_versions: [2],
+  }
+
+  it('keeps omitted requests on the legacy path', () => {
+    const logs = []
+    const gate = new VoiceStreamingNegotiator({ serverEnabled: true, log: item => logs.push(item) })
+    const decision = gate.negotiate({ requestId: 'req_legacy', sessionId: 'session_1' })
+    assert.equal(decision.effective, false)
+    assert.equal(decision.fallback_reason, 'not_requested')
+    assert.deepEqual(logs[0], { evt: 'voice_stream_negotiated', ...decision })
+  })
+
+  it('allows only an explicit compatible per-turn request', () => {
+    const gate = new VoiceStreamingNegotiator({ serverEnabled: true })
+    const decision = gate.negotiate({ requestId, sessionId: 'session_1', streaming: compatible })
+    assert.equal(decision.requested, true)
+    assert.equal(decision.capable, true)
+    assert.equal(decision.effective, true)
+    const messages = []
+    const stream = new VoiceStreamDownlink({
+      enabled: true,
+      isAllowed: id => gate.decision(id),
+      send: (_, message) => { messages.push(message); return true },
+    })
+    assert.equal(stream.append({ requestId, audio: delta(0) }).status, 'sent')
+    assert.equal(messages.length, 1)
+  })
+
+  it('returns stable reasons for capability, version, and server rejection', () => {
+    const gate = new VoiceStreamingNegotiator({ serverEnabled: true })
+    assert.equal(gate.negotiate({ requestId: 'missing', streaming: { requested: true, protocol_versions: [2] } }).fallback_reason, 'capability_missing')
+    assert.equal(gate.negotiate({ requestId: 'version', streaming: { requested: true, capabilities: ['voice_stream_downlink_v2'], protocol_versions: [1] } }).fallback_reason, 'protocol_version_mismatch')
+    const closed = new VoiceStreamingNegotiator({ serverEnabled: false })
+    assert.equal(closed.negotiate({ requestId: 'closed', streaming: compatible }).fallback_reason, 'server_disabled')
+  })
+
+  it('releases turn state so the next turn defaults to legacy', () => {
+    const gate = new VoiceStreamingNegotiator({ serverEnabled: true })
+    gate.negotiate({ requestId, streaming: compatible })
+    gate.release(requestId)
+    assert.equal(gate.decision(requestId).effective, false)
+    assert.equal(gate.decision(requestId).fallback_reason, 'not_negotiated')
   })
 })
 

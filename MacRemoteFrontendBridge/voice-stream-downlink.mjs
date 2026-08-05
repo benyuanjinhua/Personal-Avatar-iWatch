@@ -1,8 +1,53 @@
 import { createHash, randomUUID } from 'node:crypto'
 
 export const VOICE_STREAM_PROTOCOL_VERSION = 2
+export const VOICE_STREAM_DOWNLINK_CAPABILITY = 'voice_stream_downlink_v2'
 
 const digest = payload => createHash('sha256').update(payload).digest('hex')
+
+export class VoiceStreamingNegotiator {
+  constructor({ serverEnabled = false, log = () => {} } = {}) {
+    this.serverEnabled = serverEnabled === true
+    this.log = log
+    this.turns = new Map()
+  }
+
+  negotiate({ requestId, sessionId = null, streaming = null } = {}) {
+    const requested = streaming?.requested === true
+    const versions = Array.isArray(streaming?.protocol_versions) ? streaming.protocol_versions : []
+    const capabilities = Array.isArray(streaming?.capabilities) ? streaming.capabilities : []
+    const capable = capabilities.includes(VOICE_STREAM_DOWNLINK_CAPABILITY)
+      && versions.includes(VOICE_STREAM_PROTOCOL_VERSION)
+    let reason = null
+    if (!requested) reason = 'not_requested'
+    else if (!this.serverEnabled) reason = 'server_disabled'
+    else if (!capabilities.includes(VOICE_STREAM_DOWNLINK_CAPABILITY)) reason = 'capability_missing'
+    else if (!versions.includes(VOICE_STREAM_PROTOCOL_VERSION)) reason = 'protocol_version_mismatch'
+    const decision = {
+      session_id: sessionId,
+      request_id: requestId,
+      requested,
+      capable,
+      effective: requested && capable && this.serverEnabled,
+      fallback_reason: reason,
+      protocol_version: VOICE_STREAM_PROTOCOL_VERSION,
+    }
+    this.turns.set(requestId, decision)
+    this.log({ evt: 'voice_stream_negotiated', ...decision })
+    return decision
+  }
+
+  decision(requestId) {
+    return this.turns.get(requestId) ?? {
+      request_id: requestId, requested: false, capable: false, effective: false,
+      fallback_reason: 'not_negotiated', protocol_version: VOICE_STREAM_PROTOCOL_VERSION,
+    }
+  }
+
+  release(requestId) {
+    this.turns.delete(requestId)
+  }
+}
 
 // Bridge-side projection of the ESS-249 L1 state machine. The reliable m4a
 // result remains independent of this best-effort path and is never suppressed.
@@ -18,6 +63,7 @@ export class VoiceStreamDownlink {
     now = () => Date.now(),
     setTimer = setTimeout,
     clearTimer = clearTimeout,
+    isAllowed = null,
   } = {}) {
     this.enabled = enabled === true
     this.maxPayloadBytes = maxPayloadBytes
@@ -29,11 +75,16 @@ export class VoiceStreamDownlink {
     this.now = now
     this.setTimer = setTimer
     this.clearTimer = clearTimer
+    this.isAllowed = isAllowed
     this.streams = new Map()
   }
 
   append({ requestId, responseId = null, audio, sampleRate = 24_000, sequence = null }) {
     if (!this.enabled) return { status: 'disabled' }
+    const decision = this.isAllowed?.(requestId)
+    if (decision && decision.effective !== true) {
+      return { status: 'fallback', reason: decision.fallback_reason ?? 'not_negotiated' }
+    }
     if (!requestId || !audio) return this.fallback(requestId, 'invalid_chunk')
     const payload = Buffer.isBuffer(audio) ? audio : Buffer.from(audio, 'base64')
     if (!payload.length || payload.length > this.maxPayloadBytes || sampleRate !== 24_000) {
