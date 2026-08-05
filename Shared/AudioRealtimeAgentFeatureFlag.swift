@@ -41,8 +41,15 @@ struct AudioRealtimeAgentFeatureFlag {
         defaults.bool(forKey: Key.directEnabled)
     }
 
+    /// ESS-459: returns the user-configured WSS endpoint, or the dev-cluster
+    /// default (`devDefaultGatewayURLString`) when no override has been set.
+    /// User values written via `setGatewayURLString(_:)` always take priority;
+    /// removing the key from UserDefaults restores the dev default.
     var gatewayURLString: String {
-        defaults.string(forKey: Key.gatewayURL) ?? ""
+        if let user = defaults.string(forKey: Key.gatewayURL), !user.isEmpty {
+            return user
+        }
+        return Self.devDefaultGatewayURLString
     }
 
     var deviceId: String {
