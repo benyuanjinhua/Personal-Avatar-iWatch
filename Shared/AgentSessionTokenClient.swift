@@ -35,23 +35,11 @@ enum AgentSessionTokenError: Error, Equatable {
     case scopeMismatch
 }
 
-/// Hard memory bound while a turn waits for its ephemeral token.
-enum AgentTokenEnvelopeBufferBudget {
-    static let maxEnvelopeCount = 256
-    static let maxEncodedBytes = 2 * 1_024 * 1_024
-
-    static func allows(currentCount: Int, currentBytes: Int, addingBytes: Int) -> Bool {
-        currentCount >= 0 && currentBytes >= 0 && addingBytes >= 0
-            && currentCount < maxEnvelopeCount
-            && addingBytes <= maxEncodedBytes
-            && currentBytes <= maxEncodedBytes - addingBytes
-    }
-}
-
 /// Mints one short-lived, single-upgrade Gateway token for a realtime turn.
 /// The returned token is never persisted; callers retain it only until the
 /// WSS transport consumes it.
 struct AgentSessionTokenClient {
+    static let defaultTimeout: TimeInterval = 4
     private struct RequestBody: Codable {
         let protocolVersion: Int
         let deviceId: String
@@ -75,15 +63,19 @@ struct AgentSessionTokenClient {
     let gatewayURL: URL
     let credentials: RelayDeviceCredentials
     let session: URLSession
+    let timeout: TimeInterval
 
     init(
         gatewayURL: URL,
         credentials: RelayDeviceCredentials,
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        timeout: TimeInterval = Self.defaultTimeout
     ) {
+        precondition(timeout > 0)
         self.gatewayURL = gatewayURL
         self.credentials = credentials
         self.session = session
+        self.timeout = timeout
     }
 
     func mint(
@@ -120,13 +112,14 @@ struct AgentSessionTokenClient {
             generation: scope.generation,
             ttlMs: ttlMs
         ))
-        let request = RelaySignedRequestBuilder(baseURL: baseURL, credentials: credentials)
+        var request = RelaySignedRequestBuilder(baseURL: baseURL, credentials: credentials)
             .request(
                 method: "POST",
                 path: "/v1/realtime/session-token",
                 requestId: requestId,
                 body: body
             )
+        request.timeoutInterval = timeout
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw AgentSessionTokenError.invalidResponse

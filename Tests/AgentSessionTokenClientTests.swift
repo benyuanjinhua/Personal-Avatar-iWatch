@@ -31,26 +31,13 @@ final class AgentSessionTokenClientTests: XCTestCase {
         super.tearDown()
     }
 
-    func testPendingEnvelopeBudgetBoundsCountAndBytes() {
-        XCTAssertTrue(AgentTokenEnvelopeBufferBudget.allows(
-            currentCount: 255, currentBytes: 1_000, addingBytes: 1_000
-        ))
-        XCTAssertFalse(AgentTokenEnvelopeBufferBudget.allows(
-            currentCount: 256, currentBytes: 0, addingBytes: 1
-        ))
-        XCTAssertFalse(AgentTokenEnvelopeBufferBudget.allows(
-            currentCount: 1,
-            currentBytes: AgentTokenEnvelopeBufferBudget.maxEncodedBytes,
-            addingBytes: 1
-        ))
-    }
-
     func testMintSignsExactBodyAndReturnsScopedToken() async throws {
         URLProtocolStub.handler = { request in
             XCTAssertEqual(request.url?.absoluteString, "https://gateway.example/v1/realtime/session-token")
             XCTAssertEqual(request.httpMethod, "POST")
             XCTAssertEqual(request.value(forHTTPHeaderField: "X-Device-Id"), "iphone-1")
             XCTAssertEqual(request.value(forHTTPHeaderField: "X-Request-Id"), "request-1")
+            XCTAssertEqual(request.timeoutInterval, 4)
             XCTAssertFalse(request.value(forHTTPHeaderField: "X-Signature")?.isEmpty ?? true)
             // URLProtocol receives streamed request bodies with httpBody=nil;
             // the signed body hash still proves a non-empty exact payload.
@@ -74,6 +61,25 @@ final class AgentSessionTokenClientTests: XCTestCase {
         ).mint(requestId: "request-1", sessionId: "session-1", generation: 1)
         XCTAssertEqual(issued.token, "rtk_ephemeral")
         XCTAssertEqual(issued.scope.generation, 1)
+    }
+
+    func testMintUsesExplicitConfiguredTimeoutAndPropagatesTimeoutFailure() async {
+        URLProtocolStub.handler = { request in
+            XCTAssertEqual(request.timeoutInterval, 0.01, accuracy: 0.001)
+            throw URLError(.timedOut)
+        }
+        do {
+            _ = try await AgentSessionTokenClient(
+                gatewayURL: URL(string: "https://gateway.example")!,
+                credentials: RelayDeviceCredentials(deviceId: "iphone-1", token: String(repeating: "a", count: 32)),
+                session: session(),
+                timeout: 0.01
+            ).mint(requestId: "r", sessionId: "s", generation: 1)
+            XCTFail("expected timeout")
+        } catch {
+            XCTAssertEqual((error as? URLError)?.code, .timedOut)
+            XCTAssertEqual(AgentTokenFallbackReason.reason(for: error), "token_mint_timeout")
+        }
     }
 
     func testMintRejectsMismatchedScope() async {
