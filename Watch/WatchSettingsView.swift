@@ -270,73 +270,24 @@ struct WatchSettingsView: View {
 
     // MARK: - 清除历史语音（ESS-419 F1）
 
-    /// 手动一键清空结果语音：停播 → 遍历 journal turns 逐一删除 vault 文件并
-    /// 清 journal speechFileName → 扫描 vault 目录清残留 → 落日志并反馈结果。
+    /// 手动一键清空结果语音：停播 → 委托 SpeechVaultCleaner 执行 → 落日志并反馈结果。
     private func performClearHistorySpeech() {
         // 先停播，防止「文件已删但播放器仍在读」
         player.stop(reason: "clear_history_speech")
 
-        guard let vault = speechVault else {
-            clearResultMessage = "本机语音仓不可用"
-            WatchLog.info("settings", "speech_vault_cleared", detail: "vault_unavailable")
-            return
-        }
-
-        let turns = journal.turns
-        guard !turns.isEmpty else {
-            clearResultMessage = "没有可清除的语音"
-            WatchLog.info("settings", "speech_vault_cleared", detail: "removed=0 failed=0 orphan=0 turns_empty=true")
-            return
-        }
-
-        var removed = 0
-        var failed = 0
-
-        // 1. 遍历 turns，清除有 speechFileName 的语音
-        for turn in turns {
-            guard let fileName = turn.speechFileName else { continue }
-            vault.remove(name: fileName)
-            // remove 是 best-effort（吞了 throws），文件不存在也视为已清
-            if journal.clearSpeech(requestId: turn.requestId, matching: fileName) {
-                removed += 1
-            } else {
-                failed += 1
-            }
-        }
-
-        // 2. 扫描 vault 目录清 journal 已不引用的残留
-        var orphanCount = 0
-        let referencedNames = Set(turns.compactMap { $0.speechFileName })
         let vaultDir = FileManager.default.urls(
             for: .applicationSupportDirectory, in: .userDomainMask
         )[0].appendingPathComponent("SpeechVault", isDirectory: true)
-        if let contents = try? FileManager.default.contentsOfDirectory(
-            at: vaultDir, includingPropertiesForKeys: nil
-        ) {
-            for url in contents {
-                let name = url.deletingPathExtension().lastPathComponent
-                guard url.pathExtension == "sealed", !referencedNames.contains(name) else { continue }
-                try? FileManager.default.removeItem(at: url)
-                orphanCount += 1
-            }
-        }
 
-        // 3. 汇总
-        if removed == 0, failed == 0 {
-            clearResultMessage = "没有可清除的语音"
-        } else if failed == 0 {
-            clearResultMessage = "已清除 \(removed) 条结果语音"
-        } else {
-            clearResultMessage = "\(removed) 条已清，\(failed) 条失败"
-        }
-        if orphanCount > 0 {
-            clearResultMessage! += "（另清理 \(orphanCount) 个残留文件）"
-        }
-
-        WatchLog.info(
-            "settings", "speech_vault_cleared",
-            detail: "removed=\(removed) failed=\(failed) orphan=\(orphanCount)"
+        let cleaner = SpeechVaultCleaner(
+            journal: journal,
+            vault: speechVault,
+            vaultDirectoryURL: vaultDir
         )
+        let result = cleaner.clearHistorySpeech()
+        clearResultMessage = result.userMessage
+
+        WatchLog.info("settings", "speech_vault_cleared", detail: result.logDetail)
     }
 
     // MARK: - 组件
