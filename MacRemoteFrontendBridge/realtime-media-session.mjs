@@ -9,7 +9,8 @@ const CANCELLED = 'cancelled'
 export class RealtimeMediaSession {
   constructor({
     requestId, sessionId, sendUpstream, sendDownstream,
-    maxFrameBytes = 64 * 1024, log = () => {}, onResponseComplete = () => {},
+    maxFrameBytes = 64 * 1024, log = () => {}, onFirstAudio = () => {},
+    onResponseComplete = () => {},
   }) {
     if (!requestId || !sessionId) throw new Error('requestId and sessionId are required')
     if (typeof sendUpstream !== 'function' || typeof sendDownstream !== 'function') {
@@ -21,6 +22,7 @@ export class RealtimeMediaSession {
     this.sendDownstream = sendDownstream
     this.maxFrameBytes = maxFrameBytes
     this.log = log
+    this.onFirstAudio = onFirstAudio
     this.onResponseComplete = onResponseComplete
     this.state = OPEN
     this.nextInputSequence = 0
@@ -29,6 +31,7 @@ export class RealtimeMediaSession {
     this.inputCommitted = false
     this.assistantTranscript = ''
     this.taskId = null
+    this.firstAudioReported = false
   }
 
   appendInput({ sequence, audio, sampleRate = 16_000, codec = 'pcm_s16le' }) {
@@ -70,6 +73,10 @@ export class RealtimeMediaSession {
       seen.add(sequence)
       this.seenOutputSequences.set(responseId, seen)
       this.playingResponseId = event.responseId ?? this.playingResponseId
+      if (!this.firstAudioReported) {
+        this.firstAudioReported = true
+        this.onFirstAudio({ responseId: event.responseId ?? null, bytes: bytes.length })
+      }
       this.sendDownstream({
         type: 'audio.delta', request_id: this.requestId, session_id: this.sessionId,
         response_id: event.responseId ?? null, sequence, sample_rate: event.sampleRate ?? 24_000,

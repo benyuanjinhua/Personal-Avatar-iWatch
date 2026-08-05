@@ -6,14 +6,16 @@ function fixture() {
   const upstream = []
   const downstream = []
   const completed = []
+  const firstAudio = []
   const session = new RealtimeMediaSession({
     requestId: '019fcac2-20ce-75b6-a665-24eb965a32a9',
     sessionId: 'watch-session-1',
     sendUpstream: event => upstream.push(event),
     sendDownstream: event => downstream.push(event),
+    onFirstAudio: event => firstAudio.push(event),
     onResponseComplete: result => completed.push(result),
   })
-  return { session, upstream, downstream, completed }
+  return { session, upstream, downstream, completed, firstAudio }
 }
 
 describe('ESS-265 realtime media plane', () => {
@@ -35,18 +37,20 @@ describe('ESS-265 realtime media plane', () => {
   })
 
   it('forwards each agent audio delta immediately and deduplicates sequence retries', () => {
-    const { session, downstream } = fixture()
+    const { session, downstream, firstAudio } = fixture()
     assert.equal(session.handleAgentEvent({
       type: 'audio.delta', responseId: 'resp-1', sequence: 0,
       sampleRate: 24_000, audio: Buffer.from([7, 8]).toString('base64'),
     }), true)
     assert.equal(downstream.length, 1)
+    assert.deepEqual(firstAudio, [{ responseId: 'resp-1', bytes: 2 }])
     assert.equal(downstream[0].audio, 'Bwg=')
     assert.equal(session.handleAgentEvent({
       type: 'audio.delta', responseId: 'resp-1', sequence: 0,
       audio: Buffer.from([7, 8]).toString('base64'),
     }), false)
     assert.equal(downstream.length, 1)
+    assert.equal(firstAudio.length, 1)
   })
 
   it('uses real player receipts instead of acknowledging on delta receipt', () => {

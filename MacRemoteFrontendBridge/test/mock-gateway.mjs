@@ -10,9 +10,10 @@ export class MockGateway extends EventEmitter {
   // preHolder: 预置的语音所有权持有者 descriptor（模拟残留 Bridge 实例或
   //   Mac 本机/web 前台占用）。真实网关对非 owner 的 audio.append 静默丢弃，
   //   mock 复刻该行为（ESS-36 回归的关键语义）。
-  constructor({ scenario = 'direct', preHolder = null } = {}) {
+  constructor({ scenario = 'direct', preHolder = null, requireAudioCommit = false } = {}) {
     super()
     this.scenario = scenario
+    this.requireAudioCommit = requireAudioCommit
     this.tasks = new Map()
     this.permissionDecisions = []
     this.deleteCalls = []
@@ -118,6 +119,7 @@ export class MockGateway extends EventEmitter {
       }
     }
     let turnScheduled = false
+    let pendingAudioCommits = 0
     ws.on('close', () => {
       this.voiceClients.delete(client)
       if (this.holder?.ws === ws) { this.holder = null; broadcast() }
@@ -160,6 +162,7 @@ export class MockGateway extends EventEmitter {
       }
       if (msg.type === 'audio.commit' || msg.type === 'response.cancel') {
         this.mediaEvents.push(msg)
+        if (msg.type === 'audio.commit') pendingAudioCommits += 1
         return
       }
       if (msg.type === 'audio.append') {
@@ -173,7 +176,12 @@ export class MockGateway extends EventEmitter {
         turnScheduled = true
         this.realtimeTurns += 1
         const turnIndex = this.realtimeTurns
-        setTimeout(() => {
+        const respondAfterCommit = () => {
+          if (this.requireAudioCommit && pendingAudioCommits === 0) {
+            setTimeout(respondAfterCommit, 10)
+            return
+          }
+          if (this.requireAudioCommit) pendingAudioCommits -= 1
           if (this.scenario === 'no-events-once' && turnIndex === 1) {
             // 第一轮完全静默（模拟上游掉线导致帧被丢）：驱动注入回执 watchdog
             turnScheduled = false
@@ -240,7 +248,8 @@ export class MockGateway extends EventEmitter {
             send({ type: 'voice.state', state: 'idle' })
           }
           turnScheduled = false
-        }, 150)
+        }
+        setTimeout(respondAfterCommit, 150)
       }
     })
   }

@@ -1338,6 +1338,10 @@ export function createBridge(overrides = {}) {
                   sendDownstream,
                   maxFrameBytes: CONFIG.realtime_media_max_frame_bytes ?? 64 * 1024,
                   log: item => log({ evt: 'realtime_media', device_id: deviceId, ...item }),
+                  onFirstAudio: ({ responseId, bytes }) => log({
+                    evt: 'voice_stream_first_chunk', request_id: requestId,
+                    response_id: responseId, bytes, source: 'realtime_media',
+                  }),
                   onResponseComplete: completeRealtimeTurn,
                 })
                 await supervisor.openMediaSession({ label: requestId, onEvent: event => client.media?.handleAgentEvent(event) })

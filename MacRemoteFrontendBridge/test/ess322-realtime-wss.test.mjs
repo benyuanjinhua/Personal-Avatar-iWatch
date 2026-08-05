@@ -22,7 +22,7 @@ execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-keyout', KEY, 
 describe('ESS-322 authenticated realtime media WSS', () => {
   let mock, bridge, client, baseUrl
   before(async () => {
-    mock = new MockGateway({ scenario: 'direct' })
+    mock = new MockGateway({ scenario: 'direct', requireAudioCommit: true })
     const gatewayUrl = await mock.start()
     const stateDir = join(TMP, 'state')
     bridge = createBridge({
@@ -76,13 +76,17 @@ describe('ESS-322 authenticated realtime media WSS', () => {
     await waitFor(() => received.some(event => event.type === 'ready'))
     ws.send(JSON.stringify({ type: 'audio.append', sequence: 0, audio: 'AQI=' }))
     ws.send(JSON.stringify({ type: 'audio.append', sequence: 1, audio: 'AwQ=' }))
+    await new Promise(resolve => setTimeout(resolve, 200))
+    assert.equal(received.some(event => event.type === 'audio.delta'), false,
+      'gateway must not answer before audio.commit')
+    ws.send(JSON.stringify({ type: 'audio.commit' }))
     await waitFor(() => received.find(event => event.type === 'audio.delta'))
     assert.equal(mock.playbackReceipts.length, 0, 'bridge must not synthesize playback receipts')
     ws.send(JSON.stringify({ type: 'playback.started', response_id: 'resp_1' }))
     ws.send(JSON.stringify({ type: 'playback.ended', response_id: 'resp_1' }))
-    ws.send(JSON.stringify({ type: 'audio.commit' }))
     await waitFor(() => mock.mediaEvents.some(event => event.type === 'audio.commit'))
     await waitFor(() => bridge.ledger.get(requestId)?.state === 'completed')
+    await waitFor(() => mock.playbackReceipts.length === 2)
     assert.equal(bridge.ledger.get(requestId).result.text, '现在是上午九点。')
     assert.deepEqual(mock.playbackReceipts.map(event => event.type), ['playback.started', 'playback.ended'])
     assert.equal(mock.mediaEvents.filter(event => event.type === 'audio.append').length, 2)
