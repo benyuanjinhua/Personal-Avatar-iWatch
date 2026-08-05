@@ -1,0 +1,164 @@
+# ESS-366: R-02.5 关卡一（合 PR 前置）的机器可判定门禁。
+# 见 CLAUDE.md "R-02.5 真机验收是 issue 收口卡点，不是 PR 合入卡点"。
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: R-02.5 关卡一
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Tool versions
+        run: |
+          set -x
+          sw_vers
+          xcodebuild -version
+          swift --version
+          node --version
+          npm --version
+          brew --version | head -1
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      # R-02.5 关卡一 · 第 6 行：Shared/ Watch/ iOS/ 新增文件时 pbxproj 必须
+      # 同步。ESS-315 / ESS-332 教训——手写 pbxproj 会漂移。
+      - name: xcodegen — assert no pbxproj drift
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          if ! git diff --exit-code -- WristAgent.xcodeproj/project.pbxproj; then
+            echo "::error::project.pbxproj drift — run 'xcodegen generate' locally and commit the result (ESS-315 / ESS-332)"
+            exit 1
+          fi
+
+      # R-02.5 关卡一 · 第 3 行：Bridge npm test + projection/test/mock-tests.mjs
+      - name: Bridge — npm install
+        working-directory: MacRemoteFrontendBridge
+        run: npm install --no-audit --no-fund
+
+      - name: Bridge — npm test
+        working-directory: MacRemoteFrontendBridge
+        run: npm test
+
+      - name: Bridge — projection mock tests
+        working-directory: MacRemoteFrontendBridge
+        run: node projection/test/mock-tests.mjs
+
+      # R-02.5 关卡一 · 第 1 行：swift test 全绿
+      - name: swift test
+        run: swift test
+
+      # R-02.5 关卡一 · 第 4 行：iOS + watchOS 双 target build
+      - name: xcodebuild build (iOS + watchOS)
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project WristAgent.xcodeproj \
+            -scheme WristAgent \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath .build/DerivedData \
+            WRISTAGENT_BUNDLE_ID=com.benyuan.wristagent.ci.WristAgent \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      # R-02.5 关卡一 · 第 2 行：Watch 模拟器 xctest 全绿
+      # ESS-360 教训：xcodebuild 在"所有套件 0 failures 但末尾 Failing tests:
+      # 非空"时仍会退出非零，靠 exit code 兜底；同时对输出做冗余校验，任一
+      # 触发都判失败。
+      - name: Pick watchOS simulator
+        id: pick-sim
+        run: |
+          set -euo pipefail
+          watch_sim_id=$(xcrun simctl list devices -j watchOS \
+            | node -e '
+                const data = JSON.parse(require("fs").readFileSync(0, "utf8"));
+                const runtimes = data.devices || {};
+                const all = [];
+                for (const [rt, list] of Object.entries(runtimes)) {
+                  if (!rt.includes("watchOS")) continue;
+                  for (const d of list) if (d.isAvailable !== false) all.push(d);
+                }
+                const booted = all.find(d => d.state === "Booted");
+                const pick = booted || all[0];
+                if (!pick) { process.exit(2); }
+                process.stdout.write(pick.udid);
+              ')
+          if [ -z "$watch_sim_id" ]; then
+            echo "::error::No watchOS Simulator available on this runner"
+            exit 1
+          fi
+          echo "id=$watch_sim_id" >> "$GITHUB_OUTPUT"
+          echo "Picked watch sim: $watch_sim_id"
+
+      - name: xcodebuild test — WristAgent Watch App
+        run: |
+          set -uo pipefail
+          xcodebuild test \
+            -project WristAgent.xcodeproj \
+            -scheme "WristAgent Watch App" \
+            -destination "id=${{ steps.pick-sim.outputs.id }}" \
+            -derivedDataPath .build/DerivedData-WatchTest \
+            | tee xcodebuild-watch-test.log
+          xcode_exit=${PIPESTATUS[0]}
+          # ESS-360 冗余判定：xcodebuild 已用 exit code 表达失败；这里再对输出
+          # 做两条兜底校验，任何一条命中都视为失败，确保"末尾 Failing tests:
+          # 非空但 Executed .* 0 failures"这种形态不会因未来某天误改 grep 而漏过。
+          if grep -qE '^\*\* TEST FAILED \*\*' xcodebuild-watch-test.log; then
+            echo "::error::watchOS xctest failed: '** TEST FAILED **' marker present"
+            exit 1
+          fi
+          if awk '
+              /^Failing tests:$/ { in_block = 1; next }
+              in_block && /^[[:space:]]*$/ { in_block = 0; next }
+              in_block { print }
+            ' xcodebuild-watch-test.log | grep -qE '\S'; then
+            echo "::error::watchOS xctest failed: 'Failing tests:' section is non-empty (ESS-360 pattern)"
+            exit 1
+          fi
+          if [ "$xcode_exit" -ne 0 ]; then
+            echo "::error::xcodebuild test exited with code $xcode_exit"
+            exit "$xcode_exit"
+          fi
+
+      - name: Upload xcodebuild logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-watch-test-log
+          path: xcodebuild-watch-test.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # R-02.5 关卡一 · 第 5 行：git diff --check 干净（whitespace / merge marker）
+      - name: git diff --check
+        run: git diff --check HEAD
