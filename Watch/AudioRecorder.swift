@@ -7,8 +7,11 @@ enum RecorderError: LocalizedError {
     case sessionActivationFailed
     case cannotCreateRecorder
     case noRecording
+    /// ESS-375: 短按（tap-and-release）导致 AVAudioRecorder.record() 返回后
+    /// 尚未开始采集就被 stop()，产出只有容器头（~24KB）的空文件。
+    case recordingNeverStarted
 
-    static let recordingTooShortDescription = "录音太短，请按住多说一会儿。"
+    static let recordingTooShortDescription = "按住时间太短，请按住不放再说。"
 
     var errorDescription: String? {
         switch self {
@@ -16,6 +19,7 @@ enum RecorderError: LocalizedError {
         case .sessionActivationFailed: return "录音启动失败，请松开后再按住重试。"
         case .cannotCreateRecorder: return "录音器启动失败，请松开后再按住重试。"
         case .noRecording: return "没有录到语音。"
+        case .recordingNeverStarted: return RecorderError.recordingTooShortDescription
         }
     }
 }
@@ -31,6 +35,13 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
     static let maxDuration: TimeInterval = 60
     static let sampleRate = 16_000
     static let channels = 1
+
+    /// ESS-375: AAC 32kbps / 16kHz / mono / max=60s 配置下，M4A 容器(fytp+moov)的
+    /// 固定开销量级。AVAudioRecorder.record(forDuration:) 在调用时就写入容器头并预分配
+    /// mdat，若在音频采集真正开始前 stop()，文件只含容器结构，字节数 ≈ 此值。
+    /// 08-04/08-05 四次取证均得 bytes=24588（跨两天、跨录音不变）—— 真实 AAC 录音
+    /// 不存在此现象。用作「录音从未开始」的辅助判据。
+    static let m4aContainerOverheadApprox = 24_588
 
     @Published private(set) var isRecording = false
     @Published private(set) var level: Float = 0
@@ -133,8 +144,23 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
     /// `AVURLAsset.duration` sync 虽 deprecated，但本地小文件行为稳定；
     /// `finish()` 是 sync 契约（transferFile 依赖同步返回 Recording），保持
     /// sync 优于把整条链改 async。
+    ///
+    /// ESS-375 字段口径说明（三者在单里必须同时出现、互相可对照）：
+    /// - `duration_ms`：主时长（优先 `asset_ms`，回落 `wall_clock_ms`），
+    ///   即 `sanitizeDurationMs(assetMs ?? wallClockMs)`，用作 Recording 入参。
+    /// - `wall_clock_ms`：`elapsedRecordingMs()` 单调时钟差值，
+    ///   起点 = `start()` 里 `recordingStartUptime = .now()` 那一刻（`record()` 返回后）。
+    ///   口径偏大（包含了 recorder init 开销），仅取证对照，不作为主时长源。
+    /// - `asset_ms`：`AVURLAsset(url:).duration` 读取的 M4A 容器内音频真实秒数 × 1000。
+    ///   这是文件字节量最直接的时长映射，ESS-225 起作为主时长源。
     func finish() throws -> Recording {
         let wallClockMs = elapsedRecordingMs()
+
+        // ESS-375: AVAudioRecorder.record() 是异步生效的——record() 返回后
+        // 硬件可能尚未开始采集。短按路径下(record()→ stop() < 100ms) recorder
+        // 的 isRecording 仍为 false，此时文件只含 M4A 容器头（~24KB），不含任何
+        // 音频帧。先检查再 stop，避免产出固定大小空文件被误读为真实录音。
+        let wasRecording = recorder?.isRecording == true
         recorder?.stop()
         emitStreamBytes(end: true)
         streamTimer?.invalidate()
@@ -175,6 +201,20 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
             )
             throw RecorderError.noRecording
         }
+
+        // ESS-375: 录音从未真正开始 → 抛出专用错误，触发 PushToTalkController
+        // 显示「按住时间太短，请按住不放再说」这一可行动提示。
+        // 判定条件（OR）：① stop() 前 recorder.isRecording 为 false，或
+        // ② 文件字节数 ≤ M4A 容器头近似值（24,588B），双重兜底确保不误判。
+        if !wasRecording || data.count <= Self.m4aContainerOverheadApprox {
+            WatchLog.error(
+                "recorder", "recording_never_started",
+                detail: "wall_clock_ms=\(wallClockMs) bytes=\(data.count) was_recording=\(wasRecording) container_overhead=\(Self.m4aContainerOverheadApprox)",
+                code: "ERR_AUDIO_TOO_SHORT"
+            )
+            throw RecorderError.recordingNeverStarted
+        }
+
         currentURL = nil
         recorder = nil
 

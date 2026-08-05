@@ -520,7 +520,16 @@ final class PushToTalkController: ObservableObject {
             submit(recording: recording)
         } catch {
             errorMessage = Self.recordingErrorDescription(error)
-            presentAvatarError(code: "ERR_RECORDER_FINISH", requestId: nil)
+            // ESS-375: recordingNeverStarted 走 ERR_AUDIO_TOO_SHORT cue
+            // （与 too-short guard 统一），让手表看到可行动中文提示而非
+            // 通用"录音器错误"卡片。
+            let code: String
+            if case RecorderError.recordingNeverStarted = error {
+                code = "ERR_AUDIO_TOO_SHORT"
+            } else {
+                code = "ERR_RECORDER_FINISH"
+            }
+            presentAvatarError(code: code, requestId: nil)
         }
     }
 

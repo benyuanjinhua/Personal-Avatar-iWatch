@@ -21,7 +21,7 @@ final class RecorderErrorCopyTests: XCTestCase {
     func testRecordingTooShortAsksUserToSpeakLonger() {
         XCTAssertEqual(
             RecorderError.recordingTooShortDescription,
-            "录音太短，请按住多说一会儿。"
+            "按住时间太短，请按住不放再说。"
         )
     }
 
@@ -31,9 +31,10 @@ final class RecorderErrorCopyTests: XCTestCase {
             .sessionActivationFailed,
             .cannotCreateRecorder,
             .noRecording,
+            .recordingNeverStarted,
         ].compactMap(\.errorDescription)
 
-        XCTAssertEqual(descriptions.count, 4)
+        XCTAssertEqual(descriptions.count, 5)
         for description in descriptions {
             XCTAssertFalse(description.contains("OSStatus"))
             XCTAssertFalse(description.contains("NSOSStatusErrorDomain"))
