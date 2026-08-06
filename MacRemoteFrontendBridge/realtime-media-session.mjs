@@ -87,7 +87,10 @@ export class RealtimeMediaSession {
     if (event.type === 'transcript.final' && event.role === 'assistant') {
       this.assistantTranscript = event.content ?? event.text ?? this.assistantTranscript
     }
-    if (event.type === 'task.accepted' && event.task?.id) {
+    // Some gateway builds skip task.accepted on the Realtime socket and first
+    // expose ownership on running/progress/completed. Any task lifecycle event
+    // carrying the stable id is sufficient to retain request ownership.
+    if (event.type.startsWith('task.') && event.task?.id) {
       this.taskId = String(event.task.id)
       return true
     }

@@ -6,13 +6,19 @@ export const VOICE_STREAM_DOWNLINK_CAPABILITY = 'voice_stream_downlink_v2'
 const digest = payload => createHash('sha256').update(payload).digest('hex')
 
 export class VoiceStreamingNegotiator {
-  constructor({ serverEnabled = false, log = () => {} } = {}) {
+  constructor({ serverEnabled = false, log = () => {}, setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
     this.serverEnabled = serverEnabled === true
     this.log = log
+    this.setTimer = setTimer
+    this.clearTimer = clearTimer
     this.turns = new Map()
+    this.releaseTimers = new Map()
   }
 
   negotiate({ requestId, sessionId = null, streaming = null } = {}) {
+    const pendingRelease = this.releaseTimers.get(requestId)
+    if (pendingRelease) this.clearTimer(pendingRelease)
+    this.releaseTimers.delete(requestId)
     const requested = streaming?.requested === true
     const versions = Array.isArray(streaming?.protocol_versions) ? streaming.protocol_versions : []
     const capabilities = Array.isArray(streaming?.capabilities) ? streaming.capabilities : []
@@ -45,7 +51,23 @@ export class VoiceStreamingNegotiator {
   }
 
   release(requestId) {
+    const timer = this.releaseTimers.get(requestId)
+    if (timer) this.clearTimer(timer)
+    this.releaseTimers.delete(requestId)
     this.turns.delete(requestId)
+  }
+
+  releaseAfter(requestId, delayMs) {
+    if (!this.turns.has(requestId)) return false
+    const previous = this.releaseTimers.get(requestId)
+    if (previous) this.clearTimer(previous)
+    const timer = this.setTimer(() => {
+      this.releaseTimers.delete(requestId)
+      this.turns.delete(requestId)
+    }, delayMs)
+    timer?.unref?.()
+    this.releaseTimers.set(requestId, timer)
+    return true
   }
 }
 

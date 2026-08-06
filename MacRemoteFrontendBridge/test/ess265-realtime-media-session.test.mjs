@@ -107,6 +107,15 @@ describe('ESS-265 realtime media plane', () => {
     assert.equal(delegated.completed[0].taskId, 'task-1')
   })
 
+  it('retains ownership when task.completed is the first task lifecycle event', () => {
+    const delayed = fixture()
+    assert.equal(delayed.session.handleAgentEvent({
+      type: 'task.completed', task: { id: 'task-late' },
+    }), true)
+    delayed.session.handleAgentEvent({ type: 'voice.state', state: 'idle' })
+    assert.equal(delayed.completed[0].taskId, 'task-late')
+  })
+
   it('barge-in cancels the active response and clears client playback', () => {
     const { session, upstream, downstream } = fixture()
     session.handleAgentEvent({ type: 'audio.delta', responseId: 'resp-1', audio: 'AQI=' })

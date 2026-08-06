@@ -146,6 +146,21 @@ export function createBridge(overrides = {}) {
     const { ts, label, event, ...rest } = item
     if (label && RT_GATEWAY_EVENTS.has(event)) ledger.bumpEvents(label)
     log({ evt: 'realtime', request_id: label ?? null, event, ...rest })
+    // Realtime media may omit task.accepted and first expose the delegated task
+    // in a later lifecycle event. Bind that task to the active request before an
+    // announcement can race in; the ledger mapping remains valid after terminal.
+    if (event.startsWith('task.') && rest.task?.id && supervisor.mediaSession?.label) {
+      const requestId = supervisor.mediaSession.label
+      const turn = ledger.get(requestId)
+      if (turn && !turn.task_id && !['failed', 'cancelled'].includes(turn.state)) {
+        ledger.update(requestId, {
+          task_id: String(rest.task.id), path: 'background',
+          state: turn.state === 'completed' ? 'completed' : 'processing',
+          detail: 'background_accepted',
+        })
+        log({ evt: 'realtime_media_task_bound', request_id: requestId, task_id: String(rest.task.id), cause: event })
+      }
+    }
     // ESS-234：Gateway 侧偶发不发 announcement，导致 background turn 卡在
     // "有 interim 没 result_audio_attached" 的非终态。task.completed 到达时启
     // 5s 兜底计时；到期仍无 announcement 就从 realtime salvage 合成 final result。
@@ -1126,6 +1141,7 @@ export function createBridge(overrides = {}) {
   const mediaClients = new Set()
   const eventsHeartbeatMs = CONFIG.events_heartbeat_ms ?? 20_000
   const resultDeliverySweepMs = CONFIG.result_delivery_sweep_ms ?? 1_000
+  const announcementBindingTtlMs = CONFIG.voice_stream_announcement_binding_ttl_ms ?? 10 * 60 * 1000
 
   streamDownlink = new VoiceStreamDownlink({
     enabled: CONFIG.voice_streaming_v2 === true,
@@ -1175,7 +1191,10 @@ export function createBridge(overrides = {}) {
   }
   supervisor.onAnnouncementAudioDone = ({ capture }) => {
     const turn = capture.taskId ? ledger.byTaskId(capture.taskId) : null
-    if (turn) streamDownlink.finish(turn.request_id)
+    if (turn) {
+      streamDownlink.finish(turn.request_id)
+      streamNegotiator.release(turn.request_id)
+    }
     else pendingAnnouncementStreams.end(capture.taskId)
   }
 
@@ -1229,7 +1248,14 @@ export function createBridge(overrides = {}) {
       const client = clients[0]
       const turn = ledger.get(projection.request_id)
       if (client && turn) sendTerminalDelivery(turn, client, 'state_change')
-      streamNegotiator.release(projection.request_id)
+      // A background announcement is allowed to arrive after task.completed.
+      // Keep its negotiated request ownership for the same bounded window used
+      // by the durable announcement binder; EOS releases it immediately.
+      if (projection.path === 'background' && projection.status === 'completed') {
+        streamNegotiator.releaseAfter(projection.request_id, announcementBindingTtlMs)
+      } else {
+        streamNegotiator.release(projection.request_id)
+      }
       return
     }
     for (const client of clients) {
