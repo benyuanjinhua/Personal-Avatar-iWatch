@@ -17,7 +17,13 @@ import XCTest
 /// map is the ESS-331 contract surface and the file behaviour it drives.
 @MainActor
 final class PushToTalkDeferredFallbackTests: XCTestCase {
-    func testDeferredFallbackMapReflectsMidRecordFailure() {
+    func testDeferredFallbackMapReflectsMidRecordFailure() throws {
+        // ESS-501: hosted GitHub Actions runners have no audio HW;
+        // ensureRealtimeAdapter() constructs PCMFrameRecorder + RealtimePlaybackEngine,
+        // both of which instantiate AVAudioEngine and hit -10868 SetFormat on init.
+        // Local mac + real-device sim keep the full body; deferred-fallback state
+        // machine is exercised there and by ESS-360 / G9 装机 coverage.
+        try HostedCITestGate.skipIfHostedCI("ensureRealtimeAdapter() → AVAudioEngine SetFormat -10868 in testDeferredFallbackMapReflectsMidRecordFailure")
         let controller = PushToTalkController()
         let handle = RealtimeMediaSession.TurnHandle(
             requestId: "77777777-7777-7777-7777-777777777771",
@@ -40,7 +46,8 @@ final class PushToTalkDeferredFallbackTests: XCTestCase {
                        "mid-record failure must record a deferred fallback reason")
     }
 
-    func testAdapterSingleShotAbsorbsRepeatedMidRecordFailures() {
+    func testAdapterSingleShotAbsorbsRepeatedMidRecordFailures() throws {
+        try HostedCITestGate.skipIfHostedCI("ensureRealtimeAdapter() → AVAudioEngine SetFormat -10868 in testAdapterSingleShotAbsorbsRepeatedMidRecordFailures")
         let controller = PushToTalkController()
         let adapter = controller.ensureRealtimeAdapter()
         _ = adapter.session.beginTurn(requestId: "77777777-7777-7777-7777-777777777772")
@@ -62,7 +69,8 @@ final class PushToTalkDeferredFallbackTests: XCTestCase {
     /// `transport.send(envelope:recording:)` (tracked by
     /// `submittedFullFileFallbackCount`) fires exactly once, no matter how
     /// many failure signals came in.
-    func testDeferredFallbackDrainsExactlyOneRealUploadOnRecordingFinish() {
+    func testDeferredFallbackDrainsExactlyOneRealUploadOnRecordingFinish() throws {
+        try HostedCITestGate.skipIfHostedCI("ensureRealtimeAdapter() → AVAudioEngine SetFormat -10868 in testDeferredFallbackDrainsExactlyOneRealUploadOnRecordingFinish")
         let controller = PushToTalkController()
         let requestIdStr = "77777777-7777-7777-7777-777777777773"
         let adapter = controller.ensureRealtimeAdapter()
@@ -106,5 +114,45 @@ final class PushToTalkDeferredFallbackTests: XCTestCase {
 
         // Exactly one full-file upload fired.
         XCTAssertEqual(controller.submittedFullFileFallbackCount, 1)
+    }
+
+    /// ESS-501 pure-logic complement to the three ESS_498_HOSTED_CI-skipped
+    /// tests above: exercises the deferred-fallback drain semantics
+    /// (`retainRealtimeRecording` + `simulateDeferredFallbackDrainForTests`)
+    /// WITHOUT touching `ensureRealtimeAdapter()`, so it runs on hosted CI
+    /// where AVAudioEngine SetFormat returns -10868.
+    ///
+    /// The drain path (`submitFullFileFallback` fires exactly once per
+    /// retained recording) is the ESS-331 acceptance surface; this keeps that
+    /// surface asserted on the hosted runner even while the fuller
+    /// adapter-driven cases are skipped.
+    func testDeferredFallbackDrainFiresExactlyOneUploadWithoutAdapter() {
+        let controller = PushToTalkController()
+        let requestId = "77777777-7777-7777-7777-777777777901"
+        let tmpURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ess501-\(UUID().uuidString).m4a")
+        try? Data(repeating: 0x33, count: 128).write(to: tmpURL)
+        defer { try? FileManager.default.removeItem(at: tmpURL) }
+        let recording = AudioRecorder.Recording(
+            fileURL: tmpURL,
+            data: (try? Data(contentsOf: tmpURL)) ?? Data(),
+            durationMs: 1_500
+        )
+        controller.retainRealtimeRecording(recording, forRequestId: requestId)
+        XCTAssertEqual(controller.submittedFullFileFallbackCount, 0,
+                       "retain 本身不得触发上传")
+        controller.simulateDeferredFallbackDrainForTests(
+            requestId: requestId,
+            reason: .transportFailed
+        )
+        XCTAssertEqual(controller.submittedFullFileFallbackCount, 1,
+                       "drain 之后必须恰好触发一次上传")
+        // 二次 drain（无 retained recording）：no-op，计数不递增。
+        controller.simulateDeferredFallbackDrainForTests(
+            requestId: requestId,
+            reason: .transportFailed
+        )
+        XCTAssertEqual(controller.submittedFullFileFallbackCount, 1,
+                       "重复 drain 必须幂等")
     }
 }

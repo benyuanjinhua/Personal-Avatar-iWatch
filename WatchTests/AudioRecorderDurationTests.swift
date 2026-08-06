@@ -35,6 +35,43 @@ final class AudioRecorderDurationTests: XCTestCase {
         )
     }
 
+    /// ESS-498（Option A 承接）：`testFinishedDurationIsBoundedAndSelfConsistent`
+    /// 因 hosted CI 无音频 HW 恒定死锁而被 XCTSkip 后，这里补上 hosted CI
+    /// 可跑的边界不变量守卫——对任意 Int 输入（含负数、`Int.max`、`Int.min`、
+    /// ESS-219 事故复现值、边界±1），`sanitizeDurationMs` 的返回值必须落在
+    /// `[0, 60_000]` 内，永不透出 `duration_ms=51_129_344` 这种事故量级。
+    ///
+    /// 与已有两条 sanitize 用例的关系：
+    /// - `testSanitizeClampsOverflowAndLogs` 只覆盖单点 51,129,344 + 落日志
+    /// - `testSanitizePassesNormalDurations` 只覆盖 `[0, 60_000]` 内的透传
+    /// - 本用例覆盖不变量（bound-preserving）——负数、`Int.max`/`Int.min`、
+    ///   边界内外 ±1，任何未来重构（例如把 sanitize 内实现改成饱和加减、
+    ///   引入其他 clamp 策略）都不得让返回值越出 `[0, 60_000]`。
+    ///
+    /// 纯计算，无 `AVAudioRecorder` / `AVURLAsset`——在 GitHub hosted runner
+    /// 上必然能跑到终态，与 R-02.5 关卡一门禁契合。
+    func testSanitizeInvariantAcrossExtremeInputs() {
+        let candidates: [Int] = [
+            Int.min, -1_000_000_000, -60_001, -60_000, -1, 0, 1,
+            100, 999, 4_318, 5_566, 59_999, 60_000,
+            60_001, 100_000, 999_999,
+            51_129_344,   // ESS-219 事故复现值
+            51_707_905,   // ESS-217 现场取证值
+            Int.max
+        ]
+        for raw in candidates {
+            let clamped = AudioRecorder.sanitizeDurationMs(rawMs: raw)
+            XCTAssertGreaterThanOrEqual(
+                clamped, 0,
+                "raw=\(raw) sanitize 必须 ≥ 0（负输入需下饱和为 0）"
+            )
+            XCTAssertLessThanOrEqual(
+                clamped, 60_000,
+                "raw=\(raw) sanitize 必须 ≤ 60_000（上溢需截断到 max=60s；ESS-219 事故量级永不透出）"
+            )
+        }
+    }
+
     /// AC #1（正常路径）：任意一次不超过 60s 的原始值，sanitize 后原样透出，
     /// 不越出上限、不生成误报事件。
     func testSanitizePassesNormalDurations() {
@@ -58,7 +95,20 @@ final class AudioRecorderDurationTests: XCTestCase {
     /// AC #1（端到端）：走真实的 `start()`/`finish()` 释放路径——短暂等待后收尾，
     /// `record_finished` 日志与 `Recording.durationMs` 都必须是量级自洽的小值（<< 60s）。
     /// headless 模拟器起录失败时走 cancel 分支，仍然验证 duration=0（不再从 currentTime 取值）。
+    ///
+    /// ESS-498（2026-08-06）：GitHub hosted `macos-15` runner 上，本用例
+    /// 100% 稳定死锁 60min timeout（5+ 次 CI 复现，run 31058623043 attempt 6
+    /// 是最直接证据）。hosted runner 没有音频硬件，`start()` 里某个 async
+    /// 路径永不返回。hosted CI 关卡下临时 XCTSkip，本单以 Option A 承接：
+    /// 边界守卫由本文件的 `testSanitize…` 系列（含 ESS-498 新增的
+    /// `testSanitizeInvariantAcrossExtremeInputs`）在 hosted CI 覆盖；
+    /// 端到端起录路径继续由 ESS-360 的真机 sim / 白梦林 G9 装机验收把守。
+    /// 死锁根因定位与 hosted 端到端恢复由 ESS-498 的子单（Option B）跟。
     func testFinishedDurationIsBoundedAndSelfConsistent() async throws {
+        // ESS-498: hosted GitHub Actions runners have no audio HW; recorder.start()
+        // hangs. On local mac + real-device sim the full body runs; ESS-499 tracks
+        // root-cause investigation of the hang inside start().
+        try HostedCITestGate.skipIfHostedCI("recorder.start() hangs in testFinishedDurationIsBoundedAndSelfConsistent")
         try await Task.sleep(for: .seconds(4)) // 让宿主欢迎语播完，避免抢会话
         let events = EventLog()
         WatchLog.setObserver { module, event, detail, code in
@@ -180,6 +230,8 @@ final class AudioRecorderDurationTests: XCTestCase {
     /// 带 `wall_clock_ms=` 与 `asset_ms=` 两个取证字段——这是 P0 修复后 R-02.1
     /// 运行时证据的核心对照维度。headless 模拟器起录失败时跳过。
     func testFinishReturnsAssetDurationEvenWhenWallClockIsTiny() async throws {
+        // ESS-498: same `recorder.start()` hang family — skip on hosted CI only.
+        try HostedCITestGate.skipIfHostedCI("recorder.start() hangs in testFinishReturnsAssetDurationEvenWhenWallClockIsTiny")
         try await Task.sleep(for: .seconds(4)) // 让宿主欢迎语播完
         let events = EventLog()
         WatchLog.setObserver { module, event, detail, code in

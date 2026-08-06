@@ -56,6 +56,8 @@ final class AudioRecorderHandoverTests: XCTestCase {
     /// 必须交还会话（session_released result=true），紧随其后的播放必须
     /// 完整出声——修复前该激活链两级全 !res、落 playback_activation_exhausted。
     func testPlaybackSucceedsAfterRecordingSessionHandover() async throws {
+        // ESS-498: same `recorder.start()` hang family — skip on hosted CI only.
+        try HostedCITestGate.skipIfHostedCI("recorder.start() hangs in testPlaybackSucceedsAfterRecordingSessionHandover")
         try await waitForHostWelcomeToFinish()
         let events = EventLog()
         WatchLog.setObserver { _, event, detail, _ in events.record(event: event, detail: detail) }
@@ -110,6 +112,8 @@ final class AudioRecorderHandoverTests: XCTestCase {
     /// 第二轮录音同时回归 ESS-61 的「播放 → 录音」方向（-50）。
     /// 需要真实采集；headless 模拟器起录必败时跳过（真机装机由 G9 S3R 拦）。
     func testAlternatingRecordPlayTwoRounds() async throws {
+        // ESS-498: same `recorder.start()` hang family — skip on hosted CI only.
+        try HostedCITestGate.skipIfHostedCI("recorder.start() hangs in testAlternatingRecordPlayTwoRounds")
         try await waitForHostWelcomeToFinish()
         let recorder = AudioRecorder()
         let player = SpeechPlayer()
