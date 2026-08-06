@@ -7,10 +7,13 @@ final class CompanionSettings: ObservableObject {
         didSet { save() }
     }
     @Published var realtimeGatewayURL: String {
-        didSet { saveRealtimeConfiguration() }
+        didSet { saveRealtimeGatewayURL() }
     }
     @Published var realtimeCredential: String {
-        didSet { saveRealtimeConfiguration() }
+        didSet { saveRealtimeCredential() }
+    }
+    @Published var realtimeDirectEnabled: Bool {
+        didSet { AudioRealtimeAgentFeatureFlag().setDirectPathEnabled(realtimeDirectEnabled) }
     }
     @Published private(set) var realtimeValidationMessage: String?
 
@@ -20,8 +23,10 @@ final class CompanionSettings: ObservableObject {
     init() {
         let flag = AudioRealtimeAgentFeatureFlag()
         realtimeGatewayURL = flag.gatewayURLString
-        realtimeCredential = SecureTokenStore.read()
+        realtimeCredential = RelayCredentialsStore.read()?.token ?? ""
+        realtimeDirectEnabled = flag.isDirectPathEnabled
         realtimeValidationMessage = nil
+        SecureTokenStore.delete()
         guard
             let data = defaults.data(forKey: storageKey),
             let saved = try? JSONDecoder().decode(AgentConfiguration.self, from: data)
@@ -36,17 +41,24 @@ final class CompanionSettings: ObservableObject {
         AudioRealtimeAgentFeatureFlag.redactedCredentialDescription(realtimeCredential)
     }
 
-    private func saveRealtimeConfiguration() {
+    private func saveRealtimeGatewayURL() {
         let trimmed = realtimeGatewayURL.trimmingCharacters(in: .whitespacesAndNewlines)
         if let error = AudioRealtimeAgentFeatureFlag.validateGatewayURLString(trimmed) {
             realtimeValidationMessage = error.description
             return
         }
         realtimeValidationMessage = nil
-        let flag = AudioRealtimeAgentFeatureFlag()
-        flag.setGatewayURLString(trimmed)
-        flag.setDirectPathEnabled(true)
-        SecureTokenStore.save(realtimeCredential)
+        AudioRealtimeAgentFeatureFlag().setGatewayURLString(trimmed)
+    }
+
+    private func saveRealtimeCredential() {
+        guard let existing = RelayCredentialsStore.read() else {
+            realtimeValidationMessage = "请先完成 Mac Relay 配对，以取得 Gateway 已注册的设备 ID。"
+            return
+        }
+        RelayCredentialsStore.save(RelayDeviceCredentials(
+            deviceId: existing.deviceId, token: realtimeCredential
+        ))
     }
 
     private func save() {

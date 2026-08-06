@@ -292,7 +292,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
                 agentTokenTask = nil
             }
         }
-        guard let credentials = directAgentCredentials(),
+        guard let credentials = RelayCredentialsStore.read(),
               let gatewayURL = URL(string: agentFlag.gatewayURLString) else {
             drainPendingAgentEnvelopesToBridge(
                 reason: "missing_credentials_or_gateway", turn: turn, taskID: taskID
@@ -372,7 +372,10 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     @MainActor
     private func makeRealtimeTransport(requestId: String, sessionId: String) -> PhoneRealtimeSession.Transport? {
         // ESS-391: try Agent direct path first when feature flag is enabled.
-        if let agentConfig = agentFlag.resolveConfig(ephemeralToken: agentEphemeralToken ?? "") {
+        if let credentials = RelayCredentialsStore.read(),
+           let agentConfig = agentFlag.resolveConfig(
+               ephemeralToken: agentEphemeralToken ?? "", deviceId: credentials.deviceId
+           ) {
             // Gateway tokens are single-upgrade. Never reuse a session whose
             // transport was configured with the preceding turn's token.
             let session = AudioRealtimeAgentSession(config: agentConfig, sessionId: sessionId)
@@ -384,14 +387,16 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
                 sessionId: sessionId,
                 generation: 1,
                 replacementSession: { [agentFlag] generation in
-                    guard let credentials = Self.directAgentCredentials(flag: agentFlag),
+                    guard let credentials = RelayCredentialsStore.read(),
                           let gatewayURL = URL(string: agentFlag.gatewayURLString) else {
                         throw AgentSessionTokenError.invalidGatewayURL
                     }
                     let issued = try await AgentSessionTokenClient(
                         gatewayURL: gatewayURL, credentials: credentials
                     ).mint(requestId: requestId, sessionId: sessionId, generation: generation)
-                    guard let freshConfig = agentFlag.resolveConfig(ephemeralToken: issued.token) else {
+                    guard let freshConfig = agentFlag.resolveConfig(
+                        ephemeralToken: issued.token, deviceId: credentials.deviceId
+                    ) else {
                         throw AgentSessionTokenError.invalidGatewayURL
                     }
                     return AudioRealtimeAgentSession(config: freshConfig, sessionId: sessionId)
@@ -431,16 +436,6 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         let task = URLSession.shared.webSocketTask(with: request)
         realtimeSession.isAgentTransport = false
         return PhoneRealtimeWebSocketTransport(task: task)
-    }
-
-    private func directAgentCredentials() -> RelayDeviceCredentials? {
-        Self.directAgentCredentials(flag: agentFlag)
-    }
-
-    private static func directAgentCredentials(flag: AudioRealtimeAgentFeatureFlag) -> RelayDeviceCredentials? {
-        let token = SecureTokenStore.read()
-        guard !token.isEmpty else { return nil }
-        return RelayDeviceCredentials(deviceId: flag.deviceId, token: token)
     }
 
     nonisolated func session(

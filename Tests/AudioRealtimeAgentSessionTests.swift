@@ -118,16 +118,13 @@ final class AudioRealtimeAgentSessionTests: XCTestCase {
 
     // MARK: - Feature flag
 
-    func testFeatureFlagDefaultsToEnabledWithStableDeviceIdentity() {
+    func testFeatureFlagDefaultsToEnabled() {
         let defaults = UserDefaults(suiteName: "test_ess402_flag")!
         defaults.removePersistentDomain(forName: "test_ess402_flag")
         let flag = AudioRealtimeAgentFeatureFlag(defaults: defaults)
         XCTAssertTrue(flag.isDirectPathEnabled)
         // ESS-459: default URL is the dev cluster, not empty
         XCTAssertEqual(flag.gatewayURLString, AudioRealtimeAgentFeatureFlag.devDefaultGatewayURLString)
-        let generatedDeviceId = flag.deviceId
-        XCTAssertTrue(generatedDeviceId.hasPrefix("iphone-"))
-        XCTAssertEqual(flag.deviceId, generatedDeviceId)
     }
 
     func testGatewayValidationRejectsEveryNonWSSScheme() {
@@ -166,10 +163,8 @@ final class AudioRealtimeAgentSessionTests: XCTestCase {
         let flag = AudioRealtimeAgentFeatureFlag(defaults: defaults)
         flag.setDirectPathEnabled(true)
         flag.setGatewayURLString("wss://agent.example.com/api/realtime")
-        flag.setDeviceId("iphone-x")
         XCTAssertTrue(flag.isDirectPathEnabled)
         XCTAssertEqual(flag.gatewayURLString, "wss://agent.example.com/api/realtime")
-        XCTAssertEqual(flag.deviceId, "iphone-x")
 
         flag.setDirectPathEnabled(false)
         XCTAssertFalse(flag.isDirectPathEnabled)
@@ -182,8 +177,7 @@ final class AudioRealtimeAgentSessionTests: XCTestCase {
         let flag = AudioRealtimeAgentFeatureFlag(defaults: defaults)
         flag.setDirectPathEnabled(false)
         flag.setGatewayURLString("wss://agent.example.com/api/realtime")
-        flag.setDeviceId("iphone-x")
-        XCTAssertNil(flag.resolveConfig(ephemeralToken: authToken))
+        XCTAssertNil(flag.resolveConfig(ephemeralToken: authToken, deviceId: "iphone-x"))
     }
 
     func testFeatureFlagResolveConfigReturnsConfigWhenEnabled() {
@@ -192,8 +186,7 @@ final class AudioRealtimeAgentSessionTests: XCTestCase {
         let flag = AudioRealtimeAgentFeatureFlag(defaults: defaults)
         flag.setDirectPathEnabled(true)
         flag.setGatewayURLString("wss://agent.example.com/api/realtime")
-        flag.setDeviceId("iphone-x")
-        let config = flag.resolveConfig(ephemeralToken: authToken)
+        let config = flag.resolveConfig(ephemeralToken: authToken, deviceId: "iphone-x")
         XCTAssertNotNil(config)
         XCTAssertEqual(config?.authToken, authToken)
         XCTAssertEqual(config?.deviceId, "iphone-x")

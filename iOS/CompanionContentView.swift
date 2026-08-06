@@ -23,6 +23,7 @@ struct CompanionContentView: View {
 
                 if settings.configuration.mode == .cloud {
                     Section {
+                        Toggle("启用 Audio Realtime 直连", isOn: $settings.realtimeDirectEnabled)
                         TextField("wss://agent.example.com/api/realtime", text: $settings.realtimeGatewayURL)
                             .textInputAutocapitalization(.never)
                             .keyboardType(.URL)
@@ -48,7 +49,7 @@ struct CompanionContentView: View {
                     } header: {
                         Text("Audio Realtime Agent")
                     } footer: {
-                        Text("仅接受 wss:// 地址。长期密钥只保存在本机 Keychain，不会同步到 Apple Watch 或写入日志。")
+                        Text("仅接受 wss:// 地址。长期密钥与配对取得的设备 ID 一起保存在本机 Keychain，不会同步到 Apple Watch 或写入日志。")
                     }
                 }
 
