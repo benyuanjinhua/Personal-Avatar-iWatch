@@ -302,11 +302,12 @@ source allowlist accepts loopback (for the smoke) plus Tailnet CGNAT
    every ~60 days keeps the cert well within the validity window
    (persistent-service wrapper is ESS-458).
 
-   **Do not run `smoke/deploy-smoke.mjs` on top of the real cert.** The
-   deploy smoke deliberately generates a fresh self-signed cert into
-   `certs/gateway.crt` on every run (see `ensureCerts()` in that script),
-   clobbering the trusted cert. On the deployment host, either skip the
-   smoke or re-run the `tailscale cert` command above afterwards.
+   Since ESS-506, `smoke/deploy-smoke.mjs` writes its self-signed cert to
+   a per-run `mktemp -d` and points the spawned server.mjs at it via the
+   smoke config's `tls_cert` / `tls_key`, so running the smoke on the
+   deployment host no longer clobbers this trusted cert. The smoke also
+   gates on `S0-safety`, which fails if `certs/gateway.crt|key` change
+   during the run.
 2. Populate `state/devices.json` from Mac Bridge (or via a provisioning
    API); the two share the HMAC device format.
 3. Confirm qwen-audio-agent is healthy on `127.0.0.1:3101` with voice
