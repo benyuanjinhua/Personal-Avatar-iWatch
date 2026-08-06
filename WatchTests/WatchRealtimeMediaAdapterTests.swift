@@ -282,6 +282,30 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         XCTAssertEqual(transport.commitEvents.first?.sequence, 1)
     }
 
+    func testRealPlaybackCompletionEmitsDeliveryReceiptAndWatchLog() {
+        let requestId = "44444444-4444-4444-4444-444444445216"
+        let (adapter, _, player, transport, _) = makeAdapter(sessionIds: [
+            "55555555-5555-5555-5555-555555555216"
+        ])
+        final class LogSink { var events: [(String, String?)] = [] }
+        let sink = LogSink()
+        WatchLog.setObserver { _, event, detail, _ in sink.events.append((event, detail)) }
+        defer { WatchLog.setObserver(nil) }
+
+        let handle = adapter.beginTurn(requestId: requestId)
+        player.onPlaybackEvent?(.ended(
+            requestId: handle.requestId, sessionId: handle.sessionId,
+            responseId: "resp-final", bytesPlayed: 4_800
+        ))
+
+        XCTAssertEqual(transport.playbackEndEvents.count, 1)
+        XCTAssertEqual(transport.playbackEndEvents.first?.1, "resp-final")
+        XCTAssertEqual(transport.playbackEndEvents.first?.2, 4_800)
+        let delivered = sink.events.first { $0.0 == "result_delivered_after_render" }
+        XCTAssertNotNil(delivered)
+        XCTAssertTrue(delivered?.1?.contains("response_id=resp-final bytes_played=4800") == true)
+    }
+
     func testTransportFailureTriggersOneShotCompleteFileFallback() {
         let requestId = "44444444-4444-4444-4444-444444444444"
         let (adapter, recorder, _, transport, counter) = makeAdapter(sessionIds: [

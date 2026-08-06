@@ -195,8 +195,8 @@ extension VoiceMessage {
     static let resultKey = "voice_result"
 }
 
-/// Watch → iPhone → Bridge 的最终交付确认。仅在纯文本结果已入内存账本，或
-/// 结果语音通过 sha256 校验并持久落盘后发送。
+/// Watch → iPhone → Bridge 的最终交付确认。纯文本结果入内存账本后可发送；
+/// 有语音的结果只能在播放器报告真实完成后发送，下载、入队、落盘和起播均不算送达。
 struct ResultDeliveryAck: Codable, Equatable {
     let protocolVersion: String
     let requestId: String

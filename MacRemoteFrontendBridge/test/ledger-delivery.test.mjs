@@ -50,6 +50,55 @@ describe('ESS-255 D2 terminal error projection', () => {
 })
 
 describe('terminal result redelivery ledger', () => {
+  it('marks delivered only after the matching final response really rendered', () => {
+    const logs = []
+    const stateDir = mkdtempSync(join(tmpdir(), 'render-delivery-'))
+    const ledger = new TurnLedger({ stateDir, log: event => logs.push(event) })
+    ledger.create({ requestId: 'req-render', deviceId: 'watch', bodySha256: 'sha', sessionId: 's' })
+    ledger.setResult('req-render', { text: 'done', extra: { response_id: 'resp-final' } })
+
+    assert.equal(ledger.get('req-render').delivered_ack, null, 'audio.done/result storage is not delivery')
+    assert.equal(ledger.recordPlaybackEnded('req-render', {
+      responseId: 'resp-final', bytesPlayed: 0,
+    }), null, 'zero-byte/failed playback is not delivery')
+    ledger.recordPlaybackEnded('req-render', { responseId: 'resp-old', bytesPlayed: 2400 })
+    assert.equal(ledger.get('req-render').delivered_ack, null, 'another response cannot deliver the final result')
+
+    ledger.recordPlaybackEnded('req-render', { responseId: 'resp-final', bytesPlayed: 4800 })
+    assert.equal(ledger.get('req-render').delivered_ack.source, 'watch_render')
+    assert.equal(ledger.replayable().some(turn => turn.request_id === 'req-render'), false)
+    assert.ok(logs.some(event => event.evt === 'result_delivered_after_render'
+      && event.request_id === 'req-render' && event.bytes_played === 4800))
+  })
+
+  it('reconciles an out-of-order render receipt that arrives before the terminal result', () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'render-race-'))
+    const ledger = new TurnLedger({ stateDir })
+    ledger.create({ requestId: 'req-race', deviceId: 'watch', bodySha256: 'sha', sessionId: 's' })
+    ledger.recordPlaybackEnded('req-race', { responseId: 'resp-race', bytesPlayed: 3200 })
+    assert.equal(ledger.get('req-race').delivered_ack, null)
+
+    ledger.setResult('req-race', { text: 'done', extra: { response_id: 'resp-race' } })
+    assert.equal(ledger.get('req-race').delivered_ack.source, 'watch_render')
+
+    const restarted = new TurnLedger({ stateDir })
+    assert.equal(restarted.replayable().some(turn => turn.request_id === 'req-race'), false)
+  })
+
+  it('keeps interrupted playback replayable and logs attempts after delivery', () => {
+    const logs = []
+    const stateDir = mkdtempSync(join(tmpdir(), 'render-interrupted-'))
+    const ledger = new TurnLedger({ stateDir, log: event => logs.push(event) })
+    ledger.create({ requestId: 'req-interrupted', deviceId: 'watch', bodySha256: 'sha', sessionId: 's' })
+    ledger.setResult('req-interrupted', { text: 'done', extra: { response_id: 'resp-i' } })
+    assert.equal(ledger.replayable().some(turn => turn.request_id === 'req-interrupted'), true)
+
+    ledger.recordPlaybackEnded('req-interrupted', { responseId: 'resp-i', bytesPlayed: 1600 })
+    assert.equal(ledger.markResultRedelivered('req-interrupted'), null)
+    assert.ok(logs.some(event => event.evt === 'result_replayed_after_delivered'
+      && event.request_id === 'req-interrupted'))
+  })
+
   it('projects request-correlated stage timestamps, TTFT, and end-to-end latency', () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'turn-timing-'))
     const ledger = new TurnLedger({ stateDir })

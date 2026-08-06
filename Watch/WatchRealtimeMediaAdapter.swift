@@ -156,6 +156,11 @@ final class WatchRealtimeMediaAdapter {
                         responseId: responseId,
                         bytesPlayed: bytesPlayed
                     )
+                    WatchLog.info(
+                        "realtime", "result_delivered_after_render",
+                        requestId: requestId,
+                        detail: "response_id=\(responseId) bytes_played=\(bytesPlayed)"
+                    )
                 }
                 // A playback `.ended` event closes only this response. One
                 // realtime session may carry multiple responses, so ending
