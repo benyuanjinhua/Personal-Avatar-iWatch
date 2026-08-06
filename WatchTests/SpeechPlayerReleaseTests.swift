@@ -175,14 +175,14 @@ final class SpeechPlayerReleaseTests: XCTestCase {
         // owner 转到 B，此后 A 的 finish 到达时 A 已不是 owner。
         try await Task.sleep(for: .milliseconds(100))
         XCTAssertEqual(
-            SpeechPlayer.sharedSessionOwner, ObjectIdentifier(a),
+            SpeechPlayer.sharedSessionOwner, a.sessionOwnerToken,
             "前提：A 激活后必须是当前 owner"
         )
 
         b.play(data: data, context: "ess224-b-active-\(UUID().uuidString)") { _ in bFinished.fulfill() }
         try await Task.sleep(for: .milliseconds(200))
         XCTAssertEqual(
-            SpeechPlayer.sharedSessionOwner, ObjectIdentifier(b),
+            SpeechPlayer.sharedSessionOwner, b.sessionOwnerToken,
             "前提：B 激活后 owner 必须转到 B（真交错的关键）"
         )
 
@@ -250,7 +250,7 @@ final class SpeechPlayerReleaseTests: XCTestCase {
         player.play(data: data, context: "ess224-p-\(UUID().uuidString)") { _ in playerFinished.fulfill() }
         try await Task.sleep(for: .milliseconds(150))
         XCTAssertEqual(
-            SpeechPlayer.sharedSessionOwner, ObjectIdentifier(player),
+            SpeechPlayer.sharedSessionOwner, player.sessionOwnerToken,
             "前提：player 激活后是当前 owner"
         )
 

@@ -72,11 +72,14 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     /// owner 时才 `setActive(false)`——防止 A 晚到的 finishPlayback 把 B
     /// 刚激活的会话拆掉、静默截断 B 的播放。
     ///
-    /// 全部访问点都在 `@MainActor` 上，无需锁；`internal` 只为让 WatchTests
-    /// 直接读写、复现「旧 player 收尾 × 新 player 已激活」交错场景。
-    /// AudioRecorder 走独立 `.playAndRecord` 类别，`releaseAudioSession`
-    /// 里有 category 兜底检查——录音已接管时也不误 deactivate。
-    static var sharedSessionOwner: ObjectIdentifier?
+    /// 不使用 `ObjectIdentifier`：实例销毁后其地址可被新实例复用，静态 owner
+    /// 若尚未清掉就会发生 ABA，把从未激活的新 player 误判成旧 owner。
+    /// UUID 随实例生成且不复用；全部访问点都在 `@MainActor` 上，无需锁。
+    /// `internal` 只为让 WatchTests 复现「旧 player 收尾 × 新 player 已激活」
+    /// 交错场景。AudioRecorder 走独立 `.playAndRecord` 类别，
+    /// `releaseAudioSession` 里有 category 兜底检查——录音已接管时也不误 deactivate。
+    let sessionOwnerToken = UUID()
+    static var sharedSessionOwner: UUID?
 
     var currentContext: String? { isPlaying ? context : nil }
 
@@ -289,7 +292,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
                     // 覆盖任何更早的 owner 记录。四个长期存活的 player 共用
                     // 同一 session，谁最后激活谁负责最终 deactivate；旧 owner
                     // 的 finishPlayback 到达时会看到 owner 已换人、跳过 release。
-                    SpeechPlayer.sharedSessionOwner = ObjectIdentifier(self)
+                    SpeechPlayer.sharedSessionOwner = self.sessionOwnerToken
                     WatchLog.info(
                         "player", "session_activated", requestId: context,
                         detail: "category=playback policy=long_form activated=true "
@@ -339,7 +342,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
             // ESS-224 复审补丁：foreground 分支激活成功同样声明 owner，
             // 与 long_form 分支保持对称——否则回落路径下 finishPlayback
             // 永远不会走真 release，session 一直留活。
-            SpeechPlayer.sharedSessionOwner = ObjectIdentifier(self)
+            SpeechPlayer.sharedSessionOwner = sessionOwnerToken
             WatchLog.info(
                 "player", "session_activated", requestId: context,
                 detail: "category=playback policy=foreground result=true "
@@ -481,7 +484,7 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     /// 跳过路径与真 release 都留取证事件，Bridge 侧可以对账两条路径的比例。
     private func releaseAudioSession(requestId: String?, reason: String) {
         let session = AVAudioSession.sharedInstance()
-        let me = ObjectIdentifier(self)
+        let me = sessionOwnerToken
         guard SpeechPlayer.sharedSessionOwner == me else {
             WatchLog.info(
                 "player", "session_release_skipped", requestId: requestId,
