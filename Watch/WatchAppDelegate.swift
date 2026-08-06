@@ -43,7 +43,22 @@ final class WatchAppServices {
         // ESS-321: pre-warm the adapter so the settings store's downlink
         // dispatch has somewhere to send `audio.delta` payloads even before
         // the first press has fired.
-        settings.realtimeAdapter = pushToTalk.ensureRealtimeAdapter()
+        // ESS-488: skip the pre-warm when the app is hosted as an xctest
+        // target. On the GitHub macos-15 runner's watchOS 26 simulator,
+        // `AVAudioEngine.connect(playerNode, mainMixerNode, format:)` inside
+        // `RealtimePlaybackEngine.init` throws an ObjC exception (`-10868`
+        // `AUInterface.mm SetFormat`) at launch and terminates the test host
+        // before any `Test Case ... started` is emitted. Real device and app
+        // preview paths never see `XCTestConfigurationFilePath`, so the
+        // pre-warm still runs there and ESS-321's downlink readiness intent
+        // is preserved. Tests that exercise the adapter construct it
+        // explicitly via `PushToTalkController.ensureRealtimeAdapter()`
+        // (see WatchTests/PushToTalkStreamingStartupTests.swift and
+        // WatchTests/PushToTalkDeferredFallbackTests.swift), so nothing
+        // downstream loses coverage.
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
+            settings.realtimeAdapter = pushToTalk.ensureRealtimeAdapter()
+        }
         // ESS-349 接缝：接上 B4 接收器。降级只记事件——整段 m4a 走的是
         // transferSpeech 可靠通道，与 chunk 流并行，不依赖这里回信。
         let receiver = WatchStreamReceiver(debugSettings: debugSettings) { requestId, reason in

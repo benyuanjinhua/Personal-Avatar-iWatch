@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>beer.workspace.wristagent.gateway.rotator</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/jacksonmac/Services/Personal-Avatar-iWatch/AudioRealtimeGateway/scripts/rotate-log.sh</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>3600</integer>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardOutPath</key>
+	<string>/Users/jacksonmac/Services/Personal-Avatar-iWatch/AudioRealtimeGateway/logs/rotator.stdout.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/jacksonmac/Services/Personal-Avatar-iWatch/AudioRealtimeGateway/logs/rotator.stderr.log</string>
+</dict>
+</plist>

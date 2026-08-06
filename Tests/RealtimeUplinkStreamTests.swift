@@ -56,6 +56,7 @@ final class RealtimeUplinkStreamTests: XCTestCase {
                 return XCTFail("expected audio.commit")
             }
             XCTAssertEqual(commit.requestId, requestId)
+            XCTAssertEqual(commit.sequence, 2)
         default:
             XCTFail("expected emitted commit")
         }
@@ -70,6 +71,15 @@ final class RealtimeUplinkStreamTests: XCTestCase {
         default:
             XCTFail("repeat start should be a no-op")
         }
+    }
+
+    func testCommitWithoutAudioFallsBackInsteadOfSendingEmptyBuffer() {
+        var stream = makeStream()
+        _ = stream.start(capturedAtMs: 100)
+
+        XCTAssertEqual(stream.commit(capturedAtMs: 200), .fallback(.noAudioFrames))
+        XCTAssertTrue(stream.didFallback)
+        XCTAssertFalse(stream.didCommit)
     }
 
     func testAppendBeforeStartFallsBack() {

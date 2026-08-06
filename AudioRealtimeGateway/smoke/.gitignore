@@ -1,0 +1,4 @@
+# Smoke run artefacts (server stdout, captured run output) — regenerated on
+# every `node smoke/deploy-smoke.mjs`, never committed.
+*.log
+ESS-423-smoke-run.txt

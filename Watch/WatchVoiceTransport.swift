@@ -479,6 +479,17 @@ extension WatchVoiceTransport: WatchRealtimeMediaAdapter.Transport {
         )))
     }
 
+    /// ESS-404 §5: forward the barge-in ask to iPhone. iPhone owns the
+    /// generation counter and issues `cancel(generation)` on the WSS.
+    func sendBargeInRequest(_ request: RealtimeBargeInRequest) {
+        WatchLog.info(
+            "transport", "realtime_bargein_request",
+            requestId: request.requestId,
+            detail: "from_gen=\(request.fromGeneration)"
+        )
+        sendRealtimeUplink(.bargeInRequest(request))
+    }
+
     func fallbackToCompleteFile(handle: RealtimeMediaSession.TurnHandle,
                                 reason: RealtimeUplinkStream.FallbackReason) {
         // ESS-321: the coordinator has committed to fallback exactly once per

@@ -48,6 +48,10 @@ final class PhoneRealtimeSession {
     private var currentTransport: Transport?
     private(set) var state: State = .idle
     private var pendingDownlink: [RealtimeDownlinkEnvelope] = []
+    /// ESS-391: Agent transports deliver events via callbacks rather than
+    /// the Bridge-style `receive(handler:)` loop. When `true`, `scheduleReceive`
+    /// is a no-op — the transport itself wires downlink delivery.
+    var isAgentTransport: Bool = false
 
     /// Emits every decoded downlink envelope. `PhoneConnectivity` bridges this
     /// back to the watch via `WatchDownlinkOutbox`.
@@ -81,6 +85,24 @@ final class PhoneRealtimeSession {
             transition(to: .failed(reason: descriptor.reason))
             currentTransport?.close(reason: descriptor.reason)
             currentTransport = nil
+            return
+        case .bargeInRequest:
+            // ESS-391: forward barge-in to transport. For Bridge transports
+            // this is a no-op (Bridge doesn't understand generation); for
+            // Agent transports this triggers generation advance → cancel →
+            // generation.open downlink.
+            guard let ask = envelope.bargeIn else { return }
+            Self.logger.info(
+                "realtime bargein.request request=\(ask.requestId, privacy: .public) from_gen=\(ask.fromGeneration, privacy: .public)"
+            )
+            guard let transport = currentTransport else { return }
+            transport.send(envelope) { [weak self] error in
+                if let error {
+                    Self.logger.error(
+                        "bargein.request send failed: \(String(describing: error), privacy: .public)"
+                    )
+                }
+            }
             return
         }
         guard let transport = currentTransport else { return }
@@ -150,6 +172,9 @@ final class PhoneRealtimeSession {
     }
 
     private func scheduleReceive(_ transport: Transport) {
+        // ESS-391: Agent transports deliver downlink events via callbacks
+        // (wired in PhoneRealtimeAgentTransport), not through this loop.
+        if isAgentTransport { return }
         transport.receive { [weak self, weak transport] result in
             guard let self, let transport, self.currentTransport === transport else { return }
             switch result {

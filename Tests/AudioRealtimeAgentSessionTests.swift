@@ -123,8 +123,25 @@ final class AudioRealtimeAgentSessionTests: XCTestCase {
         defaults.removePersistentDomain(forName: "test_ess402_flag")
         let flag = AudioRealtimeAgentFeatureFlag(defaults: defaults)
         XCTAssertFalse(flag.isDirectPathEnabled)
-        XCTAssertTrue(flag.gatewayURLString.isEmpty)
+        // ESS-459: default URL is the dev cluster, not empty
+        XCTAssertEqual(flag.gatewayURLString, AudioRealtimeAgentFeatureFlag.devDefaultGatewayURLString)
         XCTAssertTrue(flag.deviceId.isEmpty)
+    }
+
+    /// ESS-459: user-configured URL always takes priority over the dev default.
+    func testFeatureFlagUserURLOverridesDevDefault() {
+        let defaults = UserDefaults(suiteName: "test_ess459_user_override")!
+        defaults.removePersistentDomain(forName: "test_ess459_user_override")
+        let flag = AudioRealtimeAgentFeatureFlag(defaults: defaults)
+        // Fresh install → dev default
+        XCTAssertEqual(flag.gatewayURLString, AudioRealtimeAgentFeatureFlag.devDefaultGatewayURLString)
+        // User sets custom URL
+        let customURL = "wss://staging.example.com:8444/api/realtime"
+        flag.setGatewayURLString(customURL)
+        XCTAssertEqual(flag.gatewayURLString, customURL)
+        // After clearing UserDefaults key → back to dev default
+        defaults.removeObject(forKey: AudioRealtimeAgentFeatureFlag.Key.gatewayURL)
+        XCTAssertEqual(flag.gatewayURLString, AudioRealtimeAgentFeatureFlag.devDefaultGatewayURLString)
     }
 
     func testFeatureFlagEnableAndPersist() {

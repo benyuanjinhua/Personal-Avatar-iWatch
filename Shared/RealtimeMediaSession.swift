@@ -55,6 +55,20 @@ final class RealtimeMediaSession {
         case playbackCleared(bytesDropped: Int)
         case playbackFallback(RealtimeDownlinkPlayback.FallbackReason, RealtimeMediaSession.TurnHandle)
         case downlinkDropped(RealtimeDownlinkPlayback.DropReason)
+        /// ESS-404 §3.3: `audio.done` arrived. `outcome` distinguishes barrier
+        /// released vs waiting vs `-1` zero-audio vs the degrade path when
+        /// `final_sequence` is absent.
+        case doneArrived(TurnHandle, RealtimeDownlinkPlayback.DoneOutcome)
+        /// ESS-404 §3.3: the barrier crossed after new deltas landed. Distinct
+        /// from `doneArrived` so the coordinator's caller can emit
+        /// `done_barrier_released` at exactly the moment of release.
+        case doneBarrierReleased(TurnHandle, finalSequence: Int, responseId: String?)
+        /// ESS-404 §5: Watch asks iPhone to advance generation. Adapter
+        /// forwards this as a `bargein.request` uplink envelope.
+        case bargeInRequested(TurnHandle, fromGeneration: Int)
+        /// ESS-404 §3.5: gate promoted to `.open(generation)` — pending
+        /// window closed, deltas resume.
+        case generationOpened(TurnHandle, fromGeneration: Int?, toGeneration: Int)
         case turnFinished(TurnHandle, FinishReason)
     }
 
@@ -184,14 +198,20 @@ final class RealtimeMediaSession {
     /// `responseId` is the Bridge `audio.delta.response_id` for this chunk;
     /// the reorder buffer keeps the pairing intact across out-of-order
     /// releases so playback receipts route to the correct response.
-    func receiveDownlink(_ chunk: VoiceStreamChunk, responseId: String? = nil) {
+    /// `generation` is the ESS-404 turn generation; nil traces the legacy
+    /// admit path so pre-ESS-403 traffic still works during rollout.
+    func receiveDownlink(
+        _ chunk: VoiceStreamChunk,
+        responseId: String? = nil,
+        generation: Int? = nil
+    ) {
         guard let handle = currentTurn else {
             onEvent?(.downlinkDropped(.staleSession(
                 RealtimeDownlinkPlayback.SessionKey(requestId: chunk.requestId, sessionId: chunk.streamId)
             )))
             return
         }
-        let outcome = downlink.ingest(chunk, responseId: responseId)
+        let outcome = downlink.ingest(chunk, responseId: responseId, generation: generation)
         switch outcome {
         case .ready(let frames):
             onEvent?(.playbackReady(frames))
@@ -204,13 +224,89 @@ final class RealtimeMediaSession {
         case .fallback(let reason):
             onEvent?(.playbackFallback(reason, handle))
         }
+        // ESS-404 §3.3: a delta that filled the barrier's missing set must
+        // trigger release right here — otherwise the coordinator would sit
+        // on `pendingFinalSequence` until the next barrier tick and delay
+        // `player.finish(...)` past the point of the last render.
+        if let release = downlink.checkBarrierRelease() {
+            if case .barrierReleased(let final, let responseId) = release {
+                _ = downlink.endSession()
+                onEvent?(.doneBarrierReleased(handle, finalSequence: final, responseId: responseId))
+            }
+        }
     }
 
-    /// User talked over the response — dump every buffered downlink byte
-    /// and end the current session so late frames are dropped.
+    /// ESS-404 §3.3: `audio.done` arrived for the current turn. Delegates to
+    /// the buffer's barrier logic and emits `doneArrived(...)` with the
+    /// decision. `generation` guards against stale done events closing a
+    /// newer generation's session (U8 core regression).
+    func receiveDone(
+        finalSequence: Int?,
+        responseId: String? = nil,
+        generation: Int? = nil
+    ) {
+        guard let handle = currentTurn else { return }
+        let outcome = downlink.markDone(
+            finalSequence: finalSequence, responseId: responseId, generation: generation
+        )
+        onEvent?(.doneArrived(handle, outcome))
+        switch outcome {
+        case .barrierReleased, .zeroAudio:
+            // Barrier released synchronously — either seq 0…n already there
+            // or the explicit `-1` zero-audio contract. Safe to close the
+            // downlink session so late frames from THIS response are
+            // rejected as `.sessionEnded` (a new response's deltas still
+            // arrive under the same generation once the coordinator's next
+            // turn opens).
+            _ = downlink.endSession()
+        case .missingFinalSequence:
+            // Gateway did not send `final_sequence` (legacy / rollout).
+            // Spec §3.2 row 3 degrades to `n = max emitted seq` — meaning
+            // we treat the barrier as already satisfied by what we have
+            // and release. The drain still fires (so the player renders
+            // the tail and the multi-response turn stays alive), but the
+            // structured contract-violation log is what makes the error
+            // visible so the Gateway side gets fixed.
+            break
+        case .waiting, .droppedStaleGeneration, .droppedPendingGeneration:
+            break
+        }
+    }
+
+    /// ESS-404 §3.4: 2.0 s done-barrier timer fired without the barrier
+    /// releasing. Delegates to the buffer's single-shot fallback path so
+    /// the caller only ever executes the structured-failure flow once.
+    func doneBarrierTimeout() {
+        guard let handle = currentTurn else { return }
+        let outcome = downlink.doneBarrierTimedOut()
+        if case .fallback(let reason) = outcome {
+            onEvent?(.playbackFallback(reason, handle))
+        }
+    }
+
+    /// ESS-404 §3.5: iPhone confirmed the new generation. Promotes the
+    /// downlink gate and emits `generationOpened(...)` so the adapter can
+    /// log `bargein_generation_opened`.
+    func openGeneration(_ generation: Int) {
+        guard let handle = currentTurn else { return }
+        let previous = downlink.activeGeneration
+        _ = downlink.openGeneration(generation)
+        onEvent?(.generationOpened(handle, fromGeneration: previous, toGeneration: generation))
+    }
+
+    /// User talked over the response — dump every buffered downlink byte,
+    /// transition the gate to `.pending`, and ask the transport to send a
+    /// `bargein.request` up to iPhone so it can advance the generation.
+    ///
+    /// **ESS-404 §5**: the pending window drops every incoming event until
+    /// `openGeneration(_:)` fires. `fromGeneration` is the generation Watch
+    /// last observed (or -1 if the gate was still `.unset`).
     func bargeInDownlink() {
+        guard let handle = currentTurn else { return }
+        let fromGeneration = downlink.activeGeneration ?? -1
         let cleared = downlink.bargeIn()
         if case .bargedIn(let bytes) = cleared { onEvent?(.playbackCleared(bytesDropped: bytes)) }
+        onEvent?(.bargeInRequested(handle, fromGeneration: fromGeneration))
     }
 
     /// Bridge WSS reported the downlink fast channel died — collapse to the

@@ -15,7 +15,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     @Published private(set) var pendingDownlinkCount = 0
     /// ESS-28：加密 outbox + Tailscale 上送 + 结果回传编排器。
     let relay: WristAgentPhoneRelay
-    /// ESS-321 real-time media session (Watch ↔ iPhone ↔ Bridge). Lazily
+    /// ESS-321 real-time media session (Watch ↔ iPhone ↔ Bridge/Agent). Lazily
     /// constructed on the first uplink envelope so households that never
     /// enable streaming do not pay for the WSS setup.
     private lazy var realtimeSession: PhoneRealtimeSession = {
@@ -27,6 +27,18 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         }
         return session
     }()
+    /// ESS-391: feature flag controlling the Agent direct path.
+    private let agentFlag = AudioRealtimeAgentFeatureFlag()
+    /// ESS-391: cached Agent session — created once, reused across turns.
+    /// The session is re-connected per turn with fresh token + requestId.
+    private var agentSession: AudioRealtimeAgentSession?
+    /// ESS-391: cached token for current turn (ephemeral, memory-only).
+    private var agentEphemeralToken: String?
+    /// Envelopes are held only while the per-turn token request is in flight.
+    /// A failed mint drains them through the legacy Bridge exactly once.
+    private var pendingAgentEnvelopes = AgentEnvelopeBuffer()
+    private var agentTokenTask: Task<Void, Never>?
+    private var agentTokenState = AgentTokenMintState()
     private var pendingConfiguration: AgentConfiguration?
     private let historyStorageKey = "wristagent.phone.conversation.history"
     private let voiceInbox: VoiceRequestInbox?
@@ -209,7 +221,125 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     private func handleRealtimeUplink(data: Data) {
         guard let envelope = try? JSONDecoder().decode(RealtimeUplinkEnvelope.self, from: data),
               envelope.protocolVersion == RealtimeWireVersion.uplink else { return }
-        realtimeSession.forward(envelope)
+        guard agentFlag.isDirectPathEnabled else {
+            realtimeSession.forward(envelope)
+            return
+        }
+        guard let identity = Self.turnIdentity(for: envelope) else {
+            realtimeSession.forward(envelope)
+            return
+        }
+
+        let turn = AgentTokenMintState.Turn(requestId: identity.requestId, sessionId: identity.sessionId)
+        if agentTokenState.turn == turn,
+           agentEphemeralToken != nil {
+            realtimeSession.forward(envelope)
+            return
+        }
+        if agentTokenState.failedTurn == turn {
+            // Minting already failed for this turn. Keep the entire turn on
+            // Bridge; never retry mid-turn and create a second execution.
+            realtimeSession.forward(envelope)
+            return
+        }
+
+        if agentTokenState.activate(turn) {
+            agentTokenTask?.cancel()
+            agentTokenTask = nil
+            agentEphemeralToken = nil
+            _ = pendingAgentEnvelopes.drain()
+        }
+        switch pendingAgentEnvelopes.append(envelope, encodedByteCount: data.count) {
+        case .buffered:
+            break
+        case .overflow(let buffered, let incoming, let snapshot):
+            agentTokenTask?.cancel()
+            agentEphemeralToken = nil
+            guard agentTokenState.markCurrentTurnFailed(turn) else { return }
+            Self.logAgentFallback(reason: "buffer_overflow", snapshot: snapshot, degradedCount: buffered.count + 1)
+            for item in buffered { realtimeSession.forward(item) }
+            realtimeSession.forward(incoming)
+            return
+        }
+        guard agentTokenTask == nil else { return }
+        guard let taskID = agentTokenState.registerTask() else { return }
+        agentTokenTask = Task { [weak self] in
+            await self?.mintAgentTokenAndDrain(turn: turn, taskID: taskID)
+        }
+    }
+
+    private static func turnIdentity(for envelope: RealtimeUplinkEnvelope) -> (requestId: String, sessionId: String)? {
+        switch envelope.kind {
+        case .streamStart:
+            return envelope.start.map { ($0.requestId, $0.sessionId) }
+        case .audioAppend:
+            return envelope.append.map { ($0.requestId, $0.streamId) }
+        case .audioCommit:
+            return envelope.commit.map { ($0.requestId, $0.sessionId) }
+        case .playbackStarted, .playbackEnded:
+            return envelope.playback.map { ($0.requestId, $0.sessionId) }
+        case .bargeInRequest:
+            return envelope.bargeIn.map { ($0.requestId, $0.sessionId) }
+        case .fallback:
+            return nil
+        }
+    }
+
+    private func mintAgentTokenAndDrain(turn: AgentTokenMintState.Turn, taskID: UUID) async {
+        defer {
+            if agentTokenState.finish(taskId: taskID, turn: turn) {
+                agentTokenTask = nil
+            }
+        }
+        guard let credentials = RelayCredentialsStore.read(),
+              credentials.deviceId == agentFlag.deviceId,
+              let gatewayURL = URL(string: agentFlag.gatewayURLString) else {
+            drainPendingAgentEnvelopesToBridge(
+                reason: "missing_credentials_or_gateway", turn: turn, taskID: taskID
+            )
+            return
+        }
+        do {
+            let issued = try await AgentSessionTokenClient(
+                gatewayURL: gatewayURL,
+                credentials: credentials
+            ).mint(requestId: turn.requestId, sessionId: turn.sessionId, generation: 1)
+            guard agentTokenState.owns(taskId: taskID, turn: turn) else { return }
+            agentEphemeralToken = issued.token
+            let (buffered, _) = pendingAgentEnvelopes.drain()
+            Self.logger.info(
+                "agent ephemeral token minted request=\(turn.requestId.prefix(8), privacy: .public) session=\(turn.sessionId.prefix(8), privacy: .public) ttl_ms=\(issued.ttlMs, privacy: .public)"
+            )
+            for envelope in buffered { realtimeSession.forward(envelope) }
+        } catch {
+            guard agentTokenState.owns(taskId: taskID, turn: turn) else { return }
+            Self.logger.error(
+                "agent token mint failed request=\(turn.requestId.prefix(8), privacy: .public) error=\(String(describing: error), privacy: .public)"
+            )
+            drainPendingAgentEnvelopesToBridge(
+                reason: AgentTokenFallbackReason.reason(for: error), turn: turn, taskID: taskID
+            )
+        }
+    }
+
+    private func drainPendingAgentEnvelopesToBridge(
+        reason: String, turn: AgentTokenMintState.Turn, taskID: UUID
+    ) {
+        guard agentTokenState.markFailed(taskId: taskID, turn: turn) else { return }
+        agentEphemeralToken = nil
+        let (buffered, snapshot) = pendingAgentEnvelopes.drain()
+        Self.logAgentFallback(reason: reason, snapshot: snapshot, degradedCount: buffered.count)
+        for envelope in buffered { realtimeSession.forward(envelope) }
+    }
+
+    private static func logAgentFallback(
+        reason: String,
+        snapshot: AgentEnvelopeBuffer.Snapshot,
+        degradedCount: Int
+    ) {
+        logger.notice(
+            "agent direct fallback reason=\(reason, privacy: .public) buffered_count=\(snapshot.envelopeCount, privacy: .public) buffered_bytes=\(snapshot.byteCount, privacy: .public) waited_ms=\(snapshot.waitedMilliseconds, privacy: .public) degraded_count=\(degradedCount, privacy: .public)"
+        )
     }
 
     /// Bridge → iPhone → Watch: enqueue a decoded downlink envelope onto the
@@ -226,18 +356,62 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         )
     }
 
-    /// URLSessionWebSocketTask factory bound to the relay's credentials and
-    /// bridge URL. Returns `nil` if the phone is not paired yet (the watch
-    /// side will treat that as a transport failure and fall back to the
-    /// existing full-file relay flow).
+    /// Transport factory that selects Bridge or Agent path based on the
+    /// `AudioRealtimeAgentFeatureFlag`. Returns `nil` if neither path is
+    /// available (watch side treats that as a transport failure and falls
+    /// back to the full-file relay flow).
     ///
-    /// Bridge PR #113 `server.mjs` requires `?request_id=` + `?session_id=`
-    /// on the WSS handshake AND the signed request-id to equal the URL's
-    /// `request_id`, otherwise the socket closes with `ERR_STREAM_OWNERSHIP`.
-    /// The factory therefore signs with the turn's request id (not a fresh
-    /// UUID) and stamps both ids on the URL query.
+    /// **Agent path**: creates a `PhoneRealtimeAgentTransport` wrapping an
+    /// `AudioRealtimeAgentSession`. The token must already be obtained via
+    /// `POST /v1/realtime/session-token` (ESS-401 integration). Currently
+    /// the token is passed via `agentEphemeralToken` — a downstream
+    /// ESS-401 integration must refresh it per turn.
+    ///
+    /// **Bridge path**: the existing `PhoneRealtimeWebSocketTransport` using
+    /// the relay's signed WSS endpoint (PR #113).
     @MainActor
     private func makeRealtimeTransport(requestId: String, sessionId: String) -> PhoneRealtimeSession.Transport? {
+        // ESS-391: try Agent direct path first when feature flag is enabled.
+        if let agentConfig = agentFlag.resolveConfig(ephemeralToken: agentEphemeralToken ?? "") {
+            // Gateway tokens are single-upgrade. Never reuse a session whose
+            // transport was configured with the preceding turn's token.
+            let session = AudioRealtimeAgentSession(config: agentConfig, sessionId: sessionId)
+            agentSession = session
+            let transport = PhoneRealtimeAgentTransport(
+                config: agentConfig,
+                agentSession: session,
+                requestId: requestId,
+                sessionId: sessionId,
+                generation: 1,
+                replacementSession: { [agentFlag] generation in
+                    guard let credentials = RelayCredentialsStore.read(),
+                          credentials.deviceId == agentFlag.deviceId,
+                          let gatewayURL = URL(string: agentFlag.gatewayURLString) else {
+                        throw AgentSessionTokenError.invalidGatewayURL
+                    }
+                    let issued = try await AgentSessionTokenClient(
+                        gatewayURL: gatewayURL, credentials: credentials
+                    ).mint(requestId: requestId, sessionId: sessionId, generation: generation)
+                    guard let freshConfig = agentFlag.resolveConfig(ephemeralToken: issued.token) else {
+                        throw AgentSessionTokenError.invalidGatewayURL
+                    }
+                    return AudioRealtimeAgentSession(config: freshConfig, sessionId: sessionId)
+                }
+            )
+            transport.onDownlink = { [weak self] envelope in
+                self?.forwardRealtimeDownlink(envelope)
+            }
+            transport.onStateChange = { [weak self] state in
+                Self.logger.info("agent transport state → \(String(describing: state), privacy: .public)")
+            }
+            realtimeSession.isAgentTransport = true
+            Self.logger.info(
+                "agent transport created for rid=\(requestId.prefix(8), privacy: .public)"
+            )
+            return transport
+        }
+
+        // Fallback to Bridge path
         guard let credentials = RelayCredentialsStore.read(),
               var components = URLComponents(string: relay.bridgeURLString) else { return nil }
         components.scheme = "wss"
@@ -256,6 +430,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         )
         request.url = url
         let task = URLSession.shared.webSocketTask(with: request)
+        realtimeSession.isAgentTransport = false
         return PhoneRealtimeWebSocketTransport(task: task)
     }
 

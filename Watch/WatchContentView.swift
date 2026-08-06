@@ -63,7 +63,14 @@ struct WatchContentView: View {
             .tag(1)
 
             NavigationStack {
-                WatchSettingsView(selfCheck: selfCheck, debugSettings: debugSettings, settings: settings)
+                WatchSettingsView(
+                    selfCheck: selfCheck,
+                    debugSettings: debugSettings,
+                    settings: settings,
+                    journal: pushToTalk.journal,
+                    speechVault: pushToTalk.speechVault,
+                    player: pushToTalk.player
+                )
             }
             .tag(2)
         }

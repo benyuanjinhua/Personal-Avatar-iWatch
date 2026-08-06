@@ -24,6 +24,10 @@ enum RealtimeUplinkKind: String, Codable, Sendable {
     case playbackStarted = "playback.started"
     case playbackEnded = "playback.ended"
     case fallback = "stream.fallback"
+    /// ESS-404 A4: barge-in request from Watch → iPhone (Watch is not the
+    /// generation owner; it asks iPhone to advance `generation` and issue
+    /// `cancel` on the WSS).
+    case bargeInRequest = "bargein.request"
 }
 
 struct RealtimeUplinkEnvelope: Codable, Sendable, Equatable {
@@ -34,6 +38,8 @@ struct RealtimeUplinkEnvelope: Codable, Sendable, Equatable {
     let commit: RealtimeStreamCommit?
     let playback: RealtimePlaybackReceipt?
     let fallback: RealtimeUplinkFallbackDescriptor?
+    /// ESS-404 A4: only present when `kind == .bargeInRequest`.
+    let bargeIn: RealtimeBargeInRequest?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
@@ -43,6 +49,41 @@ struct RealtimeUplinkEnvelope: Codable, Sendable, Equatable {
         case commit
         case playback
         case fallback
+        case bargeIn = "bargein"
+    }
+
+    init(
+        protocolVersion: Int,
+        kind: RealtimeUplinkKind,
+        start: RealtimeStreamStart?,
+        append: VoiceStreamChunk?,
+        commit: RealtimeStreamCommit?,
+        playback: RealtimePlaybackReceipt?,
+        fallback: RealtimeUplinkFallbackDescriptor?,
+        bargeIn: RealtimeBargeInRequest? = nil
+    ) {
+        self.protocolVersion = protocolVersion
+        self.kind = kind
+        self.start = start
+        self.append = append
+        self.commit = commit
+        self.playback = playback
+        self.fallback = fallback
+        self.bargeIn = bargeIn
+    }
+
+    /// Explicit initializer used by the JSON decoder: the `bargein` key is
+    /// optional on the wire so pre-ESS-404 messages still decode cleanly.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.protocolVersion = try c.decode(Int.self, forKey: .protocolVersion)
+        self.kind = try c.decode(RealtimeUplinkKind.self, forKey: .kind)
+        self.start = try c.decodeIfPresent(RealtimeStreamStart.self, forKey: .start)
+        self.append = try c.decodeIfPresent(VoiceStreamChunk.self, forKey: .append)
+        self.commit = try c.decodeIfPresent(RealtimeStreamCommit.self, forKey: .commit)
+        self.playback = try c.decodeIfPresent(RealtimePlaybackReceipt.self, forKey: .playback)
+        self.fallback = try c.decodeIfPresent(RealtimeUplinkFallbackDescriptor.self, forKey: .fallback)
+        self.bargeIn = try c.decodeIfPresent(RealtimeBargeInRequest.self, forKey: .bargeIn)
     }
 
     static func start(_ start: RealtimeStreamStart) -> Self {
@@ -92,6 +133,31 @@ struct RealtimeUplinkEnvelope: Codable, Sendable, Equatable {
             playback: nil, fallback: descriptor
         )
     }
+
+    /// ESS-404 A4: Watch asks iPhone to advance the generation and send
+    /// `cancel(from_generation)` on the WSS. Watch does not embed the target
+    /// generation — iPhone is the generation owner.
+    static func bargeInRequest(_ request: RealtimeBargeInRequest) -> Self {
+        RealtimeUplinkEnvelope(
+            protocolVersion: RealtimeWireVersion.uplink,
+            kind: .bargeInRequest, start: nil, append: nil, commit: nil,
+            playback: nil, fallback: nil, bargeIn: request
+        )
+    }
+}
+
+/// ESS-404 A4 barge-in request payload — carries which generation the Watch
+/// last saw (`fromGeneration`) so iPhone can dedupe stale requests.
+struct RealtimeBargeInRequest: Codable, Sendable, Equatable {
+    let requestId: String
+    let sessionId: String
+    let fromGeneration: Int
+
+    enum CodingKeys: String, CodingKey {
+        case requestId = "request_id"
+        case sessionId = "session_id"
+        case fromGeneration = "from_generation"
+    }
 }
 
 struct RealtimeUplinkFallbackDescriptor: Codable, Sendable, Equatable {
@@ -137,6 +203,12 @@ enum RealtimeDownlinkKind: String, Codable, Sendable {
     case playbackClear = "playback.clear"
     case responseInterrupted = "response.interrupted"
     case bridgeFallback = "stream.fallback"
+    /// ESS-404: iPhone → Watch generation lifecycle. `generationOpen`
+    /// promotes Watch's `activeGeneration` and unblocks the pending window
+    /// that follows a barge-in. `bargeInFailed` reports that iPhone could
+    /// not send `cancel` on the WSS, so the pending window must collapse.
+    case generationOpen = "generation.open"
+    case bargeInFailed = "bargein.failed"
 }
 
 struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
@@ -153,6 +225,16 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
     /// receipts so multi-response sessions are disambiguated. Absent for
     /// event kinds that have no notion of an Agent response.
     let responseId: String?
+    /// ESS-404 §3.1: turn generation. Optional on the wire during rollout
+    /// (Gateway ESS-403 may lag), but required by contract; `nil` triggers
+    /// the legacy path in `RealtimeDownlinkPlayback`, not a hard drop.
+    let generation: Int?
+    /// ESS-404 §3.2: completion barrier value on `audio.done`.
+    /// `n ≥ 0` means release once seq 0…n have arrived; `-1` means "zero
+    /// audio for this response" (release immediately, no `.ended`); `nil`
+    /// means Gateway did not send the field — a contract violation that
+    /// degrades to `n = max seq seen so far` under `done_missing_final_sequence`.
+    let finalSequence: Int?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
@@ -164,6 +246,51 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         case transcript
         case reason
         case responseId = "response_id"
+        case generation
+        case finalSequence = "final_sequence"
+    }
+
+    init(
+        protocolVersion: Int,
+        kind: RealtimeDownlinkKind,
+        requestId: String,
+        sessionId: String,
+        sequence: Int?,
+        audio: VoiceStreamChunk?,
+        transcript: String?,
+        reason: String?,
+        responseId: String?,
+        generation: Int? = nil,
+        finalSequence: Int? = nil
+    ) {
+        self.protocolVersion = protocolVersion
+        self.kind = kind
+        self.requestId = requestId
+        self.sessionId = sessionId
+        self.sequence = sequence
+        self.audio = audio
+        self.transcript = transcript
+        self.reason = reason
+        self.responseId = responseId
+        self.generation = generation
+        self.finalSequence = finalSequence
+    }
+
+    /// Explicit decoder so pre-ESS-404 messages (no `generation`, no
+    /// `final_sequence`) still decode. Only mandatory keys are strict.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.protocolVersion = try c.decode(Int.self, forKey: .protocolVersion)
+        self.kind = try c.decode(RealtimeDownlinkKind.self, forKey: .kind)
+        self.requestId = try c.decode(String.self, forKey: .requestId)
+        self.sessionId = try c.decode(String.self, forKey: .sessionId)
+        self.sequence = try c.decodeIfPresent(Int.self, forKey: .sequence)
+        self.audio = try c.decodeIfPresent(VoiceStreamChunk.self, forKey: .audio)
+        self.transcript = try c.decodeIfPresent(String.self, forKey: .transcript)
+        self.reason = try c.decodeIfPresent(String.self, forKey: .reason)
+        self.responseId = try c.decodeIfPresent(String.self, forKey: .responseId)
+        self.generation = try c.decodeIfPresent(Int.self, forKey: .generation)
+        self.finalSequence = try c.decodeIfPresent(Int.self, forKey: .finalSequence)
     }
 
     /// Bridge PR #113 handshake ack. Carries no payload. Adapter treats this
@@ -176,12 +303,16 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         )
     }
 
-    static func audioDelta(_ chunk: VoiceStreamChunk, responseId: String? = nil) -> Self {
+    static func audioDelta(
+        _ chunk: VoiceStreamChunk,
+        responseId: String? = nil,
+        generation: Int? = nil
+    ) -> Self {
         RealtimeDownlinkEnvelope(
             protocolVersion: RealtimeWireVersion.downlink,
             kind: .audioDelta, requestId: chunk.requestId, sessionId: chunk.streamId,
             sequence: chunk.sequence, audio: chunk, transcript: nil, reason: nil,
-            responseId: responseId
+            responseId: responseId, generation: generation
         )
     }
 
@@ -201,12 +332,18 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         )
     }
 
-    static func audioDone(requestId: String, sessionId: String, responseId: String? = nil) -> Self {
+    static func audioDone(
+        requestId: String,
+        sessionId: String,
+        responseId: String? = nil,
+        generation: Int? = nil,
+        finalSequence: Int? = nil
+    ) -> Self {
         RealtimeDownlinkEnvelope(
             protocolVersion: RealtimeWireVersion.downlink,
             kind: .audioDone, requestId: requestId, sessionId: sessionId,
             sequence: nil, audio: nil, transcript: nil, reason: nil,
-            responseId: responseId
+            responseId: responseId, generation: generation, finalSequence: finalSequence
         )
     }
 
@@ -231,6 +368,39 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
             protocolVersion: RealtimeWireVersion.downlink,
             kind: .bridgeFallback, requestId: requestId, sessionId: sessionId,
             sequence: nil, audio: nil, transcript: nil, reason: reason, responseId: nil
+        )
+    }
+
+    /// ESS-404 §5: iPhone announces the new generation after processing a
+    /// barge-in (or on a fresh turn). Watch treats this as the trigger that
+    /// exits the pending window and sets `activeGeneration = generation`.
+    static func generationOpen(
+        requestId: String,
+        sessionId: String,
+        generation: Int
+    ) -> Self {
+        RealtimeDownlinkEnvelope(
+            protocolVersion: RealtimeWireVersion.downlink,
+            kind: .generationOpen, requestId: requestId, sessionId: sessionId,
+            sequence: nil, audio: nil, transcript: nil, reason: nil,
+            responseId: nil, generation: generation
+        )
+    }
+
+    /// ESS-404 §5 exception branch: iPhone could not send `cancel` on the
+    /// WSS, so the pending window must collapse into a single fallback +
+    /// structured error card. `reason` explains why.
+    static func bargeInFailed(
+        requestId: String,
+        sessionId: String,
+        fromGeneration: Int,
+        reason: String
+    ) -> Self {
+        RealtimeDownlinkEnvelope(
+            protocolVersion: RealtimeWireVersion.downlink,
+            kind: .bargeInFailed, requestId: requestId, sessionId: sessionId,
+            sequence: nil, audio: nil, transcript: nil, reason: reason,
+            responseId: nil, generation: fromGeneration
         )
     }
 }

@@ -21,6 +21,10 @@ struct RealtimeUplinkStream: Sendable {
         case transportFailed
         case backpressure
         case sequenceOverflow
+        /// The microphone tap started but produced no PCM before commit.
+        /// Committing an empty upstream buffer is guaranteed to fail, so use
+        /// the retained complete-file recording instead of silently ending.
+        case noAudioFrames
         case invalidPayload(VoiceStreamValidationError)
     }
 
@@ -125,10 +129,12 @@ struct RealtimeUplinkStream: Sendable {
         guard !didFallback else { return .ignoredAfterFallback }
         guard didStart else { return trigger(fallback: .cancelled) }
         guard !didCommit else { return .emitted([]) }
+        guard nextSequence > 0 else { return trigger(fallback: .noAudioFrames) }
         didCommit = true
         return .emitted([.audioCommit(RealtimeStreamCommit(
             requestId: requestId,
             sessionId: sessionId,
+            sequence: nextSequence - 1,
             capturedAtMs: capturedAtMs
         ))])
     }
@@ -193,17 +199,22 @@ struct RealtimeStreamStart: Equatable, Sendable, Codable {
 struct RealtimeStreamCommit: Equatable, Sendable, Codable {
     let requestId: String
     let sessionId: String
+    /// Sequence of the final `audio.append` frame. The Agent Gateway rejects
+    /// a commit whose sequence does not equal its last accepted uplink frame.
+    let sequence: Int
     let capturedAtMs: Int64
 
-    init(requestId: String, sessionId: String, capturedAtMs: Int64) {
+    init(requestId: String, sessionId: String, sequence: Int, capturedAtMs: Int64) {
         self.requestId = requestId
         self.sessionId = sessionId
+        self.sequence = sequence
         self.capturedAtMs = capturedAtMs
     }
 
     enum CodingKeys: String, CodingKey {
         case requestId = "request_id"
         case sessionId = "session_id"
+        case sequence
         case capturedAtMs = "captured_at_ms"
     }
 }

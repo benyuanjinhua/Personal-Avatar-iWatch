@@ -79,6 +79,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         private(set) var playbackEndEvents: [(RealtimeMediaSession.TurnHandle, String, Int)] = []
         private(set) var fallbackEvents: [(RealtimeMediaSession.TurnHandle,
                                           RealtimeUplinkStream.FallbackReason)] = []
+        private(set) var bargeInRequests: [RealtimeBargeInRequest] = []
 
         func sendStreamStart(_ start: RealtimeStreamStart) { startEvents.append(start) }
         func sendAudioAppend(_ chunk: VoiceStreamChunk) { appendEvents.append(chunk) }
@@ -93,6 +94,9 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         func fallbackToCompleteFile(handle: RealtimeMediaSession.TurnHandle,
                                     reason: RealtimeUplinkStream.FallbackReason) {
             fallbackEvents.append((handle, reason))
+        }
+        func sendBargeInRequest(_ request: RealtimeBargeInRequest) {
+            bargeInRequests.append(request)
         }
     }
 
@@ -175,6 +179,20 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         // adapter actually executes the reliable path, not just signals it.
         XCTAssertEqual(counter.invocations.count, 1)
         XCTAssertEqual(counter.invocations.first?.0.requestId, requestId)
+    }
+
+    func testZeroPCMFramesFallsBackToCompleteFileOnCommit() {
+        let requestId = "44444444-4444-4444-4444-444444444444"
+        let (adapter, _, _, transport, counter) = makeAdapter(sessionIds: [
+            "55555555-5555-5555-5555-555555555555"
+        ])
+        _ = adapter.beginTurn(requestId: requestId)
+
+        adapter.commit()
+
+        XCTAssertTrue(transport.commitEvents.isEmpty)
+        XCTAssertEqual(transport.fallbackEvents.map(\.1), [.noAudioFrames])
+        XCTAssertEqual(counter.invocations.map(\.1), [.noAudioFrames])
     }
 
     func testAdapterStampsRealBridgeResponseIdOnReceipts() {

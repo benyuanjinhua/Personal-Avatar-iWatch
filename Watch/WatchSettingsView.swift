@@ -21,12 +21,23 @@ struct WatchSettingsView: View {
     @ObservedObject var debugSettings: WatchDebugSettings
     /// ESS-307：iPhone 下行队列积压计数。
     @ObservedObject var settings: WatchSettingsStore
+    /// ESS-419：语音回合日志（清除历史语音用）。
+    @ObservedObject var journal: VoiceTurnJournal
+    /// ESS-419：加密语音仓（清除历史语音用）。
+    var speechVault: EncryptedAudioVault?
+    /// ESS-419：语音播放器（清除前先停播）。
+    var player: SpeechPlayer
+
+    @State private var showClearConfirmation = false
+    @State private var clearResultMessage: String?
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
+                connectionStatusSection
                 downlinkBacklogSection
                 streamingSection
+                privacySection
                 selfCheckSection
                 buildSection
                 logsHintSection
@@ -35,6 +46,60 @@ struct WatchSettingsView: View {
             .padding(.vertical, 4)
         }
         .navigationTitle("设置")
+        .confirmationDialog(
+            "确认清除历史语音",
+            isPresented: $showClearConfirmation
+        ) {
+            Button("清除", role: .destructive) {
+                performClearHistorySpeech()
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("将删除所有已保存的结果语音文件，文字记录与处理日志保留。此操作不可撤销。")
+        }
+        .alert("清除结果", isPresented: Binding(
+            get: { clearResultMessage != nil },
+            set: { if !$0 { clearResultMessage = nil } }
+        )) {
+            Button("知道了", role: .cancel) {}
+        } message: {
+            if let message = clearResultMessage {
+                Text(message)
+            }
+        }
+    }
+
+    // MARK: - 当前链路（ESS-419 F2）
+
+    private var connectionStatusSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            sectionHeader("当前链路")
+            HStack(spacing: 4) {
+                Circle()
+                    .fill(connectionStatusColor)
+                    .frame(width: 6, height: 6)
+                Text(connectionStatusText)
+                    .font(.caption2)
+                    .foregroundStyle(.primary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(9)
+        .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var connectionStatusColor: Color {
+        guard settings.wcSessionActivationState == .activated else { return .gray }
+        return settings.wcIsReachable ? .green : .orange
+    }
+
+    private var connectionStatusText: String {
+        guard settings.wcSessionActivationState == .activated else {
+            return "会话未激活"
+        }
+        return settings.wcIsReachable
+            ? "已连接 iPhone"
+            : "iPhone 未连接（回合将排队等待）"
     }
 
     // MARK: - 下行队列积压（ESS-307）
@@ -85,6 +150,31 @@ struct WatchSettingsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(9)
         .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    // MARK: - 隐私（ESS-419 F1）
+
+    private var privacySection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            sectionHeader("隐私")
+
+            Button(role: .destructive) {
+                showClearConfirmation = true
+            } label: {
+                Label("清除历史语音", systemImage: "trash")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .tint(.red)
+            .font(.caption2)
+
+            Text("清除所有已保存的结果语音文件；文字记录与处理日志不受影响。")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(9)
+        .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
     }
 
     // MARK: - 自检（从旧 DebugPanelView 平移）
@@ -176,6 +266,28 @@ struct WatchSettingsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(9)
         .background(Color.gray.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    // MARK: - 清除历史语音（ESS-419 F1）
+
+    /// 手动一键清空结果语音：停播 → 委托 SpeechVaultCleaner 执行 → 落日志并反馈结果。
+    private func performClearHistorySpeech() {
+        // 先停播，防止「文件已删但播放器仍在读」
+        player.stop(reason: "clear_history_speech")
+
+        let vaultDir = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask
+        )[0].appendingPathComponent("SpeechVault", isDirectory: true)
+
+        let cleaner = SpeechVaultCleaner(
+            journal: journal,
+            vault: speechVault,
+            vaultDirectoryURL: vaultDir
+        )
+        let result = cleaner.clearHistorySpeech()
+        clearResultMessage = result.userMessage
+
+        WatchLog.info("settings", "speech_vault_cleared", detail: result.logDetail)
     }
 
     // MARK: - 组件

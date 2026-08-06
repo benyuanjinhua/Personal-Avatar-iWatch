@@ -75,7 +75,10 @@ final class AudioRealtimeAgentSession {
     // MARK: - State
 
     private(set) var connectionState: ConnectionState = .disconnected
-    private var transport: AudioRealtimeAgentTransport?
+    /// ESS-391: exposed for PhoneRealtimeAgentTransport to send playback
+    /// receipts (playback.started/playback.ended) and other frames that
+    /// don't have dedicated convenience methods.
+    private(set) var transport: AudioRealtimeAgentTransport?
     private var currentTurn: TurnIdentity?
     private var heartbeatTimer: Timer?
     private var pendingUplink: [AudioRealtimeAgentCodec.UplinkFrame] = []
@@ -184,13 +187,15 @@ final class AudioRealtimeAgentSession {
     }
 
     /// Send cancel (user barge-in).
-    func cancel(requestId: String, generation: Int, reason: String? = nil) {
+    func cancel(requestId: String, generation: Int, reason: String? = nil,
+                onFailure: (() -> Void)? = nil) {
         let frame = AudioRealtimeAgentCodec.UplinkFrame.cancel(
             sessionId: sessionId, requestId: requestId, generation: generation, reason: reason
         )
         transport?.send(frame) { error in
             if let error {
                 Self.logger.error("cancel send failed: \(String(describing: error), privacy: .public)")
+                onFailure?()
             }
         }
     }

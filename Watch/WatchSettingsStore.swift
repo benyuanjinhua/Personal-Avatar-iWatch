@@ -12,6 +12,9 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
     @Published private(set) var downlinkBacklogCount: Int = 0
     /// ESS-307：当前排队中的 requestId 列表，供时间线与 Gap-6 对齐。
     @Published private(set) var downlinkQueuedRequestIds: [String] = []
+    /// ESS-419：WCSession 连接状态，供设置页「当前链路」只读状态行展示。
+    @Published private(set) var wcSessionActivationState: WCSessionActivationState = .notActivated
+    @Published private(set) var wcIsReachable: Bool = false
     /// 语音传输回调转发目标（WCSession 只允许一个 delegate）。
     weak var voiceTransport: WatchVoiceTransport?
     /// 状态/权限/结果事件入账目标（ESS-29）。
@@ -71,6 +74,10 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         } else {
             WatchLog.info("wcsession", "activation_completed", detail: "state=\(activationState.rawValue)")
         }
+        Task { @MainActor in
+            self.wcSessionActivationState = activationState
+            self.wcIsReachable = session.isReachable
+        }
         guard activationState == .activated else { return }
         Task { @MainActor in
             self.voiceTransport?.retryPending()
@@ -81,6 +88,8 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
     nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
         let isReachable = session.isReachable
         Task { @MainActor in
+            self.wcIsReachable = isReachable
+            self.wcSessionActivationState = session.activationState
             self.voiceTransport?.handleReachabilityChange(isReachable: isReachable)
             // ESS-137：reachable 变 true 时补发 selfcheck_finished 快速旁路的
             // pending sendMessage，把不可达期间只入 transferUserInfo 的载荷
@@ -317,10 +326,18 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             break
         case .audioDelta:
             if let chunk = envelope.audio {
-                adapter.ingestDownlink(chunk, responseId: envelope.responseId)
+                adapter.ingestDownlink(
+                    chunk,
+                    responseId: envelope.responseId,
+                    generation: envelope.generation
+                )
             }
         case .audioDone:
-            adapter.markDownlinkComplete(responseId: envelope.responseId)
+            adapter.markDownlinkComplete(
+                responseId: envelope.responseId,
+                generation: envelope.generation,
+                finalSequence: envelope.finalSequence
+            )
         case .playbackClear, .responseInterrupted:
             adapter.bargeIn()
         case .bridgeFallback:
@@ -329,6 +346,12 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             // Text-only events are handled by the transcript layer, not the
             // playback engine — leave them to `applyVoiceStatus` for now.
             break
+        case .generationOpen:
+            if let generation = envelope.generation {
+                adapter.openGeneration(generation)
+            }
+        case .bargeInFailed:
+            adapter.markBargeInFailed(reason: envelope.reason ?? "unspecified")
         }
     }
 
