@@ -44,6 +44,12 @@ export class RealtimeSession {
     heartbeatIntervalMs = 15_000,
     idleDisconnectMs = 60_000,
     doneBarrierGapMs = 2_000,
+    // ESS-516: upstream can send `audio_done(final_sequence=-1)` up to ~1s
+    // BEFORE the real deltas arrive. If we take the -1 at face value the
+    // deltas that follow get dropped as `post_done`. Defer the empty-done
+    // commit by this window — a delta invalidates it, a later done with a
+    // real value takes over.
+    emptyDoneDeferMs = 1_500,
     maxFrameBytes = 64 * 1024,
     maxEventsPerSecond = 200,
     maxUplinkBytesPerSecond = 512 * 1024,
@@ -66,6 +72,7 @@ export class RealtimeSession {
     this.heartbeatIntervalMs = heartbeatIntervalMs
     this.idleDisconnectMs = idleDisconnectMs
     this.doneBarrierGapMs = doneBarrierGapMs
+    this.emptyDoneDeferMs = emptyDoneDeferMs
     this.maxFrameBytes = maxFrameBytes
     this.maxEventsPerSecond = maxEventsPerSecond
     this.maxUplinkBytesPerSecond = maxUplinkBytesPerSecond
@@ -98,6 +105,12 @@ export class RealtimeSession {
     this.finalSequence = null       // set when the downstream done is released
     this.staleGenerationDropped = 0
     this._barrierTimer = null
+    // ESS-516: empty-done deferral state. `_emptyDoneDeferred` is true while
+    // we are holding an upstream `audio_done(-1)` that arrived before any
+    // deltas. `_emptyDoneTimer` fires the deferred commit if no delta shows
+    // up within `emptyDoneDeferMs`.
+    this._emptyDoneDeferred = false
+    this._emptyDoneTimer = null
 
     this.agentTurn = null
 
@@ -170,6 +183,7 @@ export class RealtimeSession {
     if (this._heartbeatTimer) this.clearTimer(this._heartbeatTimer)
     if (this._idleTimer) this.clearTimer(this._idleTimer)
     this._clearBarrierTimer()
+    this._clearEmptyDoneTimer()
     if (this.agentTurn) { try { this.agentTurn.close() } catch { /* ignore */ } }
     this.log('session_ended', {
       request_id: this.scope.request_id, session_id: this.scope.session_id,
@@ -284,6 +298,8 @@ export class RealtimeSession {
     // Cancel is authoritative — kill any pending done barrier so the gap
     // timer cannot fire a fail-closed after the client has moved on.
     this._clearBarrierTimer()
+    this._clearEmptyDoneTimer()
+    this._emptyDoneDeferred = false
     this.pendingFinalSequence = null
     try { this.agentTurn?.cancel() } catch { /* best effort */ }
     this.log('cancel_received', {
@@ -345,6 +361,20 @@ export class RealtimeSession {
   }
 
   _emitDelta(event) {
+    // ESS-516: a deferred empty-done is invalidated the moment upstream
+    // sends a real delta — upstream was jumping the gun on the earlier
+    // `audio_done(-1)`. Clear the deferral before the `doneEmitted` /
+    // `pendingFinalSequence` checks so the delta flows normally.
+    if (this._emptyDoneDeferred) {
+      this._clearEmptyDoneTimer()
+      this._emptyDoneDeferred = false
+      this.log('done_barrier_empty_invalidated', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        response_id: this.responseId,
+        reason: 'delta_arrived',
+        sequence: Number.isInteger(event.sequence) ? event.sequence : null,
+      })
+    }
     if (this.doneEmitted) {
       this.staleGenerationDropped += 1
       this.log('stale_generation_dropped', {
@@ -410,6 +440,43 @@ export class RealtimeSession {
     const claimed = Number.isInteger(event.final_sequence)
       ? event.final_sequence
       : this.downlinkHighWatermark
+
+    // ESS-516: upstream (qwen-agent-transport) computes `final_sequence =
+    // nextOutputSequence - 1`, so an `audio.done` arriving BEFORE the first
+    // delta reports `-1`. Observed on real device: upstream sent `-1` at
+    // T+0, then 55 real deltas 862ms later — Gateway's fast-path fired
+    // `downlink_done(-1)` and every delta was dropped as `post_done`.
+    // Defer the empty-done commit by a short window; a delta invalidates
+    // it, a later done with a real value takes over.
+    if (this.pendingFinalSequence === null && !this._emptyDoneDeferred
+        && claimed < 0 && this.downlinkHighWatermark < 0
+        && this.emptyDoneDeferMs > 0) {
+      this._emptyDoneDeferred = true
+      this.log('done_barrier_empty_deferred', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        response_id: this.responseId,
+        claimed_final_sequence: claimed,
+        defer_ms: this.emptyDoneDeferMs,
+      })
+      this._armEmptyDoneTimer()
+      return
+    }
+
+    // A later `audio.done` arrived while we were deferring. Cancel the
+    // deferral and treat this call as the fresh done — if it's still -1
+    // and no deltas have shown up yet, we commit it below; if it's a real
+    // number, it enters the normal barrier flow. Either way the earlier
+    // `-1` is superseded, not silently kept.
+    if (this._emptyDoneDeferred) {
+      this._clearEmptyDoneTimer()
+      this._emptyDoneDeferred = false
+      this.log('done_barrier_empty_invalidated', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        response_id: this.responseId,
+        reason: 'later_done',
+        claimed_final_sequence: claimed,
+      })
+    }
     if (this.pendingFinalSequence === null) {
       this.pendingFinalSequence = claimed
       this.log('done_barrier_pending', {
@@ -491,6 +558,36 @@ export class RealtimeSession {
     if (this._barrierTimer !== null) {
       this.clearTimer(this._barrierTimer)
       this._barrierTimer = null
+    }
+  }
+
+  // ESS-516: after `emptyDoneDeferMs` elapses with no deltas, commit the
+  // deferred empty-done as the pending barrier and let `_maybeReleaseDone`
+  // fire it exactly the way the fast path did before the fix.
+  _armEmptyDoneTimer() {
+    if (this._emptyDoneTimer !== null) return
+    if (this.emptyDoneDeferMs <= 0) return
+    this._emptyDoneTimer = this.setTimer(() => {
+      this._emptyDoneTimer = null
+      if (this.state !== OPEN) return
+      if (!this._emptyDoneDeferred) return
+      if (this.cancelled || this.doneEmitted) return
+      this._emptyDoneDeferred = false
+      this.pendingFinalSequence = -1
+      this.log('done_barrier_empty_committed', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        response_id: this.responseId,
+        pending_final_sequence: -1,
+        high_watermark: this.downlinkHighWatermark,
+      })
+      this._maybeReleaseDone()
+    }, this.emptyDoneDeferMs)
+  }
+
+  _clearEmptyDoneTimer() {
+    if (this._emptyDoneTimer !== null) {
+      this.clearTimer(this._emptyDoneTimer)
+      this._emptyDoneTimer = null
     }
   }
 

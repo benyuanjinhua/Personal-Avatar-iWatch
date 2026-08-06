@@ -261,13 +261,127 @@ describe('RealtimeSession — downlink ordering', () => {
     assert.equal(logs.filter(l => l.evt === 'done_barrier_gap_timeout').length, 0)
   })
 
-  it('audio.done with final_sequence=-1 (empty response) releases immediately', () => {
-    const { session, sent, agent, scope } = harness()
+  it('audio.done with final_sequence=-1 (empty response) releases once the empty-done deferral elapses', () => {
+    // ESS-516: an empty done is held for `emptyDoneDeferMs` in case
+    // upstream is jumping the gun. When the window elapses with no
+    // deltas, it commits exactly as before — final_sequence stays -1.
+    const clock = controlledClock()
+    const { session, sent, agent, scope, logs } = harness({
+      emptyDoneDeferMs: 1_500,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: -1 })
+    assert.equal(sent.filter(e => e.type === 'audio.done').length, 0, 'done deferred, not yet emitted')
+    assert.ok(logs.some(l => l.evt === 'done_barrier_empty_deferred' && l.claimed_final_sequence === -1))
+    assert.equal(clock.pendingCount(), 1, 'empty-done deferral timer armed')
+    clock.fireAll()
+    const done = sent.find(e => e.type === 'audio.done')
+    assert.ok(done, 'done emitted after deferral elapses')
+    assert.equal(done.final_sequence, -1)
+    assert.ok(logs.some(l => l.evt === 'done_barrier_empty_committed'))
+  })
+
+  it('ESS-516 regression: audio.done(-1) followed by real deltas does NOT drop them as post_done', () => {
+    // Real-device timeline (ESS-516 §一): upstream sent
+    // audio_done(final_sequence=-1) at T+0, then 55 real deltas starting
+    // 862ms later. The pre-fix fast path fired downlink_done(-1)
+    // immediately and every delta was dropped as `post_done`, so the
+    // watch received zero audio. With the empty-done deferral in place
+    // the first delta invalidates the pending -1 and normal flow resumes.
+    const clock = controlledClock()
+    const { session, sent, agent, scope, logs } = harness({
+      emptyDoneDeferMs: 1_500,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    // Upstream jumps the gun.
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: -1 })
+    assert.equal(sent.filter(e => e.type === 'audio.done').length, 0, 'done deferred, not yet emitted')
+    assert.equal(clock.pendingCount(), 1, 'empty-done timer armed')
+    // Real audio arrives before the deferral elapses.
+    for (let seq = 0; seq < 3; seq++) {
+      agent.emit(scope.request_id, {
+        type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: seq, audio: b64('x'),
+      })
+    }
+    assert.equal(clock.pendingCount(), 0, 'first delta cleared the empty-done timer')
+    assert.ok(
+      logs.some(l => l.evt === 'done_barrier_empty_invalidated' && l.reason === 'delta_arrived'),
+      'invalidation was logged'
+    )
+    const deltas = sent.filter(e => e.type === 'audio.delta')
+    assert.equal(deltas.length, 3, 'every real delta was forwarded (none dropped as post_done)')
+    assert.equal(
+      logs.filter(l => l.evt === 'stale_generation_dropped' && l.reason === 'post_done').length,
+      0,
+      'no post_done drops — the whole point of the fix'
+    )
+    assert.equal(sent.filter(e => e.type === 'audio.done').length, 0, 'no done was sent while deltas were flowing')
+    // Upstream then sends the real done — normal barrier flow releases it
+    // with the true final_sequence, not the stale -1.
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: 2 })
+    const dones = sent.filter(e => e.type === 'audio.done')
+    assert.equal(dones.length, 1)
+    assert.equal(dones[0].final_sequence, 2, 'the corrected final_sequence, not the stale -1')
+  })
+
+  it('ESS-516: audio.done(-1) followed by a later audio.done(N) uses the corrected N', () => {
+    // Same generation, two dones from upstream: -1 first, then a real
+    // value once upstream realises there was audio. The deferral treats
+    // the later done as authoritative.
+    const clock = controlledClock()
+    const { session, sent, agent, scope, logs } = harness({
+      emptyDoneDeferMs: 1_500,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: -1 })
+    assert.equal(clock.pendingCount(), 1, 'empty-done timer armed')
+    // Real deltas + a corrected done arrive within the deferral window.
+    agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: 0, audio: b64('x') })
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: 0 })
+    const dones = sent.filter(e => e.type === 'audio.done')
+    assert.equal(dones.length, 1)
+    assert.equal(dones[0].final_sequence, 0, 'later done takes over the stale -1')
+    // If a stray -1 done arrives even after commit, it must not double-emit.
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: -1 })
+    assert.equal(sent.filter(e => e.type === 'audio.done').length, 1, 'idempotent — no double emit')
+    assert.ok(
+      logs.some(l => l.evt === 'done_barrier_empty_invalidated' && l.reason === 'delta_arrived'),
+      'delta invalidated the deferral'
+    )
+  })
+
+  it('ESS-516: cancel while empty-done is deferred clears the timer without fail-closed', () => {
+    const clock = controlledClock()
+    const { session, sent, agent, scope, closes } = harness({
+      emptyDoneDeferMs: 1_500,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: -1 })
+    assert.equal(clock.pendingCount(), 1, 'empty-done timer armed')
+    session.onFrame(JSON.stringify({
+      type: 'cancel', session_id: scope.session_id, request_id: scope.request_id, generation: scope.generation,
+    }))
+    assert.equal(clock.pendingCount(), 0, 'cancel cleared the empty-done timer')
+    clock.fireAll()  // firing nothing — timer already cleared
+    assert.equal(sent.filter(e => e.type === 'error').length, 0, 'no fail-closed — cancel is authoritative')
+    assert.equal(closes.length, 0, 'socket stays open')
+    assert.equal(sent.filter(e => e.type === 'audio.done').length, 0, 'no done ever released after cancel')
+  })
+
+  it('ESS-516: emptyDoneDeferMs=0 preserves the historical immediate-release fast path', () => {
+    // Escape hatch — deployments that don't want the deferral (e.g. test
+    // rigs) can set it to 0 and get the original behaviour back.
+    const { session, sent, agent, scope, logs } = harness({ emptyDoneDeferMs: 0 })
     start(session, scope)
     agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: -1 })
     const done = sent.find(e => e.type === 'audio.done')
-    assert.ok(done, 'done emitted for empty response')
+    assert.ok(done, 'done emitted immediately when deferral is disabled')
     assert.equal(done.final_sequence, -1)
+    assert.equal(logs.filter(l => l.evt === 'done_barrier_empty_deferred').length, 0)
   })
 
   it('gap timeout fires exactly one structured fail-closed and drops late deltas', () => {
