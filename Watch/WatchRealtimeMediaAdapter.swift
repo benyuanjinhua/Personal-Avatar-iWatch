@@ -110,6 +110,11 @@ final class WatchRealtimeMediaAdapter {
     /// sessions stay disambiguated. Cleared when the turn ends.
     private(set) var currentResponseId: String?
 
+    /// ESS-509: called when the adapter finishes the current turn (any reason).
+    /// The outer controller uses this to release the WCSession keep-alive hold
+    /// since the realtime path is done and no more downlink deltas are expected.
+    var onTurnFinished: (@MainActor (RealtimeMediaSession.TurnHandle, RealtimeMediaSession.FinishReason) -> Void)?
+
     init(
         session: RealtimeMediaSession = RealtimeMediaSession(),
         recorder: Recorder,
@@ -526,6 +531,7 @@ final class WatchRealtimeMediaAdapter {
             // ExtendedRuntimeSession can be released.
             onRealtimePendingResolved?()
             logger("turn_finished request=\(handle.requestId) reason=\(reason)")
+            onTurnFinished?(handle, reason)
         }
     }
 }

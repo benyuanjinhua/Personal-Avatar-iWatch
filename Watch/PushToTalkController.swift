@@ -1,7 +1,6 @@
 import Combine
 import Foundation
 import os
-import WatchKit
 
 /// 按住说话（ESS-22/ESS-29）：按下开始录音（最长 60 秒），松开生成
 /// UUIDv7 request_id + 版本化信封，交给 WatchVoiceTransport 发送。
@@ -60,21 +59,11 @@ final class PushToTalkController: ObservableObject {
     /// ESS-45：录音 → 等待 → 播放整个回合期间持有 ExtendedRuntimeSession，
     /// 降腕/熄屏不挂起；空闲即释放。
     let sessionKeeper = VoiceSessionKeeper()
-    /// ESS-519：后台音频保活器——录音结束后立即播放静音音频保持进程在后台
-    /// 存活，解决 WKExtendedRuntimeSession 被 .resignedFrontmost 收回后
-    /// 进程挂起导致结果音频无法播放的问题。
-    let breather = BackgroundAudioBreather()
     /// ESS-180：屏幕分身错误卡片状态机；订阅 `errorPresenter.active` 即得 UI。
     let errorPresenter = AvatarErrorPresenter()
 
-    /// ESS-522：本地兜底确认计时器，专用播放器与结果/错误隔离。
-    let confirmPlayer = SpeechPlayer(instanceTag: "confirm")
-    private(set) var confirmTimer: VoiceConfirmTimer?
-
     /// 结果语音自动播放即将开始（App 层用来打断欢迎语）。
     var onAutoPlayStarted: (() -> Void)?
-    /// ESS-535: 用户按住说话时立即触发，用于打断欢迎语音释放音频会话。
-    var onPressBegan: (() -> Void)?
 
     private static let logger = Logger(subsystem: "com.benyuan.wristagent.watch", category: "PlaybackTrigger")
     private let recorder = AudioRecorder()
@@ -94,6 +83,14 @@ final class PushToTalkController: ObservableObject {
     /// ESS-321 real-time adapter. Lazily created on first press when the
     /// streaming gate is on. Wiring lives in `ensureRealtimeAdapter()`.
     private(set) var realtimeAdapter: WatchRealtimeMediaAdapter?
+
+    /// ESS-509: true when the realtime adapter owns an active turn (from
+    /// `beginTurn` through `turnFinished`). Drives WCSession keep-alive by
+    /// keeping the VoiceSessionKeeper's runtime session alive while the Watch
+    /// waits for audio.delta or plays realtime audio — the SpeechPlayer's
+    /// `isPlaying` alone cannot cover this window because it only fires for
+    /// m4a playback, not PCM streaming.
+    @Published private(set) var isRealtimeStreaming = false
     private var pendingRealtimeRecording: [String: AudioRecorder.Recording] = [:]
     /// ESS-331: fast-channel failures can arrive while the m4a is still being
     /// recorded (i.e. before `finishRecording()`). When that happens we keep
@@ -115,15 +112,6 @@ final class PushToTalkController: ObservableObject {
     private var pendingReChatContext: (parentRequestId: String, contextSummary: String)?
     /// ESS-317：①屏球体旁「续：<摘要>」的展示文本。nil = 普通模式。
     @Published private(set) var reChatContextText: String?
-    /// ESS-532: true from uplink commit until the first playback render event
-    /// or fallback. Keeps the ExtendedRuntimeSession alive so the audio engine
-    /// stays hot while downlink deltas are in flight.
-    @Published private(set) var realtimePlaybackPending = false
-
-    /// ESS-522：主屏封锁起点（ASR final / accepted 时刻），用于计算 main_screen_blocked_ms。
-    private var mainScreenBlockedAt: Date?
-    /// ESS-522：进度事件是否发生过——任何 progress spoken 计数。恒为 0 才合格。
-    private(set) var progressSpokenCount = 0
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -156,13 +144,6 @@ final class PushToTalkController: ObservableObject {
             directory: base.appendingPathComponent("NotificationLedger", isDirectory: true)
         ))
 
-        // ESS-522：确认计时器——本地兜底语音在 1.5s 无后端确认时触发。
-        let cfm = VoiceConfirmTimer(player: confirmPlayer)
-        confirmTimer = cfm
-        cfm.onConfirmComplete = { [weak self] requestId, outcome in
-            self?.handleConfirmComplete(requestId: requestId, outcome: outcome)
-        }
-
         recorder.$level
             .receive(on: RunLoop.main)
             .assign(to: &$recordingLevel)
@@ -172,8 +153,6 @@ final class PushToTalkController: ObservableObject {
         // 未被判失败（语音后到时这三个条件都可能已不成立，旧 onChange 触发
         // 会静默漏播）。
         journal.onSpeechAttached = { [weak self] requestId in
-            // ESS-522：后台语音到了，取消本地兜底确认计时器。
-            self?.confirmTimer?.cancel(reason: "speech_attached")
             self?.autoPlayResult(requestId: requestId)
         }
 
@@ -197,13 +176,6 @@ final class PushToTalkController: ObservableObject {
         // turnFailed 触觉的落点从此处下沉到 presenter 内部，避免同一次失败震两下。
         journal.onStateApplied = { [weak self] requestId, state in
             guard let self else { return }
-            // ESS-522 S-2：收到 accepted（后端已确认受理，ASR final 之后），
-            // 启动 1.5 秒确认计时器。同时记录主屏封锁起点。
-            if state == .accepted {
-                self.mainScreenBlockedAt = Date()
-                self.confirmTimer?.arm(requestId: requestId)
-                self.setSpawnConfirmSpoken(requestId: requestId, value: false)
-            }
             if state == .failed {
                 let code = self.journal.turn(withId: requestId)?.errorCode
                 self.presentAvatarError(code: code, requestId: requestId)
@@ -217,17 +189,11 @@ final class PushToTalkController: ObservableObject {
                 self.notifier.longTaskAccepted(requestId: requestId)
             case .failed, .cancelled:
                 self.notifier.cancelProvisional(requestId: requestId)
-                // ESS-522：终态释放主屏封锁。
-                self.releaseMainScreenBlock(requestId: requestId)
             default:
                 break
             }
             if state == .completed || state == .cancelled {
                 self.retryStore.clear(requestId: requestId)
-                // ESS-522：终态释放主屏封锁（completed 路径）。
-                if state == .completed {
-                    self.releaseMainScreenBlock(requestId: requestId)
-                }
             }
         }
 
@@ -261,9 +227,10 @@ final class PushToTalkController: ObservableObject {
 
         sessionKeeper.bind(
             turns: journal.$turns.eraseToAnyPublisher(),
-            playing: player.$isPlaying.eraseToAnyPublisher(),
-            recording: $state.map { $0 != .idle }.eraseToAnyPublisher(),
-            realtimePending: $realtimePlaybackPending.eraseToAnyPublisher()
+            playing: Publishers.CombineLatest(player.$isPlaying, $isRealtimeStreaming)
+                .map { $0 || $1 }
+                .eraseToAnyPublisher(),
+            recording: $state.map { $0 != .idle }.eraseToAnyPublisher()
         )
 
         // ESS-317 历史对话留存：trim 时间监听清理 vault（必须在所有 stored property 初始化之后）。
@@ -300,9 +267,6 @@ final class PushToTalkController: ObservableObject {
 
     /// 录音期间到达的结果语音先挂起，录音结束后补播（不静默丢弃）。
     private var pendingAutoPlayRequestIds: [String] = []
-    /// ESS-541: durable result redelivery is admitted only for the latest
-    /// request/generation. A new press clears all old queued ownership.
-    private var resultPlaybackIsolation = ResultPlaybackIsolation()
     /// ESS-154 T2：同一 request_id 的同种失败终局只播一次触觉（防止
     /// 重复 finishPlayback 回调把用户震到关通知；横幅幂等在 ResultNotificationPolicy
     /// 侧按 request_id 一辈子记账，比这里更严——两层配合，不重复）。
@@ -422,22 +386,6 @@ final class PushToTalkController: ObservableObject {
     /// 保证同一 request_id 的 interim / final 两段各自独立去重——旧实现按裸
     /// request_id 去重会让 final 被 interim 顶掉、静默丢弃。
     private func autoPlayResult(requestId: String) {
-        guard case .accept = resultPlaybackIsolation.decide(requestId: requestId) else {
-            logPlaybackIsolationDrop(incomingRequestId: requestId, source: "speech_attached")
-            return
-        }
-        // ESS-539 v3: suppress SpeechPlayer auto-play for old M4A results
-        // when realtime playback is pending or in progress. The SpeechPlayer
-        // and RealtimePlaybackEngine compete for the shared AVAudioSession,
-        // causing repeated interruptions and stuttering playback.
-        guard !realtimePlaybackPending, realtimeAdapter?.currentTurn == nil else {
-            WatchLog.info(
-                "player", "auto_play_suppressed_realtime_active",
-                requestId: requestId,
-                detail: "realtime_pending=\(realtimePlaybackPending) adapter_turn=\(realtimeAdapter?.currentTurn?.requestId ?? "nil")"
-            )
-            return
-        }
         guard state == .idle else {
             Self.logger.info("auto-play deferred: recording in progress (request_id=\(requestId, privacy: .public))")
             enqueueAutoPlay(requestId, reason: "recording")
@@ -476,48 +424,17 @@ final class PushToTalkController: ObservableObject {
         autoPlayResult(requestId: requestId)
     }
 
-    private func logPlaybackIsolationDrop(incomingRequestId: String?, source: String) {
-        guard case .drop(let incoming, let incomingGeneration, let current, let reason) =
-                resultPlaybackIsolation.decide(requestId: incomingRequestId) else { return }
-        let incomingId = incoming ?? "nil"
-        let currentId = current?.requestId ?? "nil"
-        let incomingGen = incomingGeneration.map(String.init) ?? "nil"
-        let currentGen = current.map { String($0.generation) } ?? "nil"
-        WatchLog.info(
-            "player", "cross_turn_audio_dropped", requestId: incoming,
-            detail: "source=\(source) reason=\(reason.rawValue) incoming_request_id=\(incomingId) current_request_id=\(currentId) incoming_generation=\(incomingGen) current_generation=\(currentGen)"
-        )
-    }
-
     func pressBegan() {
         guard state == .idle else { return }
         errorMessage = nil
         releaseRequestedWhileStarting = false
-        let requestId = UUIDv7.generate()
-        let requestIdString = requestId.uuidString.lowercased()
-        let cleared = pendingAutoPlayRequestIds.count
-        let previous = resultPlaybackIsolation.current
-        pendingAutoPlayRequestIds.removeAll(keepingCapacity: true)
-        let current = resultPlaybackIsolation.begin(requestId: requestIdString)
-        let previousId = previous?.requestId ?? "nil"
-        let previousGeneration = previous.map { String($0.generation) } ?? "nil"
-        WatchLog.info(
-            "player", "playback_generation_opened", requestId: requestIdString,
-            detail: "generation=\(current.generation) previous_request_id=\(previousId) previous_generation=\(previousGeneration) cleared_queue=\(cleared)"
-        )
+        if let interrupted = player.currentContext {
+            enqueueAutoPlay(interrupted, reason: "recording_interrupted")
+        }
         player.stop(reason: "recording_started")
-        // ESS-519：新一轮录音开始，停止后台保活音频避免与
-        // AudioRecorder 的 .playAndRecord 会话冲突。
-        breather.stop(reason: "recording_started")
-        // ESS-535: interrupt the welcome speech before recording starts
-        // so the RealtimePlaybackEngine can own the audio session.
-        onPressBegan?()
         state = .recording
         let streaming = voiceStreamingEnabled()
-        // Generate once for both realtime and complete-file paths so result
-        // playback ownership is known from trigger-down, before late frames
-        // can race the recording finish.
-        streamRequestId = requestId
+        streamRequestId = streaming ? UUIDv7.generate() : nil
         streamId = streaming ? UUID() : nil
         streamSequence = 0
         streamAborted = false
@@ -568,15 +485,14 @@ final class PushToTalkController: ObservableObject {
     /// we're already recording still goes out. Nothing here is allowed to
     /// throw — the goal is "no crash, no silent half-configured stream,
     /// always deliverable."
-    ///
-    /// ESS-532: on successful adapter start, set `realtimePlaybackPending = true`
-    /// so the VoiceSessionKeeper holds the ExtendedRuntimeSession across the
-    /// recording→playback gap where the turn journal does not yet show an
-    /// active turn.
     private func startRealtimeTurnIfPossible(requestId: UUID) {
         let adapter = ensureRealtimeAdapter()
         let requestIdString = requestId.uuidString.lowercased()
         _ = adapter.beginTurn(requestId: requestIdString)
+        // ESS-509: mark realtime streaming active so VoiceSessionKeeper holds
+        // the WKExtendedRuntimeSession — without this, WCSession may be torn
+        // down between commit and the first audio.delta arrival.
+        isRealtimeStreaming = adapter.currentTurn != nil
         // The adapter catches its own recorder/player errors internally and
         // marks the uplink transport-failed — that trips
         // `didTriggerCompleteFileFallback` before `beginTurn` returns. If it
@@ -592,10 +508,9 @@ final class PushToTalkController: ObservableObject {
             )
             adapter.cancel(reason: .fallback)
             pendingFallbackReason.removeValue(forKey: requestIdString)
+            isRealtimeStreaming = false
             clearStreamStateAfterAbort()
-            return
         }
-        realtimePlaybackPending = true
     }
 
     /// ESS-383: reset streaming identifiers after an abort WITHOUT clearing
@@ -619,45 +534,6 @@ final class PushToTalkController: ObservableObject {
         finishRecording()
     }
 
-    /// ESS-538：录音进行中息屏/降腕——打断流标记。
-    /// - `.inactive`（降腕/横幅等瞬态）：只打标记，手势可能还活着，收尾交给
-    ///   松手路径——不主动 finish，避免通知横幅把「还在说」的录音截断。
-    /// - `.background`（表冠/切 App）：手势必然已死，主动收尾。onEnded 一旦
-    ///   丢失，`.recording` 态会把整个 PTT 卡死到重启（pressBegan 要 idle）。
-    /// 收尾仍走 finishRecording → RecordingInterruptionPolicy 裁决：残片丢弃
-    /// （卡片回前台补呈现），已说完的可用音频照常提交。
-    func noteScreenOffDuringRecording(phase: String) {
-        guard state == .recording else { return }
-        recorder.noteExternalInterruption(reason: "scene_phase=\(phase)")
-        guard phase == "background" else { return }
-        guard recorder.isRecording else {
-            // start() 还在权限/会话激活里：沿用 deferred-release 通道，
-            // start 完成后立即 finishRecording 收尾（几乎必落太短/丢弃分支）。
-            releaseRequestedWhileStarting = true
-            return
-        }
-        finishRecording()
-    }
-
-    /// ESS-538：中断丢弃的卡片若发生在屏灭/后台，当下到不了用户（卡片最小
-    /// 停留 5s 的自动收起会在抬腕前把它吞掉）——记账，回 .active 补呈现。
-    private var pendingInterruptedNotice = false
-
-    /// 回前台补呈现「刚才录音被打断了」。触觉与卡片同刻到达可见时刻。
-    func presentInterruptedNoticeIfNeeded() {
-        guard pendingInterruptedNotice else { return }
-        pendingInterruptedNotice = false
-        errorMessage = RecorderError.recordingInterrupted.errorDescription
-        presentAvatarError(code: "ERR_RECORDING_INTERRUPTED", requestId: nil)
-    }
-
-    /// ESS-538 test seam：直接记账一笔待呈现的中断提示，验证
-    /// presentInterruptedNoticeIfNeeded 的呈现契约（生产置位路径依赖真实
-    /// 采集 + 非 active 场景，模拟器不可达——口径同 AudioRecorderHandoverTests）。
-    func simulateInterruptedNoticeForTests() {
-        pendingInterruptedNotice = true
-    }
-
     private func finishRecording() {
         guard state == .recording else { return }
         state = .finishing
@@ -678,9 +554,6 @@ final class PushToTalkController: ObservableObject {
                     code: "ERR_AUDIO_TOO_SHORT"
                 )
                 errorMessage = RecorderError.recordingTooShortDescription
-                // ESS-538：太短不提交 = 本回合零提交，实时回合同样当场取消，
-                // 不让 PCM tap 挂到下次按住（与收尾抛错路径同一清理）。
-                abortUnsubmittedRealtimeTurn()
                 // ESS-180：本地失败与 Bridge 侧 ERR_AUDIO_TOO_SHORT 走同一
                 // 拟人化卡片；触觉在 presenter 内响一次，此处不再重复播放，
                 // 避免同一次「按太短」震两下。
@@ -689,50 +562,18 @@ final class PushToTalkController: ObservableObject {
             }
             submit(recording: recording)
         } catch {
-            // ESS-538：收尾抛错 = 本回合零提交。streaming 开启时 beginTurn
-            // 已在 pressBegan 跑过，必须当场取消（否则 PCM tap 挂到下次
-            // 按住才停），streamRequestId 一并清掉，避免后续 retry() 误用
-            // 陈旧 request_id。
-            abortUnsubmittedRealtimeTurn()
+            errorMessage = Self.recordingErrorDescription(error)
             // ESS-375: recordingNeverStarted 走 ERR_AUDIO_TOO_SHORT cue
             // （与 too-short guard 统一），让手表看到可行动中文提示而非
             // 通用"录音器错误"卡片。
             let code: String
             if case RecorderError.recordingNeverStarted = error {
                 code = "ERR_AUDIO_TOO_SHORT"
-            } else if case RecorderError.recordingInterrupted = error {
-                code = "ERR_RECORDING_INTERRUPTED"
             } else {
                 code = "ERR_RECORDER_FINISH"
             }
-            // ESS-538：中断丢弃发生在屏灭/后台时不当场呈现——卡片最小停留
-            // 5s 的自动收起会在抬腕前吞掉它（触觉也白费）。记账，回 .active
-            // 由 presentInterruptedNoticeIfNeeded 补呈现。
-            if case RecorderError.recordingInterrupted = error,
-               WKApplication.shared().applicationState != .active {
-                pendingInterruptedNotice = true
-                WatchLog.info("recorder", "interrupt_notice_deferred", detail: "scene_not_active")
-                return
-            }
-            errorMessage = Self.recordingErrorDescription(error)
             presentAvatarError(code: code, requestId: nil)
         }
-    }
-
-    /// ESS-538：收尾抛错路径的实时回合清理。finish() 抛错 = 本回合不会有
-    /// 任何提交；取消已 begin 的实时回合让 PCM tap 停止、uplink 作废、
-    /// realtimePlaybackPending 解除（cancel → turnFinished →
-    /// onRealtimePendingResolved → VoiceSessionKeeper 释放）。
-    private func abortUnsubmittedRealtimeTurn() {
-        if let requestId = streamRequestId?.uuidString.lowercased() {
-            pendingFallbackReason.removeValue(forKey: requestId)
-            if let adapter = realtimeAdapter, adapter.currentTurn?.requestId == requestId {
-                WatchLog.info("realtime", "unsubmitted_turn_aborted", requestId: requestId)
-                adapter.cancel(reason: .cancelled)
-            }
-        }
-        streamRequestId = nil
-        clearStreamStateAfterAbort()
     }
 
     /// 提交录音：生成信封发送，同时留一份重试缓存（失败重发不用重新说话）。
@@ -797,11 +638,6 @@ final class PushToTalkController: ObservableObject {
             transport.send(envelope: envelope, recording: recording)
         }
         WatchHaptics.play(.requestSubmitted)
-        // ESS-519：录音已发送，进入等待阶段。立即启动后台音频保活——
-        // 此时 App 仍在 active 态，音频会话可成功激活；后续降腕/熄屏时
-        // WKExtendedRuntimeSession 虽会被 .resignedFrontmost 收回，但
-        // 活跃的音频会话保持进程不被挂起，结果到达时可正常播放。
-        breather.start()
         streamRequestId = nil
         streamId = nil
         streamAborted = false
@@ -840,10 +676,14 @@ final class PushToTalkController: ObservableObject {
                 WatchLog.info("realtime", "adapter", detail: message)
             }
         )
-        // ESS-532: clear the pending hold when playback starts, the turn
-        // falls back to complete-file, or the turn finishes entirely.
-        adapter.onRealtimePendingResolved = { [weak self] in
-            self?.realtimePlaybackPending = false
+        // ESS-509: track turn lifecycle so WCSession keep-alive releases
+        // exactly when the realtime path is done — no premature release
+        // that would drop audio.delta delivery, no zombie hold after
+        // fallback/cancel that would burn battery.
+        adapter.onTurnFinished = { [weak self] _, _ in
+            self?.isRealtimeStreaming = false
+            WatchLog.info("realtime", "streaming_hold_released",
+                          detail: "reason=turn_finished adapter_turn_active=false")
         }
         realtimeAdapter = adapter
         return adapter
@@ -1094,8 +934,6 @@ final class PushToTalkController: ObservableObject {
             presentAvatarError(code: "ERR_VAULT_LOAD", requestId: requestId)
             return
         }
-        // ESS-519：真实播放即将开始，停止静音保活音频以释放系统资源。
-        breather.stop(reason: "real_playback")
         let started = player.play(data: data, context: requestId) { [weak self] finished in
             guard let self else { return }
             // ESS-45×ESS-46：只有终态回合的结果语音播完才算交付——interim
@@ -1150,59 +988,4 @@ final class PushToTalkController: ObservableObject {
 
     /// 当前续聊上下文，供提交语音请求时附加 `parent_request_id`。
     private(set) var continuationContext: ContinuationContext?
-
-    // MARK: - ESS-522 确认计时与主屏释放
-
-    /// 确认流程结束后回调（本地兜底或后端确认到达）。
-    /// 写 telemetry、释放主屏封锁。
-    private func handleConfirmComplete(requestId: String, outcome: VoiceConfirmTimer.Outcome) {
-        switch outcome {
-        case .backendConfirmationArrived:
-            // 后端确认来得及时——语音是从后台来的真实语音，记为已播。
-            setSpawnConfirmSpoken(requestId: requestId, value: true)
-        case .localFallbackPlayed:
-            // 本地兜底语音播出——记为已播。
-            setSpawnConfirmSpoken(requestId: requestId, value: true)
-        case .localFallbackMissing:
-            // 本地资源缺失，只落日志 + 触觉，不计为「已播」。
-            // spawnConfirmSpoken 保持 false——确实没有语音可播。
-            break
-        }
-        releaseMainScreenBlock(requestId: requestId)
-    }
-
-    /// 释放主屏封锁，计算并写入 `main_screen_blocked_ms`。
-    private func releaseMainScreenBlock(requestId: String) {
-        guard let blockedAt = mainScreenBlockedAt else { return }
-        mainScreenBlockedAt = nil
-        let elapsedMs = Int(Date().timeIntervalSince(blockedAt) * 1_000)
-        setMainScreenBlockedMs(requestId: requestId, value: elapsedMs)
-        WatchLog.info(
-            "confirm", "main_screen_released", requestId: requestId,
-            detail: "blocked_ms=\(elapsedMs)"
-        )
-    }
-
-    /// ESS-522 埋点：写入确认语音已播标记。
-    private func setSpawnConfirmSpoken(requestId: String, value: Bool) {
-        journal.setSpawnConfirmSpoken(requestId: requestId, value: value)
-    }
-
-    /// ESS-522 埋点：写入主屏封锁时长。
-    private func setMainScreenBlockedMs(requestId: String, value: Int) {
-        journal.setMainScreenBlockedMs(requestId: requestId, value: value)
-    }
-
-    /// ESS-522 S-3 进度静默：记录任意一次试图将进度转为语音的调用为「已违规」。
-    /// 调用方（WatchVoiceTransport / relay handler）在收到进度事件时调用此方法，
-    /// 确保 `progress_spoken` 恒为 0——进度只占角落一行，永远不出声。
-    func recordProgressEvent(requestId: String) {
-        journal.setProgressSpoken(requestId: requestId, value: true)
-        progressSpokenCount += 1
-        WatchLog.error(
-            "confirm", "progress_spoken_violation", requestId: requestId,
-            detail: "count=\(progressSpokenCount)",
-            code: "ERR_PROGRESS_SPOKEN"
-        )
-    }
 }
