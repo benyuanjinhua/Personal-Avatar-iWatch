@@ -4,7 +4,8 @@
 // ephemeral port) this drives the ACTUAL deployment surface:
 //
 //   • spawns `node server.mjs` as a separate process, cwd = module dir
-//   • uses the committed config.json verbatim — nothing is overridden
+//   • uses the committed config.json, overriding only ephemeral smoke state
+//     and port through the deployment-supported GATEWAY_CONFIG_PATH entrypoint
 //   • speaks real TLS: https:// for the control API, wss:// for the media plane
 //   • asserts on the server process's own stdout (structured log contract)
 //
@@ -40,8 +41,8 @@ const CONFIG = JSON.parse(readFileSync(join(GW_DIR, 'config.json'), 'utf8'))
 // exercises. The Gateway's own source-allowlist accepts loopback
 // unconditionally, so the smoke never touches `allowed_peer_ips`.
 const HOST = CONFIG.bind === '0.0.0.0' ? '127.0.0.1' : CONFIG.bind
-const PORT = CONFIG.port
-const WS_BASE = `wss://${HOST}:${PORT}/api/realtime`
+let port = null
+const wsBase = () => `wss://${HOST}:${port}/api/realtime`
 
 // Self-signed cert => the smoke client must not verify the chain. This is the
 // ONLY TLS relaxation; the server still runs full TLS. Scoped per-request via
@@ -51,7 +52,7 @@ const TLS_INSECURE = { rejectUnauthorized: false }
 function httpsJson(pathName, { method = 'GET', headers = {}, body = null } = {}) {
   return new Promise((res, rej) => {
     const req = https.request({
-      host: HOST, port: PORT, path: pathName, method, headers, rejectUnauthorized: false,
+      host: HOST, port, path: pathName, method, headers, rejectUnauthorized: false,
     }, response => {
       const chunks = []
       response.on('data', c => chunks.push(c))
@@ -123,8 +124,7 @@ function ensureCerts() {
 // Deployment quickstart step 2: a registered device. Only sha256(secret) is
 // persisted; the raw secret lives in this process's memory and is never
 // written to disk.
-function bootstrapDevice() {
-  const stateDir = resolve(GW_DIR, CONFIG.state_dir)
+function bootstrapDevice(stateDir) {
   rmSync(stateDir, { recursive: true, force: true })
   mkdirSync(stateDir, { recursive: true })
   const secret = crypto.randomBytes(32).toString('hex')
@@ -132,10 +132,14 @@ function bootstrapDevice() {
   return { stateDir, secret }
 }
 
-function startGateway(logPath) {
+function startGateway(logPath, configPath) {
   const child = spawn(process.execPath, ['server.mjs'], {
     cwd: GW_DIR,
-    env: { ...process.env, [CONFIG.provider_key_env]: PROVIDER_KEY_SENTINEL },
+    env: {
+      ...process.env,
+      [CONFIG.provider_key_env]: PROVIDER_KEY_SENTINEL,
+      GATEWAY_CONFIG_PATH: configPath,
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   const chunks = []
@@ -163,28 +167,13 @@ async function waitForHealth(child, timeoutMs = 10_000) {
     if (exited) {
       throw new Error(
         `gateway process exited during startup (code=${exited.code} signal=${exited.signal}) — `
-        + `refusing to probe whatever else is on ${HOST}:${PORT}. Child output:\n`
+        + `refusing to probe whatever else is on ${HOST}:${port}. Child output:\n`
         + gateway.dump().slice(0, 800))
     }
     try { return await httpsJson('/v1/health') }
     catch (e) { last = e; await sleep(150) }
   }
   throw new Error('gateway never became healthy: ' + String(last?.message ?? last))
-}
-
-// A smoke run killed with Ctrl-C never reaches the finally block, leaving a
-// gateway bound to the port that holds the PREVIOUS run's device secret in
-// memory (DeviceStore loads devices.json once at startup). The next run's
-// health probe then succeeds against the stale process while token mints
-// fail 401 SIGNATURE_INVALID — the exact mystery failure from ESS-444.
-// Detect that up front and say so, instead of misattributing it downstream.
-async function assertNoStaleGateway() {
-  let answered = null
-  try { answered = await httpsJson('/v1/health') } catch { return /* port closed: good */ }
-  throw new Error(
-    `${HOST}:${PORT} already answers GET /v1/health (status=${answered.status}) — `
-    + 'a stale gateway from an interrupted run is still bound to the port. '
-    + 'Kill it (e.g. `pkill -f "node server.mjs"`) before re-running the smoke.')
 }
 
 // The health probe returning 200 and Node delivering the child's stdout
@@ -236,7 +225,7 @@ async function mintToken(secret, { requestId, generation, ttlMs = 30_000 }) {
 }
 
 function wsUrl({ requestId, generation }) {
-  return `${WS_BASE}?device_id=${DEVICE_ID}&session_id=${SESSION_ID}`
+  return `${wsBase()}?device_id=${DEVICE_ID}&session_id=${SESSION_ID}`
     + `&request_id=${requestId}&generation=${generation}`
 }
 
@@ -317,19 +306,36 @@ function appendFrames(conn, scope, n) {
 const logPath = join(GW_DIR, 'smoke', 'gateway-smoke.log')
 let gateway = null
 let stateDir = null
+let smokeConfigPath = null
 
 try {
   const certs = ensureCerts()
-  const boot = bootstrapDevice()
+  const runId = crypto.randomBytes(8).toString('hex')
+  stateDir = join(GW_DIR, 'smoke', `.deploy-smoke-${runId}-state`)
+  smokeConfigPath = join(GW_DIR, 'smoke', `.deploy-smoke-${runId}-config.json`)
+  writeFileSync(smokeConfigPath, JSON.stringify({
+    ...CONFIG,
+    port: 0,
+    state_dir: stateDir,
+  }, null, 2))
+  const boot = bootstrapDevice(stateDir)
   stateDir = boot.stateDir
   process.stdout.write(
     `# ESS-423 gateway deployment smoke\n`
-    + `# node ${process.version}  config ${join(GW_DIR, 'config.json')} (unmodified)\n`
-    + `# tls ${certs.crt}  bind ${HOST}:${PORT}  transport ${CONFIG.agent_transport}\n\n`,
+    + `# node ${process.version}  base config ${join(GW_DIR, 'config.json')}\n`
+    + `# tls ${certs.crt}  bind ${HOST}:ephemeral  transport ${CONFIG.agent_transport}\n\n`,
   )
 
-  await assertNoStaleGateway()
-  gateway = startGateway(logPath)
+  gateway = startGateway(logPath, smokeConfigPath)
+
+  // `gateway_ready` is proof that this exact child owns the listener. Only
+  // after reading its OS-assigned port do probes begin, so an old service on
+  // committed port 8444 can never be mistaken for this run (ESS-503).
+  const ready = await waitForBootEvent('gateway_ready')
+  if (!ready || !Number.isInteger(ready.port) || ready.port <= 0) {
+    throw new Error(`gateway_ready with assigned port not captured; output: ${gateway.dump().slice(0, 800)}`)
+  }
+  port = ready.port
 
   // --- 1. process starts + health ------------------------------------------
   const health = await waitForHealth(gateway.child)
@@ -337,11 +343,9 @@ try {
     health.status === 200 && health.body?.ok === true,
     `status=${health.status} body=${JSON.stringify(health.body)}`)
 
-  const ready = await waitForBootEvent('gateway_ready')
   check('S1b', 'gateway_ready 日志：TLS 生效、provider key 从 env 读入',
     Boolean(ready) && ready.tls === true && ready.provider_key_present === true,
-    ready ? JSON.stringify(ready)
-      : `gateway_ready not captured within timeout; output so far: ${gateway.dump().slice(0, 400)}`)
+    JSON.stringify(ready))
 
   // --- 2. token 签发 --------------------------------------------------------
   const t1 = { requestId: 'req_ess423_a_' + crypto.randomBytes(3).toString('hex'), generation: 1 }
@@ -358,7 +362,7 @@ try {
   const c1 = connect(mint1.body.token, t1)
   let upgraded = true, upgradeErr = ''
   try { await c1.opened } catch (e) { upgraded = false; upgradeErr = String(e.message) }
-  check('S3a', 'WSS /api/realtime 用该 token 升级成功（真实 TLS）', upgraded, upgradeErr || `${WS_BASE}`)
+  check('S3a', 'WSS /api/realtime 用该 token 升级成功（真实 TLS）', upgraded, upgradeErr || `${wsBase()}`)
 
   const replay = new WebSocket(wsUrl(t1), {
     headers: { authorization: 'Bearer ' + mint1.body.token }, ...TLS_INSECURE,
@@ -510,16 +514,16 @@ try {
   // state_dir 和 tls_cert/tls_key 统一按模块目录解析（ESS-428）——部署脚本
   // 用绝对路径从任意 cwd 拉起进程也必须能起来。
   //
-  // 探针用的是同一份 config.json（同一个 bind:port），所以必须先把主 gateway
-  // 停掉再探，否则探针只会撞上 EADDRINUSE——证书修复前错误先发生在读证书，
-  // 修复后这个端口冲突才会暴露出来。
+  // 主 smoke 与 cwd 探针都使用 port 0，因此它们可并行存活，
+  // 也不会与已部署在 8444 的 Gateway 互相干扰。
   gateway.flush()
-  gateway.child.kill('SIGTERM')
-  await sleep(500)
-  gateway.child.kill('SIGKILL')
   const fromRepoRoot = spawnSync(process.execPath, [join(GW_DIR, 'server.mjs')], {
     cwd: resolve(GW_DIR, '..'), encoding: 'utf8', timeout: 8_000,
-    env: { ...process.env, [CONFIG.provider_key_env]: PROVIDER_KEY_SENTINEL },
+    env: {
+      ...process.env,
+      [CONFIG.provider_key_env]: PROVIDER_KEY_SENTINEL,
+      GATEWAY_CONFIG_PATH: smokeConfigPath,
+    },
   })
   // spawnSync timeout kills a healthy (still-listening) server => status null.
   // A clean exit (0) also counts; only a crash exit is a failure.
@@ -532,7 +536,6 @@ try {
   advise('S10b', '启动失败走结构化 startup_failed 日志而非裸栈',
     startedFromOtherCwd || probeOutput.includes('startup_failed'),
     startedFromOtherCwd ? 'n/a' : 'createGateway() 的抛错未被 server.mjs 末尾的 .catch 覆盖，输出是裸 stack')
-  gateway = null  // 已停，finally 不再重复 kill
 } catch (error) {
   check('S0', 'smoke harness', false, String(error?.stack ?? error))
 } finally {
@@ -544,6 +547,7 @@ try {
   }
   // Leave nothing behind: the smoke device registration is not production state.
   if (stateDir) rmSync(stateDir, { recursive: true, force: true })
+  if (smokeConfigPath) rmSync(smokeConfigPath, { force: true })
 }
 
 const gating = results.filter(r => !r.advisory)
