@@ -168,6 +168,36 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         XCTAssertEqual(player.enqueuedChunks.map(\.sequence), [0])
     }
 
+    func testUplinkAckReleasesBudgetAndLogsRuntimeReceipt() {
+        let requestId = "44444444-4444-4444-4444-444444444444"
+        let (adapter, recorder, _, transport, _) = makeAdapter(sessionIds: [
+            "55555555-5555-5555-5555-555555555555"
+        ])
+        let handle = adapter.beginTurn(requestId: requestId)
+        recorder.feed(Data(repeating: 0x11, count: 64))
+        let chunk = try! XCTUnwrap(transport.appendEvents.first)
+
+        adapter.receiveUplinkAck(RealtimeUplinkAck(
+            requestId: handle.requestId,
+            sessionId: handle.sessionId,
+            sequence: chunk.sequence,
+            byteCount: chunk.payload.count
+        ))
+        // Duplicate receipt is ignored by the byte ledger and produces no
+        // second accepted-ACK log event.
+        adapter.receiveUplinkAck(RealtimeUplinkAck(
+            requestId: handle.requestId,
+            sessionId: handle.sessionId,
+            sequence: chunk.sequence,
+            byteCount: chunk.payload.count
+        ))
+
+        recorder.feed(Data(repeating: 0x22, count: 64))
+        adapter.commit()
+        XCTAssertEqual(transport.appendEvents.map(\.sequence), [0, 1])
+        XCTAssertEqual(transport.commitEvents.first?.sequence, 1)
+    }
+
     func testTransportFailureTriggersOneShotCompleteFileFallback() {
         let requestId = "44444444-4444-4444-4444-444444444444"
         let (adapter, recorder, _, transport, counter) = makeAdapter(sessionIds: [
