@@ -66,7 +66,10 @@ final class PhoneRealtimeSession {
     /// Forward a Watch-side envelope. Opens the WSS session lazily on
     /// `stream.start` and tears it down on `audio.commit` completion or on
     /// the coordinator's fallback signal.
-    func forward(_ envelope: RealtimeUplinkEnvelope) {
+    func forward(
+        _ envelope: RealtimeUplinkEnvelope,
+        completion: ((Bool) -> Void)? = nil
+    ) {
         switch envelope.kind {
         case .streamStart:
             guard let start = envelope.start else { return }
@@ -85,6 +88,7 @@ final class PhoneRealtimeSession {
             transition(to: .failed(reason: descriptor.reason))
             currentTransport?.close(reason: descriptor.reason)
             currentTransport = nil
+            completion?(true)
             return
         case .bargeInRequest:
             // ESS-391: forward barge-in to transport. For Bridge transports
@@ -95,17 +99,24 @@ final class PhoneRealtimeSession {
             Self.logger.info(
                 "realtime bargein.request request=\(ask.requestId, privacy: .public) from_gen=\(ask.fromGeneration, privacy: .public)"
             )
-            guard let transport = currentTransport else { return }
+            guard let transport = currentTransport else {
+                completion?(false)
+                return
+            }
             transport.send(envelope) { [weak self] error in
                 if let error {
                     Self.logger.error(
                         "bargein.request send failed: \(String(describing: error), privacy: .public)"
                     )
                 }
+                completion?(error == nil)
             }
             return
         }
-        guard let transport = currentTransport else { return }
+        guard let transport = currentTransport else {
+            completion?(false)
+            return
+        }
         transport.send(envelope) { [weak self] error in
             if let error {
                 Self.logger.error(
@@ -115,6 +126,7 @@ final class PhoneRealtimeSession {
                 self?.currentTransport?.close(reason: "send_failed")
                 self?.currentTransport = nil
             }
+            completion?(error == nil)
         }
         if envelope.kind == .audioCommit {
             // Commit is the last uplink frame; the bridge will finish playback

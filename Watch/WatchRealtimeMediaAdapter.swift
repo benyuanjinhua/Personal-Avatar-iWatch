@@ -168,6 +168,14 @@ final class WatchRealtimeMediaAdapter {
         session.commitUplink()
     }
 
+    func receiveUplinkAck(_ ack: RealtimeUplinkAck) {
+        guard session.acknowledgeUplink(ack) else { return }
+        WatchLog.info(
+            "realtime", "uplink_ack_received", requestId: ack.requestId,
+            detail: "sequence=\(ack.sequence) bytes=\(ack.byteCount)"
+        )
+    }
+
     /// Called when the user starts speaking again mid-response.
     func bargeIn() {
         session.bargeInDownlink()
