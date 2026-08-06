@@ -7,6 +7,12 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # ESS-366 followup: allow `gh workflow run` for on-demand main / branch
+  # verification (e.g. after a merge to confirm the new tip is actually green
+  # on the hosted runner). Without this trigger the only way to re-run main's
+  # gate is `gh run rerun <id>`, which is limited to the exact commit of the
+  # original run and depends on GitHub's rerun scheduling.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
