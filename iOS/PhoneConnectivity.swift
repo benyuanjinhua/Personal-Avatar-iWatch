@@ -107,10 +107,11 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     }
 
     func send(_ configuration: AgentConfiguration) {
-        pendingConfiguration = configuration
+        let watchConfiguration = configuration.watchSafe
+        pendingConfiguration = watchConfiguration
         guard WCSession.default.activationState == .activated else { return }
         do {
-            let data = try JSONEncoder().encode(configuration)
+            let data = try JSONEncoder().encode(watchConfiguration)
             try WCSession.default.updateApplicationContext([ConfigurationMessage.key: data])
             if WCSession.default.isReachable {
                 WCSession.default.sendMessageData(data, replyHandler: nil) { [weak self] error in
@@ -291,8 +292,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
                 agentTokenTask = nil
             }
         }
-        guard let credentials = RelayCredentialsStore.read(),
-              credentials.deviceId == agentFlag.deviceId,
+        guard let credentials = directAgentCredentials(),
               let gatewayURL = URL(string: agentFlag.gatewayURLString) else {
             drainPendingAgentEnvelopesToBridge(
                 reason: "missing_credentials_or_gateway", turn: turn, taskID: taskID
@@ -384,8 +384,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
                 sessionId: sessionId,
                 generation: 1,
                 replacementSession: { [agentFlag] generation in
-                    guard let credentials = RelayCredentialsStore.read(),
-                          credentials.deviceId == agentFlag.deviceId,
+                    guard let credentials = Self.directAgentCredentials(flag: agentFlag),
                           let gatewayURL = URL(string: agentFlag.gatewayURLString) else {
                         throw AgentSessionTokenError.invalidGatewayURL
                     }
@@ -432,6 +431,16 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         let task = URLSession.shared.webSocketTask(with: request)
         realtimeSession.isAgentTransport = false
         return PhoneRealtimeWebSocketTransport(task: task)
+    }
+
+    private func directAgentCredentials() -> RelayDeviceCredentials? {
+        Self.directAgentCredentials(flag: agentFlag)
+    }
+
+    private static func directAgentCredentials(flag: AudioRealtimeAgentFeatureFlag) -> RelayDeviceCredentials? {
+        let token = SecureTokenStore.read()
+        guard !token.isEmpty else { return nil }
+        return RelayDeviceCredentials(deviceId: flag.deviceId, token: token)
     }
 
     nonisolated func session(

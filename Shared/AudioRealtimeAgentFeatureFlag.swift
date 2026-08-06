@@ -38,7 +38,8 @@ struct AudioRealtimeAgentFeatureFlag {
     }
 
     var isDirectPathEnabled: Bool {
-        defaults.bool(forKey: Key.directEnabled)
+        guard defaults.object(forKey: Key.directEnabled) != nil else { return true }
+        return defaults.bool(forKey: Key.directEnabled)
     }
 
     /// ESS-459: returns the user-configured WSS endpoint, or the dev-cluster
@@ -53,7 +54,10 @@ struct AudioRealtimeAgentFeatureFlag {
     }
 
     var deviceId: String {
-        defaults.string(forKey: Key.deviceId) ?? ""
+        if let value = defaults.string(forKey: Key.deviceId), !value.isEmpty { return value }
+        let value = "iphone-\(UUID().uuidString.lowercased())"
+        defaults.set(value, forKey: Key.deviceId)
+        return value
     }
 
     func setDirectPathEnabled(_ enabled: Bool) {
@@ -62,6 +66,20 @@ struct AudioRealtimeAgentFeatureFlag {
 
     func setGatewayURLString(_ urlString: String) {
         defaults.set(urlString, forKey: Key.gatewayURL)
+    }
+
+    static func validateGatewayURLString(_ value: String) -> AudioRealtimeAgentConfig.ValidationError? {
+        switch AudioRealtimeAgentConfig.validate(
+            urlString: value.trimmingCharacters(in: .whitespacesAndNewlines),
+            authToken: "validation-placeholder", deviceId: "validation-device"
+        ) {
+        case .success: return nil
+        case .failure(let error): return error
+        }
+    }
+
+    static func redactedCredentialDescription(_ credential: String) -> String {
+        credential.isEmpty ? "未配置" : "••••••••"
     }
 
     func setDeviceId(_ deviceId: String) {
