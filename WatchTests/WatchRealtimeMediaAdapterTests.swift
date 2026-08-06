@@ -57,7 +57,12 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         private(set) var preparedFor: RealtimeMediaSession.TurnHandle?
         private(set) var enqueuedPlayables: [RealtimeDownlinkPlayback.PlayableChunk] = []
         private(set) var bargedInBytes: [Int] = []
-        private(set) var finished = false
+        /// ESS-442 B1 adapter-level regression: prove `player.finish(...)`
+        /// is invoked *exactly once* on the sync-release + late-chunk trace,
+        /// not just "was called at least once".
+        private(set) var finishInvocations: [String?] = []
+        var finished: Bool { !finishInvocations.isEmpty }
+        var finishCount: Int { finishInvocations.count }
         private(set) var stopped = false
 
         var enqueuedChunks: [VoiceStreamChunk] { enqueuedPlayables.map(\.chunk) }
@@ -67,7 +72,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
             enqueuedPlayables.append(contentsOf: playables)
         }
         func bargeIn(clearedBytes: Int) { bargedInBytes.append(clearedBytes) }
-        func finish(responseId: String?) { finished = true }
+        func finish(responseId: String?) { finishInvocations.append(responseId) }
         func stop(barge: Bool) { stopped = true }
     }
 
@@ -349,5 +354,106 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         adapter.ingestDownlink(staleChunk, responseId: "resp-stale")
         XCTAssertEqual(player.enqueuedChunks.map(\.sequence), [0],
                        "a new turn must reject late chunks from the replaced turn")
+    }
+
+    // MARK: - ESS-442 B1 adapter-level regression (毕玄 REQUEST CHANGES)
+
+    /// Closes the loop 毕玄 flagged in his non-author review of #173: the
+    /// coordinator-level test in `Tests/Ess442RegressionTests.swift` only
+    /// counts `RealtimeMediaSession.Event`s, so it can't directly assert
+    /// the three ESS-442 acceptance items on the `WatchRealtimeMediaAdapter`
+    /// seam:
+    ///
+    ///   1. `player.finish(responseId:)` fires **exactly once**
+    ///   2. WatchLog `done_barrier_released` is emitted **exactly once**
+    ///   3. That unique log line contains `waited_ms=0` (proving the sync
+    ///      path — not the async `.doneBarrierReleased` path — emitted it)
+    ///
+    /// Pre-fix trace on cd86154: two `player.finish`, two logs, one
+    /// missing `waited_ms=0`. Post-fix: one `player.finish`, one log,
+    /// present `waited_ms=0`.
+    func testEss442B1_AdapterEmitsSingleFinishAndSingleReleaseLogWithWaitedMs() {
+        let requestId = "44444444-4442-4442-4442-444444424b01"
+        let sessionId = "55555555-5555-5555-5555-555555555b01"
+        let (adapter, _, player, _, _) = makeAdapter(sessionIds: [sessionId])
+
+        struct LogEvent {
+            let module: String
+            let event: String
+            let detail: String?
+        }
+        // Serial dispatch of observer callbacks is guaranteed by WatchLog's
+        // internal lock, so a plain array captured by a class ref is safe.
+        final class LogSink { var events: [LogEvent] = [] }
+        let sink = LogSink()
+        WatchLog.setObserver { module, event, detail, _ in
+            sink.events.append(LogEvent(module: module, event: event, detail: detail))
+        }
+        defer { WatchLog.setObserver(nil) }
+
+        let handle = adapter.beginTurn(requestId: requestId)
+        adapter.openGeneration(1)
+
+        // Seq 0..2 delivered in order under generation 1.
+        for i in 0..<3 {
+            adapter.ingestDownlink(
+                VoiceStreamChunk(
+                    requestId: handle.requestId, streamId: handle.sessionId,
+                    direction: .downlink, sequence: i,
+                    capturedAtMs: 1_800_000_000_000 + Int64(i),
+                    codec: "pcm_s16le", sampleRate: 24_000,
+                    payload: Data(repeating: UInt8(i), count: 64)
+                ),
+                responseId: "r-B1", generation: 1
+            )
+        }
+        // Synchronous barrier release path: done arrives after 0..2 already
+        // emitted, so `markDone` returns `.barrierReleased` immediately and
+        // the adapter's `.doneArrived(.barrierReleased)` branch fires
+        // `player.finish` + the `waited_ms=0` log.
+        adapter.markDownlinkComplete(
+            responseId: "r-B1", generation: 1, finalSequence: 2
+        )
+
+        // The regression trigger: a duplicate / late downlink chunk after
+        // the sync release. Pre-fix this would go through the coordinator's
+        // `checkBarrierRelease()` tail and produce a second
+        // `.doneBarrierReleased` → second `player.finish` + second log line.
+        adapter.ingestDownlink(
+            VoiceStreamChunk(
+                requestId: handle.requestId, streamId: handle.sessionId,
+                direction: .downlink, sequence: 2,
+                capturedAtMs: 1_800_000_000_002,
+                codec: "pcm_s16le", sampleRate: 24_000,
+                payload: Data(repeating: 2, count: 64)
+            ),
+            responseId: "r-B1", generation: 1
+        )
+
+        // Acceptance 1: player.finish exactly once, carrying the right rid.
+        XCTAssertEqual(
+            player.finishCount, 1,
+            "player.finish(...) must be invoked exactly once — a second call after sync release is the B1 regression"
+        )
+        XCTAssertEqual(player.finishInvocations.first as? String, "r-B1")
+
+        // Acceptance 2 + 3: done_barrier_released emitted exactly once, and
+        // the unique line contains `waited_ms=0` (marker for the sync path).
+        let releaseLogs = sink.events.filter {
+            $0.module == "realtime" && $0.event == "done_barrier_released"
+        }
+        XCTAssertEqual(
+            releaseLogs.count, 1,
+            "done_barrier_released must be logged exactly once — a duplicate line is R-02 evidence pollution (B1)"
+        )
+        let detail = releaseLogs.first?.detail ?? ""
+        XCTAssertTrue(
+            detail.contains("waited_ms=0"),
+            "the unique done_barrier_released line must carry waited_ms=0 (sync path marker); got detail=\(detail)"
+        )
+        XCTAssertTrue(
+            detail.contains("final_seq=2"),
+            "the unique done_barrier_released line must carry final_seq=2; got detail=\(detail)"
+        )
     }
 }
