@@ -121,6 +121,7 @@ final class PushToTalkController: ObservableObject {
                 detail: "count=\(staleIds.count) holds=[\(holdReasons)] scene_phase=\(phase)"
             )
         }
+        speechVault = try? EncryptedAudioVault(directory: base.appendingPathComponent("SpeechVault", isDirectory: true))
         // ESS-317 历史对话留存：轮次被 trim 时同步清理关联的加密音频文件，
         // 防止磁盘泄漏（超过最大保留数后旧轮次语音必须释放）。
         journal.onTurnEvicted = { [weak self] turn in
@@ -130,7 +131,6 @@ final class PushToTalkController: ObservableObject {
                               detail: "request_id=\(turn.requestId) file=\(fileName)")
             }
         }
-        speechVault = try? EncryptedAudioVault(directory: base.appendingPathComponent("SpeechVault", isDirectory: true))
         transport = WatchVoiceTransport(journal: journal)
         retryStore = RetryRecordingStore(
             directory: base.appendingPathComponent("RetryCache", isDirectory: true),
