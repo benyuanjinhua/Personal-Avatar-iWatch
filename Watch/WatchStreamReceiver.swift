@@ -39,6 +39,8 @@ final class WatchStreamReceiver: ObservableObject {
 
     private var activeStream: StreamState?
     private var disableObserverToken: UUID?
+    /// ESS-509: WCSession health monitor, started when streaming begins.
+    private let keepAlive = RealtimeSessionKeepAlive()
 
     /// 门禁：编译期 OFF + debug 开关。
     var gateOpen: Bool { debugSettings.isStreamingActive }
@@ -97,6 +99,8 @@ final class WatchStreamReceiver: ObservableObject {
                 startedAt: Date(),
                 streamingGeneration: currentGen
             )
+            // ESS-509: start WCSession keep-alive when streaming begins
+            keepAlive.start()
             WatchLog.info(
                 "stream", "stream_started",
                 requestId: chunk.requestId,
@@ -185,6 +189,7 @@ final class WatchStreamReceiver: ObservableObject {
         stream.gapTimer = nil
         stream.player?.stop()
         stream.player = nil
+        keepAlive.stop()  // ESS-509
         WatchLog.error(
             "stream", "fallback",
             requestId: requestId,
@@ -202,6 +207,7 @@ final class WatchStreamReceiver: ObservableObject {
         active.gapTimer?.cancel()
         active.player?.stop()
         activeStream = nil
+        keepAlive.stop()  // ESS-509
         WatchLog.info("stream", "stream_cancelled", requestId: requestId)
     }
 
@@ -209,6 +215,7 @@ final class WatchStreamReceiver: ObservableObject {
         guard let active = activeStream else { return }
         active.gapTimer?.cancel()
         active.player?.stop()
+        keepAlive.stop()  // ESS-509
         WatchLog.info("stream", "stream_cancelled_all",
                        requestId: active.requestId,
                        detail: "reason=\(reason)")
