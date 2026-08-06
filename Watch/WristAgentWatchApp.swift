@@ -49,6 +49,7 @@ struct WristAgentWatchApp: App {
                         services.pushToTalk.player.recoverAfterForeground()
                         services.pushToTalk.sessionKeeper.appDidBecomeActive()
                         WatchLogShipper.shared.ship(reason: "foreground")
+                        services.pushToTalk.evictStaleAudio()
                         services.pushToTalk.presentUnreadIfAny()
                     case .background:
                         WatchLogShipper.shared.ship(reason: "background")

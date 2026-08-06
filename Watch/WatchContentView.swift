@@ -53,12 +53,12 @@ struct WatchContentView: View {
                 .tag(0)
 
             NavigationStack {
-                ConversationTimelineView(journal: journal, settings: settings) { turn in
-                    // ESS-317 F2.4「再次对话」：跳回主屏并进入 listening，
-                    // 携带上一轮的问 + 答文本（Q1=a 口径）。
-                    selectedTab = 0
-                    pushToTalk.continueConversation(from: turn)
-                }
+                ConversationTimelineView(
+                    journal: journal,
+                    settings: settings,
+                    pushToTalk: pushToTalk,
+                    selectedTab: $selectedTab
+                )
             }
             .tag(1)
 
@@ -116,6 +116,13 @@ struct WatchContentView: View {
 
                     if showWelcomeBanner {
                         welcomeBanner
+                    }
+
+                    if let reChatText = pushToTalk.reChatContextText {
+                        Text(reChatText)
+                            .font(.caption2.bold())
+                            .foregroundStyle(.blue)
+                            .lineLimit(1)
                     }
 
                     // ESS-163：装机自检的过程/结果不再默认铺在首屏；
