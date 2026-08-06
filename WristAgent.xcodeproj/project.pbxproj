@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		03A62E2D08DF9037D1ED20F3 /* RealtimeDownlinkPlayback.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C41457A27FD24A41133AFFE /* RealtimeDownlinkPlayback.swift */; };
+		055DA514983496A47E9C160F /* VoiceDateDecoding.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C9AAAB5A0024E09F0F7ED66 /* VoiceDateDecoding.swift */; };
 		059C813BE15ED9958BC3C63A /* AudioRealtimeAgentSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 089122E724A393364FA3F2CA /* AudioRealtimeAgentSession.swift */; };
 		06514EB08E697AAAEEA6F10A /* ResultNotificationPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13475F099EA8ADC39FB4651D /* ResultNotificationPolicy.swift */; };
 		06E2F65AB24A39F35B1CB39D /* RuntimeSessionPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B644F4BEAE260E21C555E9E /* RuntimeSessionPolicy.swift */; };
@@ -40,6 +41,7 @@
 		2BE4825B9DE1357E0469CED7 /* SpeechPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7669A09014913EDDEC887BBE /* SpeechPlayer.swift */; };
 		2FF25EEB3BCA3688BCB58468 /* ProcessingCopyThresholdTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FA650F428590FCA9FAA371A /* ProcessingCopyThresholdTests.swift */; };
 		3094CD00C51EF6746AEB7C98 /* RealtimeBridgeWireCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B1609E87036B6E0CEFB8C95 /* RealtimeBridgeWireCodec.swift */; };
+		312A184851626BC5D2DBAB0D /* VoiceDateDecoding.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C9AAAB5A0024E09F0F7ED66 /* VoiceDateDecoding.swift */; };
 		3213E1FAF48D79262E5EA9FC /* CompanionContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A2CDFE23539DF4DB5ADDAF7 /* CompanionContentView.swift */; };
 		3216F8C5F4A8D25615A5F8E4 /* ResultNotificationPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13475F099EA8ADC39FB4651D /* ResultNotificationPolicy.swift */; };
 		34140BE278C262CF0BACEABE /* EncryptedAudioVault.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7C56A17FC91DC667B51B7D6 /* EncryptedAudioVault.swift */; };
@@ -286,6 +288,7 @@
 		837F0B1D0B26EA8AFCAAC4A0 /* WristAgentWatch.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = WristAgentWatch.entitlements; sourceTree = "<group>"; };
 		88E0836FA054B69DBE4F3E16 /* RetryRecordingStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RetryRecordingStore.swift; sourceTree = "<group>"; };
 		8A1B0A3BF7CF87587B6FF3EB /* WatchDebugSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchDebugSettings.swift; sourceTree = "<group>"; };
+		8C9AAAB5A0024E09F0F7ED66 /* VoiceDateDecoding.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceDateDecoding.swift; sourceTree = "<group>"; };
 		8CA853AA557CCC08A3446DED /* VoiceOrbView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceOrbView.swift; sourceTree = "<group>"; };
 		8D4D9B7BAB821EF5BEF00394 /* ConversationTimelineView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationTimelineView.swift; sourceTree = "<group>"; };
 		8F9C01710FDC8C90D754460F /* OpenWristAgentIntent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenWristAgentIntent.swift; sourceTree = "<group>"; };
@@ -391,6 +394,7 @@
 				D22D20695006303F619B7C73 /* SpeechVaultCleaner.swift */,
 				C426A9FB7C2456FD57F1BA1E /* SubtitleScript.swift */,
 				E36424AC38F0A8BB28751248 /* UUIDv7.swift */,
+				8C9AAAB5A0024E09F0F7ED66 /* VoiceDateDecoding.swift */,
 				D70795CA9CC1B496467FE2B8 /* VoiceInteractionCue.swift */,
 				CB7ABFE8DE51D05121E27317 /* VoiceOutbox.swift */,
 				C58AEB9B4C54F952DFC96AB2 /* VoiceRelayEvents.swift */,
@@ -720,6 +724,7 @@
 				4702936B9E5AE5D7803549D1 /* SpeechVaultCleaner.swift in Sources */,
 				D23E8DF58407ADEEE6F36F3A /* SubtitleScript.swift in Sources */,
 				59EF7588E503BBA5DF84681B /* UUIDv7.swift in Sources */,
+				312A184851626BC5D2DBAB0D /* VoiceDateDecoding.swift in Sources */,
 				7E75E969A72336DBE618BEBE /* VoiceInteractionCue.swift in Sources */,
 				3720FA2BBC2A5376CB24FD23 /* VoiceOutbox.swift in Sources */,
 				FD2534104A35901AC28B604D /* VoiceRelayEvents.swift in Sources */,
@@ -792,6 +797,7 @@
 				91EA78B6C755DACBB9576676 /* SubtitlePlaybackView.swift in Sources */,
 				26780BEBF601751525AE9BDD /* SubtitleScript.swift in Sources */,
 				D9B1A7DECC44E46204E0FFF3 /* UUIDv7.swift in Sources */,
+				055DA514983496A47E9C160F /* VoiceDateDecoding.swift in Sources */,
 				F0F7837AE17D55F9D65F291C /* VoiceInteractionCue.swift in Sources */,
 				2AFB7EE475338CDAB23D6E85 /* VoiceOrbView.swift in Sources */,
 				FD6002847EC794CD155710D5 /* VoiceOutbox.swift in Sources */,
