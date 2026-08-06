@@ -148,6 +148,10 @@ export class VoiceStreamDownlink {
 
   finish(requestId) {
     if (!this.enabled) return { status: 'disabled' }
+    const decision = this.isAllowed?.(requestId)
+    if (decision && decision.effective !== true) {
+      return this.fallback(requestId, decision.fallback_reason ?? 'not_negotiated')
+    }
     const stream = this.streams.get(requestId)
     if (!stream) return { status: 'missing' }
     if (stream.fellBack) return { status: 'already_fell_back' }

@@ -298,6 +298,125 @@ describe('ESS-38 announcement aggregation cap', () => {
   })
 })
 
+describe('ESS-387 delayed announcement streaming integration', () => {
+  const streaming = {
+    requested: true,
+    capabilities: ['voice_stream_downlink_v2'],
+    protocol_versions: [2],
+  }
+
+  it('keeps server ledger ownership through background terminal and streams delayed chunks plus EOS before TTL', async () => {
+    const ctx = await launch({
+      overrides: {
+        voice_streaming_v2: true,
+        voice_stream_announcement_binding_ttl_ms: 1_000,
+      },
+    })
+    const events = ctx.client.events()
+    try {
+      await waitFor(() => events.received.some(event => event.type === 'snapshot'))
+      const id = rid()
+      const accepted = await ctx.client.createTurn(id, pcm16(), {
+        sessionId: 'session-ess387-before-ttl',
+        streaming,
+      })
+      assert.equal(accepted.status, 202)
+      assert.equal(accepted.json.streaming.effective, true)
+      await waitFor(async () => (await ctx.client.getTurn(id)).json.task_id === 'task_bg')
+
+      ctx.mock.emitTask('task.completed', {
+        ...ctx.mock.tasks.get('task_bg'),
+        status: 'completed',
+        resultMetadata: { presentation: { speech: '后台任务完成。' } },
+      })
+      await waitFor(async () => (await ctx.client.getTurn(id)).json.status === 'completed')
+
+      await new Promise(resolve => setTimeout(resolve, 50))
+      const delayedPcm = Buffer.alloc(4_800, 17)
+      ctx.mock.announce({
+        taskId: 'task_bg',
+        responseId: 'resp_ess387_before_ttl',
+        transcript: '延迟播报已送达。',
+        pcm: delayedPcm,
+        deltaBytes: delayedPcm.length,
+      })
+
+      const streamed = await waitFor(() => events.received.find(event =>
+        event.type === 'voice.stream.chunk'
+        && event.chunk.request_id === id
+        && event.chunk.payload === delayedPcm.toString('base64')))
+      assert.equal(streamed.chunk.end_of_stream, false)
+      const eos = await waitFor(() => events.received.find(event =>
+        event.type === 'voice.stream.chunk'
+        && event.chunk.request_id === id
+        && event.chunk.end_of_stream === true
+        && event.chunk.sequence > streamed.chunk.sequence))
+      assert.equal(Buffer.from(eos.chunk.payload, 'base64').length, 2)
+
+      const durable = await waitFor(async () => {
+        const turn = (await ctx.client.getTurn(id)).json
+        return turn.result?.audio ? turn : null
+      })
+      assert.equal(durable.result.speech_text, '延迟播报已送达。')
+    } finally {
+      events.ws.close()
+      await ctx.bridge.stop(); await ctx.mock.stop()
+    }
+  })
+
+  it('isolates delayed announcement streaming after the terminal ownership TTL', async () => {
+    const ctx = await launch({
+      overrides: {
+        voice_streaming_v2: true,
+        voice_stream_announcement_binding_ttl_ms: 75,
+      },
+    })
+    const events = ctx.client.events()
+    try {
+      await waitFor(() => events.received.some(event => event.type === 'snapshot'))
+      const id = rid()
+      await ctx.client.createTurn(id, pcm16(), {
+        sessionId: 'session-ess387-after-ttl',
+        streaming,
+      })
+      await waitFor(async () => (await ctx.client.getTurn(id)).json.task_id === 'task_bg')
+      await waitFor(() => events.received.some(event =>
+        event.type === 'voice.stream.chunk' && event.chunk.request_id === id))
+      ctx.mock.emitTask('task.completed', {
+        ...ctx.mock.tasks.get('task_bg'),
+        status: 'completed',
+        resultMetadata: { presentation: { speech: '后台任务完成。' } },
+      })
+      await waitFor(async () => (await ctx.client.getTurn(id)).json.status === 'completed')
+      const chunksAtTerminal = events.received.filter(event =>
+        event.type === 'voice.stream.chunk' && event.chunk.request_id === id).length
+
+      await new Promise(resolve => setTimeout(resolve, 150))
+      const expiredPcm = Buffer.alloc(4_800, 23)
+      ctx.mock.announce({
+        taskId: 'task_bg',
+        responseId: 'resp_ess387_after_ttl',
+        transcript: '仅走持久结果。',
+        pcm: expiredPcm,
+        deltaBytes: expiredPcm.length,
+      })
+
+      const durable = await waitFor(async () => {
+        const turn = (await ctx.client.getTurn(id)).json
+        return turn.result?.speech_text === '仅走持久结果。' ? turn : null
+      })
+      assert.ok(durable.result.audio, 'TTL only isolates best-effort streaming, not durable result delivery')
+      await new Promise(resolve => setTimeout(resolve, 100))
+      assert.equal(events.received.filter(event =>
+        event.type === 'voice.stream.chunk' && event.chunk.request_id === id).length,
+      chunksAtTerminal, 'expired announcement must emit neither PCM nor EOS')
+    } finally {
+      events.ws.close()
+      await ctx.bridge.stop(); await ctx.mock.stop()
+    }
+  })
+})
+
 describe('ESS-38 direct path stores file + metadata too', () => {
   it('direct answer exposes audio metadata and the download endpoint', async () => {
     const ctx = await launch({ scenario: 'direct' })
