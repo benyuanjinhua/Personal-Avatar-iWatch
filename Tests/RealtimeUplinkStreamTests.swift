@@ -148,6 +148,46 @@ final class RealtimeUplinkStreamTests: XCTestCase {
         }
     }
 
+    func testContinuousAcknowledgementsAllowMoreThanProductionBudgetAndCommit() {
+        var stream = makeStream(maxInFlightBytes: 256 * 1024)
+        _ = stream.start(capturedAtMs: 0)
+        let frame = Data(repeating: 0x5A, count: 3_200)
+
+        // 100 frames = 320KB, larger than the production 256KB budget.
+        for sequence in 0..<100 {
+            guard case .emitted = stream.appendPCM(
+                frame, capturedAtMs: Int64(sequence + 1)
+            ) else {
+                return XCTFail("acknowledged stream must not fall back at sequence \(sequence)")
+            }
+            stream.acknowledge(sequence: sequence, byteCount: frame.count)
+            // Duplicate and stale ACKs must not release budget twice.
+            stream.acknowledge(sequence: sequence, byteCount: frame.count)
+        }
+
+        guard case .emitted(let frames) = stream.commit(capturedAtMs: 101),
+              case .audioCommit(let commit)? = frames.first else {
+            return XCTFail("acknowledged stream should commit")
+        }
+        XCTAssertEqual(commit.sequence, 99)
+        XCTAssertFalse(stream.didFallback)
+    }
+
+    func testRealtimeUplinkAckRoundTripAndRejectsInvalidValues() {
+        let ack = RealtimeUplinkAck(
+            requestId: requestId, sessionId: sessionId,
+            sequence: 7, byteCount: 3_200
+        )
+        XCTAssertEqual(RealtimeUplinkAck(message: ack.message), ack)
+
+        var invalid = ack.message
+        invalid[RealtimeUplinkAck.byteCountKey] = 0
+        XCTAssertNil(RealtimeUplinkAck(message: invalid))
+        invalid = ack.message
+        invalid[RealtimeUplinkAck.requestIdKey] = "not-a-uuid"
+        XCTAssertNil(RealtimeUplinkAck(message: invalid))
+    }
+
     func testMarkTransportFailedIsIdempotent() {
         var stream = makeStream()
         _ = stream.start(capturedAtMs: 0)

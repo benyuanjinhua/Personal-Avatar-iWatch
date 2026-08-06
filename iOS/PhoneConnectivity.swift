@@ -209,6 +209,33 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         }
     }
 
+    /// Realtime audio appends use the WCSession reply channel as a delivery
+    /// ACK. The iPhone replies only after the validated envelope has been
+    /// handed to the direct/legacy forwarding state machine.
+    nonisolated func session(
+        _ session: WCSession,
+        didReceiveMessage message: [String: Any],
+        replyHandler: @escaping ([String: Any]) -> Void
+    ) {
+        guard let data = message[RealtimeMediaMessage.uplinkEnvelopeKey] as? Data,
+              let envelope = try? JSONDecoder().decode(RealtimeUplinkEnvelope.self, from: data),
+              envelope.protocolVersion == RealtimeWireVersion.uplink,
+              let chunk = envelope.append,
+              VoiceStreamValidator().validate(chunk) == nil else {
+            replyHandler([:])
+            return
+        }
+        Task { @MainActor in
+            self.handleRealtimeUplink(data: data)
+            replyHandler(RealtimeUplinkAck(
+                requestId: chunk.requestId,
+                sessionId: chunk.streamId,
+                sequence: chunk.sequence,
+                byteCount: chunk.payload.count
+            ).message)
+        }
+    }
+
     nonisolated func session(_ session: WCSession, didReceiveMessageData messageData: Data) {
         guard let chunk = try? JSONDecoder().decode(VoiceStreamChunk.self, from: messageData),
               VoiceStreamValidator().validate(chunk) == nil,

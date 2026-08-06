@@ -57,6 +57,7 @@ final class WatchVoiceTransport: ObservableObject {
     /// player 完全隔离，避免探针挤占用户结果播放的会话/上下文。
     private let probePlayer = SpeechPlayer()
     private var failedUplinkStreams: Set<String> = []
+    var onUplinkAcknowledged: ((RealtimeUplinkAck) -> Void)?
 
     init(journal: VoiceTurnJournal? = nil) {
         self.journal = journal
@@ -419,7 +420,29 @@ final class WatchVoiceTransport: ObservableObject {
             onFailure?()
             return
         }
-        session.sendMessage(payload, replyHandler: nil) { [weak self] error in
+        let replyHandler: (([String: Any]) -> Void)?
+        if let chunk = envelope.append {
+            replyHandler = { [weak self] reply in
+                guard let ack = RealtimeUplinkAck(message: reply),
+                      ack.requestId == chunk.requestId,
+                      ack.sessionId == chunk.streamId,
+                      ack.sequence == chunk.sequence,
+                      ack.byteCount == chunk.payload.count else { return }
+                Task { @MainActor in
+                    if ack.sequence == 0 || ack.sequence.isMultiple(of: 50) {
+                        WatchLog.info(
+                            "transport", "realtime_uplink_ack",
+                            requestId: ack.requestId,
+                            detail: "sequence=\(ack.sequence) bytes=\(ack.byteCount)"
+                        )
+                    }
+                    self?.onUplinkAcknowledged?(ack)
+                }
+            }
+        } else {
+            replyHandler = nil
+        }
+        session.sendMessage(payload, replyHandler: replyHandler) { [weak self] error in
             Task { @MainActor in
                 WatchLog.error(
                     "transport", "realtime_uplink_failed",

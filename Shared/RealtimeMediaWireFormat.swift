@@ -17,6 +17,51 @@ enum RealtimeWireVersion {
     static let downlink: Int = 1
 }
 
+/// iPhone → Watch delivery acknowledgement for one realtime uplink audio
+/// frame. The Watch validates every echoed identity field before releasing
+/// its bounded in-flight byte budget.
+struct RealtimeUplinkAck: Equatable, Sendable {
+    static let markerKey = "realtime_uplink_ack"
+    static let requestIdKey = "request_id"
+    static let sessionIdKey = "session_id"
+    static let sequenceKey = "sequence"
+    static let byteCountKey = "byte_count"
+
+    let requestId: String
+    let sessionId: String
+    let sequence: Int
+    let byteCount: Int
+
+    var message: [String: Any] {
+        [
+            Self.markerKey: true,
+            Self.requestIdKey: requestId,
+            Self.sessionIdKey: sessionId,
+            Self.sequenceKey: sequence,
+            Self.byteCountKey: byteCount
+        ]
+    }
+
+    init(requestId: String, sessionId: String, sequence: Int, byteCount: Int) {
+        self.requestId = requestId
+        self.sessionId = sessionId
+        self.sequence = sequence
+        self.byteCount = byteCount
+    }
+
+    init?(message: [String: Any]) {
+        guard message[Self.markerKey] as? Bool == true,
+              let requestId = message[Self.requestIdKey] as? String,
+              UUID(uuidString: requestId) != nil,
+              let sessionId = message[Self.sessionIdKey] as? String,
+              UUID(uuidString: sessionId) != nil,
+              let sequence = message[Self.sequenceKey] as? Int, sequence >= 0,
+              let byteCount = message[Self.byteCountKey] as? Int, byteCount > 0 else { return nil }
+        self.init(requestId: requestId, sessionId: sessionId,
+                  sequence: sequence, byteCount: byteCount)
+    }
+}
+
 enum RealtimeUplinkKind: String, Codable, Sendable {
     case streamStart = "stream.start"
     case audioAppend = "audio.append"

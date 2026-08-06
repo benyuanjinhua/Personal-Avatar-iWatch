@@ -43,6 +43,7 @@ final class WatchRealtimeMediaAdapter {
     }
 
     protocol Transport: AnyObject {
+        var onUplinkAcknowledged: ((RealtimeUplinkAck) -> Void)? { get set }
         func sendStreamStart(_ start: RealtimeStreamStart)
         func sendAudioAppend(_ chunk: VoiceStreamChunk)
         func sendAudioCommit(_ commit: RealtimeStreamCommit)
@@ -107,6 +108,9 @@ final class WatchRealtimeMediaAdapter {
     private func wire() {
         recorder.onFrame = { [weak self] frame in self?.session.pushMicrophonePCM(frame) }
         recorder.onFailure = { [weak self] _ in self?.session.markUplinkTransportFailed() }
+        transport.onUplinkAcknowledged = { [weak self] ack in
+            self?.session.acknowledgeUplink(ack)
+        }
         player.onPlaybackEvent = { [weak self] event in
             guard let self else { return }
             switch event {

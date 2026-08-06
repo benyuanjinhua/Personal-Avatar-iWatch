@@ -159,6 +159,17 @@ final class RealtimeMediaSession {
         uplink = stream
     }
 
+    /// iPhone confirmed receipt of one sequenced frame. Unknown, duplicate,
+    /// or stale ACKs are absorbed by `RealtimeUplinkStream`.
+    func acknowledgeUplink(_ ack: RealtimeUplinkAck) {
+        guard let handle = currentTurn,
+              ack.requestId == handle.requestId,
+              ack.sessionId == handle.sessionId,
+              var stream = uplink else { return }
+        stream.acknowledge(sequence: ack.sequence, byteCount: ack.byteCount)
+        uplink = stream
+    }
+
     /// User released the button (or the recorder finished). Flushes any tail
     /// bytes as one final `audio.append` (marked endOfStream) and emits the
     /// `audio.commit` frame.

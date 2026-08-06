@@ -77,6 +77,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
     }
 
     private final class MockTransport: WatchRealtimeMediaAdapter.Transport {
+        var onUplinkAcknowledged: ((RealtimeUplinkAck) -> Void)?
         private(set) var startEvents: [RealtimeStreamStart] = []
         private(set) var appendEvents: [VoiceStreamChunk] = []
         private(set) var commitEvents: [RealtimeStreamCommit] = []
@@ -140,6 +141,31 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
             fullFileFallback: { handle, reason in counter.record(handle, reason) }
         )
         return (adapter, recorder, player, transport, counter)
+    }
+
+    func testTransportAcknowledgementReleasesCoordinatorUplinkBudget() {
+        let requestId = "44444444-4444-4444-4444-444444445200"
+        let sessionId = "55555555-5555-5555-5555-555555555200"
+        let (adapter, recorder, _, transport, counter) = makeAdapter(sessionIds: [sessionId])
+        _ = adapter.beginTurn(requestId: requestId)
+
+        for sequence in 0..<160 { // 10KB total; adapter budget is 8KB.
+            recorder.onFrame?(Data(repeating: UInt8(sequence % 255), count: 64))
+            guard let chunk = transport.appendEvents.last else {
+                return XCTFail("missing append at sequence \(sequence)")
+            }
+            let ack = RealtimeUplinkAck(
+                requestId: chunk.requestId, sessionId: chunk.streamId,
+                sequence: chunk.sequence, byteCount: chunk.payload.count
+            )
+            transport.onUplinkAcknowledged?(ack)
+            transport.onUplinkAcknowledged?(ack)
+        }
+        adapter.commit()
+
+        XCTAssertTrue(counter.invocations.isEmpty)
+        XCTAssertEqual(transport.appendEvents.count, 160)
+        XCTAssertEqual(transport.commitEvents.last?.sequence, 159)
     }
 
     func testFullTurnRoutesUplinkToTransportAndDownlinkToPlayer() {
