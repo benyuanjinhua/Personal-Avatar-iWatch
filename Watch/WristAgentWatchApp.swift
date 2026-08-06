@@ -48,6 +48,12 @@ struct WristAgentWatchApp: App {
                         // 被 resignedFrontmost 收回的 runtime session 重新持有。
                         services.pushToTalk.player.recoverAfterForeground()
                         services.pushToTalk.sessionKeeper.appDidBecomeActive()
+                        // ESS-519：回到前台时若静音保活仍在但无真实播放，
+                        // 停止保活以释放系统资源（runtime session 已重启，
+                        // 前台态不需额外保活）。
+                        if !services.pushToTalk.player.isPlaying {
+                            services.pushToTalk.breather.stop(reason: "foreground")
+                        }
                         WatchLogShipper.shared.ship(reason: "foreground")
                         services.pushToTalk.evictStaleAudio()
                         services.pushToTalk.presentUnreadIfAny()

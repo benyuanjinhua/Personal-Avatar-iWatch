@@ -44,6 +44,7 @@
 		312A184851626BC5D2DBAB0D /* VoiceDateDecoding.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C9AAAB5A0024E09F0F7ED66 /* VoiceDateDecoding.swift */; };
 		3213E1FAF48D79262E5EA9FC /* CompanionContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A2CDFE23539DF4DB5ADDAF7 /* CompanionContentView.swift */; };
 		3216F8C5F4A8D25615A5F8E4 /* ResultNotificationPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13475F099EA8ADC39FB4651D /* ResultNotificationPolicy.swift */; };
+		33640AA227F3BD90C08361BF /* BackgroundAudioBreather.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0043EBE7A14AFB45A9C2EE0B /* BackgroundAudioBreather.swift */; };
 		34140BE278C262CF0BACEABE /* EncryptedAudioVault.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7C56A17FC91DC667B51B7D6 /* EncryptedAudioVault.swift */; };
 		34523D43C35817094DA2E618 /* PermissionRequestView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0D0D96E379DBB5414F01FA7 /* PermissionRequestView.swift */; };
 		3679C158DB9AD81045389B1A /* VoiceRequestInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AB8CD6D695437D845CE87AF /* VoiceRequestInbox.swift */; };
@@ -219,6 +220,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		0043EBE7A14AFB45A9C2EE0B /* BackgroundAudioBreather.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundAudioBreather.swift; sourceTree = "<group>"; };
 		01965DB663A6353C9F367FFF /* ErrorCue_RealtimeStalled.m4a */ = {isa = PBXFileReference; path = ErrorCue_RealtimeStalled.m4a; sourceTree = "<group>"; };
 		035DF4EEFBF9F540A0B791F7 /* VoiceRelayWire.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRelayWire.swift; sourceTree = "<group>"; };
 		082465840BA4F405D5850B27 /* ErrorCue_Generic.m4a */ = {isa = PBXFileReference; path = ErrorCue_Generic.m4a; sourceTree = "<group>"; };
@@ -460,6 +462,7 @@
 				98840DEEAC5DA7B6F8FCC628 /* AudioRecorder.swift */,
 				38CFFC49761BA3D8F3C402C8 /* AvatarErrorCardView.swift */,
 				448AA6286D0C4ACA51DC8ADD /* AvatarErrorPresenter.swift */,
+				0043EBE7A14AFB45A9C2EE0B /* BackgroundAudioBreather.swift */,
 				8D4D9B7BAB821EF5BEF00394 /* ConversationTimelineView.swift */,
 				13F51C6DCBABB59C404B307D /* Info.plist */,
 				8F9C01710FDC8C90D754460F /* OpenWristAgentIntent.swift */,
@@ -763,6 +766,7 @@
 				8A5EEAA528E32C9DAB749BFD /* AudioSessionPolicy.swift in Sources */,
 				9FCAF92E7F4BAF6D75258EC3 /* AvatarErrorCardView.swift in Sources */,
 				CCB3BBBEF6EAB9DDD84249E5 /* AvatarErrorPresenter.swift in Sources */,
+				33640AA227F3BD90C08361BF /* BackgroundAudioBreather.swift in Sources */,
 				A0B992F64AF3212C3F47CB0E /* BargeInGenerationCoordinator.swift in Sources */,
 				E817250A3DAFD3D2F889876B /* BridgeTurnProjection.swift in Sources */,
 				1EF906148F17573C9B7D948E /* BuildFingerprint.swift in Sources */,
