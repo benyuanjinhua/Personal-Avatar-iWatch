@@ -82,7 +82,13 @@ final class PushToTalkStreamingStartupTests: XCTestCase {
     /// - `currentTurn` 归零
     /// - `didTriggerCompleteFileFallback` 保留（供 metrics/log）
     /// - `pendingFallbackReason` 已被 controller 消化
-    func testRealtimeStartFailureLeavesAdapterQuiescentAndReliablePathReady() {
+    func testRealtimeStartFailureLeavesAdapterQuiescentAndReliablePathReady() throws {
+        // ESS-501: hosted GitHub Actions runners have no audio HW;
+        // ensureRealtimeAdapter() constructs PCMFrameRecorder + RealtimePlaybackEngine,
+        // both of which instantiate AVAudioEngine and hit -10868 SetFormat on init.
+        // Local mac + real-device sim keep the full body; ESS-362 收口 covers this
+        // path end-to-end on real device (关卡二).
+        try HostedCITestGate.skipIfHostedCI("ensureRealtimeAdapter() → AVAudioEngine SetFormat -10868 in testRealtimeStartFailureLeavesAdapterQuiescentAndReliablePathReady")
         let controller = PushToTalkController()
         let adapter = controller.ensureRealtimeAdapter()
 
@@ -113,7 +119,8 @@ final class PushToTalkStreamingStartupTests: XCTestCase {
 
     /// 单次 `pressBegan` 触发 `ensureRealtimeAdapter` 一次；重复调用必须
     /// 复用同一实例（避免每次点击创建新 AVAudioEngine 攒下多份内存/句柄）。
-    func testEnsureRealtimeAdapterReturnsSameInstanceAcrossPresses() {
+    func testEnsureRealtimeAdapterReturnsSameInstanceAcrossPresses() throws {
+        try HostedCITestGate.skipIfHostedCI("ensureRealtimeAdapter() → AVAudioEngine SetFormat -10868 in testEnsureRealtimeAdapterReturnsSameInstanceAcrossPresses")
         let controller = PushToTalkController()
         let first = controller.ensureRealtimeAdapter()
         let second = controller.ensureRealtimeAdapter()
@@ -124,7 +131,8 @@ final class PushToTalkStreamingStartupTests: XCTestCase {
     /// 不能污染同一 controller 的下一 turn。用 `simulateDeferredFallbackDrain`
     /// 直接消费该 key，覆盖 controller 里 `pendingFallbackReason.removeValue`
     /// 的调用点（无法直接 hook 私有方法，落在语义等价性上）。
-    func testDeferredFallbackForFailedTurnIsCleared() {
+    func testDeferredFallbackForFailedTurnIsCleared() throws {
+        try HostedCITestGate.skipIfHostedCI("ensureRealtimeAdapter() → AVAudioEngine SetFormat -10868 in testDeferredFallbackForFailedTurnIsCleared")
         let controller = PushToTalkController()
         let adapter = controller.ensureRealtimeAdapter()
         let requestId = "77777777-7777-7777-7777-777777777702"
