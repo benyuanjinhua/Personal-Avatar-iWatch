@@ -23,7 +23,8 @@
 import crypto from 'node:crypto'
 import https from 'node:https'
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import WebSocket from 'ws'
@@ -94,13 +95,17 @@ const sleep = ms => new Promise(r => setTimeout(r, ms))
 
 // ---------------------------------------------------------------- setup ----
 
-// Deployment quickstart step 1: TLS cert + key. Generated fresh into the
-// gitignored certs/ dir so the smoke is reproducible on any machine.
+// ESS-506: TLS cert + key are generated into an ephemeral temp dir, NOT the
+// deploy dir's `certs/`. Writing to `<GW_DIR>/certs/gateway.crt|key` would
+// clobber the trusted Let's Encrypt cert (ESS-457) with the smoke's
+// `O=ESS-423 smoke` self-signed cert on every run — invisible to `curl -k`
+// smoke but fatal to a real iPhone `wss://` handshake. The smoke config
+// (written below) points `tls_cert` / `tls_key` at the returned absolute
+// paths, so the spawned server.mjs never touches the deploy `certs/`.
 function ensureCerts() {
-  const certDir = join(GW_DIR, 'certs')
-  mkdirSync(certDir, { recursive: true })
-  const crt = resolve(GW_DIR, CONFIG.tls_cert)
-  const key = resolve(GW_DIR, CONFIG.tls_key)
+  const certDir = mkdtempSync(join(tmpdir(), 'deploy-smoke-certs-'))
+  const crt = join(certDir, 'gateway.crt')
+  const key = join(certDir, 'gateway.key')
   // ESS-447 B2: include `public_host` in the SAN so real-device clients that
   // resolve the Multica magic-workspace hostname also validate the cert.
   // Loopback remains listed so the smoke itself keeps working from the same
@@ -118,7 +123,11 @@ function ensureCerts() {
     '-addext', 'subjectAltName=' + sans.join(','),
   ], { encoding: 'utf8' })
   if (r.status !== 0) throw new Error('openssl failed: ' + (r.stderr || r.stdout))
-  return { crt, key }
+  return { crt, key, dir: certDir }
+}
+
+function sha256File(path) {
+  return crypto.createHash('sha256').update(readFileSync(path)).digest('hex')
 }
 
 // Deployment quickstart step 2: a registered device. Only sha256(secret) is
@@ -307,9 +316,21 @@ const logPath = join(GW_DIR, 'smoke', 'gateway-smoke.log')
 let gateway = null
 let stateDir = null
 let smokeConfigPath = null
+let certDir = null
+
+// ESS-506 safety fingerprint. Capture the digest of the deploy dir's TLS
+// material BEFORE any smoke work; a matching digest after we clean up proves
+// the smoke did not clobber it. Missing files at either end are treated as
+// digest `null` — a fresh clone has no `certs/` yet, and that's fine as long
+// as nothing materialized.
+const deployCertPath = join(GW_DIR, 'certs', 'gateway.crt')
+const deployKeyPath = join(GW_DIR, 'certs', 'gateway.key')
+const beforeCertHash = existsSync(deployCertPath) ? sha256File(deployCertPath) : null
+const beforeKeyHash = existsSync(deployKeyPath) ? sha256File(deployKeyPath) : null
 
 try {
   const certs = ensureCerts()
+  certDir = certs.dir
   const runId = crypto.randomBytes(8).toString('hex')
   stateDir = join(GW_DIR, 'smoke', `.deploy-smoke-${runId}-state`)
   smokeConfigPath = join(GW_DIR, 'smoke', `.deploy-smoke-${runId}-config.json`)
@@ -317,6 +338,12 @@ try {
     ...CONFIG,
     port: 0,
     state_dir: stateDir,
+    // ESS-506: force the spawned server.mjs to load TLS material from the
+    // ephemeral temp dir, not `./certs/` (which in a deploy is the trusted
+    // Let's Encrypt cert). server.mjs resolves these against its module dir
+    // only when the path is relative; absolute paths pass through unchanged.
+    tls_cert: certs.crt,
+    tls_key: certs.key,
   }, null, 2))
   const boot = bootstrapDevice(stateDir)
   stateDir = boot.stateDir
@@ -548,7 +575,22 @@ try {
   // Leave nothing behind: the smoke device registration is not production state.
   if (stateDir) rmSync(stateDir, { recursive: true, force: true })
   if (smokeConfigPath) rmSync(smokeConfigPath, { force: true })
+  if (certDir) rmSync(certDir, { recursive: true, force: true })
 }
+
+// ESS-506 safety gate. Runs after cleanup so it observes the final state of
+// the deploy dir. Any digest change here means the smoke clobbered Gateway
+// TLS material — a silent regression of ESS-457 that would surface on the
+// next service restart as an iPhone `wss://` handshake failure. Must gate
+// the exit code so CI catches a re-introduction.
+const afterCertHash = existsSync(deployCertPath) ? sha256File(deployCertPath) : null
+const afterKeyHash = existsSync(deployKeyPath) ? sha256File(deployKeyPath) : null
+check('S0-safety', 'smoke does not touch certs/gateway.crt|key in the deploy dir',
+  beforeCertHash === afterCertHash && beforeKeyHash === afterKeyHash,
+  `crt before=${beforeCertHash?.slice(0, 12) ?? 'absent'} `
+  + `after=${afterCertHash?.slice(0, 12) ?? 'absent'} `
+  + `key before=${beforeKeyHash?.slice(0, 12) ?? 'absent'} `
+  + `after=${afterKeyHash?.slice(0, 12) ?? 'absent'}`)
 
 const gating = results.filter(r => !r.advisory)
 const failed = gating.filter(r => !r.ok)
