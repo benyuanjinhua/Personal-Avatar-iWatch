@@ -18,19 +18,20 @@ struct CompanionContentView: View {
                 } footer: {
                     Text(settings.configuration.mode == .demo
                          ? "无需服务器即可在手表上体验完整流程。"
-                         : "语音会发送到你配置的 HTTPS Agent Gateway。")
+                         : "iPhone 将通过 WSS 直连 Audio Realtime Agent，不经过 Mac Bridge 媒体中转。")
                 }
 
                 if settings.configuration.mode == .cloud {
-                    Section("云端 Agent") {
-                        TextField("https://agent.example.com", text: binding(\.endpoint))
+                    Section {
+                        TextField(AudioRealtimeAgentFeatureFlag.devDefaultGatewayURLString,
+                                  text: binding(\.endpoint))
                             .textInputAutocapitalization(.never)
                             .keyboardType(.URL)
                         HStack {
                             if tokenVisible {
-                                TextField("Bearer Token", text: binding(\.bearerToken))
+                                TextField("长期访问密钥", text: binding(\.bearerToken))
                             } else {
-                                SecureField("Bearer Token", text: binding(\.bearerToken))
+                                SecureField("长期访问密钥", text: binding(\.bearerToken))
                             }
                             Button {
                                 tokenVisible.toggle()
@@ -38,6 +39,16 @@ struct CompanionContentView: View {
                                 Image(systemName: tokenVisible ? "eye.slash" : "eye")
                             }
                             .buttonStyle(.plain)
+                        }
+                    } header: {
+                        Text("Audio Realtime Agent")
+                    } footer: {
+                        if settings.configuration.isRealtimeDirectReady {
+                            Text("直连配置有效。密钥仅保存在本机 Keychain，不会同步到 Watch 或写入日志。")
+                                .foregroundStyle(.green)
+                        } else {
+                            Text("请输入完整的 wss:// 地址和访问密钥；不接受 HTTPS、明文 WS、URL 查询参数或内嵌凭据。")
+                                .foregroundStyle(.orange)
                         }
                     }
                 }

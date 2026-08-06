@@ -108,9 +108,10 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
 
     func send(_ configuration: AgentConfiguration) {
         pendingConfiguration = configuration
+        configureAgentDirectPath(configuration)
         guard WCSession.default.activationState == .activated else { return }
         do {
-            let data = try JSONEncoder().encode(configuration)
+            let data = try JSONEncoder().encode(configuration.watchSafe)
             try WCSession.default.updateApplicationContext([ConfigurationMessage.key: data])
             if WCSession.default.isReachable {
                 WCSession.default.sendMessageData(data, replyHandler: nil) { [weak self] error in
@@ -121,6 +122,24 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         } catch {
             status = "无法保存设置：\(error.localizedDescription)"
         }
+    }
+
+    /// Apply iPhone-only direct media settings. The long-lived credential is
+    /// read from Keychain and never copied into the Watch configuration.
+    private func configureAgentDirectPath(_ configuration: AgentConfiguration) {
+        guard configuration.isRealtimeDirectReady,
+              let gatewayURL = configuration.realtimeGatewayURL,
+              let credentials = RelayCredentialsStore.read() else {
+            agentFlag.setDirectPathEnabled(false)
+            agentEphemeralToken = nil
+            return
+        }
+        agentFlag.setGatewayURLString(gatewayURL.absoluteString)
+        agentFlag.setDeviceId(credentials.deviceId)
+        agentFlag.setDirectPathEnabled(true)
+        // The user explicitly opted into a client-held long-lived key. It is
+        // persisted only by SecureTokenStore and held here in memory per run.
+        agentEphemeralToken = configuration.bearerToken
     }
 
     nonisolated func session(
@@ -226,6 +245,16 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
             return
         }
         guard let identity = Self.turnIdentity(for: envelope) else {
+            realtimeSession.forward(envelope)
+            return
+        }
+
+        // ESS-508: an explicitly configured long-lived client key bypasses
+        // the ephemeral-token mint endpoint and authenticates WSS directly.
+        // It remains Keychain/memory-only and is never logged or synced.
+        let persistentToken = SecureTokenStore.read()
+        if !persistentToken.isEmpty {
+            agentEphemeralToken = persistentToken
             realtimeSession.forward(envelope)
             return
         }
@@ -384,6 +413,11 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
                 sessionId: sessionId,
                 generation: 1,
                 replacementSession: { [agentFlag] generation in
+                    let persistentToken = SecureTokenStore.read()
+                    if !persistentToken.isEmpty,
+                       let config = agentFlag.resolveConfig(ephemeralToken: persistentToken) {
+                        return AudioRealtimeAgentSession(config: config, sessionId: sessionId)
+                    }
                     guard let credentials = RelayCredentialsStore.read(),
                           credentials.deviceId == agentFlag.deviceId,
                           let gatewayURL = URL(string: agentFlag.gatewayURLString) else {

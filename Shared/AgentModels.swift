@@ -130,6 +130,31 @@ struct AgentConfiguration: Codable, Equatable {
         conciseReply: true,
         voiceStreamingV2: true
     )
+
+    /// The Watch never needs the Agent credential. Keep it on the iPhone
+    /// Keychain and only sync non-sensitive presentation settings.
+    var watchSafe: AgentConfiguration {
+        var copy = self
+        copy.bearerToken = ""
+        return copy
+    }
+
+    /// Production direct media accepts WSS only. HTTP(S) is the legacy task
+    /// API and `ws://` would expose the long-lived client credential.
+    var realtimeGatewayURL: URL? {
+        let trimmed = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let components = URLComponents(string: trimmed),
+              components.scheme?.lowercased() == "wss",
+              let host = components.host, !host.isEmpty,
+              components.user == nil, components.password == nil,
+              components.query == nil,
+              let url = components.url else { return nil }
+        return url
+    }
+
+    var isRealtimeDirectReady: Bool {
+        mode == .cloud && realtimeGatewayURL != nil && !bearerToken.isEmpty
+    }
 }
 
 enum ConnectionMode: String, Codable, CaseIterable {

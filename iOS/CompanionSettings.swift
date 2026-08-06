@@ -19,6 +19,11 @@ final class CompanionSettings: ObservableObject {
             return
         }
         saved.bearerToken = SecureTokenStore.read()
+        if saved.mode == .cloud,
+           saved.realtimeGatewayURL == nil,
+           saved.endpoint.isEmpty || saved.endpoint.contains("agent.example.com") {
+            saved.endpoint = AudioRealtimeAgentFeatureFlag.devDefaultGatewayURLString
+        }
         configuration = saved
     }
 

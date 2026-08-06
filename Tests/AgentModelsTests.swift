@@ -42,6 +42,39 @@ func cloudConfigurationRoundTrips() throws {
 }
 
 @Test
+func realtimeConfigurationRequiresSecureWSSWithoutURLCredentials() {
+    let valid = AgentConfiguration(
+        mode: .cloud, endpoint: "wss://agent.example.com/api/realtime",
+        bearerToken: "secret", autoListen: true, hapticsEnabled: true,
+        conciseReply: false
+    )
+    #expect(valid.isRealtimeDirectReady)
+    #expect(valid.realtimeGatewayURL?.absoluteString == "wss://agent.example.com/api/realtime")
+
+    for invalid in [
+        "https://agent.example.com/api/realtime",
+        "ws://agent.example.com/api/realtime",
+        "wss://user:secret@agent.example.com/api/realtime",
+        "wss://agent.example.com/api/realtime?token=secret"
+    ] {
+        var candidate = valid
+        candidate.endpoint = invalid
+        #expect(!candidate.isRealtimeDirectReady)
+    }
+}
+
+@Test
+func watchSafeConfigurationRedactsLongLivedCredential() {
+    let value = AgentConfiguration(
+        mode: .cloud, endpoint: "wss://agent.example.com/api/realtime",
+        bearerToken: "long-lived-secret", autoListen: true,
+        hapticsEnabled: true, conciseReply: false
+    )
+    #expect(value.watchSafe.bearerToken.isEmpty)
+    #expect(value.watchSafe.endpoint == value.endpoint)
+}
+
+@Test
 func legacyConfigurationDecodesWithoutVoiceStreamingV2AsFalse() throws {
     // Upgrade safety: a stored config without voiceStreamingV2 must still decode as false.
     let legacy = Data(#"{"mode":"demo","endpoint":"","bearerToken":"","autoListen":false,"hapticsEnabled":true,"conciseReply":true}"#.utf8)
@@ -54,7 +87,7 @@ func freshConfigurationDefaultsVoiceStreamingV2ToTrue() {
     // ESS-356: fresh install (no stored config) defaults streaming to ON.
     let fresh = AgentConfiguration(
         mode: .cloud,
-        endpoint: "https://agent.example.com",
+        endpoint: "wss://agent.example.com/api/realtime",
         bearerToken: "secret",
         autoListen: true,
         hapticsEnabled: true,
