@@ -122,15 +122,6 @@ final class PushToTalkController: ObservableObject {
             )
         }
         speechVault = try? EncryptedAudioVault(directory: base.appendingPathComponent("SpeechVault", isDirectory: true))
-        // ESS-317 历史对话留存：轮次被 trim 时同步清理关联的加密音频文件，
-        // 防止磁盘泄漏（超过最大保留数后旧轮次语音必须释放）。
-        journal.onTurnEvicted = { [weak self] turn in
-            if let fileName = turn.speechFileName {
-                self?.speechVault?.remove(name: fileName)
-                WatchLog.info("retention", "trim_evicted",
-                              detail: "request_id=\(turn.requestId) file=\(fileName)")
-            }
-        }
         transport = WatchVoiceTransport(journal: journal)
         retryStore = RetryRecordingStore(
             directory: base.appendingPathComponent("RetryCache", isDirectory: true),
@@ -231,6 +222,15 @@ final class PushToTalkController: ObservableObject {
             playing: player.$isPlaying.eraseToAnyPublisher(),
             recording: $state.map { $0 != .idle }.eraseToAnyPublisher()
         )
+
+        // ESS-317 历史对话留存：trim 时间监听清理 vault（必须在所有 stored property 初始化之后）。
+        journal.onTurnEvicted = { [weak self] turn in
+            if let fileName = turn.speechFileName {
+                self?.speechVault?.remove(name: fileName)
+                WatchLog.info("retention", "trim_evicted",
+                              detail: "request_id=\(turn.requestId) file=\(fileName)")
+            }
+        }
 
         // ESS-317：冷启动时清理超过 24h 的过期轮次与音频。
         journal.evictExpiredAudio(vault: speechVault)
