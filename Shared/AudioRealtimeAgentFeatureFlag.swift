@@ -8,19 +8,18 @@ import Foundation
 /// revert if the direct path encounters Gateway-side issues.
 ///
 /// The flag is backed by `UserDefaults` with a runtime override for tests. It
-/// reads `audio_realtime_agent_direct_enabled` (Bool, default `false` on clean
+/// reads `audio_realtime_agent_direct_enabled` (Bool, default `true` on clean
 /// install) and `audio_realtime_agent_gateway_url` (String, the WSS endpoint).
 ///
-/// **F6**: This flag stores the Gateway URL and device identity in
-/// UserDefaults. The ephemeral auth token is managed separately by the
-/// caller (obtained via `POST /v1/realtime/session-token`) and NEVER stored
-/// here or in Keychain. The long-lived device credential for HMAC-signing
-/// the session-token request lives in the existing `SecureTokenStore`.
+/// **F6**: This flag stores only the Gateway URL and routing preference in
+/// UserDefaults. Device identity and its long-lived credential remain together
+/// in `RelayCredentialsStore` (iPhone Keychain). The ephemeral auth token is
+/// managed separately by the caller (obtained via
+/// `POST /v1/realtime/session-token`) and NEVER stored here or in Keychain.
 struct AudioRealtimeAgentFeatureFlag {
     enum Key {
         static let directEnabled = "audio_realtime_agent_direct_enabled"
         static let gatewayURL = "audio_realtime_agent_gateway_url"
-        static let deviceId = "audio_realtime_agent_device_id"
     }
 
     /// ESS-447 dev-cluster Gateway URL: Jackson's Mac mini exposed via the
@@ -38,7 +37,8 @@ struct AudioRealtimeAgentFeatureFlag {
     }
 
     var isDirectPathEnabled: Bool {
-        defaults.bool(forKey: Key.directEnabled)
+        guard defaults.object(forKey: Key.directEnabled) != nil else { return true }
+        return defaults.bool(forKey: Key.directEnabled)
     }
 
     /// ESS-459: returns the user-configured WSS endpoint, or the dev-cluster
@@ -52,10 +52,6 @@ struct AudioRealtimeAgentFeatureFlag {
         return Self.devDefaultGatewayURLString
     }
 
-    var deviceId: String {
-        defaults.string(forKey: Key.deviceId) ?? ""
-    }
-
     func setDirectPathEnabled(_ enabled: Bool) {
         defaults.set(enabled, forKey: Key.directEnabled)
     }
@@ -64,8 +60,18 @@ struct AudioRealtimeAgentFeatureFlag {
         defaults.set(urlString, forKey: Key.gatewayURL)
     }
 
-    func setDeviceId(_ deviceId: String) {
-        defaults.set(deviceId, forKey: Key.deviceId)
+    static func validateGatewayURLString(_ value: String) -> AudioRealtimeAgentConfig.ValidationError? {
+        switch AudioRealtimeAgentConfig.validate(
+            urlString: value.trimmingCharacters(in: .whitespacesAndNewlines),
+            authToken: "validation-placeholder", deviceId: "validation-device"
+        ) {
+        case .success: return nil
+        case .failure(let error): return error
+        }
+    }
+
+    static func redactedCredentialDescription(_ credential: String) -> String {
+        credential.isEmpty ? "未配置" : "••••••••"
     }
 
     /// Resolve a valid config from the flag state. Returns `nil` when the
@@ -74,17 +80,17 @@ struct AudioRealtimeAgentFeatureFlag {
     /// it's single-use and never persisted).
     func resolveConfig(
         ephemeralToken: String,
+        deviceId: String,
         allowInsecure: Bool = false
     ) -> AudioRealtimeAgentConfig? {
         guard isDirectPathEnabled else { return nil }
         let urlString = gatewayURLString
-        let devId = deviceId
-        guard !urlString.isEmpty, !devId.isEmpty, !ephemeralToken.isEmpty else {
+        guard !urlString.isEmpty, !deviceId.isEmpty, !ephemeralToken.isEmpty else {
             return nil
         }
         switch AudioRealtimeAgentConfig.validate(
             urlString: urlString, authToken: ephemeralToken,
-            deviceId: devId, allowInsecure: allowInsecure
+            deviceId: deviceId, allowInsecure: allowInsecure
         ) {
         case .success(let config): return config
         case .failure: return nil

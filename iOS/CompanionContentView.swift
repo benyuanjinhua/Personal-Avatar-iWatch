@@ -18,19 +18,20 @@ struct CompanionContentView: View {
                 } footer: {
                     Text(settings.configuration.mode == .demo
                          ? "无需服务器即可在手表上体验完整流程。"
-                         : "语音会发送到你配置的 HTTPS Agent Gateway。")
+                         : "语音默认通过 iPhone 直连 Audio Realtime Agent。")
                 }
 
                 if settings.configuration.mode == .cloud {
-                    Section("云端 Agent") {
-                        TextField("https://agent.example.com", text: binding(\.endpoint))
+                    Section {
+                        Toggle("启用 Audio Realtime 直连", isOn: $settings.realtimeDirectEnabled)
+                        TextField("wss://agent.example.com/api/realtime", text: $settings.realtimeGatewayURL)
                             .textInputAutocapitalization(.never)
                             .keyboardType(.URL)
                         HStack {
                             if tokenVisible {
-                                TextField("Bearer Token", text: binding(\.bearerToken))
+                                TextField("长期密钥", text: $settings.realtimeCredential)
                             } else {
-                                SecureField("Bearer Token", text: binding(\.bearerToken))
+                                SecureField("长期密钥", text: $settings.realtimeCredential)
                             }
                             Button {
                                 tokenVisible.toggle()
@@ -39,6 +40,16 @@ struct CompanionContentView: View {
                             }
                             .buttonStyle(.plain)
                         }
+                        if let message = settings.realtimeValidationMessage {
+                            Text(message).foregroundStyle(.red).font(.caption)
+                        } else {
+                            LabeledContent("密钥", value: settings.realtimeCredentialSummary)
+                                .font(.caption)
+                        }
+                    } header: {
+                        Text("Audio Realtime Agent")
+                    } footer: {
+                        Text("仅接受 wss:// 地址。长期密钥与配对取得的设备 ID 一起保存在本机 Keychain，不会同步到 Apple Watch 或写入日志。")
                     }
                 }
 

@@ -130,6 +130,15 @@ struct AgentConfiguration: Codable, Equatable {
         conciseReply: true,
         voiceStreamingV2: true
     )
+
+    /// Watch only needs UX preferences and the non-sensitive connection mode.
+    /// Gateway coordinates and credentials remain exclusively on iPhone.
+    var watchSafe: AgentConfiguration {
+        var value = self
+        value.endpoint = ""
+        value.bearerToken = ""
+        return value
+    }
 }
 
 enum ConnectionMode: String, Codable, CaseIterable {

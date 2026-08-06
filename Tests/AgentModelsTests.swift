@@ -42,6 +42,31 @@ func cloudConfigurationRoundTrips() throws {
 }
 
 @Test
+func watchConfigurationRemovesSensitiveConnectionMaterial() throws {
+    let value = AgentConfiguration(
+        mode: .cloud, endpoint: "wss://secret.example/api/realtime", bearerToken: "long-secret",
+        autoListen: true, hapticsEnabled: true, conciseReply: false
+    ).watchSafe
+    #expect(value.mode == .cloud)
+    #expect(value.endpoint.isEmpty)
+    #expect(value.bearerToken.isEmpty)
+    let encoded = String(decoding: try JSONEncoder().encode(value), as: UTF8.self)
+    #expect(!encoded.contains("secret.example"))
+    #expect(!encoded.contains("long-secret"))
+}
+
+@Test
+func longLivedCredentialRoundTripsOnlyThroughKeychain() {
+    let service = "com.benyuan.wristagent.tests.\(UUID().uuidString)"
+    defer { SecureTokenStore.delete(service: service) }
+    #expect(SecureTokenStore.read(service: service).isEmpty)
+    SecureTokenStore.save("keychain-only-secret", service: service)
+    #expect(SecureTokenStore.read(service: service) == "keychain-only-secret")
+    SecureTokenStore.delete(service: service)
+    #expect(SecureTokenStore.read(service: service).isEmpty)
+}
+
+@Test
 func legacyConfigurationDecodesWithoutVoiceStreamingV2AsFalse() throws {
     // Upgrade safety: a stored config without voiceStreamingV2 must still decode as false.
     let legacy = Data(#"{"mode":"demo","endpoint":"","bearerToken":"","autoListen":false,"hapticsEnabled":true,"conciseReply":true}"#.utf8)

@@ -118,14 +118,27 @@ final class AudioRealtimeAgentSessionTests: XCTestCase {
 
     // MARK: - Feature flag
 
-    func testFeatureFlagDefaultsToDisabled() {
+    func testFeatureFlagDefaultsToEnabled() {
         let defaults = UserDefaults(suiteName: "test_ess402_flag")!
         defaults.removePersistentDomain(forName: "test_ess402_flag")
         let flag = AudioRealtimeAgentFeatureFlag(defaults: defaults)
-        XCTAssertFalse(flag.isDirectPathEnabled)
+        XCTAssertTrue(flag.isDirectPathEnabled)
         // ESS-459: default URL is the dev cluster, not empty
         XCTAssertEqual(flag.gatewayURLString, AudioRealtimeAgentFeatureFlag.devDefaultGatewayURLString)
-        XCTAssertTrue(flag.deviceId.isEmpty)
+    }
+
+    func testGatewayValidationRejectsEveryNonWSSScheme() {
+        for value in ["http://agent.example", "https://agent.example", "ws://agent.example", "not a url"] {
+            XCTAssertNotNil(AudioRealtimeAgentFeatureFlag.validateGatewayURLString(value), value)
+        }
+        XCTAssertNil(AudioRealtimeAgentFeatureFlag.validateGatewayURLString("wss://agent.example/api/realtime"))
+    }
+
+    func testCredentialRedactionNeverContainsSecret() {
+        let secret = "top-secret-long-key"
+        let redacted = AudioRealtimeAgentFeatureFlag.redactedCredentialDescription(secret)
+        XCTAssertFalse(redacted.contains(secret))
+        XCTAssertEqual(redacted, "••••••••")
     }
 
     /// ESS-459: user-configured URL always takes priority over the dev default.
@@ -150,10 +163,8 @@ final class AudioRealtimeAgentSessionTests: XCTestCase {
         let flag = AudioRealtimeAgentFeatureFlag(defaults: defaults)
         flag.setDirectPathEnabled(true)
         flag.setGatewayURLString("wss://agent.example.com/api/realtime")
-        flag.setDeviceId("iphone-x")
         XCTAssertTrue(flag.isDirectPathEnabled)
         XCTAssertEqual(flag.gatewayURLString, "wss://agent.example.com/api/realtime")
-        XCTAssertEqual(flag.deviceId, "iphone-x")
 
         flag.setDirectPathEnabled(false)
         XCTAssertFalse(flag.isDirectPathEnabled)
@@ -164,9 +175,9 @@ final class AudioRealtimeAgentSessionTests: XCTestCase {
         let defaults = UserDefaults(suiteName: "test_ess402_flag_3")!
         defaults.removePersistentDomain(forName: "test_ess402_flag_3")
         let flag = AudioRealtimeAgentFeatureFlag(defaults: defaults)
+        flag.setDirectPathEnabled(false)
         flag.setGatewayURLString("wss://agent.example.com/api/realtime")
-        flag.setDeviceId("iphone-x")
-        XCTAssertNil(flag.resolveConfig(ephemeralToken: authToken))
+        XCTAssertNil(flag.resolveConfig(ephemeralToken: authToken, deviceId: "iphone-x"))
     }
 
     func testFeatureFlagResolveConfigReturnsConfigWhenEnabled() {
@@ -175,8 +186,7 @@ final class AudioRealtimeAgentSessionTests: XCTestCase {
         let flag = AudioRealtimeAgentFeatureFlag(defaults: defaults)
         flag.setDirectPathEnabled(true)
         flag.setGatewayURLString("wss://agent.example.com/api/realtime")
-        flag.setDeviceId("iphone-x")
-        let config = flag.resolveConfig(ephemeralToken: authToken)
+        let config = flag.resolveConfig(ephemeralToken: authToken, deviceId: "iphone-x")
         XCTAssertNotNil(config)
         XCTAssertEqual(config?.authToken, authToken)
         XCTAssertEqual(config?.deviceId, "iphone-x")

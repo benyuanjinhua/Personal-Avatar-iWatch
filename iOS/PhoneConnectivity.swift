@@ -107,10 +107,11 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     }
 
     func send(_ configuration: AgentConfiguration) {
-        pendingConfiguration = configuration
+        let watchConfiguration = configuration.watchSafe
+        pendingConfiguration = watchConfiguration
         guard WCSession.default.activationState == .activated else { return }
         do {
-            let data = try JSONEncoder().encode(configuration)
+            let data = try JSONEncoder().encode(watchConfiguration)
             try WCSession.default.updateApplicationContext([ConfigurationMessage.key: data])
             if WCSession.default.isReachable {
                 WCSession.default.sendMessageData(data, replyHandler: nil) { [weak self] error in
@@ -292,7 +293,6 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
             }
         }
         guard let credentials = RelayCredentialsStore.read(),
-              credentials.deviceId == agentFlag.deviceId,
               let gatewayURL = URL(string: agentFlag.gatewayURLString) else {
             drainPendingAgentEnvelopesToBridge(
                 reason: "missing_credentials_or_gateway", turn: turn, taskID: taskID
@@ -372,7 +372,10 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     @MainActor
     private func makeRealtimeTransport(requestId: String, sessionId: String) -> PhoneRealtimeSession.Transport? {
         // ESS-391: try Agent direct path first when feature flag is enabled.
-        if let agentConfig = agentFlag.resolveConfig(ephemeralToken: agentEphemeralToken ?? "") {
+        if let credentials = RelayCredentialsStore.read(),
+           let agentConfig = agentFlag.resolveConfig(
+               ephemeralToken: agentEphemeralToken ?? "", deviceId: credentials.deviceId
+           ) {
             // Gateway tokens are single-upgrade. Never reuse a session whose
             // transport was configured with the preceding turn's token.
             let session = AudioRealtimeAgentSession(config: agentConfig, sessionId: sessionId)
@@ -385,14 +388,15 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
                 generation: 1,
                 replacementSession: { [agentFlag] generation in
                     guard let credentials = RelayCredentialsStore.read(),
-                          credentials.deviceId == agentFlag.deviceId,
                           let gatewayURL = URL(string: agentFlag.gatewayURLString) else {
                         throw AgentSessionTokenError.invalidGatewayURL
                     }
                     let issued = try await AgentSessionTokenClient(
                         gatewayURL: gatewayURL, credentials: credentials
                     ).mint(requestId: requestId, sessionId: sessionId, generation: generation)
-                    guard let freshConfig = agentFlag.resolveConfig(ephemeralToken: issued.token) else {
+                    guard let freshConfig = agentFlag.resolveConfig(
+                        ephemeralToken: issued.token, deviceId: credentials.deviceId
+                    ) else {
                         throw AgentSessionTokenError.invalidGatewayURL
                     }
                     return AudioRealtimeAgentSession(config: freshConfig, sessionId: sessionId)

@@ -5,10 +5,11 @@ enum SecureTokenStore {
     private static let service = "com.benyuan.wristagent.agent-token"
     private static let account = "default"
 
-    static func read() -> String {
+    static func read(service serviceOverride: String? = nil) -> String {
+        let selectedService = serviceOverride ?? service
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
+            kSecAttrService as String: selectedService,
             kSecAttrAccount as String: account,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
@@ -24,10 +25,11 @@ enum SecureTokenStore {
         return token
     }
 
-    static func save(_ token: String) {
+    static func save(_ token: String, service serviceOverride: String? = nil) {
+        let selectedService = serviceOverride ?? service
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
+            kSecAttrService as String: selectedService,
             kSecAttrAccount as String: account
         ]
         SecItemDelete(query as CFDictionary)
@@ -37,5 +39,13 @@ enum SecureTokenStore {
         item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         SecItemAdd(item as CFDictionary, nil)
     }
-}
 
+    static func delete(service serviceOverride: String? = nil) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceOverride ?? service,
+            kSecAttrAccount as String: account
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+}
