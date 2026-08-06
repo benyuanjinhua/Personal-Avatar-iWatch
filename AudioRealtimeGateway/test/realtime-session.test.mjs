@@ -261,13 +261,139 @@ describe('RealtimeSession — downlink ordering', () => {
     assert.equal(logs.filter(l => l.evt === 'done_barrier_gap_timeout').length, 0)
   })
 
-  it('audio.done with final_sequence=-1 (empty response) releases immediately', () => {
-    const { session, sent, agent, scope } = harness()
+  it('audio.done with final_sequence=-1 does NOT release until the zero-audio grace expires (ESS-517)', () => {
+    // Upstream sends `done(-1)` before the first real delta of a turn
+    // (observed 2026-08-06, request 019fd7d7-46f3-79fb-aa37-f4e921158cf8:
+    // 862 ms between `done(-1)` and the first `delta(0)`). The old code
+    // released downstream `audio.done(-1)` immediately, then dropped every
+    // subsequent delta as `post_done`. The tentative-zero window prevents
+    // that: hold `done(-1)`, only release if the grace timer expires with
+    // no dissenting delta / done.
+    const clock = controlledClock()
+    const { session, sent, agent, scope, logs } = harness({
+      zeroAudioGraceMs: 800,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
     start(session, scope)
     agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: -1 })
+    assert.equal(sent.filter(e => e.type === 'audio.done').length, 0, 'done(-1) must NOT release inside the grace window')
+    assert.equal(clock.pendingCount(), 1, 'tentative-zero timer is armed exactly once')
+    assert.ok(logs.some(l => l.evt === 'done_barrier_tentative_zero' && l.grace_ms === 800))
+    clock.fireAll()  // advance past zeroAudioGraceMs
     const done = sent.find(e => e.type === 'audio.done')
-    assert.ok(done, 'done emitted for empty response')
+    assert.ok(done, 'done emitted after the grace expires with no dissent')
     assert.equal(done.final_sequence, -1)
+    assert.ok(logs.some(l => l.evt === 'zero_audio_confirmed' && l.final_sequence === -1))
+  })
+
+  it('ESS-517 case A: done(-1) followed 862 ms later by 0..54 deltas + done(54) → full downlink, no post_done drops', () => {
+    // Reproduces the observed real-world sequence. With a controlled clock
+    // the delta arrives BEFORE the tentative timer fires, so the tentative
+    // is retracted and every delta flows through.
+    const clock = controlledClock()
+    const { session, sent, agent, scope, logs } = harness({
+      zeroAudioGraceMs: 800,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: -1 })
+    assert.equal(sent.filter(e => e.type === 'audio.done').length, 0, 'no premature done')
+    // Delta 0 arrives during the tentative window — retracts the tentative.
+    agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: 0, audio: b64('x') })
+    assert.ok(logs.some(l => l.evt === 'done_barrier_tentative_zero_cancelled' && l.reason === 'delta_arrived'))
+    // Feed the remaining tail.
+    for (let seq = 1; seq <= 54; seq++) {
+      agent.emit(scope.request_id, {
+        type: 'agent.audio.delta', response_id: 'r-1:gen1',
+        sequence: seq, audio: b64('x'),
+      })
+    }
+    // Upstream corrects itself.
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: 54 })
+    const deltas = sent.filter(e => e.type === 'audio.delta')
+    assert.equal(deltas.length, 55, 'every single delta reaches the client')
+    assert.deepEqual(deltas.map(d => d.sequence), Array.from({ length: 55 }, (_, i) => i))
+    const dones = sent.filter(e => e.type === 'audio.done')
+    assert.equal(dones.length, 1, 'exactly one downstream done')
+    assert.equal(dones[0].final_sequence, 54, 'released with the real final_sequence, not -1')
+    assert.equal(logs.filter(l => l.evt === 'stale_generation_dropped' && l.reason === 'post_done').length, 0,
+      'no post_done drops — the whole turn arrives at the client')
+  })
+
+  it('ESS-517 case B: done(-1) with no follow-up releases audio.done(-1) after the grace (real zero-audio path preserved)', () => {
+    const clock = controlledClock()
+    const { session, sent, agent, scope, logs } = harness({
+      zeroAudioGraceMs: 800,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: -1 })
+    assert.equal(sent.filter(e => e.type === 'audio.done').length, 0)
+    clock.fireAll()  // grace expires
+    const dones = sent.filter(e => e.type === 'audio.done')
+    assert.equal(dones.length, 1)
+    assert.equal(dones[0].final_sequence, -1)
+    assert.ok(logs.some(l => l.evt === 'zero_audio_confirmed'))
+  })
+
+  it('ESS-517 case C: done(-1) → delta(0) → done(0) releases exactly one downlink delta + done(0)', () => {
+    const clock = controlledClock()
+    const { session, sent, agent, scope, logs } = harness({
+      zeroAudioGraceMs: 800,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: -1 })
+    agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: 0, audio: b64('x') })
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: 0 })
+    const deltas = sent.filter(e => e.type === 'audio.delta')
+    assert.equal(deltas.length, 1)
+    assert.equal(deltas[0].sequence, 0)
+    const dones = sent.filter(e => e.type === 'audio.done')
+    assert.equal(dones.length, 1)
+    assert.equal(dones[0].final_sequence, 0, 'the corrected final_sequence, not the tentative -1')
+    assert.ok(logs.some(l => l.evt === 'done_barrier_tentative_zero_cancelled' && l.reason === 'delta_arrived'))
+    assert.equal(logs.filter(l => l.evt === 'zero_audio_confirmed').length, 0)
+    // Verify no residual tentative timer left behind.
+    clock.fireAll()
+    assert.equal(sent.filter(e => e.type === 'audio.done').length, 1, 'no double-done after firing residual timers')
+  })
+
+  it('ESS-517: done(-1) upgraded to done(N ≥ 0) directly (no delta in between) cancels tentative and waits for tail', () => {
+    const clock = controlledClock()
+    const { session, sent, agent, scope, logs } = harness({
+      zeroAudioGraceMs: 800,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: -1 })
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: 1 })
+    assert.ok(logs.some(l => l.evt === 'done_barrier_tentative_zero_cancelled' && l.reason === 'done_upgraded'))
+    assert.equal(sent.filter(e => e.type === 'audio.done').length, 0, 'no release yet — waiting on 0 and 1')
+    agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: 0, audio: b64('x') })
+    agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: 1, audio: b64('x') })
+    const dones = sent.filter(e => e.type === 'audio.done')
+    assert.equal(dones.length, 1)
+    assert.equal(dones[0].final_sequence, 1)
+  })
+
+  it('ESS-517: cancel during tentative-zero clears the timer without a spurious done', () => {
+    const clock = controlledClock()
+    const { session, sent, agent, scope, closes } = harness({
+      zeroAudioGraceMs: 800,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: -1 })
+    assert.equal(clock.pendingCount(), 1)
+    session.onFrame(JSON.stringify({
+      type: 'cancel', session_id: scope.session_id, request_id: scope.request_id, generation: scope.generation,
+    }))
+    assert.equal(clock.pendingCount(), 0, 'cancel cleared the tentative-zero timer')
+    clock.fireAll()
+    assert.equal(sent.filter(e => e.type === 'audio.done').length, 0, 'no zero-audio done after cancel')
+    assert.equal(sent.filter(e => e.type === 'error').length, 0, 'cancel is authoritative — no fail-closed either')
+    assert.equal(closes.length, 0)
   })
 
   it('gap timeout fires exactly one structured fail-closed and drops late deltas', () => {

@@ -44,6 +44,7 @@ export class RealtimeSession {
     heartbeatIntervalMs = 15_000,
     idleDisconnectMs = 60_000,
     doneBarrierGapMs = 2_000,
+    zeroAudioGraceMs = 800,
     maxFrameBytes = 64 * 1024,
     maxEventsPerSecond = 200,
     maxUplinkBytesPerSecond = 512 * 1024,
@@ -66,6 +67,7 @@ export class RealtimeSession {
     this.heartbeatIntervalMs = heartbeatIntervalMs
     this.idleDisconnectMs = idleDisconnectMs
     this.doneBarrierGapMs = doneBarrierGapMs
+    this.zeroAudioGraceMs = zeroAudioGraceMs
     this.maxFrameBytes = maxFrameBytes
     this.maxEventsPerSecond = maxEventsPerSecond
     this.maxUplinkBytesPerSecond = maxUplinkBytesPerSecond
@@ -98,6 +100,9 @@ export class RealtimeSession {
     this.finalSequence = null       // set when the downstream done is released
     this.staleGenerationDropped = 0
     this._barrierTimer = null
+    // Armed only while `pendingFinalSequence === -1` (see `_emitDone`).
+    // Non-null timer ↔ tentative-zero state; the two must stay in sync.
+    this._tentativeZeroTimer = null
 
     this.agentTurn = null
 
@@ -170,6 +175,7 @@ export class RealtimeSession {
     if (this._heartbeatTimer) this.clearTimer(this._heartbeatTimer)
     if (this._idleTimer) this.clearTimer(this._idleTimer)
     this._clearBarrierTimer()
+    this._clearTentativeZeroTimer()
     if (this.agentTurn) { try { this.agentTurn.close() } catch { /* ignore */ } }
     this.log('session_ended', {
       request_id: this.scope.request_id, session_id: this.scope.session_id,
@@ -282,8 +288,11 @@ export class RealtimeSession {
     }
     this.cancelled = true
     // Cancel is authoritative — kill any pending done barrier so the gap
-    // timer cannot fire a fail-closed after the client has moved on.
+    // timer cannot fire a fail-closed after the client has moved on. Same
+    // for the tentative-zero timer: no zero-audio release once the client
+    // has moved on.
     this._clearBarrierTimer()
+    this._clearTentativeZeroTimer()
     this.pendingFinalSequence = null
     try { this.agentTurn?.cancel() } catch { /* best effort */ }
     this.log('cancel_received', {
@@ -355,6 +364,11 @@ export class RealtimeSession {
       return
     }
     if (!Number.isInteger(event.sequence) || event.sequence < 0) return
+    // A real delta during tentative-zero means the upstream's earlier
+    // `done(-1)` was premature; retract it and let the delta flow through.
+    if (this.pendingFinalSequence === -1) {
+      this._cancelTentativeZero('delta_arrived')
+    }
     // Deltas whose sequence is beyond the upstream-claimed final_sequence
     // are dropped — upstream is contradicting itself, and forwarding them
     // would let a client receive frames past the promised barrier.
@@ -407,10 +421,46 @@ export class RealtimeSession {
     // before it (毕玄 review on PR #159 — the old clamp let a hole like
     // {0, 2, done(2)} slip through as done(0) and the client would then
     // silently lose seq=1 when it arrived late).
+    //
+    // ESS-517: `done(-1)` is a tentative "zero audio" claim, NOT a hard
+    // barrier. Real upstreams (observed 2026-08-06 request
+    // `019fd7d7-46f3-79fb-aa37-f4e921158cf8`) send `done(-1)` ~862 ms
+    // before the first real delta of the turn. We hold instead of
+    // releasing, and let either a later delta or a later `done(N ≥ 0)`
+    // retract the tentative — only a `zeroAudioGraceMs` timeout confirms.
     const claimed = Number.isInteger(event.final_sequence)
       ? event.final_sequence
       : this.downlinkHighWatermark
+
+    if (this.pendingFinalSequence === -1) {
+      // Tentative-zero is armed. A repeat `-1` is a no-op (timer keeps
+      // running). A `done(N ≥ 0)` retracts the tentative and adopts the
+      // real barrier — not a protocol conflict, just upstream correcting
+      // itself.
+      if (claimed < 0) return
+      this._cancelTentativeZero('done_upgraded')
+      this.pendingFinalSequence = claimed
+      this.log('done_barrier_pending', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        response_id: this.responseId,
+        pending_final_sequence: claimed,
+        high_watermark: this.downlinkHighWatermark,
+        missing: this._missingBelow(claimed),
+      })
+      return this._maybeReleaseDone()
+    }
+
     if (this.pendingFinalSequence === null) {
+      if (claimed < 0 && this.zeroAudioGraceMs > 0) {
+        this.pendingFinalSequence = -1
+        this.log('done_barrier_tentative_zero', {
+          request_id: this.scope.request_id, session_id: this.scope.session_id,
+          response_id: this.responseId,
+          grace_ms: this.zeroAudioGraceMs,
+          high_watermark: this.downlinkHighWatermark,
+        })
+        return this._armTentativeZeroTimer()
+      }
       this.pendingFinalSequence = claimed
       this.log('done_barrier_pending', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
@@ -436,12 +486,16 @@ export class RealtimeSession {
   // Release the held `audio.done` if the dense prefix has caught up to the
   // upstream-claimed `pendingFinalSequence`. Idempotent: only fires once,
   // always with the original `pendingFinalSequence`.
+  //
+  // Never fires for a tentative-zero (`pendingFinalSequence === -1`) —
+  // that path is owned by `_confirmZeroAudio`, driven off the grace timer
+  // set up in `_armTentativeZeroTimer`.
   _maybeReleaseDone() {
     if (this.doneEmitted) return
     if (this.pendingFinalSequence === null) return
     const target = this.pendingFinalSequence
-    // A negative claim (e.g. -1) means "no frames" — release immediately.
-    if (target < 0 || this._highestDensePrefix() >= target) {
+    if (target < 0) return
+    if (this._highestDensePrefix() >= target) {
       this._clearBarrierTimer()
       this.finalSequence = target
       this.doneEmitted = true
@@ -459,6 +513,57 @@ export class RealtimeSession {
     }
     // Still waiting for holes to be backfilled — arm the gap timer once.
     this._armBarrierTimer()
+  }
+
+  _armTentativeZeroTimer() {
+    if (this._tentativeZeroTimer !== null) return
+    this._tentativeZeroTimer = this.setTimer(() => {
+      this._tentativeZeroTimer = null
+      if (this.state !== OPEN) return
+      if (this.doneEmitted || this.cancelled) return
+      if (this.pendingFinalSequence !== -1) return
+      this._confirmZeroAudio()
+    }, this.zeroAudioGraceMs)
+  }
+
+  // Called from `_emitDelta` (delta retracts) and from `_emitDone` when a
+  // later `done(N ≥ 0)` upgrades the tentative to a real barrier, plus
+  // from `_handleCancel` / `onSocketClose`. Silent no-op when no timer is
+  // armed, so the callers stay branch-free.
+  _cancelTentativeZero(reason) {
+    if (this._tentativeZeroTimer === null) return
+    this.clearTimer(this._tentativeZeroTimer)
+    this._tentativeZeroTimer = null
+    if (this.pendingFinalSequence === -1) {
+      this.pendingFinalSequence = null
+    }
+    this.log('done_barrier_tentative_zero_cancelled', {
+      request_id: this.scope.request_id, session_id: this.scope.session_id,
+      response_id: this.responseId, reason,
+    })
+  }
+
+  // Silent clear used by teardown paths (cancel, socket close) — no state
+  // mutation beyond releasing the timer handle.
+  _clearTentativeZeroTimer() {
+    if (this._tentativeZeroTimer === null) return
+    this.clearTimer(this._tentativeZeroTimer)
+    this._tentativeZeroTimer = null
+  }
+
+  _confirmZeroAudio() {
+    this.finalSequence = -1
+    this.doneEmitted = true
+    this._sendJson({
+      type: 'audio.done',
+      session_id: this.scope.session_id, request_id: this.scope.request_id,
+      response_id: this.responseId, generation: this.scope.generation,
+      final_sequence: -1,
+    })
+    this.log('zero_audio_confirmed', {
+      request_id: this.scope.request_id, session_id: this.scope.session_id,
+      response_id: this.responseId, final_sequence: -1,
+    })
   }
 
   _armBarrierTimer() {
