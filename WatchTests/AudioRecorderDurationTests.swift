@@ -105,10 +105,10 @@ final class AudioRecorderDurationTests: XCTestCase {
     /// 端到端起录路径继续由 ESS-360 的真机 sim / 白梦林 G9 装机验收把守。
     /// 死锁根因定位与 hosted 端到端恢复由 ESS-498 的子单（Option B）跟。
     func testFinishedDurationIsBoundedAndSelfConsistent() async throws {
-        // ESS-498: unconditional skip on hosted CI. Not `throw` at top of func to
-        // keep the below body reachable and syntactically valid (no dead-code warning);
-        // real-device sim (ESS-360 AC) and G9 装机 still exercise the full path.
-        try XCTSkipIf(true, "ESS-498: hangs on hosted CI (no audio HW); sanitize boundary is guarded by testSanitize… siblings; end-to-end runs on real-device sim / G9")
+        // ESS-498: hosted GitHub Actions runners have no audio HW; recorder.start()
+        // hangs. On local mac + real-device sim the full body runs; ESS-499 tracks
+        // root-cause investigation of the hang inside start().
+        try HostedCITestGate.skipIfHostedCI("recorder.start() hangs in testFinishedDurationIsBoundedAndSelfConsistent")
         try await Task.sleep(for: .seconds(4)) // 让宿主欢迎语播完，避免抢会话
         let events = EventLog()
         WatchLog.setObserver { module, event, detail, code in
@@ -230,6 +230,8 @@ final class AudioRecorderDurationTests: XCTestCase {
     /// 带 `wall_clock_ms=` 与 `asset_ms=` 两个取证字段——这是 P0 修复后 R-02.1
     /// 运行时证据的核心对照维度。headless 模拟器起录失败时跳过。
     func testFinishReturnsAssetDurationEvenWhenWallClockIsTiny() async throws {
+        // ESS-498: same `recorder.start()` hang family — skip on hosted CI only.
+        try HostedCITestGate.skipIfHostedCI("recorder.start() hangs in testFinishReturnsAssetDurationEvenWhenWallClockIsTiny")
         try await Task.sleep(for: .seconds(4)) // 让宿主欢迎语播完
         let events = EventLog()
         WatchLog.setObserver { module, event, detail, code in

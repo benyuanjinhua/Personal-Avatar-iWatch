@@ -238,6 +238,8 @@ final class SpeechPlayerReleaseTests: XCTestCase {
     /// **但会话状态已被改成 `.playAndRecord`**——正是事故的危险态，走本单
     /// category 兜底逻辑与真机路径完全一致。
     func testPlayerReleaseSkipsWhenRecorderTookOverCategory() async throws {
+        // ESS-498: same `recorder.start()` hang family — skip on hosted CI only.
+        try HostedCITestGate.skipIfHostedCI("recorder.start() hangs in testPlayerReleaseSkipsWhenRecorderTookOverCategory")
         try await waitForHostWelcomeToFinish()
         let player = SpeechPlayer(instanceTag: "test-player-vs-recorder")
         let recorder = AudioRecorder()

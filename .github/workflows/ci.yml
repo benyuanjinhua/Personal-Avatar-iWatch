@@ -120,7 +120,22 @@ jobs:
           echo "id=$watch_sim_id" >> "$GITHUB_OUTPUT"
           echo "Picked watch sim: $watch_sim_id"
 
+      # ESS-498: step-level cap so any future audio-HW hang fails (not job-cancels)
+      # at a bounded time. Without it, GitHub's 60min hard-timeout cancels the whole
+      # job, skipping the `Upload xcodebuild logs` step below and leaving triage
+      # blind. 25min = comfortably above the 15-16min baseline of a healthy Watch
+      # test run (measured on prior main), below the 33-60min hang band seen in
+      # ESS-498 evidence (#196/#171/#173/#154 all died in 33-60min).
+      #
+      # `-D ESS_498_HOSTED_CI`: compile-time flag read by HostedCITestGate; only
+      # set here on the hosted-runner build. Local + real-device sim builds omit
+      # it, so those envs run the full recorder.start() body (ESS-360 / G9 装机
+      # coverage preserved). We use a compile flag rather than a runtime env var
+      # because xcodebuild does not forward host env vars into the watchOS test
+      # process (`RUNNER_ENVIRONMENT`, `SIMCTL_CHILD_*`, `TEST_RUNNER_*` all
+      # silently drop — verified locally).
       - name: xcodebuild test — WristAgent Watch App
+        timeout-minutes: 25
         run: |
           set -uo pipefail
           xcodebuild test \
@@ -128,6 +143,7 @@ jobs:
             -scheme "WristAgent Watch App" \
             -destination "id=${{ steps.pick-sim.outputs.id }}" \
             -derivedDataPath .build/DerivedData-WatchTest \
+            OTHER_SWIFT_FLAGS='$(inherited) -D ESS_498_HOSTED_CI' \
             | tee xcodebuild-watch-test.log
           xcode_exit=${PIPESTATUS[0]}
           # ESS-360 冗余判定：xcodebuild 已用 exit code 表达失败；这里再对输出
