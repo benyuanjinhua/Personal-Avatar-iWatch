@@ -65,6 +65,34 @@ describe('ESS-265 realtime media plane', () => {
     ])
   })
 
+  it('normalizes audio.done metadata for the Watch completion barrier', () => {
+    const { session, downstream } = fixture()
+    session.handleAgentEvent({
+      type: 'audio.delta', responseId: 'resp-1', sequence: 0,
+      audio: Buffer.from([1, 2]).toString('base64'),
+    })
+    session.handleAgentEvent({
+      type: 'audio.delta', responseId: 'resp-1', sequence: 1,
+      audio: Buffer.from([3, 4]).toString('base64'),
+    })
+
+    assert.equal(session.handleAgentEvent({
+      type: 'audio.done', responseId: 'resp-1', turnGeneration: 3,
+    }), true)
+    assert.deepEqual(downstream.at(-1), {
+      type: 'audio.done', request_id: '019fcac2-20ce-75b6-a665-24eb965a32a9',
+      session_id: 'watch-session-1', response_id: 'resp-1',
+      generation: 3, final_sequence: 1,
+    })
+  })
+
+  it('marks a zero-audio response with final_sequence -1', () => {
+    const { session, downstream } = fixture()
+    session.handleAgentEvent({ type: 'audio.done', responseId: 'resp-empty' })
+    assert.equal(downstream.at(-1).response_id, 'resp-empty')
+    assert.equal(downstream.at(-1).final_sequence, -1)
+  })
+
   it('reports direct and delegated turn completion only when the voice turn is idle', () => {
     const direct = fixture()
     direct.session.handleAgentEvent({ type: 'transcript.final', role: 'assistant', content: '直接结果' })

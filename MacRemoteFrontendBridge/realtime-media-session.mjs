@@ -91,6 +91,18 @@ export class RealtimeMediaSession {
       this.taskId = String(event.task.id)
       return true
     }
+    if (event.type === 'audio.done') {
+      const responseId = event.responseId ?? this.playingResponseId ?? 'unknown'
+      const seen = this.seenOutputSequences.get(responseId)
+      const finalSequence = seen?.size ? Math.max(...seen) : -1
+      this.sendDownstream({
+        type: 'audio.done', request_id: this.requestId, session_id: this.sessionId,
+        response_id: responseId,
+        generation: event.turnGeneration ?? event.generation ?? 0,
+        final_sequence: finalSequence,
+      })
+      return true
+    }
     if (event.type === 'voice.state' && event.state === 'idle') {
       this.onResponseComplete({
         responseId: event.responseId ?? null,
@@ -100,7 +112,7 @@ export class RealtimeMediaSession {
       return true
     }
     if (event.type === 'transcript.delta' || event.type === 'transcript.final'
-      || event.type === 'audio.done' || event.type === 'playback.clear'
+      || event.type === 'playback.clear'
       || event.type === 'response.interrupted') {
       this.sendDownstream({ ...event, request_id: this.requestId, session_id: this.sessionId })
       return true

@@ -329,11 +329,39 @@ source allowlist accepts loopback (for the smoke) plus Tailnet CGNAT
    (matches `AudioRealtimeAgentFeatureFlag.devDefaultGatewayURLString`).
    Keep the Mac Bridge `realtime_media_v1` flag as a fallback (per ESS-388).
 
-For a persistent deployment on the Mac mini, wrap step 4 in a launchd
-service (`~/Library/LaunchAgents/dev.wristagent.gateway.plist`) with
-`WorkingDirectory` set to the module directory, `KeepAlive: true`, and
-stdout / stderr redirected to a rotating log — the structured stdout
-records are the operator's diagnostic surface.
+For a persistent deployment on the Mac mini, use the launchd assets
+under `scripts/launchd/` (ESS-458):
+
+- `beer.workspace.wristagent.gateway.plist` — Gateway itself.
+  `RunAtLoad: true`, `KeepAlive: true`, `ThrottleInterval: 5`. Stdout and
+  stderr both go to `logs/gateway.log` (the structured JSONL stream —
+  see `## Structured logs`).
+- `beer.workspace.wristagent.gateway.rotator.plist` — hourly rotator.
+  Invokes `scripts/rotate-log.sh`, which copy-truncates `gateway.log`
+  (preserving the inode so the running server's stdout FD keeps
+  writing), gzips the copy as `gateway.log.YYYYMMDD-HHMMSS.gz`,
+  rotates at ≥ 20 MiB or once per day, retains 14 days of compressed
+  rotations, and emits `rotator_rotated` / `rotator_purged` events to
+  `logs/rotator.log`.
+- `scripts/install-launchd.sh` — installs both plists into
+  `~/Library/LaunchAgents/`, bootstraps them into the user's gui
+  domain, and runs a loopback health probe. Assumes the module has
+  been rsync'd to `/Users/jacksonmac/Services/Personal-Avatar-iWatch/AudioRealtimeGateway/`,
+  `npm install` has run, and `certs/` is populated.
+
+Diagnostic commands:
+
+```
+launchctl list beer.workspace.wristagent.gateway
+launchctl print gui/$(id -u)/beer.workspace.wristagent.gateway
+tail -f /Users/jacksonmac/Services/Personal-Avatar-iWatch/AudioRealtimeGateway/logs/gateway.log
+```
+
+`KeepAlive: true` means launchd auto-restarts the process on any exit
+(SIGKILL included); the 5-second `ThrottleInterval` is the minimum time
+between successive relaunches — a healthy relaunch after `kill -9`
+lands in under a second in practice, followed by a fresh
+`gateway_ready` line in `logs/gateway.log`.
 
 ## Fallback and rollback
 
