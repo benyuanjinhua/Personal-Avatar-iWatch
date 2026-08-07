@@ -39,6 +39,42 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         XCTAssertEqual(attempts, 2)
     }
 
+    func testRenderRecoveryAlwaysRestartsOnFirstDeltaAfterSessionActivation() {
+        XCTAssertTrue(RealtimeRenderRecoveryPolicy.shouldRestartEngine(
+            firstDeltaAfterSessionActivation: true,
+            engineIsRunning: true
+        ), "AVAudioEngine may report running after the shared session lost its output route")
+    }
+
+    func testRenderRecoveryRestartsStoppedEngineOnLaterDelta() {
+        XCTAssertTrue(RealtimeRenderRecoveryPolicy.shouldRestartEngine(
+            firstDeltaAfterSessionActivation: false,
+            engineIsRunning: false
+        ))
+    }
+
+    func testRenderRecoveryDoesNotRestartHealthyEngineOrNode() {
+        XCTAssertFalse(RealtimeRenderRecoveryPolicy.shouldRestartEngine(
+            firstDeltaAfterSessionActivation: false,
+            engineIsRunning: true
+        ))
+        XCTAssertFalse(RealtimeRenderRecoveryPolicy.shouldRestartNode(
+            engineWasRestarted: false,
+            nodeIsPlaying: true
+        ))
+    }
+
+    func testRenderRecoveryRestartsNodeWheneverEngineWasRestarted() {
+        XCTAssertTrue(RealtimeRenderRecoveryPolicy.shouldRestartNode(
+            engineWasRestarted: true,
+            nodeIsPlaying: true
+        ))
+        XCTAssertTrue(RealtimeRenderRecoveryPolicy.shouldRestartNode(
+            engineWasRestarted: false,
+            nodeIsPlaying: false
+        ))
+    }
+
     private final class MockRecorder: WatchRealtimeMediaAdapter.Recorder {
         var onFrame: ((Data) -> Void)?
         var onFailure: ((Error) -> Void)?
