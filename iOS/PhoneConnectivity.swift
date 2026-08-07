@@ -381,7 +381,15 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     /// queue that carries status envelopes.
     @MainActor
     private func forwardRealtimeDownlink(_ envelope: RealtimeDownlinkEnvelope) {
-        guard let data = try? JSONEncoder().encode(envelope) else { return }
+        guard let data = try? JSONEncoder().encode(envelope) else {
+            Self.logger.error(
+                "downlink_enqueue_failed request_id=\(envelope.requestId, privacy: .public) reason=encode"
+            )
+            return
+        }
+        Self.logger.info(
+            "downlink_forwarded_to_watch_outbox request_id=\(envelope.requestId, privacy: .public) bytes=\(data.count, privacy: .public)"
+        )
         enqueueDownlink(
             requestId: envelope.requestId,
             kind: .relayStatus,

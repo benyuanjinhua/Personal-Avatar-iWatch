@@ -253,7 +253,7 @@ final class AudioRealtimeAgentSession {
             }
             currentTurn?.deliveredSequences.insert(seq)
             Self.logger.info(
-                "agent audio.delta rid=\(rid.prefix(8), privacy: .public) gen=\(gen) resp=\(respId.prefix(8), privacy: .public) seq=\(seq) bytes=\(audioBytes.count)"
+                "downlink_enqueued request_id=\(rid, privacy: .public) session_id=\(sid, privacy: .public) generation=\(gen) response_id=\(respId, privacy: .public) sequence=\(seq) bytes=\(audioBytes.count)"
             )
             let chunk = VoiceStreamChunk(
                 requestId: rid, streamId: sid, direction: .downlink,
@@ -268,7 +268,7 @@ final class AudioRealtimeAgentSession {
                   turn.requestId == rid else { return }
             currentTurn?.finalSequence = finalSeq
             Self.logger.info(
-                "agent audio.done rid=\(rid.prefix(8), privacy: .public) gen=\(gen) resp=\(respId.prefix(8), privacy: .public) final_seq=\(finalSeq)"
+                "downlink_done_received request_id=\(rid, privacy: .public) session_id=\(sid, privacy: .public) generation=\(gen) response_id=\(respId, privacy: .public) final_sequence=\(finalSeq)"
             )
             onAudioDone?(rid, respId, gen, finalSeq)
 

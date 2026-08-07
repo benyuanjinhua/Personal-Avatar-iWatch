@@ -25,12 +25,28 @@ final class AudioRealtimeAgentTransport {
     }
 
     private let task: URLSessionWebSocketTask
+    /// Keep the owning session alive for exactly as long as the WebSocket.
+    /// The direct-Agent path uses an ephemeral session (unlike the legacy
+    /// Bridge path's `URLSession.shared`), so retaining only its task leaves
+    /// the session lifetime implicit and can terminate an otherwise healthy
+    /// WSS with an abnormal close.
+    private let urlSession: URLSession?
     private let sessionId: String
+    private let requestId: String
     private var isClosed = false
+    private var consecutiveMalformedFrames = 0
+    private static let malformedFrameLimit = 3
 
-    init(task: URLSessionWebSocketTask, sessionId: String) {
+    init(
+        task: URLSessionWebSocketTask,
+        sessionId: String,
+        requestId: String = "unknown",
+        urlSession: URLSession? = nil
+    ) {
         self.task = task
         self.sessionId = sessionId
+        self.requestId = requestId
+        self.urlSession = urlSession
         task.resume()
     }
 
@@ -69,7 +85,10 @@ final class AudioRealtimeAgentTransport {
 
         let session = URLSession(configuration: .ephemeral)
         let task = session.webSocketTask(with: request)
-        return AudioRealtimeAgentTransport(task: task, sessionId: sessionId)
+        return AudioRealtimeAgentTransport(
+            task: task, sessionId: sessionId, requestId: requestId,
+            urlSession: session
+        )
     }
 
     // MARK: - Send
@@ -114,6 +133,9 @@ final class AudioRealtimeAgentTransport {
                 guard let self, !self.isClosed else { return }
                 switch result {
                 case .success(let message):
+                    Self.logger.info(
+                        "downlink_frame_received request_id=\(self.requestId, privacy: .public) session_id=\(self.sessionId, privacy: .public)"
+                    )
                     let raw: String?
                     switch message {
                     case .string(let text): raw = text
@@ -130,7 +152,10 @@ final class AudioRealtimeAgentTransport {
                     let outcome = AudioRealtimeAgentCodec.decodeOutcome(raw)
                     switch outcome {
                     case .event(let event):
-                        Self.logger.debug("RECV type event")
+                        self.consecutiveMalformedFrames = 0
+                        Self.logger.info(
+                            "downlink_decode_succeeded request_id=\(self.requestId, privacy: .public) session_id=\(self.sessionId, privacy: .public)"
+                        )
                         handler(.event(event))
                         self.receive(handler: handler)
                     case .unrecognised(let type):
@@ -140,15 +165,26 @@ final class AudioRealtimeAgentTransport {
                         handler(.unrecognised(type: type))
                         self.receive(handler: handler)
                     case .malformed:
-                        Self.logger.error("agent downlink malformed frame")
-                        handler(.error(NSError(
+                        self.consecutiveMalformedFrames += 1
+                        let error = NSError(
                             domain: "AudioRealtimeAgentTransport", code: 3,
                             userInfo: [NSLocalizedDescriptionKey: "malformed agent downlink frame"]
-                        )))
+                        )
+                        Self.logger.error(
+                            "downlink_decode_failed request_id=\(self.requestId, privacy: .public) session_id=\(self.sessionId, privacy: .public) consecutive=\(self.consecutiveMalformedFrames, privacy: .public)"
+                        )
+                        if self.consecutiveMalformedFrames >= Self.malformedFrameLimit {
+                            handler(.error(error))
+                        } else {
+                            self.receive(handler: handler)
+                        }
                     }
                 case .failure(let error):
+                    let closeReason = self.task.closeReason.flatMap {
+                        String(data: $0, encoding: .utf8)
+                    } ?? "nil"
                     Self.logger.error(
-                        "agent downlink recv failed error=\(String(describing: error), privacy: .public)"
+                        "agent downlink recv failed request_id=\(self.requestId, privacy: .public) session_id=\(self.sessionId, privacy: .public) close_code=\(self.task.closeCode.rawValue, privacy: .public) close_reason=\(closeReason, privacy: .public) error=\(String(describing: error), privacy: .public)"
                     )
                     handler(.error(error))
                 }
@@ -165,5 +201,6 @@ final class AudioRealtimeAgentTransport {
             "agent socket close reason=\(reason, privacy: .public)"
         )
         task.cancel(with: .goingAway, reason: reason.data(using: .utf8))
+        urlSession?.finishTasksAndInvalidate()
     }
 }
