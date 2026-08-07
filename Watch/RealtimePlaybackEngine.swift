@@ -116,18 +116,22 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         guard let turn = currentTurn else { return }
         // ESS-532/ESS-535: the recorder deactivates the shared AVAudioSession
         // when recording ends. AVAudioEngine was started under .playAndRecord;
-        // after the session transitions to .playback, the engine may need a
-        // stop/start cycle to resume output (merely setActive(true) is not
-        // enough on device — the engine's internal I/O unit stays in the old
-        // session's format). Stop + restart guarantees a clean re-attach.
+        // after the session transitions, the engine needs a clean restart.
+        //
+        // ESS-535 fix v2 (OSStatus !pri = 561017449): the recorder's async
+        // deactivation races with our activation. On device, calling
+        // setActive(true) immediately after the recorder's setActive(false)
+        // fails with '!pri' (session still in use). Deactivate first with
+        // .notifyOthersOnDeactivation to yield, then re-activate cleanly.
         do {
             try audioSessionGate.activate {
                 let session = AVAudioSession.sharedInstance()
+                // Yield the session in case the recorder's async deactivation
+                // hasn't completed — this is a no-op if already inactive.
+                try? session.setActive(false, options: .notifyOthersOnDeactivation)
                 try session.setCategory(.playback, mode: .default)
                 try session.setActive(true)
-                // ESS-535: restart the engine under the new playback session.
-                // If the engine was already running from prepare(), stop it
-                // first so the I/O unit picks up the new session format.
+                // Restart the engine under the new playback session.
                 if isRunning {
                     playerNode.stop()
                     audioEngine.stop()
@@ -219,7 +223,6 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         currentTurn = nil
         tracker.reset()
         audioSessionGate.reset()
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
     func shutdown() {
