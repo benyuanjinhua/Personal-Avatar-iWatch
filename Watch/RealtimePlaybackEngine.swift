@@ -17,6 +17,26 @@ struct RealtimePlaybackAudioSessionGate {
     }
 }
 
+/// ESS-534: decide whether the render path must be rebuilt after the recorder
+/// releases the shared AVAudioSession. The first downlink after activation is
+/// always rebuilt because AVAudioEngine may still report `isRunning == true`
+/// even though the session deactivation has detached it from the output route.
+struct RealtimeRenderRecoveryPolicy {
+    static func shouldRestartEngine(
+        firstDeltaAfterSessionActivation: Bool,
+        engineIsRunning: Bool
+    ) -> Bool {
+        firstDeltaAfterSessionActivation || !engineIsRunning
+    }
+
+    static func shouldRestartNode(
+        engineWasRestarted: Bool,
+        nodeIsPlaying: Bool
+    ) -> Bool {
+        engineWasRestarted || !nodeIsPlaying
+    }
+}
+
 /// ESS-321 real playback engine for streamed `audio.delta` chunks.
 ///
 /// The bridge/agent delivers 24 kHz mono PCM16 chunks. Rather than wait for
@@ -117,17 +137,73 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         // ESS-532: the recorder deactivates the shared AVAudioSession when
         // recording ends. Re-activate it for playback before the first
         // buffer lands so the engine can actually render.
+        let engineWasRunning = audioEngine.isRunning
+        let nodeWasPlaying = playerNode.isPlaying
+        // A later system interruption can stop the engine after this turn's
+        // first activation. Re-open the gate so the same recovery path also
+        // reactivates AVAudioSession instead of trying to start an engine on
+        // an inactive session.
+        if audioSessionGate.isActivated && !engineWasRunning {
+            audioSessionGate.reset()
+        }
+        let sessionActivationRequired = !audioSessionGate.isActivated
         do {
             try audioSessionGate.activate {
                 let session = AVAudioSession.sharedInstance()
                 try session.setCategory(.playback, mode: .default)
                 try session.setActive(true)
             }
+
+            // ESS-534: AudioRecorder.finish() deactivates the shared
+            // AVAudioSession after prepare() has already started this engine.
+            // Re-activating the session alone does not reliably reconnect an
+            // existing engine to the output route. Rebuild once on the first
+            // delta, before any buffer for this turn has been scheduled.
+            let restartEngine = RealtimeRenderRecoveryPolicy.shouldRestartEngine(
+                firstDeltaAfterSessionActivation: sessionActivationRequired,
+                engineIsRunning: audioEngine.isRunning
+            )
+            if restartEngine {
+                playerNode.stop()
+                audioEngine.stop()
+                audioEngine.prepare()
+                try audioEngine.start()
+                isRunning = true
+                WatchLog.info(
+                    "realtime", "playback_engine_restarted",
+                    requestId: turn.requestId,
+                    detail: "session_reactivated=\(sessionActivationRequired) was_running=\(engineWasRunning)"
+                )
+            }
+
+            if RealtimeRenderRecoveryPolicy.shouldRestartNode(
+                engineWasRestarted: restartEngine,
+                nodeIsPlaying: playerNode.isPlaying
+            ) {
+                playerNode.play()
+                WatchLog.info(
+                    "realtime", "playback_node_restarted",
+                    requestId: turn.requestId,
+                    detail: "engine_restarted=\(restartEngine) was_playing=\(nodeWasPlaying)"
+                )
+            }
+
+            if sessionActivationRequired {
+                let session = AVAudioSession.sharedInstance()
+                let route = session.currentRoute.outputs
+                    .map { "\($0.portType.rawValue)(\($0.portName))" }
+                    .joined(separator: ",")
+                WatchLog.info(
+                    "realtime", "playback_first_delta_state",
+                    requestId: turn.requestId,
+                    detail: "engine_running=\(audioEngine.isRunning) node_playing=\(playerNode.isPlaying) category=\(session.category.rawValue) route=\(route)"
+                )
+            }
         } catch {
             WatchLog.error(
                 "realtime", "playback_audio_session_failed",
                 requestId: turn.requestId,
-                detail: "category=playback active=true",
+                detail: "category=playback active=true engine_running=\(audioEngine.isRunning) node_playing=\(playerNode.isPlaying)",
                 code: "ERR_AUDIO_SESSION", error: error
             )
             onPlaybackEvent?(.failed(
