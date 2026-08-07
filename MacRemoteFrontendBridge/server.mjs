@@ -220,6 +220,15 @@ export function createBridge(overrides = {}) {
   const realtimeAudioSalvage = new Map() // request_id → { pcm24k: Buffer, taskId, at }
   // ESS-234：已启动 task.completed 5s 兜底计时的 request_id，防止重复触发。
   const realtimeFallbackTimers = new Map() // request_id → Timeout
+  // ESS-542：上游 Qwen 偶发不携带 taskId 的 announcement。暂存于 orphan 池，
+  // 等待 ledger 新 turn 投影到达时尝试通过 turnId / task_id 重新绑定。
+  const orphanAnnouncements = new Map() // response_id → { announcement, at }
+  let orphanAnnouncementBytes = 0
+  const ORPHAN_ANNOUNCEMENT_TTL_MS = 30_000           // orphan 最长等待窗口
+  const MAX_ORPHAN_ANNOUNCEMENTS = 16                  // 远小于正常 pending 池
+  const MAX_ORPHAN_ANNOUNCEMENT_BYTES = 2 * 1024 * 1024 // 2 MB PCM
+  // ESS-542：announcement_unmatched 计数，供运维观测频率与趋势。
+  let announcementUnmatchedCount = 0
   const REALTIME_FALLBACK_WAIT_MS = CONFIG.realtime_fallback_wait_ms ?? 5_000
   const PENDING_AUDIO_TTL_MS = 10 * 60 * 1000
   const MAX_PENDING_ANNOUNCEMENTS = 64
@@ -357,11 +366,72 @@ export function createBridge(overrides = {}) {
     }
   }
 
+  function queueOrphanAnnouncement(announcement) {
+    const { responseId, pcm24k, turnId } = announcement
+    announcementUnmatchedCount += 1
+    // Capacity guard
+    while (orphanAnnouncements.size >= MAX_ORPHAN_ANNOUNCEMENTS
+      || orphanAnnouncementBytes + pcm24k.length > MAX_ORPHAN_ANNOUNCEMENT_BYTES) {
+      const oldestKey = orphanAnnouncements.keys().next().value
+      if (oldestKey === undefined) break
+      const dropped = orphanAnnouncements.get(oldestKey)
+      orphanAnnouncements.delete(oldestKey)
+      orphanAnnouncementBytes -= dropped.announcement.pcm24k.length
+      log({ evt: 'announcement_orphan_evicted', response_id: oldestKey, reason: 'capacity' })
+    }
+    if (pcm24k.length > MAX_ORPHAN_ANNOUNCEMENT_BYTES) {
+      log({ evt: 'announcement_orphan_too_large', response_id: responseId, pcm_bytes: pcm24k.length })
+      return
+    }
+    orphanAnnouncements.set(responseId, { announcement, at: Date.now() })
+    orphanAnnouncementBytes += pcm24k.length
+    log({
+      evt: 'announcement_orphan_pending', response_id: responseId,
+      turn_id: turnId ?? null,
+      pcm_bytes: pcm24k.length,
+      orphan_total: orphanAnnouncements.size,
+      orphan_bytes: orphanAnnouncementBytes,
+      unmatched_total: announcementUnmatchedCount,
+      ttl_ms: ORPHAN_ANNOUNCEMENT_TTL_MS,
+    })
+    log({ evt: 'l1_audio_failed', request_id: null, task_id: null, response_id: responseId, source: 'background', stage: 'ownership', reason: 'missing_task_id_orphan_pending' })
+  }
+
+  // ESS-542：当 ledger 新增 turn 时，尝试将 orphan 池中的无 taskId 公告
+  // 绑定到新 turn。匹配策略：优先 task_id 直接命中（标准路径已在
+  // attachPendingAnnouncement 中覆盖），次选 responseId 前缀或 turnId 命中。
+  function attachOrphanAnnouncements(projection) {
+    if (orphanAnnouncements.size === 0) return
+    if (projection.task_id) {
+      for (const [responseId, entry] of orphanAnnouncements) {
+        const { announcement } = entry
+        // ESS-542: try turn_id match from injected realtime turn
+        if (announcement.turnId && projection.turn_id && String(announcement.turnId) === String(projection.turn_id)) {
+          const turn = ledger.get(projection.request_id)
+          if (turn) {
+            orphanAnnouncements.delete(responseId)
+            orphanAnnouncementBytes -= announcement.pcm24k.length
+            log({
+              evt: 'announcement_orphan_rebound',
+              request_id: turn.request_id,
+              response_id: announcement.responseId,
+              matched_by: 'turn_id',
+              turn_id: announcement.turnId,
+              unmatched_total: announcementUnmatchedCount,
+            })
+            void bindAnnouncement(announcement, turn)
+            return // one binding per projection tick; others stay for next turn
+          }
+        }
+      }
+    }
+  }
+
   function queueAnnouncement(announcement) {
     const { taskId, responseId, pcm24k } = announcement
     if (!taskId) {
       log({ evt: 'announcement_unmatched', task_id: null, response_id: responseId, pcm_bytes: pcm24k.length, reason: 'missing_task_id' })
-      log({ evt: 'l1_audio_failed', request_id: null, task_id: null, response_id: responseId, source: 'background', stage: 'ownership', reason: 'missing_task_id' })
+      queueOrphanAnnouncement(announcement)
       return
     }
     const key = String(taskId)
@@ -400,7 +470,19 @@ export function createBridge(overrides = {}) {
   }
 
   supervisor.onAnnouncement = async announcement => {
-    const turn = announcement.taskId ? ledger.byTaskId(announcement.taskId) : null
+    // ESS-542: taskId is the primary key, but Qwen sometimes omits it.
+    // Try turnId as a fallback correlation before queueing.
+    let turn = announcement.taskId ? ledger.byTaskId(announcement.taskId) : null
+    if (!turn && announcement.turnId) {
+      // turnId from Qwen may appear in injected realtime turns as turn_id
+      for (const t of ledger.turns.values()) {
+        if (t.turn_id && String(t.turn_id) === String(announcement.turnId)) {
+          turn = t
+          log({ evt: 'announcement_matched_by_turn_id', response_id: announcement.responseId, turn_id: announcement.turnId, request_id: t.request_id })
+          break
+        }
+      }
+    }
     if (!turn) return queueAnnouncement(announcement)
     await bindAnnouncement(announcement, turn)
   }
@@ -408,6 +490,7 @@ export function createBridge(overrides = {}) {
   // task 终态先于 announcement 落账时，completed 投影触发补挂
   ledger.on('turn', projection => {
     attachPendingAnnouncement(projection)
+    attachOrphanAnnouncements(projection)
     if (['completed', 'failed', 'cancelled'].includes(projection.status)) {
       clearInterim(projection.request_id)
     }
@@ -418,6 +501,7 @@ export function createBridge(overrides = {}) {
 
   const pendingAudioSweeper = setInterval(() => {
     const cutoff = Date.now() - PENDING_AUDIO_TTL_MS
+    const orphanCutoff = Date.now() - ORPHAN_ANNOUNCEMENT_TTL_MS
     for (const [requestId, entry] of pendingResultAudio) {
       if (entry.at < cutoff) pendingResultAudio.delete(requestId)
     }
@@ -426,6 +510,18 @@ export function createBridge(overrides = {}) {
         pendingAnnouncements.delete(taskId)
         pendingAnnouncementBytes -= entry.pcm24k.length
         log({ evt: 'announcement_unmatched_expired', task_id: taskId, response_id: entry.responseId, reason: 'ttl' })
+      }
+    }
+    // ESS-542：过期的 orphan announcement 清理
+    for (const [responseId, entry] of orphanAnnouncements) {
+      if (entry.at < orphanCutoff) {
+        orphanAnnouncements.delete(responseId)
+        orphanAnnouncementBytes -= entry.announcement.pcm24k.length
+        log({
+          evt: 'announcement_orphan_expired', response_id: responseId,
+          pcm_bytes: entry.announcement.pcm24k.length,
+          unmatched_total: announcementUnmatchedCount,
+        })
       }
     }
     // ESS-234：过期未被 task.completed 触发的 salvage 条目清理（一般不会发生——
