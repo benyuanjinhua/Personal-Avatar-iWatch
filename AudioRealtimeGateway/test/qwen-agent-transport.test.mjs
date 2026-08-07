@@ -53,6 +53,12 @@ test('agent transport forwards real upstream audio with request-scoped logs', as
   assert.deepEqual(events.map(event => event.type), ['agent.audio.delta', 'agent.audio.done'])
   assert.ok(logs.some(item => item.evt === 'upstream_ready' && item.request_id === 'r1'))
   assert.ok(logs.some(item => item.evt === 'upstream_audio_done' && item.request_id === 'r1'))
+  assert.deepEqual(
+    logs.filter(item => item.evt === 'upstream_event_received').map(item => item.upstream_event_type),
+    ['audio.delta', 'audio.done'],
+  )
+  assert.ok(logs.filter(item => item.evt === 'upstream_event_received')
+    .every(item => item.request_id === 'r1'))
   assert.ok(!JSON.stringify(logs).includes('provider'))
   turn.close()
 })
