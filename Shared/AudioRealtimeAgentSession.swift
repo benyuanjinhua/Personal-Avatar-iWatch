@@ -27,6 +27,10 @@ final class AudioRealtimeAgentSession {
         category: "AgentRealtimeSession"
     )
 
+    /// Log module tag emitted in `PhoneAgentClientLog` entries so bridge.log
+    /// grep queries stay stable across refactors.
+    static let logModule = "agent_session"
+
     // MARK: - Connection state
 
     enum ConnectionState: Equatable, CustomStringConvertible {
@@ -219,6 +223,11 @@ final class AudioRealtimeAgentSession {
                 self.handleDownlinkEvent(event)
             case .unrecognised(let type):
                 Self.logger.info("agent unrecognised downlink type=\(type, privacy: .public)")
+            case .malformed(let bytes):
+                // ESS-525: protocol drift — the transport already logged
+                // `downlink_decode_failed`. Do NOT close the session; the
+                // receive loop stays live for the next frame.
+                Self.logger.error("agent malformed downlink frame bytes=\(bytes)")
             case .error(let error):
                 Self.logger.error("agent receive error: \(String(describing: error), privacy: .public)")
                 self.handleTransportFailure(reason: "recv_error")
@@ -249,11 +258,23 @@ final class AudioRealtimeAgentSession {
             // Dedup
             if turn.deliveredSequences.contains(seq) {
                 Self.logger.debug("agent dup seq=\(seq) — dropped")
+                PhoneAgentClientLog.info(
+                    module: Self.logModule,
+                    event: "downlink_audio_delta_dup",
+                    requestId: rid, sessionId: sid,
+                    detail: "seq=\(seq) gen=\(gen)"
+                )
                 return
             }
             currentTurn?.deliveredSequences.insert(seq)
             Self.logger.info(
                 "agent audio.delta rid=\(rid.prefix(8), privacy: .public) gen=\(gen) resp=\(respId.prefix(8), privacy: .public) seq=\(seq) bytes=\(audioBytes.count)"
+            )
+            PhoneAgentClientLog.info(
+                module: Self.logModule,
+                event: "downlink_audio_delta_accepted",
+                requestId: rid, sessionId: sid,
+                detail: "seq=\(seq) gen=\(gen) bytes=\(audioBytes.count) sr=\(sampleRate) codec=\(codec)"
             )
             let chunk = VoiceStreamChunk(
                 requestId: rid, streamId: sid, direction: .downlink,
@@ -269,6 +290,12 @@ final class AudioRealtimeAgentSession {
             currentTurn?.finalSequence = finalSeq
             Self.logger.info(
                 "agent audio.done rid=\(rid.prefix(8), privacy: .public) gen=\(gen) resp=\(respId.prefix(8), privacy: .public) final_seq=\(finalSeq)"
+            )
+            PhoneAgentClientLog.info(
+                module: Self.logModule,
+                event: "downlink_audio_done_accepted",
+                requestId: rid, sessionId: sid,
+                detail: "final_seq=\(finalSeq) gen=\(gen)"
             )
             onAudioDone?(rid, respId, gen, finalSeq)
 
@@ -352,6 +379,16 @@ final class AudioRealtimeAgentSession {
                 }
             }
         }
+    }
+
+    // MARK: - Testing hooks
+
+    /// Test-only funnel — drives `handleDownlinkEvent` without the
+    /// URLSession-backed receive loop. Real code paths go through
+    /// `startReceiveLoop` → `handleDownlinkEvent`; tests bypass the
+    /// transport so they can exercise decoded events deterministically.
+    func handleForTesting(event: AudioRealtimeAgentCodec.DownlinkEvent) {
+        handleDownlinkEvent(event)
     }
 
     // MARK: - State transitions

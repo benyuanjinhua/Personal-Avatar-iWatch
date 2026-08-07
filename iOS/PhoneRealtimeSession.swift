@@ -82,6 +82,16 @@ final class PhoneRealtimeSession {
             openIfNeeded(requestId: commit.requestId, sessionId: commit.sessionId)
         case .playbackStarted, .playbackEnded:
             guard let receipt = envelope.playback else { return }
+            // ESS-525 §1 acceptance: `play_started` / `play_finished`
+            // must land in `bridge.log` for the same request_id as the
+            // Gateway downlink. Watch reports the receipt via WCSession
+            // uplink; that arrives here — log before we hand it off.
+            PhoneAgentClientLog.info(
+                module: "phone_session",
+                event: envelope.kind == .playbackStarted ? "play_started" : "play_finished",
+                requestId: receipt.requestId, sessionId: receipt.sessionId,
+                detail: "response_id=\(receipt.responseId)"
+            )
             openIfNeeded(requestId: receipt.requestId, sessionId: receipt.sessionId)
         case .fallback:
             guard let descriptor = envelope.fallback else { return }

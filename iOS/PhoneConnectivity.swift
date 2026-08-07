@@ -48,6 +48,9 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     private static let downlinkLogger = Logger(
         subsystem: "beer.workspace.wristagent", category: "watch-downlink"
     )
+    /// ESS-525: iPhone-side structured client log → bridge.log shipper. Lets
+    /// downlink evidence for a given request_id land next to Watch entries.
+    private let phoneClientLog: PhoneClientLog
 
     override init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -57,6 +60,14 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
             log: { event in PhoneConnectivity.logDownlink(event) }
         )
         relay = WristAgentPhoneRelay()
+        // Uplink is nil until pairing succeeds; PhoneClientLog stores locally
+        // in the meantime and drains once `WristAgentPhoneRelay` has a client.
+        let logDirectory = base.appendingPathComponent("PhoneClientLogs", isDirectory: true)
+        let relayRef = relay
+        phoneClientLog = PhoneClientLog(
+            directory: logDirectory,
+            uplink: { relayRef.clientLogUplink }
+        )
         super.init()
         relay.watchChannel = self
         pendingDownlinkCount = downlink?.pendingCount() ?? 0
@@ -102,6 +113,11 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         WCSession.default.delegate = self
         WCSession.default.activate()
         relay.start()
+        // ESS-525: install the phone client-log sink AFTER relay.start so
+        // `clientLogUplink` has already been constructed. Any preceding
+        // downlink event still lands (PhoneAgentClientLog no-ops without a
+        // sink), just doesn't ship to bridge.log until this point.
+        phoneClientLog.start()
         // 冷启动补投：上次进程排队/在途未确认的下行，App 一打开就重投。
         flushDownlink(trigger: "activate")
     }
