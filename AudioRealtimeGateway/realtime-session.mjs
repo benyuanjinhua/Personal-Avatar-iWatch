@@ -43,7 +43,7 @@ export class RealtimeSession {
     protocolVersion = 1,
     heartbeatIntervalMs = 15_000,
     idleDisconnectMs = 60_000,
-    doneBarrierGapMs = 2_000,
+    doneBarrierGapMs = 30_000,
     maxFrameBytes = 64 * 1024,
     maxEventsPerSecond = 200,
     maxUplinkBytesPerSecond = 512 * 1024,
