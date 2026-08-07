@@ -64,6 +64,8 @@ final class PushToTalkController: ObservableObject {
 
     /// 结果语音自动播放即将开始（App 层用来打断欢迎语）。
     var onAutoPlayStarted: (() -> Void)?
+    /// ESS-535: 用户按住说话时立即触发，用于打断欢迎语音释放音频会话。
+    var onPressBegan: (() -> Void)?
 
     private static let logger = Logger(subsystem: "com.benyuan.wristagent.watch", category: "PlaybackTrigger")
     private let recorder = AudioRecorder()
@@ -427,6 +429,9 @@ final class PushToTalkController: ObservableObject {
             enqueueAutoPlay(interrupted, reason: "recording_interrupted")
         }
         player.stop(reason: "recording_started")
+        // ESS-535: interrupt the welcome speech before recording starts
+        // so the RealtimePlaybackEngine can own the audio session.
+        onPressBegan?()
         state = .recording
         let streaming = voiceStreamingEnabled()
         streamRequestId = streaming ? UUIDv7.generate() : nil

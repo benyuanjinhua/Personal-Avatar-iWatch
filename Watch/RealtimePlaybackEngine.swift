@@ -114,14 +114,34 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
 
     func enqueue(playables: [RealtimeDownlinkPlayback.PlayableChunk]) {
         guard let turn = currentTurn else { return }
-        // ESS-532: the recorder deactivates the shared AVAudioSession when
-        // recording ends. Re-activate it for playback before the first
-        // buffer lands so the engine can actually render.
+        // ESS-532/ESS-535: the recorder deactivates the shared AVAudioSession
+        // when recording ends. AVAudioEngine was started under .playAndRecord;
+        // after the session transitions to .playback, the engine may need a
+        // stop/start cycle to resume output (merely setActive(true) is not
+        // enough on device — the engine's internal I/O unit stays in the old
+        // session's format). Stop + restart guarantees a clean re-attach.
         do {
             try audioSessionGate.activate {
                 let session = AVAudioSession.sharedInstance()
                 try session.setCategory(.playback, mode: .default)
                 try session.setActive(true)
+                // ESS-535: restart the engine under the new playback session.
+                // If the engine was already running from prepare(), stop it
+                // first so the I/O unit picks up the new session format.
+                if isRunning {
+                    playerNode.stop()
+                    audioEngine.stop()
+                    isRunning = false
+                }
+                audioEngine.prepare()
+                try audioEngine.start()
+                isRunning = true
+                playerNode.play()
+                WatchLog.info(
+                    "realtime", "playback_engine_restarted",
+                    requestId: turn.requestId,
+                    detail: "session=.playback engine_running=\(audioEngine.isRunning) player_playing=\(playerNode.isPlaying)"
+                )
             }
         } catch {
             WatchLog.error(
