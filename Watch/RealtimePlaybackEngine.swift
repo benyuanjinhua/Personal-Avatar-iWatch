@@ -124,6 +124,12 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
                 try session.setActive(true)
             }
         } catch {
+            WatchLog.error(
+                "realtime", "playback_audio_session_failed",
+                requestId: turn.requestId,
+                detail: "category=playback active=true",
+                code: "ERR_AUDIO_SESSION", error: error
+            )
             onPlaybackEvent?(.failed(
                 requestId: turn.requestId, sessionId: turn.sessionId,
                 responseId: nil, code: "ERR_AUDIO_SESSION"
