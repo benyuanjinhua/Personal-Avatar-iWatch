@@ -73,6 +73,15 @@ final class PhoneRealtimeSession {
         switch envelope.kind {
         case .streamStart:
             guard let start = envelope.start else { return }
+            // ESS-539: a new stream.start means a new turn. Discard any
+            // downlink envelopes queued from a previous incomplete session
+            // so they don't pollute the new turn's playback.
+            if !pendingDownlink.isEmpty {
+                Self.logger.info(
+                    "realtime discarding \(self.pendingDownlink.count) stale downlink envelopes from previous session"
+                )
+                pendingDownlink.removeAll(keepingCapacity: true)
+            }
             openIfNeeded(requestId: start.requestId, sessionId: start.sessionId)
         case .audioAppend:
             guard let append = envelope.append else { return }
