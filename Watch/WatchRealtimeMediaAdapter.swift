@@ -136,6 +136,10 @@ final class WatchRealtimeMediaAdapter {
                 // next turn remains responsible for closing/replacing it.
             case .bargedIn, .failed:
                 break
+            case .renderProgress(let requestId, let sessionId, let responseId, let bytesPlayed, let totalBytes):
+                WatchLog.info("realtime", "play_progress",
+                              requestId: requestId,
+                              detail: "response_id=\\(responseId ?? "nil") bytes_played=\\(bytesPlayed) total_bytes=\\(totalBytes)")
             }
             self.logger("playback_event=\(event)")
         }

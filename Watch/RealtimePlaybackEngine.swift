@@ -42,6 +42,13 @@ struct RealtimePlaybackAudioSessionGate {
 /// engine keeps per-response counters so multi-response sessions route
 /// receipts correctly across out-of-order releases.
 ///
+/// **ESS-531**: `AudioRecorder.finish()` deactivates `AVAudioSession` before
+/// downlink PCM chunks arrive, starving the player of audio output. The fix:
+/// (a) activate the shared audio session independently via the gate before
+/// each render attempt — this reactivates after the recorder released it;
+/// (b) add a lazy-init path in `enqueue()` so a missed `prepare()` (e.g. a
+/// thrown exception in `beginTurn`) doesn't silently drop all chunks.
+///
 /// Real-device acceptance (P95 latency, lock-screen resume, etc.) is scoped
 /// to ESS-265. Here we deliver deterministic client code the coordinator can
 /// exercise via the simulated closed loop and via WatchTests.
@@ -56,6 +63,11 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         /// rendered. `bytesPlayed` counts only the bytes whose completion
         /// callback fired; bytes discarded by barge-in / stop are excluded.
         case ended(requestId: String, sessionId: String, responseId: String?, bytesPlayed: Int)
+        /// ESS-531: fires periodically as buffers complete rendering, carrying
+        /// cumulative bytes played so the Bridge can track playback progress
+        /// across the 40+ chunk realtime response.
+        case renderProgress(requestId: String, sessionId: String, responseId: String?,
+                            bytesPlayed: Int, totalBytes: Int)
         case bargedIn(requestId: String, sessionId: String, responseId: String?, bytesDropped: Int)
         case failed(requestId: String, sessionId: String, responseId: String?, code: String)
     }
@@ -71,6 +83,11 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
     /// tracker's returned receipts become the `.started/.ended` events we
     /// forward through `onPlaybackEvent`.
     private var tracker = RealtimePlaybackReceiptTracker()
+    /// ESS-531: per-turn audio-session gate. `AudioRecorder.finish()` calls
+    /// `AVAudioSession.setActive(false)` before downlink chunks arrive; this
+    /// gate reactivates the session on the first `enqueue()` after recording
+    /// ends, so queued buffers actually render.
+    private var sessionGate = RealtimePlaybackAudioSessionGate()
 
     /// Coordinator subscribes here so the session can turn playback receipts
     /// into `playback.started` / `playback.ended` on the wire.
@@ -98,16 +115,84 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         stop(barge: false)
         currentTurn = turn
         tracker.reset()
+        sessionGate.reset()
+        try prepareEngineIfNeeded()
+    }
+
+    /// ESS-531: lazy prepare that doesn't require a prior `beginTurn` call.
+    /// Used when chunks arrive but `player.currentTurn` is nil (e.g. the
+    /// adapter's `beginTurn` catch block never reached `player.prepare`).
+    private func prepareInPlace(for turn: RealtimeMediaSession.TurnHandle) throws {
+        stop(barge: false)
+        currentTurn = turn
+        tracker.reset()
+        sessionGate.reset()
+        try prepareEngineIfNeeded()
+    }
+
+    /// Shared engine boot: audio session activation + engine start + playerNode.play.
+    private func prepareEngineIfNeeded() throws {
+        try sessionGate.activate {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playAndRecord, mode: .spokenAudio,
+                                    policy: .default, options: [.allowBluetooth])
+            try session.setActive(true)
+        }
         if !isRunning {
             audioEngine.prepare()
             try audioEngine.start()
             isRunning = true
         }
         playerNode.play()
+        WatchLog.info("realtime", "player_engine_ready",
+                      requestId: currentTurn?.requestId,
+                      detail: "engine_running=\\(isRunning)")
     }
 
     func enqueue(playables: [RealtimeDownlinkPlayback.PlayableChunk]) {
+        // ESS-531 part (b): if the player hasn't been prepared yet (e.g.
+        // recorder.start failed and the catch block never called prepare),
+        // do a best-effort lazy init so realtime chunks don't silently drop.
+        if currentTurn == nil, let chunk = playables.first?.chunk {
+            let dummyTurn = RealtimeMediaSession.TurnHandle(
+                requestId: chunk.requestId, sessionId: chunk.streamId
+            )
+            do {
+                try prepareInPlace(for: dummyTurn)
+                WatchLog.info("realtime", "playback_lazy_prepared",
+                              requestId: dummyTurn.requestId,
+                              detail: "state=lazy_init")
+            } catch {
+                WatchLog.error("realtime", "playback_lazy_prepare_failed",
+                               requestId: dummyTurn.requestId,
+                               detail: "error=\\(error.localizedDescription)",
+                               code: "ERR_PLAYER_PREPARE")
+                onPlaybackEvent?(.failed(
+                    requestId: dummyTurn.requestId, sessionId: dummyTurn.sessionId,
+                    responseId: nil, code: "ERR_PLAYER_PREPARE"
+                ))
+                return
+            }
+        }
         guard let turn = currentTurn else { return }
+
+        // ESS-531 part (a): reactivate the audio session. AudioRecorder.finish()
+        // may have deactivated it between recording end and the first downlink
+        // chunk arrival. Without this, buffers schedule but never render.
+        do {
+            try sessionGate.activate {
+                let session = AVAudioSession.sharedInstance()
+                try session.setCategory(.playAndRecord, mode: .spokenAudio,
+                                        policy: .default, options: [.allowBluetooth])
+                try session.setActive(true)
+            }
+        } catch {
+            WatchLog.error("realtime", "playback_session_activate_failed",
+                           requestId: turn.requestId,
+                           detail: "error=\\(error.localizedDescription)",
+                           code: "ERR_PLAYER_SESSION")
+            return
+        }
         for playable in playables where
             playable.chunk.requestId == turn.requestId &&
             playable.chunk.streamId == turn.sessionId {
@@ -170,6 +255,7 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         }
         currentTurn = nil
         tracker.reset()
+        sessionGate.reset()
     }
 
     func shutdown() {
@@ -187,11 +273,26 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
                 requestId: turn.requestId, sessionId: turn.sessionId,
                 responseId: started.responseId
             ))
+            WatchLog.info("realtime", "play_started",
+                          requestId: turn.requestId,
+                          detail: "response_id=\\(started.responseId ?? "nil")")
         }
         if let ended = receipts.ended {
             onPlaybackEvent?(.ended(
                 requestId: turn.requestId, sessionId: turn.sessionId,
                 responseId: ended.responseId, bytesPlayed: ended.bytesPlayed
+            ))
+            WatchLog.info("realtime", "play_completed",
+                          requestId: turn.requestId,
+                          detail: "response_id=\\(ended.responseId ?? "nil") bytes_played=\\(ended.bytesPlayed)")
+        }
+        // ESS-531: emit render_progress on every buffer completion so the
+        // Bridge can track playback progress across the streaming response.
+        if let progress = receipts.progress {
+            onPlaybackEvent?(.renderProgress(
+                requestId: turn.requestId, sessionId: turn.sessionId,
+                responseId: progress.responseId,
+                bytesPlayed: progress.bytesPlayed, totalBytes: progress.totalBytes
             ))
         }
     }
