@@ -100,6 +100,16 @@ enum ErrorCueCatalog {
                 clip: "ErrorCue_TranscriptDiscarded",
                 recoveryFamily: .reRecord
             )
+        // ESS-538：录音进行中锁屏，息屏后音频采集即断，残片不提交。
+        // 抬腕回前台后呈现（锁屏当下卡片/语音都到不了用户）。无预置语音，
+        // 走「文字 + 触觉」降级路径——这正是 catalog 设计的兜底通道。
+        case "ERR_RECORDING_INTERRUPTED":
+            return ErrorCueEntry(
+                code: code,
+                text: "锁屏把刚才的录音打断了，请再说一次。",
+                clip: nil,
+                recoveryFamily: .reRecord
+            )
         case "ERR_VOICE_BUSY":
             return ErrorCueEntry(
                 code: code,

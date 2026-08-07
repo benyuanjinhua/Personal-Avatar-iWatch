@@ -50,10 +50,19 @@ struct WristAgentWatchApp: App {
                         services.pushToTalk.sessionKeeper.appDidBecomeActive()
                         WatchLogShipper.shared.ship(reason: "foreground")
                         services.pushToTalk.evictStaleAudio()
+                        // ESS-538：抬腕后补呈现「锁屏打断了录音」
+                        // （锁屏当下卡片/语音都到不了用户）。
+                        services.pushToTalk.presentLockInterruptNoticeIfNeeded()
                         services.pushToTalk.presentUnreadIfAny()
-                    case .background:
-                        WatchLogShipper.shared.ship(reason: "background")
-                    default: break
+                    case .inactive, .background:
+                        // ESS-538：录音进行中锁屏 → 立即主动收尾（抢救提交或
+                        // 丢弃 + 抬腕告知），不再让残片在松手时被当正常录音提交。
+                        services.pushToTalk.recordingInterruptedByLock(
+                            phase: String(describing: newPhase)
+                        )
+                        if newPhase == .background {
+                            WatchLogShipper.shared.ship(reason: "background")
+                        }
                     }
                 }
         }

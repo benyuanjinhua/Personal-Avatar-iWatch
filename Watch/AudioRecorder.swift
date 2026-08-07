@@ -12,6 +12,9 @@ enum RecorderError: LocalizedError {
     case recordingNeverStarted
 
     static let recordingTooShortDescription = "按住时间太短，请按住不放再说。"
+    /// ESS-538：录音进行中锁屏 → 采集即断，残片丢弃后抬腕呈现的文案。
+    /// 与 ErrorCueCatalog 的 ERR_RECORDING_INTERRUPTED 保持一致。
+    static let recordingInterruptedDescription = "锁屏把刚才的录音打断了，请再说一次。"
 
     var errorDescription: String? {
         switch self {

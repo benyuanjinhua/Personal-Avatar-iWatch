@@ -873,6 +873,82 @@ final class PushToTalkController: ObservableObject {
         flushPendingAutoPlay()
     }
 
+    // MARK: - ESS-538 录音进行中锁屏
+
+    /// ESS-538：锁屏打断录音后、抬腕回前台时待呈现的提示。
+    private var pendingLockInterruptNotice = false
+
+    /// 录音进行中锁屏（scene → inactive/background）时主动收尾。
+    ///
+    /// 真机证据（ESS-538，2026-08-07 17:06 bridge.log）：息屏后音频采集
+    /// 立即死亡，但 AVAudioRecorder 仍在走——等用户松手才 finish 时产出
+    /// wall_clock ≫ asset 的残片（5.9s 手势只录进 316ms），残片过了 300ms
+    /// 最短门被当正常录音提交，回合必然失败（「没听清，请重说」）。
+    ///
+    /// 修法：锁屏瞬间主动收尾——
+    /// - 采到的音频 ≥ 最短门：**抢救提交**。锁屏前说的话不白说；结果经
+    ///   ESS-55 通知链路透传，覆盖「放腕即结束，好了叫你」的形态；
+    /// - 太短 / 从未开始：丢弃并记账，抬腕回前台时明确告知（不静默丢帧）。
+    func recordingInterruptedByLock(phase: String) {
+        guard state == .recording else { return }
+        WatchLog.info("recorder", "recording_interrupted_by_lock", detail: "scene_phase=\(phase)")
+        guard recorder.isRecording else {
+            // start() 还在权限/会话激活里：沿用 deferred-release 通道，
+            // start 完成后立即 finishRecording 收尾；几乎必然落入太短分支，
+            // 提示在抬腕时补呈现。
+            releaseRequestedWhileStarting = true
+            pendingLockInterruptNotice = true
+            return
+        }
+        state = .finishing
+        defer {
+            state = .idle
+            releaseRequestedWhileStarting = false
+            flushPendingAutoPlay()
+        }
+        do {
+            let recording = try recorder.finish()
+            guard recording.durationMs >= VoiceRequestEnvelope.minimumAudioDurationMs else {
+                try? FileManager.default.removeItem(at: recording.fileURL)
+                WatchLog.error(
+                    "recorder", "lock_interrupt_discarded",
+                    detail: "duration_ms=\(recording.durationMs) bytes=\(recording.data.count)",
+                    code: "ERR_RECORDING_INTERRUPTED"
+                )
+                pendingLockInterruptNotice = true
+                return
+            }
+            WatchLog.info(
+                "recorder", "lock_interrupt_salvaged",
+                detail: "duration_ms=\(recording.durationMs) bytes=\(recording.data.count)"
+            )
+            submit(recording: recording)
+        } catch {
+            WatchLog.error(
+                "recorder", "lock_interrupt_finish_failed",
+                detail: "error=\(error.localizedDescription)",
+                code: "ERR_RECORDING_INTERRUPTED"
+            )
+            pendingLockInterruptNotice = true
+        }
+    }
+
+    /// ESS-538 test seam：直接记账一笔待呈现的锁屏打断提示，验证
+    /// presentLockInterruptNoticeIfNeeded 的呈现契约（生产置位路径依赖
+    /// 真实采集，模拟器不可达——口径同 AudioRecorderHandoverTests）。
+    func simulateLockInterruptNoticeForTests() {
+        pendingLockInterruptNotice = true
+    }
+
+    /// 抬腕回前台后补呈现「锁屏打断了录音」。锁屏当下语音与卡片都到不了
+    /// 用户，提示必须推迟到 .active。
+    func presentLockInterruptNoticeIfNeeded() {
+        guard pendingLockInterruptNotice else { return }
+        pendingLockInterruptNotice = false
+        errorMessage = RecorderError.recordingInterruptedDescription
+        presentAvatarError(code: "ERR_RECORDING_INTERRUPTED", requestId: nil)
+    }
+
     /// 权限确认（§5.3）：只对当前回合生效；先本地记账（UI 立即反馈），再上行给 iPhone 签名转发。
     func respondPermission(approved: Bool) {
         guard
