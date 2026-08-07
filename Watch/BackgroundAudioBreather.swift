@@ -18,9 +18,21 @@ import WatchKit
 ///   again. Releases the audio session.
 @MainActor
 final class BackgroundAudioBreather {
+    /// ESS-519 复审加固：静音保活的绝对上限。回合以非播放方式终结
+    /// （失败 cue / 纯文本结果）或结果永远不到达时，若无人停 breather，
+    /// 静音循环会在背景无限耗电。超过上限自动停止；此后的结果交付
+    /// 降级到 ESS-55 的本地通知链路，不静默丢失。
+    nonisolated static let defaultMaxDuration: TimeInterval = 120
+
+    private let maxDuration: TimeInterval
     private var player: AVAudioPlayer?
     private var session: AVAudioSession { AVAudioSession.sharedInstance() }
+    private var capTask: Task<Void, Never>?
     private(set) var isActive = false
+
+    init(maxDuration: TimeInterval = BackgroundAudioBreather.defaultMaxDuration) {
+        self.maxDuration = maxDuration
+    }
 
     /// Start silent audio playback. Must be called while the app is still
     /// active — audio session activation fails in background (bridge.log
@@ -53,6 +65,13 @@ final class BackgroundAudioBreather {
             }
             player = p
             isActive = true
+            let cap = maxDuration
+            capTask?.cancel()
+            capTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(cap * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                self?.stop(reason: "safety_cap")
+            }
             WatchLog.info("breather", "started", detail: "sample_rate=8000 duration_s=2 loops=-1")
         } catch {
             WatchLog.error(
@@ -66,6 +85,8 @@ final class BackgroundAudioBreather {
     /// Stop silent audio playback and release the audio session.
     func stop(reason: String = "explicit") {
         guard isActive else { return }
+        capTask?.cancel()
+        capTask = nil
         player?.stop()
         player = nil
         try? session.setActive(false, options: .notifyOthersOnDeactivation)
@@ -78,7 +99,7 @@ final class BackgroundAudioBreather {
     /// Generate a 2-second silent 16-bit mono PCM WAV at 8000 Hz.
     /// 8000 Hz minimises payload size (32 KB) while still being a valid
     /// PCM sample rate accepted by AVAudioPlayer on watchOS.
-    private static func makeSilentWAV() -> Data {
+    static func makeSilentWAV() -> Data {
         let sampleRate: UInt32 = 8000
         let bitsPerSample: UInt16 = 16
         let channels: UInt16 = 1
