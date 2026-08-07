@@ -149,9 +149,18 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
     }
 
     private func startSessionIfNeeded(reason: String) {
-        if startPending { return }
-        if let session, session.state == .running || session.state == .scheduled { return }
-        guard !restartSuppressed else { return }
+        if startPending {
+            WatchLog.info("runtime", "session_start_skipped", detail: "reason=startPending")
+            return
+        }
+        if let session, session.state == .running || session.state == .scheduled {
+            WatchLog.info("runtime", "session_start_skipped", detail: "reason=already_running")
+            return
+        }
+        guard !restartSuppressed else {
+            WatchLog.info("runtime", "session_start_skipped", detail: "reason=restartSuppressed lastCode=\(lastInvalidationReasonCode ?? -1)")
+            return
+        }
 
         // ESS-363：WKExtendedRuntimeSession.start() 必须在 app active 时调用，
         // 否则系统直接抛 ERR_RUNTIME_SESSION 甚至崩进程。

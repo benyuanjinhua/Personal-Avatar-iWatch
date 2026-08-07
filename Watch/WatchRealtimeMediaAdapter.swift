@@ -163,6 +163,14 @@ final class WatchRealtimeMediaAdapter {
                 // as `.sessionEnded`. Explicit cancel, interruption, or the
                 // next turn remains responsible for closing/replacing it.
             case .bargedIn, .failed:
+                if case .failed(let rid, _, _, let code) = event {
+                    WatchLog.error(
+                        "realtime", "playback_engine_failed",
+                        requestId: rid,
+                        detail: "playback_event=failed",
+                        code: code
+                    )
+                }
                 break
             }
             self.logger("playback_event=\(event)")
