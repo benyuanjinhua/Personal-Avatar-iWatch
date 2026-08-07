@@ -52,7 +52,7 @@ struct RealtimeUplinkStream: Sendable {
     private(set) var didCommit = false
     private(set) var didFallback = false
     private(set) var fallbackReason: FallbackReason?
-    private var emittedSequences: Set<Int> = []
+    private var emittedSequences: [Int: Int] = [:]
 
     init(
         requestId: String,
@@ -119,7 +119,7 @@ struct RealtimeUplinkStream: Sendable {
             return trigger(fallback: .invalidPayload(error))
         }
         nextSequence += 1
-        emittedSequences.insert(sequence)
+        emittedSequences[sequence] = payload.count
         inFlightBytes += payload.count
         return .emitted([.audioAppend(chunk)])
     }
@@ -154,9 +154,14 @@ struct RealtimeUplinkStream: Sendable {
 
     /// Report a delivered ack from the peer. Frees the in-flight byte budget
     /// used by the sequenced payload; unknown sequences are ignored.
-    mutating func acknowledge(sequence: Int, byteCount: Int) {
-        guard emittedSequences.remove(sequence) != nil else { return }
-        inFlightBytes = max(0, inFlightBytes - byteCount)
+    @discardableResult
+    mutating func acknowledge(sequence: Int, byteCount: Int) -> Bool {
+        guard byteCount > 0,
+              let emittedByteCount = emittedSequences[sequence],
+              emittedByteCount == byteCount else { return false }
+        emittedSequences.removeValue(forKey: sequence)
+        inFlightBytes = max(0, inFlightBytes - emittedByteCount)
+        return true
     }
 
     private mutating func trigger(fallback reason: FallbackReason) -> Outcome {

@@ -223,24 +223,24 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         guard let envelope = try? JSONDecoder().decode(RealtimeUplinkEnvelope.self, from: data),
               envelope.protocolVersion == RealtimeWireVersion.uplink else { return }
         guard agentFlag.isDirectPathEnabled else {
-            realtimeSession.forward(envelope)
+            forwardRealtimeEnvelope(envelope)
             return
         }
         guard let identity = Self.turnIdentity(for: envelope) else {
-            realtimeSession.forward(envelope)
+            forwardRealtimeEnvelope(envelope)
             return
         }
 
         let turn = AgentTokenMintState.Turn(requestId: identity.requestId, sessionId: identity.sessionId)
         if agentTokenState.turn == turn,
            agentEphemeralToken != nil {
-            realtimeSession.forward(envelope)
+            forwardRealtimeEnvelope(envelope)
             return
         }
         if agentTokenState.failedTurn == turn {
             // Minting already failed for this turn. Keep the entire turn on
             // Bridge; never retry mid-turn and create a second execution.
-            realtimeSession.forward(envelope)
+            forwardRealtimeEnvelope(envelope)
             return
         }
 
@@ -258,8 +258,8 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
             agentEphemeralToken = nil
             guard agentTokenState.markCurrentTurnFailed(turn) else { return }
             Self.logAgentFallback(reason: "buffer_overflow", snapshot: snapshot, degradedCount: buffered.count + 1)
-            for item in buffered { realtimeSession.forward(item) }
-            realtimeSession.forward(incoming)
+            for item in buffered { forwardRealtimeEnvelope(item) }
+            forwardRealtimeEnvelope(incoming)
             return
         }
         guard agentTokenTask == nil else { return }
@@ -267,6 +267,40 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         agentTokenTask = Task { [weak self] in
             await self?.mintAgentTokenAndDrain(turn: turn, taskID: taskID)
         }
+    }
+
+    /// The ACK closes Watch-side flow control only after the selected WSS
+    /// transport reports the append sent. Delivery failure tears down the
+    /// realtime session; a lost ACK leaves the 256 KB safety limit intact.
+    private func forwardRealtimeEnvelope(_ envelope: RealtimeUplinkEnvelope) {
+        realtimeSession.forward(envelope) { [weak self] forwarded in
+            guard forwarded else { return }
+            self?.acknowledgeRealtimeAppendIfNeeded(envelope)
+        }
+    }
+
+    private func acknowledgeRealtimeAppendIfNeeded(_ envelope: RealtimeUplinkEnvelope) {
+        guard envelope.kind == .audioAppend,
+              let chunk = envelope.append,
+              !chunk.payload.isEmpty,
+              VoiceStreamValidator().validate(chunk) == nil,
+              let data = try? JSONEncoder().encode(RealtimeUplinkAck(
+                requestId: chunk.requestId,
+                sessionId: chunk.streamId,
+                sequence: chunk.sequence,
+                byteCount: chunk.payload.count
+              )) else { return }
+        let session = WCSession.default
+        guard session.activationState == .activated, session.isReachable else { return }
+        session.sendMessage(
+            [RealtimeMediaMessage.uplinkAckEnvelopeKey: data],
+            replyHandler: nil,
+            errorHandler: { error in
+                Self.logger.info(
+                    "realtime uplink ack lost request=\(chunk.requestId.prefix(8), privacy: .public) sequence=\(chunk.sequence, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+                )
+            }
+        )
     }
 
     private static func turnIdentity(for envelope: RealtimeUplinkEnvelope) -> (requestId: String, sessionId: String)? {
@@ -310,7 +344,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
             Self.logger.info(
                 "agent ephemeral token minted request=\(turn.requestId.prefix(8), privacy: .public) session=\(turn.sessionId.prefix(8), privacy: .public) ttl_ms=\(issued.ttlMs, privacy: .public)"
             )
-            for envelope in buffered { realtimeSession.forward(envelope) }
+            for envelope in buffered { forwardRealtimeEnvelope(envelope) }
         } catch {
             guard agentTokenState.owns(taskId: taskID, turn: turn) else { return }
             Self.logger.error(
@@ -329,7 +363,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         agentEphemeralToken = nil
         let (buffered, snapshot) = pendingAgentEnvelopes.drain()
         Self.logAgentFallback(reason: reason, snapshot: snapshot, degradedCount: buffered.count)
-        for envelope in buffered { realtimeSession.forward(envelope) }
+        for envelope in buffered { forwardRealtimeEnvelope(envelope) }
     }
 
     private static func logAgentFallback(

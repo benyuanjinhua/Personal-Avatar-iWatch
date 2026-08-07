@@ -184,6 +184,20 @@ final class RealtimeMediaSession {
         emit(outcome: outcome, handle: handle)
     }
 
+    /// Release an acknowledged uplink frame. Stale-turn, duplicate and
+    /// malformed ACKs are ignored by the turn identity and stream ledger.
+    @discardableResult
+    func acknowledgeUplink(_ ack: RealtimeUplinkAck) -> Bool {
+        guard let handle = currentTurn,
+              handle.requestId == ack.requestId,
+              handle.sessionId == ack.sessionId,
+              var stream = uplink,
+              !stream.didFallback else { return false }
+        let accepted = stream.acknowledge(sequence: ack.sequence, byteCount: ack.byteCount)
+        uplink = stream
+        return accepted
+    }
+
     /// User cancelled mid-record.
     func cancelUplink() {
         guard let handle = currentTurn, var stream = uplink else { return }

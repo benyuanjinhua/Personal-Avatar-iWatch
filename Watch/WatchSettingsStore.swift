@@ -162,6 +162,10 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         if let data = message[RealtimeMediaMessage.downlinkEnvelopeKey] as? Data {
             Task { @MainActor in self.applyRealtimeDownlink(data) }
         }
+        if let data = message[RealtimeMediaMessage.uplinkAckEnvelopeKey] as? Data,
+           let ack = try? JSONDecoder().decode(RealtimeUplinkAck.self, from: data) {
+            Task { @MainActor in self.realtimeAdapter?.receiveUplinkAck(ack) }
+        }
         guard let data = message[VoiceStatusMessage.envelopeKey] as? Data else { return }
         Task { @MainActor in self.applyVoiceStatus(data) }
     }
