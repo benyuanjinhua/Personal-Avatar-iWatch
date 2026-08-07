@@ -11,12 +11,18 @@ export class QwenAgentTransport {
     connectTimeoutMs = 10_000,
     maxPendingBytes = 2 * 1024 * 1024,
     takeover = true,
+    // ESS-532: grace period to wait for late-arriving deltas after the
+    // upstream emits audio.done with zero emitted deltas. The qwen-audio-agent
+    // can emit done(final=-1) and then send actual deltas several seconds
+    // later (observed in production: 8 s gap, see ESS-532 gateway.log Session 3).
+    doneZeroGraceMs = 3_000,
     log = () => {},
   } = {}) {
     this.gatewayUrl = gatewayUrl
     this.connectTimeoutMs = connectTimeoutMs
     this.maxPendingBytes = maxPendingBytes
     this.takeover = takeover
+    this.doneZeroGraceMs = doneZeroGraceMs
     this.log = log
     this.turns = new Map()
   }
@@ -30,6 +36,9 @@ export class QwenAgentTransport {
       ws: null, ready: false, terminal: false, committed: false,
       pending: [], pendingBytes: 0, nextOutputSequence: 0,
       connectTimer: null,
+      // ESS-532: grace timer for late deltas after upstream done
+      doneZeroGraceTimer: null,
+      doneEmitted: false,
     }
     this.turns.set(requestId, turn)
     this.log('upstream_connecting', { request_id: requestId, session_id: sessionId, generation })
@@ -108,9 +117,53 @@ export class QwenAgentTransport {
             type: 'agent.audio.delta', response_id: responseId, sequence,
             sample_rate: event.sampleRate ?? 24_000, codec: 'pcm_s16le', audio: event.audio,
           })
+          // ESS-532: if we had a deferred done (zero-delta done with grace
+          // timer pending), a late delta has now arrived — cancel the grace
+          // timer so the real done (with the correct final_sequence) takes over.
+          if (turn.doneZeroGraceTimer) {
+            clearTimeout(turn.doneZeroGraceTimer)
+            turn.doneZeroGraceTimer = null
+            this.log('done_zero_grace_cancelled', {
+              request_id: requestId, session_id: sessionId, generation,
+              detail: 'late delta arrived, will use real done for final_sequence',
+            })
+          }
           return
         }
         if (event.type === 'audio.done') {
+          // ESS-532: if the upstream has not emitted any deltas yet
+          // (nextOutputSequence === 0), this is a zero-audio done. The
+          // qwen-audio-agent can emit done before its deltas arrive —
+          // observed in production with an 8 s gap (ESS-532 Session 3).
+          // Defer the done emission for a short grace window; if a delta
+          // arrives, we cancel the grace timer and let the real audio flow
+          // produce the real done with the correct final_sequence.
+          if (turn.nextOutputSequence === 0 && !turn.doneZeroGraceTimer) {
+            this.log('done_zero_grace_started', {
+              request_id: requestId, session_id: sessionId, generation,
+              grace_ms: this.doneZeroGraceMs,
+            })
+            turn.doneZeroGraceTimer = setTimeout(() => {
+              turn.doneZeroGraceTimer = null
+              if (turn.doneEmitted) return
+              turn.doneEmitted = true
+              this.log('done_zero_grace_expired', {
+                request_id: requestId, session_id: sessionId, generation,
+                final_sequence: -1,
+              })
+              onEvent({
+                type: 'agent.audio.done', response_id: responseId,
+                final_sequence: -1,
+              })
+            }, this.doneZeroGraceMs)
+            return
+          }
+          if (turn.doneEmitted) return
+          turn.doneEmitted = true
+          if (turn.doneZeroGraceTimer) {
+            clearTimeout(turn.doneZeroGraceTimer)
+            turn.doneZeroGraceTimer = null
+          }
           const finalSequence = turn.nextOutputSequence - 1
           this.log('upstream_event_received', {
             request_id: requestId, session_id: sessionId, generation,
