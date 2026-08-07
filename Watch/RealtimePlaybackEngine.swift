@@ -134,9 +134,9 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
 
     func enqueue(playables: [RealtimeDownlinkPlayback.PlayableChunk]) {
         guard let turn = currentTurn else { return }
-        // ESS-532: the recorder deactivates the shared AVAudioSession when
-        // recording ends. Re-activate it for playback before the first
-        // buffer lands so the engine can actually render.
+        // ESS-532/ESS-535: the recorder deactivates the shared AVAudioSession
+        // when recording ends. Re-activate it for playback before the first
+        // buffer lands, then rebuild the real render path.
         let engineWasRunning = audioEngine.isRunning
         let nodeWasPlaying = playerNode.isPlaying
         // A later system interruption can stop the engine after this turn's
@@ -150,6 +150,9 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         do {
             try audioSessionGate.activate {
                 let session = AVAudioSession.sharedInstance()
+                // Yield the session in case the recorder's async deactivation
+                // hasn't completed — this is a no-op if already inactive.
+                try? session.setActive(false, options: .notifyOthersOnDeactivation)
                 try session.setCategory(.playback, mode: .default)
                 try session.setActive(true)
             }
@@ -275,7 +278,6 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         currentTurn = nil
         tracker.reset()
         audioSessionGate.reset()
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
     func shutdown() {
