@@ -104,6 +104,10 @@ final class PushToTalkController: ObservableObject {
     private var pendingReChatContext: (parentRequestId: String, contextSummary: String)?
     /// ESS-317：①屏球体旁「续：<摘要>」的展示文本。nil = 普通模式。
     @Published private(set) var reChatContextText: String?
+    /// ESS-532: true from uplink commit until the first playback render event
+    /// or fallback. Keeps the ExtendedRuntimeSession alive so the audio engine
+    /// stays hot while downlink deltas are in flight.
+    @Published private(set) var realtimePlaybackPending = false
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -220,7 +224,8 @@ final class PushToTalkController: ObservableObject {
         sessionKeeper.bind(
             turns: journal.$turns.eraseToAnyPublisher(),
             playing: player.$isPlaying.eraseToAnyPublisher(),
-            recording: $state.map { $0 != .idle }.eraseToAnyPublisher()
+            recording: $state.map { $0 != .idle }.eraseToAnyPublisher(),
+            realtimePending: $realtimePlaybackPending.eraseToAnyPublisher()
         )
 
         // ESS-317 历史对话留存：trim 时间监听清理 vault（必须在所有 stored property 初始化之后）。
@@ -475,6 +480,11 @@ final class PushToTalkController: ObservableObject {
     /// we're already recording still goes out. Nothing here is allowed to
     /// throw — the goal is "no crash, no silent half-configured stream,
     /// always deliverable."
+    ///
+    /// ESS-532: on successful adapter start, set `realtimePlaybackPending = true`
+    /// so the VoiceSessionKeeper holds the ExtendedRuntimeSession across the
+    /// recording→playback gap where the turn journal does not yet show an
+    /// active turn.
     private func startRealtimeTurnIfPossible(requestId: UUID) {
         let adapter = ensureRealtimeAdapter()
         let requestIdString = requestId.uuidString.lowercased()
@@ -495,7 +505,9 @@ final class PushToTalkController: ObservableObject {
             adapter.cancel(reason: .fallback)
             pendingFallbackReason.removeValue(forKey: requestIdString)
             clearStreamStateAfterAbort()
+            return
         }
+        realtimePlaybackPending = true
     }
 
     /// ESS-383: reset streaming identifiers after an abort WITHOUT clearing
@@ -661,6 +673,11 @@ final class PushToTalkController: ObservableObject {
                 WatchLog.info("realtime", "adapter", detail: message)
             }
         )
+        // ESS-532: clear the pending hold when playback starts, the turn
+        // falls back to complete-file, or the turn finishes entirely.
+        adapter.onRealtimePendingResolved = { [weak self] in
+            self?.realtimePlaybackPending = false
+        }
         realtimeAdapter = adapter
         return adapter
     }

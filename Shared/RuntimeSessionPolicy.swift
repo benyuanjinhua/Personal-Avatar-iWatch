@@ -20,6 +20,12 @@ enum RuntimeSessionPolicy {
         let reviewAt: Date?
     }
 
+    /// Maximum time to hold the extended runtime session waiting for the first
+    /// realtime playback frame after uplink commit. Matches the Gateway session
+    /// idle timeout window — if no delta arrives within this period, the session
+    /// is released and the turn degrades to the complete-file fallback.
+    static let realtimePlaybackPendingTimeout: TimeInterval = 8
+
     /// Interactive recording already keeps the app in the foreground. Starting a
     /// WKExtendedRuntimeSession while the press gesture is still active can cancel
     /// that gesture on device, producing a 10-60 ms AAC header-only recording.
@@ -48,15 +54,31 @@ enum RuntimeSessionPolicy {
     ///     和「音频还没到」，需要这份内存标记）。
     ///   - isRecording: 按住说话进行中（含收尾 finishing）。
     ///   - isPlaying: 播放器播放中（结果语音或欢迎语）。
+    ///   - realtimePending: 实时流式回合已提交上行、下行首帧尚未开始渲染。
+    ///     录音结束后到下行首帧到达之间有约 1-2 s 窗口，若此时释放
+    ///     ExtendedRuntimeSession，降腕会挂起 AVAudioEngine 导致 delta
+    ///     无法渲染（ESS-532）。
     static func decide(
         turns: [VoiceTurnRecord],
         deliveredRequestIds: Set<String>,
         isRecording: Bool,
         isPlaying: Bool,
-        now: Date
+        now: Date,
+        realtimePending: Bool = false
     ) -> Verdict {
         if isRecording { return Verdict(decision: .hold(reason: "recording"), reviewAt: nil) }
         if isPlaying { return Verdict(decision: .hold(reason: "playing"), reviewAt: nil) }
+        // ESS-532: realtime pending must take priority over active-turn checks
+        // because the turn journal won't show the turn as active until the
+        // relay status callback arrives (1-2 s after recording ends). During
+        // that window the audio engine must stay alive so downlink deltas can
+        // be rendered.
+        if realtimePending {
+            return Verdict(
+                decision: .hold(reason: "realtime_playback_pending"),
+                reviewAt: now.addingTimeInterval(realtimePlaybackPendingTimeout)
+            )
+        }
         if let active = turns.first(where: \.isActive) {
             return Verdict(decision: .hold(reason: "turn_active:\(active.requestId)"), reviewAt: nil)
         }
