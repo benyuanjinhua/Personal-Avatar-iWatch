@@ -264,6 +264,9 @@ final class PushToTalkController: ObservableObject {
 
     /// 录音期间到达的结果语音先挂起，录音结束后补播（不静默丢弃）。
     private var pendingAutoPlayRequestIds: [String] = []
+    /// ESS-541: durable result redelivery is admitted only for the latest
+    /// request/generation. A new press clears all old queued ownership.
+    private var resultPlaybackIsolation = ResultPlaybackIsolation()
     /// ESS-154 T2：同一 request_id 的同种失败终局只播一次触觉（防止
     /// 重复 finishPlayback 回调把用户震到关通知；横幅幂等在 ResultNotificationPolicy
     /// 侧按 request_id 一辈子记账，比这里更严——两层配合，不重复）。
@@ -383,6 +386,10 @@ final class PushToTalkController: ObservableObject {
     /// 保证同一 request_id 的 interim / final 两段各自独立去重——旧实现按裸
     /// request_id 去重会让 final 被 interim 顶掉、静默丢弃。
     private func autoPlayResult(requestId: String) {
+        guard case .accept = resultPlaybackIsolation.decide(requestId: requestId) else {
+            logPlaybackIsolationDrop(incomingRequestId: requestId, source: "speech_attached")
+            return
+        }
         guard state == .idle else {
             Self.logger.info("auto-play deferred: recording in progress (request_id=\(requestId, privacy: .public))")
             enqueueAutoPlay(requestId, reason: "recording")
@@ -421,20 +428,45 @@ final class PushToTalkController: ObservableObject {
         autoPlayResult(requestId: requestId)
     }
 
+    private func logPlaybackIsolationDrop(incomingRequestId: String?, source: String) {
+        guard case .drop(let incoming, let incomingGeneration, let current, let reason) =
+                resultPlaybackIsolation.decide(requestId: incomingRequestId) else { return }
+        let incomingId = incoming ?? "nil"
+        let currentId = current?.requestId ?? "nil"
+        let incomingGen = incomingGeneration.map(String.init) ?? "nil"
+        let currentGen = current.map { String($0.generation) } ?? "nil"
+        WatchLog.info(
+            "player", "cross_turn_audio_dropped", requestId: incoming,
+            detail: "source=\(source) reason=\(reason.rawValue) incoming_request_id=\(incomingId) current_request_id=\(currentId) incoming_generation=\(incomingGen) current_generation=\(currentGen)"
+        )
+    }
+
     func pressBegan() {
         guard state == .idle else { return }
         errorMessage = nil
         releaseRequestedWhileStarting = false
-        if let interrupted = player.currentContext {
-            enqueueAutoPlay(interrupted, reason: "recording_interrupted")
-        }
+        let requestId = UUIDv7.generate()
+        let requestIdString = requestId.uuidString.lowercased()
+        let cleared = pendingAutoPlayRequestIds.count
+        let previous = resultPlaybackIsolation.current
+        pendingAutoPlayRequestIds.removeAll(keepingCapacity: true)
+        let current = resultPlaybackIsolation.begin(requestId: requestIdString)
+        let previousId = previous?.requestId ?? "nil"
+        let previousGeneration = previous.map { String($0.generation) } ?? "nil"
+        WatchLog.info(
+            "player", "playback_generation_opened", requestId: requestIdString,
+            detail: "generation=\(current.generation) previous_request_id=\(previousId) previous_generation=\(previousGeneration) cleared_queue=\(cleared)"
+        )
         player.stop(reason: "recording_started")
         // ESS-535: interrupt the welcome speech before recording starts
         // so the RealtimePlaybackEngine can own the audio session.
         onPressBegan?()
         state = .recording
         let streaming = voiceStreamingEnabled()
-        streamRequestId = streaming ? UUIDv7.generate() : nil
+        // Generate once for both realtime and complete-file paths so result
+        // playback ownership is known from trigger-down, before late frames
+        // can race the recording finish.
+        streamRequestId = requestId
         streamId = streaming ? UUID() : nil
         streamSequence = 0
         streamAborted = false
