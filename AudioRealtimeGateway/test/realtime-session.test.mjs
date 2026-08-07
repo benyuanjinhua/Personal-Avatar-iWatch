@@ -353,6 +353,46 @@ describe('RealtimeSession — downlink ordering', () => {
     )
   })
 
+  it('ESS-516 regression: duplicate audio_done(-1) during deferral stays idempotent (Jackson Bai review on PR #206)', () => {
+    // Reviewer minimal repro: two identical `audio_done(-1)` back-to-back
+    // inside the 1500ms deferral. The buggy version collapsed the second
+    // one into an immediate `downlink_done(-1)` — any real delta after
+    // that then hit `doneEmitted` and got dropped as `post_done`. The
+    // duplicate must leave the deferral armed instead.
+    const clock = controlledClock()
+    const { session, sent, agent, scope, logs } = harness({
+      emptyDoneDeferMs: 1_500,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: -1 })
+    assert.equal(clock.pendingCount(), 1, 'empty-done timer armed on first -1')
+    assert.equal(sent.filter(e => e.type === 'audio.done').length, 0)
+    // Second identical -1 — must NOT commit or clear the timer.
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: -1 })
+    assert.equal(clock.pendingCount(), 1, 'duplicate -1 kept the timer armed')
+    assert.equal(sent.filter(e => e.type === 'audio.done').length, 0, 'duplicate -1 did NOT commit an empty done')
+    assert.ok(logs.some(l => l.evt === 'done_barrier_empty_duplicate'),
+      'duplicate empty-done was logged as such')
+    // Real audio then arrives — none of it should be dropped as post_done.
+    for (let seq = 0; seq < 3; seq++) {
+      agent.emit(scope.request_id, {
+        type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: seq, audio: b64('x'),
+      })
+    }
+    assert.equal(sent.filter(e => e.type === 'audio.delta').length, 3,
+      'every delta forwarded — the whole point of keeping the deferral idempotent')
+    assert.equal(
+      logs.filter(l => l.evt === 'stale_generation_dropped' && l.reason === 'post_done').length,
+      0, 'no post_done drops',
+    )
+    // Real done arrives — barrier releases with the true final_sequence.
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: 2 })
+    const dones = sent.filter(e => e.type === 'audio.done')
+    assert.equal(dones.length, 1)
+    assert.equal(dones[0].final_sequence, 2, 'corrected final_sequence, not the stale -1')
+  })
+
   it('ESS-516: cancel while empty-done is deferred clears the timer without fail-closed', () => {
     const clock = controlledClock()
     const { session, sent, agent, scope, closes } = harness({

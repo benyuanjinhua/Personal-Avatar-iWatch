@@ -462,12 +462,22 @@ export class RealtimeSession {
       return
     }
 
-    // A later `audio.done` arrived while we were deferring. Cancel the
-    // deferral and treat this call as the fresh done — if it's still -1
-    // and no deltas have shown up yet, we commit it below; if it's a real
-    // number, it enters the normal barrier flow. Either way the earlier
-    // `-1` is superseded, not silently kept.
+    // A later `audio.done` arrived while we were deferring.
+    //   - Another negative claim is a duplicate empty-done. Stay idempotent:
+    //     keep the timer armed, leave `_emptyDoneDeferred` set. Collapsing
+    //     it into an immediate commit here would resurrect the ESS-516
+    //     `post_done` path (Jackson Bai review on PR #206).
+    //   - A non-negative claim supersedes the stale `-1`; cancel the timer,
+    //     clear the flag, and let normal barrier flow take over below.
     if (this._emptyDoneDeferred) {
+      if (claimed < 0) {
+        this.log('done_barrier_empty_duplicate', {
+          request_id: this.scope.request_id, session_id: this.scope.session_id,
+          response_id: this.responseId,
+          claimed_final_sequence: claimed,
+        })
+        return
+      }
       this._clearEmptyDoneTimer()
       this._emptyDoneDeferred = false
       this.log('done_barrier_empty_invalidated', {
