@@ -95,8 +95,14 @@ export class RealtimeSession {
     // is dense in `seenDownlinkSequences`, then release ONE downstream
     // `audio.done(final_sequence=pendingFinalSequence)`. Never rewritten.
     this.pendingFinalSequence = null
+    // `done(-1)` is ambiguous until a short bounded window elapses: it can
+    // mean a genuinely empty response, or (as observed in ESS-526) an
+    // upstream marker that races ahead of the first delta.  Do not commit it
+    // downstream until the existing barrier window proves no delta followed.
+    this._emptyDoneWindowElapsed = false
     this.finalSequence = null       // set when the downstream done is released
     this.staleGenerationDropped = 0
+    this.postDoneAudioDropped = 0
     this._barrierTimer = null
 
     this.agentTurn = null
@@ -177,6 +183,7 @@ export class RealtimeSession {
       reason: (reason && String(reason)) || 'peer_closed',
       close_code: typeof code === 'number' ? code : null,
       stale_generation_dropped: this.staleGenerationDropped,
+      post_done_audio_dropped: this.postDoneAudioDropped,
       final_sequence: this.finalSequence,
       done_emitted: this.doneEmitted,
       cancelled: this.cancelled,
@@ -347,14 +354,33 @@ export class RealtimeSession {
   _emitDelta(event) {
     if (this.doneEmitted) {
       this.staleGenerationDropped += 1
+      this.postDoneAudioDropped += 1
       this.log('stale_generation_dropped', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
         reason: 'post_done', sequence: event.sequence,
         total_dropped: this.staleGenerationDropped,
       })
+      this.log('post_done_audio_dropped', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        response_id: this.responseId, code: 'ERR_UPSTREAM_AUDIO_AFTER_DONE',
+        sequence: event.sequence, dropped_count: this.postDoneAudioDropped,
+      })
       return
     }
     if (!Number.isInteger(event.sequence) || event.sequence < 0) return
+    // A first delta inside the bounded empty-response window disproves the
+    // provisional done(-1).  Withdraw only that ambiguous marker.  A later
+    // done(N) is still held and released verbatim under the ESS-388 barrier.
+    if (this.pendingFinalSequence !== null && this.pendingFinalSequence < 0
+      && this.seenDownlinkSequences.size === 0) {
+      this.log('premature_empty_done_withdrawn', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        response_id: this.responseId, first_sequence: event.sequence,
+      })
+      this.pendingFinalSequence = null
+      this._emptyDoneWindowElapsed = false
+      this._clearBarrierTimer()
+    }
     // Deltas whose sequence is beyond the upstream-claimed final_sequence
     // are dropped — upstream is contradicting itself, and forwarding them
     // would let a client receive frames past the promised barrier.
@@ -440,8 +466,11 @@ export class RealtimeSession {
     if (this.doneEmitted) return
     if (this.pendingFinalSequence === null) return
     const target = this.pendingFinalSequence
-    // A negative claim (e.g. -1) means "no frames" — release immediately.
-    if (target < 0 || this._highestDensePrefix() >= target) {
+    // A negative claim (e.g. -1) is only a proven empty response after its
+    // bounded observation window.  Positive barriers retain their original
+    // dense-prefix semantics and are never rewritten.
+    if ((target < 0 && this._emptyDoneWindowElapsed)
+      || (target >= 0 && this._highestDensePrefix() >= target)) {
       this._clearBarrierTimer()
       this.finalSequence = target
       this.doneEmitted = true
@@ -469,6 +498,16 @@ export class RealtimeSession {
       if (this.state !== OPEN) return
       if (this.doneEmitted || this.cancelled) return
       if (this.pendingFinalSequence === null) return
+      if (this.pendingFinalSequence < 0) {
+        this._emptyDoneWindowElapsed = true
+        this.log('empty_done_window_elapsed', {
+          request_id: this.scope.request_id, session_id: this.scope.session_id,
+          response_id: this.responseId,
+          pending_final_sequence: this.pendingFinalSequence,
+        })
+        this._maybeReleaseDone()
+        return
+      }
       // Structured fail-closed: single event, no forged smaller endpoint,
       // no double execution. Client falls back per turn to the legacy path.
       this.log('done_barrier_gap_timeout', {

@@ -261,13 +261,41 @@ describe('RealtimeSession — downlink ordering', () => {
     assert.equal(logs.filter(l => l.evt === 'done_barrier_gap_timeout').length, 0)
   })
 
-  it('audio.done with final_sequence=-1 (empty response) releases immediately', () => {
-    const { session, sent, agent, scope } = harness()
+  it('audio.done with final_sequence=-1 releases after a bounded empty-response window', () => {
+    const clock = controlledClock()
+    const { session, sent, agent, scope, logs } = harness({
+      doneBarrierGapMs: 2_000,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
     start(session, scope)
     agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: -1 })
+    assert.equal(sent.some(e => e.type === 'audio.done'), false, 'ambiguous empty done is held')
+    assert.equal(clock.pendingCount(), 1)
+    clock.fireAll()
     const done = sent.find(e => e.type === 'audio.done')
-    assert.ok(done, 'done emitted for empty response')
+    assert.ok(done, 'done emitted once the empty-response window elapsed')
     assert.equal(done.final_sequence, -1)
+    assert.ok(logs.some(l => l.evt === 'empty_done_window_elapsed'))
+  })
+
+  it('withdraws premature done(-1) and delivers all later deltas before the real done(N)', () => {
+    const clock = controlledClock()
+    const { session, sent, agent, scope, logs } = harness({
+      doneBarrierGapMs: 2_000,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: -1 })
+    for (const sequence of [0, 1, 2]) {
+      agent.emit(scope.request_id, {
+        type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence, audio: b64('x'),
+      })
+    }
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: 2 })
+    assert.deepEqual(sent.filter(e => e.type === 'audio.delta').map(e => e.sequence), [0, 1, 2])
+    assert.deepEqual(sent.filter(e => e.type === 'audio.done').map(e => e.final_sequence), [2])
+    assert.equal(clock.pendingCount(), 0, 'provisional empty-done timer was cancelled')
+    assert.ok(logs.some(l => l.evt === 'premature_empty_done_withdrawn' && l.request_id === 'r-1'))
   })
 
   it('gap timeout fires exactly one structured fail-closed and drops late deltas', () => {
@@ -336,6 +364,9 @@ describe('RealtimeSession — downlink ordering', () => {
     agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: 1, audio: b64('x') })
     assert.equal(sent.filter(e => e.type === 'audio.delta').length, 1)
     assert.ok(logs.some(l => l.evt === 'stale_generation_dropped' && l.reason === 'post_done'))
+    assert.ok(logs.some(l => l.evt === 'post_done_audio_dropped'
+      && l.code === 'ERR_UPSTREAM_AUDIO_AFTER_DONE'
+      && l.request_id === 'r-1' && l.dropped_count === 1))
   })
 })
 
