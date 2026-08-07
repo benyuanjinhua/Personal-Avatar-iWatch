@@ -93,6 +93,17 @@ enum ErrorCueCatalog {
                 clip: "ErrorCue_AudioTooShort",
                 recoveryFamily: .reRecord
             )
+        // ESS-538 · 族 A（重说）：录音进行中被降腕息屏/会话中断截断，
+        // 残片已本地丢弃、从未提交——没有缓存可重发，唯一恢复动作是
+        // 重新按住说一次。与 ERR_AUDIO_TOO_SHORT 区分：用户不是按太短，
+        // 是这次录音被系统打断了。
+        case "ERR_RECORDING_INTERRUPTED":
+            return ErrorCueEntry(
+                code: code,
+                text: "刚才录音被打断了，按住我重新说一次。",
+                clip: nil,
+                recoveryFamily: .reRecord
+            )
         case "ERR_TRANSCRIPT_DISCARDED":
             return ErrorCueEntry(
                 code: code,

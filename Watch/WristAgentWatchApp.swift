@@ -51,7 +51,12 @@ struct WristAgentWatchApp: App {
                         WatchLogShipper.shared.ship(reason: "foreground")
                         services.pushToTalk.evictStaleAudio()
                         services.pushToTalk.presentUnreadIfAny()
+                    case .inactive:
+                        // ESS-538：录音进行中降腕息屏——打断流标记，收尾时
+                        // 残片按 RecordingInterruptionPolicy 丢弃并提示重说。
+                        services.pushToTalk.noteScreenOffDuringRecording(phase: "inactive")
                     case .background:
+                        services.pushToTalk.noteScreenOffDuringRecording(phase: "background")
                         WatchLogShipper.shared.ship(reason: "background")
                     default: break
                     }

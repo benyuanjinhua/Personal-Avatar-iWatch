@@ -25,6 +25,15 @@ final class RecorderErrorCopyTests: XCTestCase {
         )
     }
 
+    /// ESS-538：被息屏/中断截断的录音给出「被打断、重说」的可行动文案，
+    /// 与「按太短」区分——用户不是按太短，是录音被系统打断了。
+    func testRecordingInterruptedAsksUserToReRecord() {
+        XCTAssertEqual(
+            RecorderError.recordingInterrupted.errorDescription,
+            "刚才录音被打断了，请按住重新说一次。"
+        )
+    }
+
     func testAllRecorderErrorsRemainChineseAndDoNotExposeSystemDomains() {
         let descriptions = [
             RecorderError.permissionDenied,
@@ -32,9 +41,10 @@ final class RecorderErrorCopyTests: XCTestCase {
             .cannotCreateRecorder,
             .noRecording,
             .recordingNeverStarted,
+            .recordingInterrupted,
         ].compactMap(\.errorDescription)
 
-        XCTAssertEqual(descriptions.count, 5)
+        XCTAssertEqual(descriptions.count, 6)
         for description in descriptions {
             XCTAssertFalse(description.contains("OSStatus"))
             XCTAssertFalse(description.contains("NSOSStatusErrorDomain"))

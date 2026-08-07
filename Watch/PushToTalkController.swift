@@ -536,6 +536,15 @@ final class PushToTalkController: ObservableObject {
         finishRecording()
     }
 
+    /// ESS-538：录音进行中息屏/降腕/切后台——给本次录音打断流标记。
+    /// 不主动收尾：手势释放仍走原 finish 路径，残片丢弃由
+    /// RecordingInterruptionPolicy 在收尾时裁决（残片提示重说，
+    /// 说完才息屏的完整录音照常提交）。
+    func noteScreenOffDuringRecording(phase: String) {
+        guard state == .recording else { return }
+        recorder.noteExternalInterruption(reason: "scene_phase=\(phase)")
+    }
+
     private func finishRecording() {
         guard state == .recording else { return }
         state = .finishing
@@ -556,6 +565,9 @@ final class PushToTalkController: ObservableObject {
                     code: "ERR_AUDIO_TOO_SHORT"
                 )
                 errorMessage = RecorderError.recordingTooShortDescription
+                // ESS-538：太短不提交 = 本回合零提交，实时回合同样当场取消，
+                // 不让 PCM tap 挂到下次按住（与收尾抛错路径同一清理）。
+                abortUnsubmittedRealtimeTurn()
                 // ESS-180：本地失败与 Bridge 侧 ERR_AUDIO_TOO_SHORT 走同一
                 // 拟人化卡片；触觉在 presenter 内响一次，此处不再重复播放，
                 // 避免同一次「按太短」震两下。
@@ -565,17 +577,40 @@ final class PushToTalkController: ObservableObject {
             submit(recording: recording)
         } catch {
             errorMessage = Self.recordingErrorDescription(error)
+            // ESS-538：收尾抛错 = 本回合零提交。streaming 开启时 beginTurn
+            // 已在 pressBegan 跑过，必须当场取消（否则 PCM tap 挂到下次
+            // 按住才停），streamRequestId 一并清掉，避免后续 retry() 误用
+            // 陈旧 request_id。
+            abortUnsubmittedRealtimeTurn()
             // ESS-375: recordingNeverStarted 走 ERR_AUDIO_TOO_SHORT cue
             // （与 too-short guard 统一），让手表看到可行动中文提示而非
             // 通用"录音器错误"卡片。
             let code: String
             if case RecorderError.recordingNeverStarted = error {
                 code = "ERR_AUDIO_TOO_SHORT"
+            } else if case RecorderError.recordingInterrupted = error {
+                code = "ERR_RECORDING_INTERRUPTED"
             } else {
                 code = "ERR_RECORDER_FINISH"
             }
             presentAvatarError(code: code, requestId: nil)
         }
+    }
+
+    /// ESS-538：收尾抛错路径的实时回合清理。finish() 抛错 = 本回合不会有
+    /// 任何提交；取消已 begin 的实时回合让 PCM tap 停止、uplink 作废、
+    /// realtimePlaybackPending 解除（cancel → turnFinished →
+    /// onRealtimePendingResolved → VoiceSessionKeeper 释放）。
+    private func abortUnsubmittedRealtimeTurn() {
+        if let requestId = streamRequestId?.uuidString.lowercased() {
+            pendingFallbackReason.removeValue(forKey: requestId)
+            if let adapter = realtimeAdapter, adapter.currentTurn?.requestId == requestId {
+                WatchLog.info("realtime", "unsubmitted_turn_aborted", requestId: requestId)
+                adapter.cancel(reason: .cancelled)
+            }
+        }
+        streamRequestId = nil
+        clearStreamStateAfterAbort()
     }
 
     /// 提交录音：生成信封发送，同时留一份重试缓存（失败重发不用重新说话）。

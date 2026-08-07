@@ -103,6 +103,7 @@
 		87589EC57C16EFE13A79738E /* RealtimeMediaSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49D1CFEB2C03FAA07DA192C1 /* RealtimeMediaSession.swift */; };
 		88162BC2A9F5ADF2F56E6246 /* PlaybackEndgamePolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F3363DB5FB9EF9FF44F0744 /* PlaybackEndgamePolicy.swift */; };
 		8A5EEAA528E32C9DAB749BFD /* AudioSessionPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC3ECBAA9A62DE9AED7C9C34 /* AudioSessionPolicy.swift */; };
+		8B6A6F0FCCDA3292ED9D8EDC /* RecordingInterruptionPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 660A4DC8375BF7F24E66C40F /* RecordingInterruptionPolicy.swift */; };
 		8D74BBCA5601E569150562B6 /* PhoneHistoryViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0A1CA98E116775B1257DB33 /* PhoneHistoryViews.swift */; };
 		8DF32A5F83D4DAB84323E012 /* SpeechVaultCleaner.swift in Sources */ = {isa = PBXBuildFile; fileRef = D22D20695006303F619B7C73 /* SpeechVaultCleaner.swift */; };
 		8E707FCD5F8E34356AF80305 /* WatchDownlinkOutbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA60FA5DC7EA82EC5729B54B /* WatchDownlinkOutbox.swift */; };
@@ -156,6 +157,7 @@
 		CEA31973C29CBFC9511A3BAB /* PlaybackEndgamePolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F3363DB5FB9EF9FF44F0744 /* PlaybackEndgamePolicy.swift */; };
 		CFE0EF1FB0CD60D2CA12A03B /* SelfCheckPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5781515B605FE09873311309 /* SelfCheckPolicy.swift */; };
 		D23E8DF58407ADEEE6F36F3A /* SubtitleScript.swift in Sources */ = {isa = PBXBuildFile; fileRef = C426A9FB7C2456FD57F1BA1E /* SubtitleScript.swift */; };
+		D3C4178F9DE0CC5B10EE75A9 /* RecordingInterruptionPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 660A4DC8375BF7F24E66C40F /* RecordingInterruptionPolicy.swift */; };
 		D3EFA8AA982DB431C5827917 /* ErrorCue_Retryable.m4a in Resources */ = {isa = PBXBuildFile; fileRef = 96150E5C8428B98CF5C6765B /* ErrorCue_Retryable.m4a */; };
 		D482537406EC7EC94069E3AF /* WristAgentPhoneRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79F87E24A5046DA1229304B2 /* WristAgentPhoneRelay.swift */; };
 		D51204118681270691727D4C /* SpeechPlayerInterruptionEvidenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FDE52A8C1B2854E4646A286 /* SpeechPlayerInterruptionEvidenceTests.swift */; };
@@ -276,6 +278,7 @@
 		5CA20270A3348D748D8929F4 /* AudioRealtimeAgentConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRealtimeAgentConfig.swift; sourceTree = "<group>"; };
 		5CAC488B088EEC6542FF5CAB /* PlaybackEndgameChainTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackEndgameChainTests.swift; sourceTree = "<group>"; };
 		63B4FAFE429B15682CA5E9F8 /* RealtimeMediaWireFormat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeMediaWireFormat.swift; sourceTree = "<group>"; };
+		660A4DC8375BF7F24E66C40F /* RecordingInterruptionPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingInterruptionPolicy.swift; sourceTree = "<group>"; };
 		670B3104058BFB1235409EF2 /* PhoneRealtimeWebSocketTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneRealtimeWebSocketTransport.swift; sourceTree = "<group>"; };
 		67C6A03628F073DFB7BD92CF /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		69D850E7D15B7525D07D9DBF /* ErrorCue_VoiceBusy.m4a */ = {isa = PBXFileReference; path = ErrorCue_VoiceBusy.m4a; sourceTree = "<group>"; };
@@ -393,6 +396,7 @@
 				63B4FAFE429B15682CA5E9F8 /* RealtimeMediaWireFormat.swift */,
 				716B2884D666AEE57BA6AB37 /* RealtimePlaybackReceiptTracker.swift */,
 				D57D9FD3BB121F4AAB879ACF /* RealtimeUplinkStream.swift */,
+				660A4DC8375BF7F24E66C40F /* RecordingInterruptionPolicy.swift */,
 				13475F099EA8ADC39FB4651D /* ResultNotificationPolicy.swift */,
 				52E037554E3E0CDA3ACF1D0B /* ResultPlaybackLedger.swift */,
 				88E0836FA054B69DBE4F3E16 /* RetryRecordingStore.swift */,
@@ -727,6 +731,7 @@
 				ADA9DA139E2F37E309F1C70C /* RealtimeMediaWireFormat.swift in Sources */,
 				AFE89128B354D801AA7BF512 /* RealtimePlaybackReceiptTracker.swift in Sources */,
 				954F45FCF33EA311254AEDDF /* RealtimeUplinkStream.swift in Sources */,
+				D3C4178F9DE0CC5B10EE75A9 /* RecordingInterruptionPolicy.swift in Sources */,
 				06514EB08E697AAAEEA6F10A /* ResultNotificationPolicy.swift in Sources */,
 				8E7B08D7721A06F71A5C9644 /* ResultPlaybackLedger.swift in Sources */,
 				414956366089B530CE9C6F98 /* RetryRecordingStore.swift in Sources */,
@@ -797,6 +802,7 @@
 				2A378D7F61247334FF9CE66A /* RealtimePlaybackEngine.swift in Sources */,
 				9CC8DFCBBBA03E71A76FA9BB /* RealtimePlaybackReceiptTracker.swift in Sources */,
 				B6585933C8D51C2E81B72056 /* RealtimeUplinkStream.swift in Sources */,
+				8B6A6F0FCCDA3292ED9D8EDC /* RecordingInterruptionPolicy.swift in Sources */,
 				3216F8C5F4A8D25615A5F8E4 /* ResultNotificationPolicy.swift in Sources */,
 				070E69DBE697BF3DE0503A23 /* ResultNotifier.swift in Sources */,
 				AB03B7110AD0AB3696A9E607 /* ResultPlaybackLedger.swift in Sources */,
