@@ -141,6 +141,13 @@ public enum RealtimeReducerAction: Equatable, Sendable {
     case audioDoneTimeout(turnId: UUID, generation: UUID, atMs: Int64)
     /// 用户点球打断（增强半双工 MVP 唯一打断路径）。
     case userBargeIn(nextTurnId: UUID, atMs: Int64)
+    /// 由上层为下一轮显式登记 turn。§1.2 会话层环路 `playing → listening → committing → …`
+    /// 的第 2 圈由此闭合：`audioDone` / `audioDoneTimeout` / `turnFailed` 之后
+    /// `session == .listening && currentTurn == nil`，由上层拿到新 `turnId` 后
+    /// 发本 action；其他任何状态都必须被 `rejected` 并给明确 reason。
+    /// ESS-567：本 action 是 S2-1 接入 reducer 的硬前置，禁止在 reducer 体外
+    /// 直接改写 `state.currentTurn` 装载下一轮。
+    case beginNextTurn(turnId: UUID, atMs: Int64)
     /// 用户点 X 退出。
     case userExit(atMs: Int64)
     /// `conversation.close` 已被服务端 ack；ending → idle 收口。
@@ -264,6 +271,9 @@ public enum RealtimeSessionReducer {
         case let .userBargeIn(nextTurnId, atMs):
             handleUserBargeIn(nextTurnId: nextTurnId, atMs: atMs,
                               state: &state, effects: &effects)
+        case let .beginNextTurn(turnId, atMs):
+            handleBeginNextTurn(turnId: turnId, atMs: atMs,
+                                state: &state, effects: &effects)
         case let .userExit(atMs):
             handleUserExit(atMs: atMs, state: &state, effects: &effects)
         case let .sessionClosed(atMs):
@@ -566,12 +576,11 @@ public enum RealtimeSessionReducer {
         moveTurn(to: .completed, reason: "audio_done", atMs: atMs,
                  state: &state, effects: &effects)
         retireGeneration(generation, state: &state)
-        // 生成新的 capturing 占位，仍由调用方在下一次 vadFinal 前给 turnId；
-        // 这里把 currentTurn 清空，交给调用方 explicit `beginTurn` —— 但为了
-        // 让「回到 listening」自动可用（§1.2），我们提供一个下一个 turn 的空位
-        // 由调用方通过 audio_done 时不提供 turnId 无法完成，改由 `channelReady`/
-        // `explicitResume` 的路径不同：正常闭环下上层在观察到 audio_done 后自行
-        // 调用 `beginTurn` —— 见 handler 末尾的 effect 提示。
+        // 契约（ESS-567）：audio_done 只负责收尾——把 currentTurn 清空并回到 listening。
+        // §1.2 环路的第 2 圈由上层显式驱动：观察到本次 audio_done 后，调用方拿到
+        // 下一轮的 turnId 再发 `.beginNextTurn(turnId:, atMs:)`，reducer 才会装上
+        // 新的 capturing turn。本 handler **不** 自动构造下一轮占位，避免上层无
+        // turnId 时被迫在 reducer 体外改写 state.currentTurn。
         state.currentTurn = nil
         moveSession(to: .listening, reason: "audio_done", atMs: atMs,
                     state: &state, effects: &effects)
@@ -639,6 +648,43 @@ public enum RealtimeSessionReducer {
         moveSession(to: .listening, reason: "user_barge_in", atMs: atMs,
                     state: &state, effects: &effects)
         effects.append(.beginTurn(turnId: nextTurnId, atMs: atMs))
+    }
+
+    private static func handleBeginNextTurn(
+        turnId: UUID,
+        atMs: Int64,
+        state: inout RealtimeSessionSnapshot,
+        effects: inout [RealtimeReducerEffect]
+    ) {
+        // 前置 1：会话必须处于 listening（audioDone / audioDoneTimeout / turnFailed 后的稳态）。
+        guard state.session == .listening else {
+            effects.append(.rejected(
+                action: "begin_next_turn", from: state.session,
+                reason: "begin_next_turn_requires_listening"
+            ))
+            return
+        }
+        // 前置 2：currentTurn 必须为空——防止在已装载 turn（barge-in / explicitResume 已
+        // 自建下一轮）之上重复覆盖。
+        guard state.currentTurn == nil else {
+            effects.append(.rejected(
+                action: "begin_next_turn", from: state.session,
+                reason: "begin_next_turn_requires_no_current_turn"
+            ))
+            return
+        }
+        state.currentTurn = RealtimeTurnRuntime(
+            turnId: turnId, generation: nil,
+            phase: .capturing, enteredAtMs: atMs
+        )
+        // 显式发出 logTurnTransition 让上层可观察到「新 turn 已进入 capturing」——
+        // from == to == .capturing 语义为「turn 创建」，与既有 phase-to-phase 迁移
+        // 用同一通道，避免 S2-1 集成方为「turn 创建」再定义一条独立日志格式。
+        effects.append(.logTurnTransition(
+            turnId: turnId, from: .capturing, to: .capturing,
+            reason: "begin_next_turn", generation: nil
+        ))
+        effects.append(.beginTurn(turnId: turnId, atMs: atMs))
     }
 
     private static func handleUserExit(
