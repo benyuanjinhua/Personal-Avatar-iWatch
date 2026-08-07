@@ -37,14 +37,16 @@ final class RuntimeSessionPolicyTests: XCTestCase {
         turns: [VoiceTurnRecord] = [],
         delivered: Set<String> = [],
         isRecording: Bool = false,
-        isPlaying: Bool = false
+        isPlaying: Bool = false,
+        realtimePending: Bool = false
     ) -> RuntimeSessionPolicy.Verdict {
         RuntimeSessionPolicy.decide(
             turns: turns,
             deliveredRequestIds: delivered,
             isRecording: isRecording,
             isPlaying: isPlaying,
-            now: now
+            now: now,
+            realtimePending: realtimePending
         )
     }
 
@@ -152,6 +154,50 @@ final class RuntimeSessionPolicyTests: XCTestCase {
             result: VoiceResultPayload(summary: "好的", isTruncated: false, speechSha256: "ab", speechDurationMs: 1000)
         )
         XCTAssertEqual(decide(turns: [turn], isRecording: true).decision, .hold(reason: "recording"))
+    }
+
+    // MARK: ESS-532 实时流式待播持有
+
+    func testRealtimePendingHoldsWithTimeout() {
+        // 录音结束 → 下行首帧到达前：realtimePending=true 持有 session，
+        // 防止降腕挂起 AVAudioEngine 导致 delta 无法渲染。
+        let verdict = decide(realtimePending: true)
+        XCTAssertEqual(verdict.decision, .hold(reason: "realtime_playback_pending"))
+        XCTAssertEqual(
+            verdict.reviewAt,
+            now.addingTimeInterval(RuntimeSessionPolicy.realtimePlaybackPendingTimeout)
+        )
+    }
+
+    func testRealtimePendingTakesPriorityOverActiveTurn() {
+        // 实时待播必须在活跃回合之前返回——turn journal 尚未标记为 active，
+        // 但下行 delta 已经在途。如果先检查 activeTurn（返回 release），
+        // 整个 realtimePending 逻辑就白写了。
+        let turn = makeTurn(states: [.recorded])
+        // 非活跃回合（.recorded 不满足 isActive），realtimePending=true 应持有。
+        let verdict = decide(turns: [turn], realtimePending: true)
+        XCTAssertEqual(verdict.decision, .hold(reason: "realtime_playback_pending"))
+    }
+
+    func testRealtimePendingExtendedSessionStarts() {
+        let decision = decide(realtimePending: true).decision
+        XCTAssertTrue(RuntimeSessionPolicy.shouldStartExtendedSession(for: decision))
+    }
+
+    func testRealtimePendingDoesNotOverrideRecording() {
+        // 录音中 realtimePending 也应为 true（PCM 采集和下行准备可以重叠），
+        // 但 decision 理由应为 recording（更强的 hold reason）。
+        XCTAssertEqual(
+            decide(isRecording: true, realtimePending: true).decision,
+            .hold(reason: "recording")
+        )
+    }
+
+    func testRealtimePendingDoesNotOverridePlaying() {
+        XCTAssertEqual(
+            decide(isPlaying: true, realtimePending: true).decision,
+            .hold(reason: "playing")
+        )
     }
 
     // MARK: ESS-58 锁屏收回后的重持

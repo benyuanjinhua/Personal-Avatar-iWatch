@@ -33,16 +33,23 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
     private var deliveredRequestIds: Set<String> = []
     private var isRecording = false
     private var isPlaying = false
+    /// ESS-532: true when a realtime streaming turn has been committed
+    /// uplink and the first playback render event has not yet fired.
+    private var isRealtimePending = false
 
     private var reviewTimer: Timer?
     private var cancellables: Set<AnyCancellable> = []
 
     /// 输入全部走 publisher：@Published 在 willSet 时发布，直接读属性会拿到旧值，
     /// 所以这里只依赖发布出来的新值，不回读来源对象。
+    /// - Parameters:
+    ///   - realtimePending: ESS-532, true when a realtime streaming turn uplink
+    ///     has been committed and the first playback frame has not yet rendered.
     func bind(
         turns: AnyPublisher<[VoiceTurnRecord], Never>,
         playing: AnyPublisher<Bool, Never>,
-        recording: AnyPublisher<Bool, Never>
+        recording: AnyPublisher<Bool, Never>,
+        realtimePending: AnyPublisher<Bool, Never> = Just(false).eraseToAnyPublisher()
     ) {
         turns
             .sink { [weak self] value in
@@ -65,6 +72,13 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
                 if value { self.restartSuppressed = false }
                 self.isRecording = value
                 self.reevaluate()
+            }
+            .store(in: &cancellables)
+        realtimePending
+            .removeDuplicates()
+            .sink { [weak self] value in
+                self?.isRealtimePending = value
+                self?.reevaluate()
             }
             .store(in: &cancellables)
     }
@@ -109,7 +123,8 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
             deliveredRequestIds: deliveredRequestIds,
             isRecording: isRecording,
             isPlaying: isPlaying,
-            now: Date()
+            now: Date(),
+            realtimePending: isRealtimePending
         )
         scheduleReview(at: verdict.reviewAt)
         switch verdict.decision {

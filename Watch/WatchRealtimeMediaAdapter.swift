@@ -87,6 +87,13 @@ final class WatchRealtimeMediaAdapter {
     typealias FullFileFallback = @MainActor (RealtimeMediaSession.TurnHandle,
                                              RealtimeUplinkStream.FallbackReason) -> Void
 
+    /// ESS-532: called when the realtime playback pending state is resolved —
+    /// either the first frame has started rendering, the turn fell back to
+    /// complete-file, or the turn finished entirely. The PushToTalkController
+    /// wires this to clear `realtimePlaybackPending` so the VoiceSessionKeeper
+    /// can release the ExtendedRuntimeSession.
+    var onRealtimePendingResolved: (@MainActor () -> Void)?
+
     let session: RealtimeMediaSession
     private let recorder: Recorder
     private let player: Player
@@ -129,6 +136,9 @@ final class WatchRealtimeMediaAdapter {
             guard let self else { return }
             switch event {
             case .started(let requestId, let sessionId, let responseId):
+                // ESS-532: first frame rendered — playback is live now, the
+                // ExtendedRuntimeSession can be released.
+                self.onRealtimePendingResolved?()
                 // ESS-330 v3: forward the response_id the player emitted
                 // (which was preserved per chunk through the reorder buffer).
                 // No session_id substitution — Bixuan's acceptance criteria
@@ -317,6 +327,9 @@ final class WatchRealtimeMediaAdapter {
                 fullFileFallback(handle, reason)
                 logger("uplink_fallback reason=\(reason) request=\(handle.requestId)")
             }
+            // ESS-532: uplink fallback resolves the pending state so the
+            // VoiceSessionKeeper can release.
+            onRealtimePendingResolved?()
         case .playbackReady(let playables):
             player.enqueue(playables: playables)
         case .playbackCleared(let bytesDropped):
@@ -334,6 +347,8 @@ final class WatchRealtimeMediaAdapter {
             barrierTimer.cancel()
             player.stop(barge: false)
             logger("downlink_fallback reason=\(reason)")
+            // ESS-532: downlink fallback resolves pending so the keeper releases.
+            onRealtimePendingResolved?()
             if case .doneBarrierTimedOut(let missing) = reason {
                 WatchLog.error(
                     "realtime", "done_barrier_timeout",
@@ -478,6 +493,10 @@ final class WatchRealtimeMediaAdapter {
                 currentTurn = nil
                 currentResponseId = nil
             }
+            // ESS-532: turn finished (audio.done + playback complete, or
+            // cancel/interrupt) clears the pending hold so the
+            // ExtendedRuntimeSession can be released.
+            onRealtimePendingResolved?()
             logger("turn_finished request=\(handle.requestId) reason=\(reason)")
         }
     }
