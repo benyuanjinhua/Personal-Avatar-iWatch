@@ -63,6 +63,12 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
     private let audioEngine: AVAudioEngine
     private let playerNode: AVAudioPlayerNode
     private let format: AVAudioFormat
+    /// ESS-532: the recorder activates `.playAndRecord` during recording then
+    /// deactivates it in `finish()`. If the engine was started under the
+    /// recorder's session, it keeps running after deactivation but produces
+    /// silence — every delta enqueued thereafter is silently lost.
+    /// Activating `.playback` on the first buffer closes that gap.
+    private var audioSessionGate = RealtimePlaybackAudioSessionGate()
 
     private(set) var currentTurn: RealtimeMediaSession.TurnHandle?
     private(set) var isRunning = false
@@ -108,6 +114,22 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
 
     func enqueue(playables: [RealtimeDownlinkPlayback.PlayableChunk]) {
         guard let turn = currentTurn else { return }
+        // ESS-532: the recorder deactivates the shared AVAudioSession when
+        // recording ends. Re-activate it for playback before the first
+        // buffer lands so the engine can actually render.
+        do {
+            try audioSessionGate.activate {
+                let session = AVAudioSession.sharedInstance()
+                try session.setCategory(.playback, mode: .default)
+                try session.setActive(true)
+            }
+        } catch {
+            onPlaybackEvent?(.failed(
+                requestId: turn.requestId, sessionId: turn.sessionId,
+                responseId: nil, code: "ERR_AUDIO_SESSION"
+            ))
+            return
+        }
         for playable in playables where
             playable.chunk.requestId == turn.requestId &&
             playable.chunk.streamId == turn.sessionId {
@@ -170,6 +192,8 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         }
         currentTurn = nil
         tracker.reset()
+        audioSessionGate.reset()
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
     func shutdown() {
