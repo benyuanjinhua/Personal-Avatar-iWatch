@@ -152,13 +152,17 @@ final class PhoneClientLog {
 
     private func approxEncodedSize(of entry: ClientLogEntry) -> Int {
         // Rough estimate; the encoder never blows this up by more than ~40 %.
-        let base = 64
-        return base
-            + entry.module.utf8.count
-            + entry.event.utf8.count
-            + (entry.requestId?.utf8.count ?? 0)
-            + (entry.detail?.utf8.count ?? 0)
-            + (entry.error?.description.utf8.count ?? 0)
-            + (entry.error?.code?.utf8.count ?? 0)
+        // Broken into intermediate lets so Swift's expression type checker
+        // (Xcode 26 in CI) doesn't time out on a single long chain of
+        // optional utf8.count summands (ESS-525 CI regression).
+        var total = 64
+        total += entry.module.utf8.count
+        total += entry.event.utf8.count
+        total += entry.requestId?.utf8.count ?? 0
+        total += entry.detail?.utf8.count ?? 0
+        let errorInfo = entry.error
+        total += errorInfo?.description.utf8.count ?? 0
+        total += errorInfo?.code?.utf8.count ?? 0
+        return total
     }
 }
