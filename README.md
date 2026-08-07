@@ -166,7 +166,21 @@ Release 构建只接受 HTTPS。
 ./Scripts/verify.sh
 ```
 
-验证脚本会生成工程、运行共享模型测试，并分别构建 iOS Simulator 与 watchOS Simulator Target。
+验证脚本会生成工程、运行共享模型测试、构建 iOS Simulator Target，并在真实的
+watchOS Simulator 运行时执行 Watch 测试。后续开发统一按以下顺序推进：
+
+1. 开发完成后运行 `./Scripts/verify.sh`；Watch 模拟器测试必须全绿。
+2. 模拟器阶段重点拦截实时流接收、乱序与降级、播放调度，以及
+   `AVAudioEngine` / `AVAudioPlayerNode` 停止后的恢复问题。
+3. 模拟器失败时，保留带 `request_id` 的 `stream` / `realtime` / `player`
+   日志并定位失败层；不得仅以重新打包交由真机发现。
+4. 模拟器全绿后再进入 PR 复审、合入与装机流程。
+5. 麦克风采集、真实音频路由、WCSession 抖动、后台及锁屏行为仍须在合入后
+   真机验收；模拟器全绿不代表这些能力已经通过。
+
+当前 watchOS Simulator 可能没有默认音频输入设备；出现
+`Could not find default input device` / `record_start_failed` 时属于模拟器输入能力
+限制，不能据此判定产品录音链路失败，也不能用它替代真机录音验收。
 
 ## 当前 MVP 边界
 
