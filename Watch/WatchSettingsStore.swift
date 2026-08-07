@@ -318,10 +318,24 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             )
             return
         }
+        // ESS-527: emit `sequence` alongside `kind` so bridge.log can pin
+        // exactly which deltas the Watch actually saw post-dedup — the
+        // reason the caller could not tell "153 dispatches missing 54..76"
+        // from "153 dispatches over the same seq range".
+        let sequenceDetail: String
+        switch envelope.kind {
+        case .audioDelta:
+            sequenceDetail = " sequence=\(envelope.audio?.sequence.description ?? "nil")"
+        case .audioDone:
+            sequenceDetail = " final_sequence=\(envelope.finalSequence?.description ?? "nil")"
+        case .ready, .playbackClear, .responseInterrupted, .bridgeFallback,
+             .transcriptDelta, .transcriptFinal, .generationOpen, .bargeInFailed:
+            sequenceDetail = ""
+        }
         WatchLog.info(
             "turn", "realtime_downlink_dispatch",
             requestId: envelope.requestId,
-            detail: "kind=\(envelope.kind.rawValue) session=\(envelope.sessionId)"
+            detail: "kind=\(envelope.kind.rawValue) session=\(envelope.sessionId)\(sequenceDetail)"
         )
         switch envelope.kind {
         case .ready:
