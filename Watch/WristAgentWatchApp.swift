@@ -50,6 +50,9 @@ struct WristAgentWatchApp: App {
                         services.pushToTalk.sessionKeeper.appDidBecomeActive()
                         WatchLogShipper.shared.ship(reason: "foreground")
                         services.pushToTalk.evictStaleAudio()
+                        // ESS-538：屏灭/后台期间丢弃的录音，回前台补呈现
+                        // 「录音被打断」卡片（屏灭时呈现会被自动收起吞掉）。
+                        services.pushToTalk.presentInterruptedNoticeIfNeeded()
                         services.pushToTalk.presentUnreadIfAny()
                     case .inactive:
                         // ESS-538：录音进行中降腕息屏——打断流标记，收尾时
