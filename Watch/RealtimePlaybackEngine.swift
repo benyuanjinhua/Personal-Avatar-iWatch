@@ -107,6 +107,26 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
     }
 
     func enqueue(playables: [RealtimeDownlinkPlayback.PlayableChunk]) {
+        // ESS-531: if the player hasn't been prepared yet (e.g. recorder.start
+        // failed and the catch block never called prepare), do a best-effort
+        // lazy init so realtime chunks don't silently drop.
+        if currentTurn == nil, let chunk = playables.first?.chunk {
+            let dummyTurn = RealtimeMediaSession.TurnHandle(
+                requestId: chunk.requestId, sessionId: chunk.streamId
+            )
+            do {
+                try prepareInPlace(for: dummyTurn)
+            } catch {
+                WatchLog.error("realtime", "playback_lazy_prepare_failed",
+                               requestId: dummyTurn.requestId,
+                               detail: "error=\(error.localizedDescription)",
+                               code: "ERR_PLAYER_PREPARE")
+                return
+            }
+            WatchLog.info("realtime", "playback_lazy_prepared",
+                          requestId: dummyTurn.requestId,
+                          detail: "state=lazy_init")
+        }
         guard let turn = currentTurn else { return }
         for playable in playables where
             playable.chunk.requestId == turn.requestId &&
@@ -128,6 +148,19 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
                 }
             }
         }
+    }
+
+    /// ESS-531: lazy prepare that doesn't require a prior `beginTurn` call.
+    private func prepareInPlace(for turn: RealtimeMediaSession.TurnHandle) throws {
+        stop(barge: false)
+        currentTurn = turn
+        tracker.reset()
+        if !isRunning {
+            audioEngine.prepare()
+            try audioEngine.start()
+            isRunning = true
+        }
+        playerNode.play()
     }
 
     /// Called by the coordinator when the user talks over the response — dump
