@@ -18,18 +18,25 @@ struct WatchContentView: View {
     @ObservedObject private var debugSettings: WatchDebugSettings
     /// ESS-307：设置页配置 + 下行积压计数。
     @ObservedObject private var settings: WatchSettingsStore
+    /// ESS-573（Wave 1 / F1）：会话态主屏生命周期。isInSession 时主屏
+    /// 切换为会话模式（大球偏下 + X 常驻右下角 + 手势冲突处理）。
+    @ObservedObject private var session: SessionController
     /// ESS-280 方案 A（PM Jackson Bai 2026-08-04 拍板；R-04.6 后一条覆盖前一条）：
     /// 三屏结构 —— 0 = 主界面、1 = 状态时间线（原挂在主屏 NavigationLink 下的
     /// `ConversationTimelineView` 抬升为独立屏）、2 = 设置。冷启动落 tag 0。
     /// 白梦林原话「右滑第 3 屏设置」字面成立即靠这里的 tag 2。
     @State private var selectedTab: Int = 0
+    /// ESS-573：点球手势的 touch-down 时刻——松手时按时长分流
+    /// 「点一下进会话」 vs 「按住说话」（见主屏 orb 手势）。
+    @State private var orbTouchDownAt: Date?
 
     init(
         pushToTalk: PushToTalkController,
         welcome: WelcomeGreeter,
         selfCheck: SelfCheckRunner,
         debugSettings: WatchDebugSettings,
-        settings: WatchSettingsStore
+        settings: WatchSettingsStore,
+        session: SessionController
     ) {
         self.pushToTalk = pushToTalk
         self.welcome = welcome
@@ -41,6 +48,7 @@ struct WatchContentView: View {
         self.errorPresenter = pushToTalk.errorPresenter
         self.debugSettings = debugSettings
         self.settings = settings
+        self.session = session
     }
 
     var body: some View {
@@ -52,27 +60,33 @@ struct WatchContentView: View {
             mainScreen
                 .tag(0)
 
-            NavigationStack {
-                ConversationTimelineView(
-                    journal: journal,
-                    settings: settings,
-                    pushToTalk: pushToTalk,
-                    selectedTab: $selectedTab
-                )
-            }
-            .tag(1)
+            // ESS-573 / PRD §3.5.6：会话中左右滑切屏**禁用**——滑走等于
+            // 静默丢失上下文。实现口径是「会话中②③屏根本不渲染」：
+            // TabView 只剩一页，横扫无页可切，不存在拖到一半回弹的
+            // 中间态（比运行时拒绝 set 更彻底）。
+            if SessionController.showsAuxiliaryTabs(inSession: session.isInSession) {
+                NavigationStack {
+                    ConversationTimelineView(
+                        journal: journal,
+                        settings: settings,
+                        pushToTalk: pushToTalk,
+                        selectedTab: $selectedTab
+                    )
+                }
+                .tag(1)
 
-            NavigationStack {
-                WatchSettingsView(
-                    selfCheck: selfCheck,
-                    debugSettings: debugSettings,
-                    settings: settings,
-                    journal: pushToTalk.journal,
-                    speechVault: pushToTalk.speechVault,
-                    player: pushToTalk.player
-                )
+                NavigationStack {
+                    WatchSettingsView(
+                        selfCheck: selfCheck,
+                        debugSettings: debugSettings,
+                        settings: settings,
+                        journal: pushToTalk.journal,
+                        speechVault: pushToTalk.speechVault,
+                        player: pushToTalk.player
+                    )
+                }
+                .tag(2)
             }
-            .tag(2)
         }
         .tabViewStyle(.page)
         // 字幕式播放视图（ESS-48）：播放开始/纯文本结果到达时由控制器置入会话。
@@ -87,8 +101,24 @@ struct WatchContentView: View {
 
     // MARK: - 屏 0：主界面
 
+    /// ESS-573：主屏双模——会话中（isInSession）整屏切换为会话态 UI
+    /// （PRD §3.5.3 布局：大球偏下、X 常驻右下角、无状态文字）；待机时
+    /// 为既有 PTT 内容，功能完整保留。
     private var mainScreen: some View {
         NavigationStack {
+            if session.isInSession {
+                sessionScreen
+            } else {
+                pttMainContent
+            }
+        }
+        // 结果语音的自动播放已下沉到 PushToTalkController（journal.onSpeechAttached
+        // 按 request_id 定向触发，ESS-41 B3）：不再依赖本视图挂载或该回合仍是
+        // activeTurn——旧的 onChange 触发在「语音后到 + 回合已切换/已判失败」时
+        // 会静默漏播。
+    }
+
+    private var pttMainContent: some View {
             ScrollView {
                 VStack(spacing: 10) {
                     // ESS-180：屏幕分身错误卡片放在顶部，确保失败终态永远
@@ -103,15 +133,37 @@ struct WatchContentView: View {
                     VoiceOrbView(mode: orbMode, size: 70)
                         .padding(.top, 4)
                         .gesture(
+                            // ESS-573 / PRD F1：点一下进入实时对话，按住
+                            // 仍是 PTT。两者共用一个手势且**零延迟**：
+                            // touch-down 立即 pressBegan（与旧行为一致，
+                            // 早期语音不丢）；松手时按时长分流——短按
+                            // （点）转入会话常驻监听（录音不中断、不提交），
+                            // 长按松手走既有 pressEnded 提交。
                             DragGesture(minimumDistance: 0)
                                 .onChanged { _ in
+                                    guard orbTouchDownAt == nil else { return }
+                                    orbTouchDownAt = Date()
                                     welcome.interrupt()
                                     // ESS-65 铁律 3：自检绝不锁死 App——用户按住说话
                                     // 即打断自检让出音频会话，结论记 inconclusive。
                                     selfCheck.interrupt()
                                     pushToTalk.pressBegan()
                                 }
-                                .onEnded { _ in pushToTalk.pressEnded() }
+                                .onEnded { _ in
+                                    let downAt = orbTouchDownAt
+                                    orbTouchDownAt = nil
+                                    let heldSeconds = downAt.map { Date().timeIntervalSince($0) } ?? .infinity
+                                    if SessionController.isTapToEnter(holdSeconds: heldSeconds),
+                                       pushToTalk.state == .recording {
+                                        // 点一下 = 进入会话。录音已在 touch-down
+                                        // 开始（pressBegan 幂等，enterSession 内部
+                                        // 的 onBeginChannel 不会重复发起）；就绪
+                                        // 由真实 uplink ack 驱动，见 SessionController。
+                                        session.enterSession()
+                                    } else {
+                                        pushToTalk.pressEnded()
+                                    }
+                                }
                         )
 
                     if showWelcomeBanner {
@@ -213,11 +265,141 @@ struct WatchContentView: View {
                 }
                 .padding(.horizontal, 6)
             }
+    }
+
+    // MARK: - 会话态主屏（ESS-573 / PRD §3.5.3 布局规格）
+
+    /// 会话模式整屏 UI。布局规格（45mm 基准，【待调】项真机体感定稿）：
+    /// 球直径 140pt、圆心位于垂直 62%（偏下，照 ChatGPT 视觉重心）、上方留白；
+    /// X 常驻右下角、触控区 ≥44×44pt（Apple HIG 最小触控）、视觉 28pt；
+    /// 建立中三点在球正下方 16pt（直径 4pt、间距 6pt）；异常一行文案在球
+    /// 正下方 20pt、单行截断。全程无状态文字（PRD F7 硬约束），唯一例外是
+    /// 异常链的一行可行动文案。
+    private var sessionScreen: some View {
+        GeometryReader { proxy in
+            let orbSize = min(140, proxy.size.width * 0.7)
+            ZStack {
+                // 语音球：会话中只投影、不接手势（F4 手动打断降级在后续
+                // Wave 决定是否给球加点击语义；X 与下滑是 Wave 1 全部出口）。
+                VoiceOrbView(mode: sessionOrbMode, size: orbSize)
+                    .position(x: proxy.size.width / 2, y: proxy.size.height * 0.62)
+                    .accessibilityLabel("实时对话中")
+
+                // 建立中 >800ms 未就绪 → 三点渐显（PRD §3.5.1 第 3 步）。
+                if session.showConnectingDots {
+                    connectingDots
+                        .position(
+                            x: proxy.size.width / 2,
+                            y: proxy.size.height * 0.62 + orbSize / 2 + 16
+                        )
+                        .transition(.opacity)
+                }
+
+                // 异常一行文案（全 PRD 唯一允许状态文字的地方）
+                if let notice = session.failureNotice {
+                    Text(notice)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .padding(.horizontal, 12)
+                        .position(
+                            x: proxy.size.width / 2,
+                            y: proxy.size.height * 0.62 + orbSize / 2 + 20
+                        )
+                        .transition(.opacity)
+                }
+
+                // 首次引导（PRD §3.5.7）：只出现一次，3 秒淡出。
+                if session.showFirstRunGuide {
+                    Text("说话就行，说完停一下")
+                        .font(.caption)
+                        .foregroundStyle(.cyan)
+                        .lineLimit(1)
+                        .padding(.horizontal, 12)
+                        .position(
+                            x: proxy.size.width / 2,
+                            y: proxy.size.height * 0.62 + orbSize / 2 + 20
+                        )
+                        .transition(.opacity)
+                }
+
+                // X：右下角常驻，任何会话态可点——隐私开关，触控区
+                // ≥44×44pt。会话中球不接手势，不存在「点 X 误触球」的
+                // 重叠面（PRD §3.5.3 的不重叠规则由此结构性满足）。
+                Button {
+                    session.exitSession()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 28, height: 28)
+                        .background(Color.white.opacity(0.18), in: Circle())
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("结束对话")
+                .position(
+                    x: proxy.size.width - 6 - 22,
+                    y: proxy.size.height - 6 - 22
+                )
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // 下滑 = 点 X（PRD §3.5.6 拦截规则）。只响应垂直为主的下滑，
+            // 水平/斜向拖拽不触发；表冠不拦（系统默认）。
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 20)
+                    .onEnded { value in
+                        if SessionController.isVerticalDismiss(translation: value.translation) {
+                            session.exitSession()
+                        }
+                    }
+            )
+            .animation(.easeInOut(duration: 0.2), value: session.showConnectingDots)
+            .animation(.easeInOut(duration: 0.2), value: session.failureNotice)
+            .animation(.easeInOut(duration: 0.3), value: session.showFirstRunGuide)
         }
-        // 结果语音的自动播放已下沉到 PushToTalkController（journal.onSpeechAttached
-        // 按 request_id 定向触发，ESS-41 B3）：不再依赖本视图挂载或该回合仍是
-        // activeTurn——旧的 onChange 触发在「语音后到 + 回合已切换/已判失败」时
-        // 会静默漏播。
+    }
+
+    /// 建立中三点提示：直径 4pt、间距 6pt（PRD §3.5.3）。【待调】
+    private var connectingDots: some View {
+        HStack(spacing: 6) {
+            ForEach(0..<3, id: \.self) { _ in
+                Circle().fill(Color.cyan).frame(width: 4, height: 4)
+            }
+        }
+        .accessibilityHidden(true)
+    }
+
+    /// 会话中的球体投影——从既有可观察量计算，与 PTT 屏 orbMode 同一
+    /// 口径，不在 SessionController 里另建回合真相：
+    /// 建立中 → connecting（0.6 Hz）；录音中 → listening 随人声能量；
+    /// 回合在跑/提交中 → thinking；播放中（含实时 PCM）→ speaking；
+    /// 回合已终态且未在录/播 → idle（诚实表达「此刻没在采」，多轮
+    /// 自动回聆听是 F2/F5 Wave 的事）。
+    private var sessionOrbMode: VoiceOrbView.Mode {
+        switch session.state {
+        case .connecting:
+            // ESS-573 rebase 注：orb 侧的「建立中」态收敛到 ESS-572 已合入的
+            // `.establishing`（0.6Hz 同一规格）；分支曾命名为 `.connecting`，
+            // 与 #244 重复实现，rebase 时统一走 main 的命名与视觉。
+            return .establishing
+        case .listening:
+            if pushToTalk.state == .recording {
+                return .listening(level: pushToTalk.recordingLevel)
+            }
+            if isSpeaking || pushToTalk.realtimePlaybackPending {
+                return .speaking
+            }
+            if pushToTalk.state == .finishing || activeTurn?.isActive == true {
+                return .thinking
+            }
+            return .idle
+        case .disconnecting, .idle:
+            return .idle
+        }
     }
 
     // MARK: - 欢迎语（ESS-40）

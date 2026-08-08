@@ -23,6 +23,11 @@ private extension VoiceInteractionCue {
         case .taskAccepted: return .click
         case .resultArrived: return .notification
         case .turnFailed: return .failure
+        // ESS-573 会话触觉口径（PRD §3.5.5）：就绪 .click（最重要——
+        // 「可以开口」的唯一信号）、退出 .stop、通道失败 .failure。
+        case .sessionReady: return .click
+        case .sessionExit: return .stop
+        case .sessionChannelFailed: return .failure
         }
     }
 }

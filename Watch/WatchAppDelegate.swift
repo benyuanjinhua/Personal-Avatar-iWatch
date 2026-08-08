@@ -20,6 +20,9 @@ final class WatchAppServices {
     /// 是 weak，服务图必须自己持有强引用，否则 `didReceiveMessageData` 解出
     /// chunk 时接收器已经被释放，链路静默断在最后一跳。
     private(set) var streamReceiver: WatchStreamReceiver?
+    /// ESS-573（Wave 1 / F1）：会话态主屏生命周期控制器。与其他控制器
+    /// 同级持有在服务图——视图挂载与否不影响会话态与计时器存活。
+    let sessionController = SessionController()
     private var bootstrapped = false
 
     /// 幂等接线 + WCSession 激活；前台启动与后台唤醒共用。
@@ -42,6 +45,37 @@ final class WatchAppServices {
         pushToTalk.onAutoPlayStarted = { [welcome] in welcome.interrupt() }
         // ESS-535: stop welcome speech immediately when user presses to talk.
         pushToTalk.onPressBegan = { [welcome] in welcome.interrupt() }
+        // ESS-573：会话模式接线。
+        // - 进入：与 PTT 共用同一条录音 + 实时上行链（pressBegan），进入
+        //   触觉 .start 由该链既有的 .recordingStarted 兑现，不重复播；
+        // - 就绪/失败：只认真实通道事件（首个 uplink ack / 发送失败 /
+        //   回退 / 超时），由 SessionController 驱动 connecting →
+        //   listening / idle——不在发起后同步宣告 ready；
+        // - 退出：点 X / 下滑走 endSessionChannel，真正释放麦克风。
+        sessionController.playHaptic = { haptic in
+            switch haptic {
+            case .ready: WatchHaptics.play(.sessionReady)
+            case .exit: WatchHaptics.play(.sessionExit)
+            case .failure: WatchHaptics.play(.sessionChannelFailed)
+            }
+        }
+        sessionController.onBeginChannel = { [pushToTalk, selfCheck] in
+            // 与 PTT 手势同一前置：自检让出音频会话（ESS-65 铁律 3）。
+            selfCheck.interrupt()
+            pushToTalk.pressBegan()
+        }
+        sessionController.onTeardownChannel = { [pushToTalk] in
+            pushToTalk.endSessionChannel()
+        }
+        sessionController.onCommitTurn = { [pushToTalk] in
+            pushToTalk.endSessionTurn()
+        }
+        pushToTalk.onRealtimeChannelReady = { [sessionController] in
+            sessionController.markChannelReady()
+        }
+        pushToTalk.onRealtimeChannelFailed = { [sessionController] failure in
+            sessionController.markChannelFailed(failure)
+        }
         // ESS-554：会话级持有期间，所有 SpeechPlayer（结果语音 / 错误语音 /
         // 欢迎语 / 自检）既不重配会话也不 deactivate——会话归
         // ConversationAudioController 独占，点 X 才由它真释放（PD-2）。

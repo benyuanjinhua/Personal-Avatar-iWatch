@@ -13,6 +13,14 @@ enum VoiceInteractionCue: String, CaseIterable, Equatable {
     case resultArrived
     /// 回合失败。
     case turnFailed
+    /// ESS-573：实时会话通道就绪（首个 uplink ack 被对端确认）——
+    /// 「现在可以开口」的唯一信号，PRD §3.5.5 称为最重要的一次触觉。
+    case sessionReady
+    /// ESS-573：用户点 X / 下滑退出实时会话。
+    case sessionExit
+    /// ESS-573：实时会话通道建立失败或中途断开（录音启动失败走既有
+    /// turnFailed 链，不在此重复——同一次失败只震一下）。
+    case sessionChannelFailed
 }
 
 /// 远端状态事件 → 触觉 cue 的映射与去重。
