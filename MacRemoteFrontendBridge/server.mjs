@@ -1479,7 +1479,18 @@ export function createBridge(overrides = {}) {
                 acceptRealtimeTurn()
               }
               else if (message.type === 'playback.started') client.media.playbackStarted(message.response_id)
-              else if (message.type === 'playback.ended') client.media.playbackEnded(message.response_id)
+              else if (message.type === 'playback.ended') {
+                client.media.playbackEnded(message.response_id)
+                const delivered = ledger.recordPlaybackEnded(requestId, {
+                  responseId: message.response_id,
+                  bytesPlayed: message.bytes_played,
+                })
+                log({
+                  evt: 'playback_render_receipt', request_id: requestId,
+                  response_id: message.response_id, bytes_played: message.bytes_played,
+                  delivered: Boolean(delivered?.delivered_ack),
+                })
+              }
               else if (message.type === 'barge_in') client.media.bargeIn()
               else if (message.type === 'close') ws.close(1000, 'completed')
               else throw Object.assign(new Error('unknown media event'), { code: 'ERR_STREAM_PROTOCOL' })

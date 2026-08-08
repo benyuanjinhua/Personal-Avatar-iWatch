@@ -166,7 +166,8 @@ final class WatchVoiceTransport: ObservableObject {
             detail: "bytes=\(audioData.count)"
         )
         lastResult = payload
-        sendResultAck(requestId: payload.requestId)
+        // ESS-521: storing/downloading is not delivery. PushToTalkController
+        // sends the ACK only from SpeechPlayer's successful completion.
     }
 
     func send(envelope: VoiceRequestEnvelope, recording: AudioRecorder.Recording) {

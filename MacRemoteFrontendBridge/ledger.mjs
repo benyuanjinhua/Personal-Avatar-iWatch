@@ -116,6 +116,7 @@ export class TurnLedger extends EventEmitter {
       permission: null,           // { id, ...bounded summary } while permission_required
       result: null,               // { text, audio_base64?, truncated? } once terminal
       delivered_ack: null,        // { at, source } once Watch has durably stored the result
+      playback_receipts: {},      // response_id → real render completion (may arrive before terminal result)
       delivery_attempts: 0,       // terminal snapshot redeliveries (bounded + backed off)
       next_delivery_at: null,
       error: null,                // stable ERR_* code once failed
@@ -169,11 +170,13 @@ export class TurnLedger extends EventEmitter {
       audioBase64 = null // inline audio over cap is dropped; metadata + download endpoint remain
       truncated = true
     }
-    return this.update(requestId, {
+    const turn = this.update(requestId, {
       state,
       permission: null,
       result: { text, audio_base64: audioBase64, audio, truncated, ...extra },
     })
+    this.reconcilePlaybackDelivery(requestId)
+    return turn
   }
 
   // 迟到的结果语音补挂到已完成 turn（ESS-38：announcement 在 task 终态之后
@@ -270,6 +273,39 @@ export class TurnLedger extends EventEmitter {
     return turn
   }
 
+  // ESS-521: only the Watch player's real final-frame receipt can deliver an
+  // audio result. The receipt is persisted even when it races ahead of the
+  // terminal projection; setResult() reconciles that out-of-order case.
+  recordPlaybackEnded(requestId, { responseId, bytesPlayed, source = 'watch_render' } = {}) {
+    const turn = this.turns.get(requestId)
+    if (!turn || typeof responseId !== 'string' || responseId.length === 0
+      || !Number.isSafeInteger(bytesPlayed) || bytesPlayed <= 0) return null
+    turn.playback_receipts = turn.playback_receipts || {}
+    if (!turn.playback_receipts[responseId]) {
+      turn.playback_receipts[responseId] = {
+        at: new Date().toISOString(), bytes_played: bytesPlayed, source,
+      }
+      this.save()
+    }
+    return this.reconcilePlaybackDelivery(requestId)
+  }
+
+  reconcilePlaybackDelivery(requestId) {
+    const turn = this.turns.get(requestId)
+    const responseId = turn?.result?.response_id
+    if (!turn || turn.state !== 'completed' || typeof responseId !== 'string') return turn ?? null
+    const receipt = turn.playback_receipts?.[responseId]
+    if (!receipt) return turn
+    const duplicate = Boolean(turn.delivered_ack)
+    const delivered = this.acknowledgeResult(requestId, { source: receipt.source })
+    this.log({
+      evt: duplicate ? 'result_replayed_after_delivered' : 'result_delivered_after_render',
+      request_id: requestId, response_id: responseId,
+      bytes_played: receipt.bytes_played, duplicate,
+    })
+    return delivered
+  }
+
   dueTerminalDeliveries({ now = Date.now(), terminalTtlMs = 30 * 60 * 1000, maxDeliveryAttempts = 5 } = {}) {
     return [...this.turns.values()].filter(turn =>
       this.isTerminalDeliveryDue(turn, { now, terminalTtlMs, maxDeliveryAttempts }))
@@ -286,7 +322,14 @@ export class TurnLedger extends EventEmitter {
 
   markResultRedelivered(requestId, { now = Date.now(), baseDelayMs = 2_000, maxDelayMs = 300_000 } = {}) {
     const turn = this.turns.get(requestId)
-    if (!turn || !TERMINAL.has(turn.state) || turn.delivered_ack) return null
+    if (!turn || !TERMINAL.has(turn.state)) return null
+    if (turn.delivered_ack) {
+      this.log({
+        evt: 'result_replayed_after_delivered', request_id: requestId,
+        delivered_at: turn.delivered_ack.at, source: turn.delivered_ack.source,
+      })
+      return null
+    }
     turn.delivery_attempts = (turn.delivery_attempts || 0) + 1
     const delay = Math.min(maxDelayMs, baseDelayMs * 2 ** Math.max(0, turn.delivery_attempts - 1))
     turn.next_delivery_at = new Date(now + delay).toISOString()

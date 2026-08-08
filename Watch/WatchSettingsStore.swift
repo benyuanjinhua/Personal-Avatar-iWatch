@@ -452,11 +452,7 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
                 detail: "ttft_ms=\(audioTTFTMs) bytes=\(audioData.count) clock=watch_turn"
             )
         }
-        // interim 语音（ESS-46，非终态信封）落盘不算交付：ACK 只对终态结果发，
-        // 否则 Bridge 会在回合转终态后接受这个早发的 ACK，final 丢失时不再重投（ESS-47）。
-        if envelope.state.isTerminal {
-            voiceTransport?.sendResultAck(requestId: envelope.requestId)
-        }
+        // ESS-521: 终态语音入库也不算送达；真实播放完成回调才 ACK。
         WatchLogShipper.shared.ship(reason: "speech_stored")
     }
 }
