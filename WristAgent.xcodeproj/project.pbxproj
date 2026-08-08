@@ -78,11 +78,13 @@
 		5E9988BFEA3673DAA88C1F70 /* PushToTalkController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FB53D6920928D88D7BE6631 /* PushToTalkController.swift */; };
 		5F2C4158D75D2FD0FC814B50 /* AgentSessionTokenClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76F4CA04541733B7F630C774 /* AgentSessionTokenClient.swift */; };
 		5FC7E0538B77B76B1A1E55BE /* PersistHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 827B4FDF631BEBEFA13118A9 /* PersistHelper.swift */; };
+		5FDDCA93B9385470FA7D76DE /* ConversationHandle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B040C1E0BEEDB84847B5572 /* ConversationHandle.swift */; };
 		6367A07D0292627141725AB1 /* VoiceTurnState.swift in Sources */ = {isa = PBXBuildFile; fileRef = F928ACBF6FA59402D5EB1275 /* VoiceTurnState.swift */; };
 		6430DBD9D8E4A5E8D6567B0D /* PushToTalkDeferredFallbackTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F07106FBFCBFC4FE539B6E5 /* PushToTalkDeferredFallbackTests.swift */; };
 		68781D48489578E0762AA9F7 /* PhoneClientLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA723C972910467E39E5B5DE /* PhoneClientLog.swift */; };
 		687F960B1AC7EF8B42C02037 /* RealtimeSessionReducer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73DA7FDE513C75183DABE590 /* RealtimeSessionReducer.swift */; };
 		68EF687B6F0F17A356355833 /* SpeechPlayerReleaseTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9BD4DBA7700C65F134EF3 /* SpeechPlayerReleaseTests.swift */; };
+		6AD4FA3C94B7437C0C079281 /* RealtimeEventEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7A1BD199C212A963E77B735 /* RealtimeEventEnvelope.swift */; };
 		6B6BB598A338463642687ADC /* SelfCheckYieldBarrierTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE83A54EC29559337BA73D64 /* SelfCheckYieldBarrierTests.swift */; };
 		6E29B7205156CA2469859086 /* ConfirmFallback_README.md in Resources */ = {isa = PBXBuildFile; fileRef = 55FC31B2EB4E09E810DB3EA8 /* ConfirmFallback_README.md */; };
 		6FB34EA4C12FC1D5FFE06F94 /* WatchSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DAF03C2F2C11D4CBC8D9587 /* WatchSettingsView.swift */; };
@@ -147,8 +149,10 @@
 		B61FF83E4DCF49ED91557083 /* EncryptedAudioVault.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7C56A17FC91DC667B51B7D6 /* EncryptedAudioVault.swift */; };
 		B6585933C8D51C2E81B72056 /* RealtimeUplinkStream.swift in Sources */ = {isa = PBXBuildFile; fileRef = D57D9FD3BB121F4AAB879ACF /* RealtimeUplinkStream.swift */; };
 		B8341DE12C11F07793D54054 /* MainStatusCopy.swift in Sources */ = {isa = PBXBuildFile; fileRef = C608A2AC1FA2B2981F7EB790 /* MainStatusCopy.swift */; };
+		BAC7F9CEA797CDA54D80E3D4 /* RealtimeEventEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7A1BD199C212A963E77B735 /* RealtimeEventEnvelope.swift */; };
 		BD58016CCCEA3B35C68B307A /* AvatarErrorPresenterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA9DA8A923948AE9124C19F9 /* AvatarErrorPresenterTests.swift */; };
 		BE736ADFC210C176CA197273 /* VoiceOrbModeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9C49719F53E734FE041D10B /* VoiceOrbModeTests.swift */; };
+		BEF6659D8084AF07F14F8117 /* ConversationHandle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B040C1E0BEEDB84847B5572 /* ConversationHandle.swift */; };
 		BF1A28E74E549CDAB4F6DB58 /* VoiceRelayEvents.swift in Sources */ = {isa = PBXBuildFile; fileRef = C58AEB9B4C54F952DFC96AB2 /* VoiceRelayEvents.swift */; };
 		C0C2D4425ABBD56621171848 /* AudioRealtimeAgentCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFCE4F8E6894C97A571F6634 /* AudioRealtimeAgentCodec.swift */; };
 		C2DD31347EF19DFDA9187ABB /* PhoneRealtimeSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = F824A2078CC9EF4E32AEA011 /* PhoneRealtimeSession.swift */; };
@@ -284,6 +288,7 @@
 		5781515B605FE09873311309 /* SelfCheckPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfCheckPolicy.swift; sourceTree = "<group>"; };
 		57F64DE4D4F59AFD226CD234 /* ErrorCue_TextOnly.m4a */ = {isa = PBXFileReference; path = ErrorCue_TextOnly.m4a; sourceTree = "<group>"; };
 		5A61F7EAFB8A0CCF3D03F1D2 /* BridgeTurnProjection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeTurnProjection.swift; sourceTree = "<group>"; };
+		5B040C1E0BEEDB84847B5572 /* ConversationHandle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationHandle.swift; sourceTree = "<group>"; };
 		5B3297717E736F5BC5E44F85 /* WatchStreamReceiverTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchStreamReceiverTests.swift; sourceTree = "<group>"; };
 		5C77CA501A013873CA471BBC /* RealtimePlaybackEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimePlaybackEngine.swift; sourceTree = "<group>"; };
 		5CA20270A3348D748D8929F4 /* AudioRealtimeAgentConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRealtimeAgentConfig.swift; sourceTree = "<group>"; };
@@ -331,6 +336,7 @@
 		C58AEB9B4C54F952DFC96AB2 /* VoiceRelayEvents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRelayEvents.swift; sourceTree = "<group>"; };
 		C608A2AC1FA2B2981F7EB790 /* MainStatusCopy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainStatusCopy.swift; sourceTree = "<group>"; };
 		C6F558DCDF4B9CA8F0BA2E2D /* VoiceTurnJournal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceTurnJournal.swift; sourceTree = "<group>"; };
+		C7A1BD199C212A963E77B735 /* RealtimeEventEnvelope.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeEventEnvelope.swift; sourceTree = "<group>"; };
 		C85D18E0360A2A1EBDF04975 /* WatchSettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchSettingsStore.swift; sourceTree = "<group>"; };
 		C8BFD3B8E68CD0ED9C78C500 /* SpeechPlayerUserInterruptTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechPlayerUserInterruptTests.swift; sourceTree = "<group>"; };
 		CA60FA5DC7EA82EC5729B54B /* WatchDownlinkOutbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchDownlinkOutbox.swift; sourceTree = "<group>"; };
@@ -394,6 +400,7 @@
 				5A61F7EAFB8A0CCF3D03F1D2 /* BridgeTurnProjection.swift */,
 				32C8DAF30CCFE15F09A5351A /* BuildFingerprint.swift */,
 				234EBF336FF2F9724F289524 /* ClientLog.swift */,
+				5B040C1E0BEEDB84847B5572 /* ConversationHandle.swift */,
 				E92A4F28175D63C6FBD62D7E /* ConversationHistory.swift */,
 				F7C56A17FC91DC667B51B7D6 /* EncryptedAudioVault.swift */,
 				3A74603EEEBF6327940BB0BE /* ErrorCueCatalog.swift */,
@@ -404,6 +411,7 @@
 				905294A59B10050708A50FBF /* PlaybackRecoveryPolicy.swift */,
 				1B1609E87036B6E0CEFB8C95 /* RealtimeBridgeWireCodec.swift */,
 				4C41457A27FD24A41133AFFE /* RealtimeDownlinkPlayback.swift */,
+				C7A1BD199C212A963E77B735 /* RealtimeEventEnvelope.swift */,
 				1CEDAB5F3CD7B29B993F0FA2 /* RealtimeMediaFormat.swift */,
 				49D1CFEB2C03FAA07DA192C1 /* RealtimeMediaSession.swift */,
 				63B4FAFE429B15682CA5E9F8 /* RealtimeMediaWireFormat.swift */,
@@ -731,6 +739,7 @@
 				FF6E483DDC04EDE981F240A3 /* ClientLogUplink.swift in Sources */,
 				3213E1FAF48D79262E5EA9FC /* CompanionContentView.swift in Sources */,
 				DADA85367CAACD55C3514A81 /* CompanionSettings.swift in Sources */,
+				5FDDCA93B9385470FA7D76DE /* ConversationHandle.swift in Sources */,
 				FF0CBF3B2F165CCB9D3F426C /* ConversationHistory.swift in Sources */,
 				B61FF83E4DCF49ED91557083 /* EncryptedAudioVault.swift in Sources */,
 				FFC6B09DA5B4296BAC67C690 /* ErrorCueCatalog.swift in Sources */,
@@ -747,6 +756,7 @@
 				3BED828277BCE6296AFDC424 /* PlaybackRecoveryPolicy.swift in Sources */,
 				E9BABA745F521D5A45E84D50 /* RealtimeBridgeWireCodec.swift in Sources */,
 				03A62E2D08DF9037D1ED20F3 /* RealtimeDownlinkPlayback.swift in Sources */,
+				BAC7F9CEA797CDA54D80E3D4 /* RealtimeEventEnvelope.swift in Sources */,
 				7249351A21B20AAC649807D9 /* RealtimeMediaFormat.swift in Sources */,
 				87589EC57C16EFE13A79738E /* RealtimeMediaSession.swift in Sources */,
 				ADA9DA139E2F37E309F1C70C /* RealtimeMediaWireFormat.swift in Sources */,
@@ -803,6 +813,7 @@
 				E817250A3DAFD3D2F889876B /* BridgeTurnProjection.swift in Sources */,
 				1EF906148F17573C9B7D948E /* BuildFingerprint.swift in Sources */,
 				74339B1DE6A6C27DBE1885DD /* ClientLog.swift in Sources */,
+				BEF6659D8084AF07F14F8117 /* ConversationHandle.swift in Sources */,
 				54817C157F20C92848363962 /* ConversationHistory.swift in Sources */,
 				2600C4D0F1086887A7E1B04A /* ConversationTimelineView.swift in Sources */,
 				34140BE278C262CF0BACEABE /* EncryptedAudioVault.swift in Sources */,
@@ -818,6 +829,7 @@
 				5E9988BFEA3673DAA88C1F70 /* PushToTalkController.swift in Sources */,
 				3094CD00C51EF6746AEB7C98 /* RealtimeBridgeWireCodec.swift in Sources */,
 				C8D3D2E8D0626D66145B3C31 /* RealtimeDownlinkPlayback.swift in Sources */,
+				6AD4FA3C94B7437C0C079281 /* RealtimeEventEnvelope.swift in Sources */,
 				7787B4B28677EFC96B299E8D /* RealtimeMediaFormat.swift in Sources */,
 				1DEEC7DB7C45672A9EE48707 /* RealtimeMediaSession.swift in Sources */,
 				ECA89E26FFC474C089D1802D /* RealtimeMediaWireFormat.swift in Sources */,

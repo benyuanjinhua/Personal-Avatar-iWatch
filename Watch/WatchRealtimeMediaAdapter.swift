@@ -58,9 +58,9 @@ final class WatchRealtimeMediaAdapter {
     }
 
     protocol Transport: AnyObject {
-        func sendStreamStart(_ start: RealtimeStreamStart)
-        func sendAudioAppend(_ chunk: VoiceStreamChunk)
-        func sendAudioCommit(_ commit: RealtimeStreamCommit)
+        func sendStreamStart(_ start: RealtimeStreamStart, conversationId: String?, turnId: String?)
+        func sendAudioAppend(_ chunk: VoiceStreamChunk, conversationId: String?, turnId: String?)
+        func sendAudioCommit(_ commit: RealtimeStreamCommit, conversationId: String?, turnId: String?)
         /// Bridge PR #113 contract: real `playback.started/ended` receipts are
         /// forwarded up the WSS so the Bridge treats the Watch player as the
         /// authority — receiving `audio.delta` does not count.
@@ -172,10 +172,6 @@ final class WatchRealtimeMediaAdapter {
                     )
                 }
                 break
-            case .renderProgress(let requestId, let sessionId, let responseId, let bytesPlayed, let totalBytes):
-                WatchLog.info("realtime", "play_progress",
-                              requestId: requestId,
-                              detail: "response_id=\(responseId ?? "nil") bytes_played=\(bytesPlayed) total_bytes=\(totalBytes)")
             }
             self.logger("playback_event=\(event)")
         }
@@ -318,11 +314,26 @@ final class WatchRealtimeMediaAdapter {
     private func handle(_ event: RealtimeMediaSession.Event) {
         switch event {
         case .uplinkStart(let start):
-            transport.sendStreamStart(start)
+            let handle = currentTurn
+            transport.sendStreamStart(
+                start,
+                conversationId: handle?.conversationId,
+                turnId: handle?.turnId
+            )
         case .uplinkAppend(let chunk):
-            transport.sendAudioAppend(chunk)
+            let handle = currentTurn
+            transport.sendAudioAppend(
+                chunk,
+                conversationId: handle?.conversationId,
+                turnId: handle?.turnId
+            )
         case .uplinkCommit(let commit):
-            transport.sendAudioCommit(commit)
+            let handle = currentTurn
+            transport.sendAudioCommit(
+                commit,
+                conversationId: handle?.conversationId,
+                turnId: handle?.turnId
+            )
         case .uplinkFallback(let reason, let handle):
             recorder.stop()
             player.stop(barge: false)

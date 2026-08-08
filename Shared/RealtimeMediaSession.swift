@@ -82,10 +82,18 @@ final class RealtimeMediaSession {
     struct TurnHandle: Equatable, Hashable, Sendable {
         let requestId: String
         let sessionId: String
+        /// ESS-571: conversation-level identity — links all turns within
+        /// the same conversation. Populated from `ConversationHandle`.
+        var conversationId: String?
+        /// ESS-571: turn-level identity — unique per user utterance.
+        /// Defaults to a new UUIDv7; maps to the proposal's `turn_id`.
+        var turnId: String
 
-        init(requestId: String, sessionId: String) {
+        init(requestId: String, sessionId: String, conversationId: String? = nil, turnId: String? = nil) {
             self.requestId = requestId
             self.sessionId = sessionId
+            self.conversationId = conversationId
+            self.turnId = turnId ?? UUIDv7.generate().uuidString
         }
     }
 
@@ -105,6 +113,7 @@ final class RealtimeMediaSession {
     }
 
     private var pcmScratch = Data()
+    private var conversation: ConversationHandle?
     private var currentTurn: TurnHandle?
     private var uplink: RealtimeUplinkStream?
     private(set) var downlink = RealtimeDownlinkPlayback()
@@ -114,6 +123,24 @@ final class RealtimeMediaSession {
     var onEvent: ((Event) -> Void)?
 
     var activeTurn: TurnHandle? { currentTurn }
+    var activeConversationId: String? { conversation?.conversationId }
+
+    /// Start or replace the continuous conversation boundary. The identifier
+    /// stays stable across all subsequent `beginTurn` calls until `closeConversation`.
+    @discardableResult
+    func beginConversation(_ handle: ConversationHandle = ConversationHandle()) -> ConversationHandle {
+        finishTurn(reason: .interrupted)
+        conversation = handle
+        return handle
+    }
+
+    /// Close the continuous conversation. Late events from any of its turns are
+    /// rejected because no conversation remains active.
+    func closeConversation(reason: FinishReason = .cancelled) {
+        finishTurn(reason: reason)
+        conversation?.close()
+        conversation = nil
+    }
 
     /// Start a new turn. Any in-flight uplink is aborted (single-fallback)
     /// and the downlink buffer barges in so the old session's late frames
@@ -121,7 +148,20 @@ final class RealtimeMediaSession {
     func beginTurn(requestId: String) -> TurnHandle {
         finishTurn(reason: .interrupted)
         let sessionId = sessionIdFactory()
-        let handle = TurnHandle(requestId: requestId, sessionId: sessionId)
+        if conversation == nil { conversation = ConversationHandle() }
+        let turnId: String
+        if conversation?.turnCount == 0, let firstTurnId = conversation?.firstTurnId {
+            turnId = firstTurnId
+            conversation?.markFirstTurnStarted()
+        } else {
+            turnId = conversation!.nextTurn()
+        }
+        let handle = TurnHandle(
+            requestId: requestId,
+            sessionId: sessionId,
+            conversationId: conversation?.conversationId,
+            turnId: turnId
+        )
         currentTurn = handle
         var stream = RealtimeUplinkStream(
             requestId: requestId,

@@ -438,20 +438,20 @@ final class WatchVoiceTransport: ObservableObject {
 /// extension so `WatchVoiceTransport`'s core file stays focused on the
 /// existing full-file / relay flow.
 extension WatchVoiceTransport: WatchRealtimeMediaAdapter.Transport {
-    func sendStreamStart(_ start: RealtimeStreamStart) {
-        sendRealtimeUplink(.start(start)) { [weak self] in
+    func sendStreamStart(_ start: RealtimeStreamStart, conversationId: String?, turnId: String?) {
+        sendRealtimeUplink(.start(start, conversationId: conversationId, turnId: turnId)) { [weak self] in
             self?.notifyRealtimeUplinkFailed(requestId: start.requestId)
         }
     }
 
-    func sendAudioAppend(_ chunk: VoiceStreamChunk) {
-        sendRealtimeUplink(.append(chunk)) { [weak self] in
+    func sendAudioAppend(_ chunk: VoiceStreamChunk, conversationId: String?, turnId: String?) {
+        sendRealtimeUplink(.append(chunk, conversationId: conversationId, turnId: turnId)) { [weak self] in
             self?.notifyRealtimeUplinkFailed(requestId: chunk.requestId)
         }
     }
 
-    func sendAudioCommit(_ commit: RealtimeStreamCommit) {
-        sendRealtimeUplink(.commit(commit)) { [weak self] in
+    func sendAudioCommit(_ commit: RealtimeStreamCommit, conversationId: String?, turnId: String?) {
+        sendRealtimeUplink(.commit(commit, conversationId: conversationId, turnId: turnId)) { [weak self] in
             self?.notifyRealtimeUplinkFailed(requestId: commit.requestId)
         }
     }
