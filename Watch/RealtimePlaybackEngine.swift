@@ -146,7 +146,7 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         playerNode.play()
         WatchLog.info("realtime", "player_engine_ready",
                       requestId: currentTurn?.requestId,
-                      detail: "engine_running=\\(isRunning)")
+                      detail: "engine_running=\(isRunning)")
     }
 
     func enqueue(playables: [RealtimeDownlinkPlayback.PlayableChunk]) {
@@ -165,7 +165,7 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
             } catch {
                 WatchLog.error("realtime", "playback_lazy_prepare_failed",
                                requestId: dummyTurn.requestId,
-                               detail: "error=\\(error.localizedDescription)",
+                               detail: "error=\(error.localizedDescription)",
                                code: "ERR_PLAYER_PREPARE")
                 onPlaybackEvent?(.failed(
                     requestId: dummyTurn.requestId, sessionId: dummyTurn.sessionId,
@@ -189,7 +189,7 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         } catch {
             WatchLog.error("realtime", "playback_session_activate_failed",
                            requestId: turn.requestId,
-                           detail: "error=\\(error.localizedDescription)",
+                           detail: "error=\(error.localizedDescription)",
                            code: "ERR_PLAYER_SESSION")
             return
         }
@@ -275,7 +275,7 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
             ))
             WatchLog.info("realtime", "play_started",
                           requestId: turn.requestId,
-                          detail: "response_id=\\(started.responseId ?? "nil")")
+                          detail: "response_id=\(started.responseId ?? "nil")")
         }
         if let ended = receipts.ended {
             onPlaybackEvent?(.ended(
@@ -284,7 +284,7 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
             ))
             WatchLog.info("realtime", "play_completed",
                           requestId: turn.requestId,
-                          detail: "response_id=\\(ended.responseId ?? "nil") bytes_played=\\(ended.bytesPlayed)")
+                          detail: "response_id=\(ended.responseId ?? "nil") bytes_played=\(ended.bytesPlayed)")
         }
         // ESS-531: emit render_progress on every buffer completion so the
         // Bridge can track playback progress across the streaming response.
