@@ -180,6 +180,31 @@ final class PhoneRealtimeSession {
         return snapshot
     }
 
+    /// Agent transports push events through callbacks instead of the Bridge
+    /// receive loop. Funnel them through the same current-transport gate so a
+    /// callback already queued by a superseded turn cannot reach Watch.
+    func receiveAgentDownlink(
+        _ envelope: RealtimeDownlinkEnvelope,
+        from transport: Transport
+    ) {
+        guard currentTransport === transport else {
+            logDroppedDownlink(envelope, reason: "superseded_transport")
+            return
+        }
+        guard case .active(let activeRequestId, let activeSessionId) = state,
+              RealtimeRequestIsolationPolicy.accepts(
+                incomingRequestId: envelope.requestId,
+                incomingSessionId: envelope.sessionId,
+                activeRequestId: activeRequestId,
+                activeSessionId: activeSessionId
+              ) else {
+            logDroppedDownlink(envelope, reason: "request_session_mismatch")
+            return
+        }
+        pendingDownlink.append(envelope)
+        onDownlink?(envelope)
+    }
+
     private func openIfNeeded(requestId: String, sessionId: String) {
         switch state {
         case .active(let activeRequest, let activeSession)
@@ -227,5 +252,23 @@ final class PhoneRealtimeSession {
         guard state != newState else { return }
         state = newState
         onStateChange?(newState)
+    }
+
+    private func logDroppedDownlink(_ envelope: RealtimeDownlinkEnvelope, reason: String) {
+        let incomingGeneration = envelope.generation.map { String($0) } ?? "nil"
+        let active: String
+        switch state {
+        case .active(let requestId, let sessionId), .connecting(let requestId, let sessionId):
+            active = "current_request=\(requestId) current_session=\(sessionId)"
+        default:
+            active = "current_state=\(String(describing: state))"
+        }
+        PhoneAgentClientLog.info(
+            module: "phone_session",
+            event: "downlink_stale_request_dropped",
+            requestId: envelope.requestId,
+            sessionId: envelope.sessionId,
+            detail: "reason=\(reason) incoming_generation=\(incomingGeneration) \(active)"
+        )
     }
 }

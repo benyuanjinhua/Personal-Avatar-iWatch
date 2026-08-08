@@ -228,6 +228,22 @@ enum RealtimeDownlinkKind: String, Codable, Sendable {
     case bargeInFailed = "bargein.failed"
 }
 
+/// ESS-541: a downlink may only enter the playback pipeline for the exact
+/// request/session tuple that currently owns the phone-side transport.
+/// Superseded transports can still deliver already-queued callbacks after
+/// `close(reason:)`; those callbacks must never leak into the next turn.
+enum RealtimeRequestIsolationPolicy {
+    static func accepts(
+        incomingRequestId: String,
+        incomingSessionId: String,
+        activeRequestId: String,
+        activeSessionId: String
+    ) -> Bool {
+        guard !incomingRequestId.isEmpty, !incomingSessionId.isEmpty else { return false }
+        return incomingRequestId == activeRequestId && incomingSessionId == activeSessionId
+    }
+}
+
 struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
     let protocolVersion: Int
     let kind: RealtimeDownlinkKind

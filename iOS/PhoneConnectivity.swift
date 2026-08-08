@@ -452,8 +452,9 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
                     return AudioRealtimeAgentSession(config: freshConfig, sessionId: sessionId)
                 }
             )
-            transport.onDownlink = { [weak self] envelope in
-                self?.forwardRealtimeDownlink(envelope)
+            transport.onDownlink = { [weak self, weak transport] envelope in
+                guard let self, let transport else { return }
+                self.realtimeSession.receiveAgentDownlink(envelope, from: transport)
             }
             transport.onStateChange = { [weak self] state in
                 Self.logger.info("agent transport state → \(String(describing: state), privacy: .public)")
