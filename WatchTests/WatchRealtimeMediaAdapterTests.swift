@@ -22,7 +22,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         var vadEvents: [LocalVADEvent] = []
         adapter.onVADEvent = { vadEvents.append($0) }
 
-        adapter.beginTurn(requestId: "vad-auto-commit")
+        adapter.beginTurn(requestId: "44444444-4444-4444-4444-444444444451")
         recorder.feed(Self.pcmFrame(rms: 0.08))
         recorder.feed(Self.pcmFrame(rms: 0.08))
         for _ in 0..<7 { recorder.feed(Self.pcmFrame(rms: 0)) }
