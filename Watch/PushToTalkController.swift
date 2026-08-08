@@ -60,6 +60,10 @@ final class PushToTalkController: ObservableObject {
     /// ESS-45：录音 → 等待 → 播放整个回合期间持有 ExtendedRuntimeSession，
     /// 降腕/熄屏不挂起；空闲即释放。
     let sessionKeeper = VoiceSessionKeeper()
+    /// ESS-519：后台音频保活器——录音结束后立即播放静音音频保持进程在后台
+    /// 存活，解决 WKExtendedRuntimeSession 被 .resignedFrontmost 收回后
+    /// 进程挂起导致结果音频无法播放的问题。
+    let breather = BackgroundAudioBreather()
     /// ESS-180：屏幕分身错误卡片状态机；订阅 `errorPresenter.active` 即得 UI。
     let errorPresenter = AvatarErrorPresenter()
 
@@ -502,6 +506,9 @@ final class PushToTalkController: ObservableObject {
             detail: "generation=\(current.generation) previous_request_id=\(previousId) previous_generation=\(previousGeneration) cleared_queue=\(cleared)"
         )
         player.stop(reason: "recording_started")
+        // ESS-519：新一轮录音开始，停止后台保活音频避免与
+        // AudioRecorder 的 .playAndRecord 会话冲突。
+        breather.stop(reason: "recording_started")
         // ESS-535: interrupt the welcome speech before recording starts
         // so the RealtimePlaybackEngine can own the audio session.
         onPressBegan?()
@@ -790,6 +797,11 @@ final class PushToTalkController: ObservableObject {
             transport.send(envelope: envelope, recording: recording)
         }
         WatchHaptics.play(.requestSubmitted)
+        // ESS-519：录音已发送，进入等待阶段。立即启动后台音频保活——
+        // 此时 App 仍在 active 态，音频会话可成功激活；后续降腕/熄屏时
+        // WKExtendedRuntimeSession 虽会被 .resignedFrontmost 收回，但
+        // 活跃的音频会话保持进程不被挂起，结果到达时可正常播放。
+        breather.start()
         streamRequestId = nil
         streamId = nil
         streamAborted = false
@@ -1082,6 +1094,8 @@ final class PushToTalkController: ObservableObject {
             presentAvatarError(code: "ERR_VAULT_LOAD", requestId: requestId)
             return
         }
+        // ESS-519：真实播放即将开始，停止静音保活音频以释放系统资源。
+        breather.stop(reason: "real_playback")
         let started = player.play(data: data, context: requestId) { [weak self] finished in
             guard let self else { return }
             // ESS-45×ESS-46：只有终态回合的结果语音播完才算交付——interim

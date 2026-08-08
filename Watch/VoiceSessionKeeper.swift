@@ -227,7 +227,7 @@ extension VoiceSessionKeeper: WKExtendedRuntimeSessionDelegate {
             self.startPending = false
             self.sessionStartedAt = Date()
             let expiresIn = extendedRuntimeSession.expirationDate
-                .map { String(format: "expires_in=%.0fs", $0.timeIntervalSinceNow) } ?? "expires_in=?"
+                .map { String(format: "expires_in_requested=%.0fs", $0.timeIntervalSinceNow) } ?? "expires_in_requested=?"
             WatchLog.info(
                 "runtime", "session_started",
                 detail: "reason=\(self.holdReason ?? "?") \(expiresIn)"
@@ -252,7 +252,9 @@ extension VoiceSessionKeeper: WKExtendedRuntimeSessionDelegate {
         Task { @MainActor in
             // 主动释放（releaseSession 已置空并记账）触发的回调不重复处理。
             guard extendedRuntimeSession === self.session else { return }
-            let detail = "reason_code=\(reason.rawValue) hold=\(self.holdReason ?? "-") \(self.heldDescription())"
+            let detail = "reason_code=\(reason.rawValue) hold=\(self.holdReason ?? "-") \(self.heldDescription())" +
+                (reason.rawValue == 3 && self.holdReason != nil
+                    ? " survival=background_audio_breather" : "")
             if error != nil || reason == .error {
                 WatchLog.error(
                     "runtime", "session_invalidated", detail: detail,
