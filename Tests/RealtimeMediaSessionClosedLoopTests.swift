@@ -160,6 +160,37 @@ final class RealtimeMediaSessionClosedLoopTests: XCTestCase {
         XCTAssertEqual(fallbacks.first, .transportFailed)
     }
 
+    func testAckLoopKeepsLargeUplinkRealtimeAndReachesCommit() {
+        let configuration = RealtimeMediaSession.Configuration(
+            uplinkFrameBytes: 3_200,
+            maxInFlightUplinkBytes: 256 * 1024
+        )
+        let session = RealtimeMediaSession(
+            configuration: configuration,
+            now: { 123 },
+            sessionIdFactory: { "22222222-2222-2222-2222-222222222222" }
+        )
+        var emitted: [RealtimeMediaSession.Event] = []
+        session.onEvent = { emitted.append($0) }
+        _ = session.beginTurn(requestId: requestId(1))
+        for _ in 0..<100 {
+            session.pushMicrophonePCM(Data(repeating: 0x11, count: 3_200))
+            guard case .uplinkAppend(let chunk)? = emitted.last else {
+                return XCTFail("expected append before ACK")
+            }
+            session.acknowledgeUplink(RealtimeUplinkAck(
+                requestId: chunk.requestId,
+                sessionId: chunk.streamId,
+                sequence: chunk.sequence,
+                byteCount: chunk.payload.count
+            ))
+        }
+        session.commitUplink()
+
+        XCTAssertFalse(emitted.contains { if case .uplinkFallback = $0 { return true }; return false })
+        XCTAssertTrue(emitted.contains { if case .uplinkCommit = $0 { return true }; return false })
+    }
+
     func testDownlinkGapTimeoutFallsBackOnce() {
         let handle = session.beginTurn(requestId: requestId(1))
         // Feed a downlink chunk that leaves seq 0 missing.

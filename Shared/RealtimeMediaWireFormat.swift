@@ -17,6 +17,23 @@ enum RealtimeWireVersion {
     static let downlink: Int = 1
 }
 
+/// iPhone receipt for a Watch `audio.append`. ACKs travel independently from
+/// uplink frames, so the Watch validates the turn identity and sequence and
+/// treats duplicates / reordering as harmless no-ops.
+struct RealtimeUplinkAck: Codable, Sendable, Equatable {
+    let requestId: String
+    let sessionId: String
+    let sequence: Int
+    let byteCount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case requestId = "request_id"
+        case sessionId = "session_id"
+        case sequence
+        case byteCount = "byte_count"
+    }
+}
+
 enum RealtimeUplinkKind: String, Codable, Sendable {
     case streamStart = "stream.start"
     case audioAppend = "audio.append"
@@ -209,6 +226,22 @@ enum RealtimeDownlinkKind: String, Codable, Sendable {
     /// not send `cancel` on the WSS, so the pending window must collapse.
     case generationOpen = "generation.open"
     case bargeInFailed = "bargein.failed"
+}
+
+/// ESS-541: a downlink may only enter the playback pipeline for the exact
+/// request/session tuple that currently owns the phone-side transport.
+/// Superseded transports can still deliver already-queued callbacks after
+/// `close(reason:)`; those callbacks must never leak into the next turn.
+enum RealtimeRequestIsolationPolicy {
+    static func accepts(
+        incomingRequestId: String,
+        incomingSessionId: String,
+        activeRequestId: String,
+        activeSessionId: String
+    ) -> Bool {
+        guard !incomingRequestId.isEmpty, !incomingSessionId.isEmpty else { return false }
+        return incomingRequestId == activeRequestId && incomingSessionId == activeSessionId
+    }
 }
 
 struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
@@ -412,5 +445,6 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
 /// data]` via `sendMessage` (fast path) and `transferUserInfo` (durable ack).
 enum RealtimeMediaMessage {
     static let uplinkEnvelopeKey = "wristagent_realtime_uplink"
+    static let uplinkAckEnvelopeKey = "wristagent_realtime_uplink_ack"
     static let downlinkEnvelopeKey = "wristagent_realtime_downlink"
 }

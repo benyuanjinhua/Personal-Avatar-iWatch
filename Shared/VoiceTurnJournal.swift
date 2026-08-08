@@ -357,7 +357,7 @@ final class VoiceTurnJournal: ObservableObject {
     /// 静态方法，因为 init 时必须完成清理才能给 turns 赋值。
     /// 返回 (cleanedTurns, staleIds)。
     private static func cleanupStaleTurns(_ loaded: [VoiceTurnRecord]) -> ([VoiceTurnRecord], [String]) {
-        let staleThreshold: TimeInterval = 600 // 10 min
+        let staleThreshold: TimeInterval = 120 // 2 min — real turn completes within 60s
         let now = Date()
         var cleaned = loaded
         var staleIds: [String] = []

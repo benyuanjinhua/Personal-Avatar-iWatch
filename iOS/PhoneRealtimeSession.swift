@@ -66,10 +66,22 @@ final class PhoneRealtimeSession {
     /// Forward a Watch-side envelope. Opens the WSS session lazily on
     /// `stream.start` and tears it down on `audio.commit` completion or on
     /// the coordinator's fallback signal.
-    func forward(_ envelope: RealtimeUplinkEnvelope) {
+    func forward(
+        _ envelope: RealtimeUplinkEnvelope,
+        completion: ((Bool) -> Void)? = nil
+    ) {
         switch envelope.kind {
         case .streamStart:
             guard let start = envelope.start else { return }
+            // ESS-539: a new stream.start means a new turn. Discard any
+            // downlink envelopes queued from a previous incomplete session
+            // so they don't pollute the new turn's playback.
+            if !pendingDownlink.isEmpty {
+                Self.logger.info(
+                    "realtime discarding \(self.pendingDownlink.count) stale downlink envelopes from previous session"
+                )
+                pendingDownlink.removeAll(keepingCapacity: true)
+            }
             openIfNeeded(requestId: start.requestId, sessionId: start.sessionId)
         case .audioAppend:
             guard let append = envelope.append else { return }
@@ -79,12 +91,23 @@ final class PhoneRealtimeSession {
             openIfNeeded(requestId: commit.requestId, sessionId: commit.sessionId)
         case .playbackStarted, .playbackEnded:
             guard let receipt = envelope.playback else { return }
+            // ESS-525 §1 acceptance: `play_started` / `play_finished`
+            // must land in `bridge.log` for the same request_id as the
+            // Gateway downlink. Watch reports the receipt via WCSession
+            // uplink; that arrives here — log before we hand it off.
+            PhoneAgentClientLog.info(
+                module: "phone_session",
+                event: envelope.kind == .playbackStarted ? "play_started" : "play_finished",
+                requestId: receipt.requestId, sessionId: receipt.sessionId,
+                detail: "response_id=\(receipt.responseId)"
+            )
             openIfNeeded(requestId: receipt.requestId, sessionId: receipt.sessionId)
         case .fallback:
             guard let descriptor = envelope.fallback else { return }
             transition(to: .failed(reason: descriptor.reason))
             currentTransport?.close(reason: descriptor.reason)
             currentTransport = nil
+            completion?(true)
             return
         case .bargeInRequest:
             // ESS-391: forward barge-in to transport. For Bridge transports
@@ -95,17 +118,24 @@ final class PhoneRealtimeSession {
             Self.logger.info(
                 "realtime bargein.request request=\(ask.requestId, privacy: .public) from_gen=\(ask.fromGeneration, privacy: .public)"
             )
-            guard let transport = currentTransport else { return }
+            guard let transport = currentTransport else {
+                completion?(false)
+                return
+            }
             transport.send(envelope) { [weak self] error in
                 if let error {
                     Self.logger.error(
                         "bargein.request send failed: \(String(describing: error), privacy: .public)"
                     )
                 }
+                completion?(error == nil)
             }
             return
         }
-        guard let transport = currentTransport else { return }
+        guard let transport = currentTransport else {
+            completion?(false)
+            return
+        }
         transport.send(envelope) { [weak self] error in
             if let error {
                 Self.logger.error(
@@ -115,6 +145,7 @@ final class PhoneRealtimeSession {
                 self?.currentTransport?.close(reason: "send_failed")
                 self?.currentTransport = nil
             }
+            completion?(error == nil)
         }
         if envelope.kind == .audioCommit {
             // Commit is the last uplink frame; the bridge will finish playback
@@ -147,6 +178,31 @@ final class PhoneRealtimeSession {
         let snapshot = pendingDownlink
         pendingDownlink.removeAll(keepingCapacity: false)
         return snapshot
+    }
+
+    /// Agent transports push events through callbacks instead of the Bridge
+    /// receive loop. Funnel them through the same current-transport gate so a
+    /// callback already queued by a superseded turn cannot reach Watch.
+    func receiveAgentDownlink(
+        _ envelope: RealtimeDownlinkEnvelope,
+        from transport: Transport
+    ) {
+        guard currentTransport === transport else {
+            logDroppedDownlink(envelope, reason: "superseded_transport")
+            return
+        }
+        guard case .active(let activeRequestId, let activeSessionId) = state,
+              RealtimeRequestIsolationPolicy.accepts(
+                incomingRequestId: envelope.requestId,
+                incomingSessionId: envelope.sessionId,
+                activeRequestId: activeRequestId,
+                activeSessionId: activeSessionId
+              ) else {
+            logDroppedDownlink(envelope, reason: "request_session_mismatch")
+            return
+        }
+        pendingDownlink.append(envelope)
+        onDownlink?(envelope)
     }
 
     private func openIfNeeded(requestId: String, sessionId: String) {
@@ -196,5 +252,23 @@ final class PhoneRealtimeSession {
         guard state != newState else { return }
         state = newState
         onStateChange?(newState)
+    }
+
+    private func logDroppedDownlink(_ envelope: RealtimeDownlinkEnvelope, reason: String) {
+        let incomingGeneration = envelope.generation.map { String($0) } ?? "nil"
+        let active: String
+        switch state {
+        case .active(let requestId, let sessionId), .connecting(let requestId, let sessionId):
+            active = "current_request=\(requestId) current_session=\(sessionId)"
+        default:
+            active = "current_state=\(String(describing: state))"
+        }
+        PhoneAgentClientLog.info(
+            module: "phone_session",
+            event: "downlink_stale_request_dropped",
+            requestId: envelope.requestId,
+            sessionId: envelope.sessionId,
+            detail: "reason=\(reason) incoming_generation=\(incomingGeneration) \(active)"
+        )
     }
 }

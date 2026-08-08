@@ -20,6 +20,21 @@ import Foundation
 /// injected `Recorder` / `Player` / `Transport` protocols draw the seam.
 @MainActor
 final class WatchRealtimeMediaAdapter {
+    /// ESS-404 §3.4 / ESS-527: outer timer service that arms on
+    /// `done_barrier_waiting` and calls `session.doneBarrierTimeout()` after
+    /// `doneBarrierTimeoutSeconds`. Injected so tests can drive it
+    /// deterministically; production uses the `Task.sleep`-backed default.
+    protocol BarrierTimer: AnyObject {
+        /// Arm (or re-arm) the timer. Cancels any prior pending fire.
+        @MainActor func arm(after seconds: TimeInterval, fire: @escaping @MainActor () -> Void)
+        /// Cancel any pending fire. Idempotent.
+        @MainActor func cancel()
+    }
+
+    /// ESS-404 §3.4: 2.0 s barrier budget. Matches the value the spec calls
+    /// out and the buffer-level fallback reason (`.doneBarrierTimedOut`).
+    static let doneBarrierTimeoutSeconds: TimeInterval = 2.0
+
     protocol Recorder: AnyObject {
         var onFrame: ((Data) -> Void)? { get set }
         var onFailure: ((Error) -> Void)? { get set }
@@ -72,12 +87,20 @@ final class WatchRealtimeMediaAdapter {
     typealias FullFileFallback = @MainActor (RealtimeMediaSession.TurnHandle,
                                              RealtimeUplinkStream.FallbackReason) -> Void
 
+    /// ESS-532: called when the realtime playback pending state is resolved —
+    /// either the first frame has started rendering, the turn fell back to
+    /// complete-file, or the turn finished entirely. The PushToTalkController
+    /// wires this to clear `realtimePlaybackPending` so the VoiceSessionKeeper
+    /// can release the ExtendedRuntimeSession.
+    var onRealtimePendingResolved: (@MainActor () -> Void)?
+
     let session: RealtimeMediaSession
     private let recorder: Recorder
     private let player: Player
     private let transport: Transport
     private let fullFileFallback: FullFileFallback
     private let logger: (String) -> Void
+    private let barrierTimer: BarrierTimer
     private(set) var didTriggerCompleteFileFallback = false
     private(set) var currentTurn: RealtimeMediaSession.TurnHandle?
     /// ESS-330: latest `response_id` observed on `audio.delta` for the current
@@ -93,7 +116,8 @@ final class WatchRealtimeMediaAdapter {
         player: Player,
         transport: Transport,
         fullFileFallback: @escaping FullFileFallback = { _, _ in },
-        logger: @escaping (String) -> Void = { _ in }
+        logger: @escaping (String) -> Void = { _ in },
+        barrierTimer: BarrierTimer = TaskBasedBarrierTimer()
     ) {
         self.session = session
         self.recorder = recorder
@@ -101,6 +125,7 @@ final class WatchRealtimeMediaAdapter {
         self.transport = transport
         self.fullFileFallback = fullFileFallback
         self.logger = logger
+        self.barrierTimer = barrierTimer
         wire()
     }
 
@@ -111,6 +136,9 @@ final class WatchRealtimeMediaAdapter {
             guard let self else { return }
             switch event {
             case .started(let requestId, let sessionId, let responseId):
+                // ESS-532: first frame rendered — playback is live now, the
+                // ExtendedRuntimeSession can be released.
+                self.onRealtimePendingResolved?()
                 // ESS-330 v3: forward the response_id the player emitted
                 // (which was preserved per chunk through the reorder buffer).
                 // No session_id substitution — Bixuan's acceptance criteria
@@ -135,7 +163,19 @@ final class WatchRealtimeMediaAdapter {
                 // as `.sessionEnded`. Explicit cancel, interruption, or the
                 // next turn remains responsible for closing/replacing it.
             case .bargedIn, .failed:
+                if case .failed(let rid, _, _, let code) = event {
+                    WatchLog.error(
+                        "realtime", "playback_engine_failed",
+                        requestId: rid,
+                        detail: "playback_event=failed",
+                        code: code
+                    )
+                }
                 break
+            case .renderProgress(let requestId, let sessionId, let responseId, let bytesPlayed, let totalBytes):
+                WatchLog.info("realtime", "play_progress",
+                              requestId: requestId,
+                              detail: "response_id=\(responseId ?? "nil") bytes_played=\(bytesPlayed) total_bytes=\(totalBytes)")
             }
             self.logger("playback_event=\(event)")
         }
@@ -149,6 +189,10 @@ final class WatchRealtimeMediaAdapter {
     func beginTurn(requestId: String) -> RealtimeMediaSession.TurnHandle {
         didTriggerCompleteFileFallback = false
         currentResponseId = nil
+        // `session.beginTurn(...)` fires a `.turnFinished(...)` for any
+        // existing turn which already cancels; the explicit cancel here is a
+        // defence for the first-ever call (no prior turn to fire finished).
+        barrierTimer.cancel()
         let handle = session.beginTurn(requestId: requestId)
         currentTurn = handle
         do {
@@ -166,6 +210,14 @@ final class WatchRealtimeMediaAdapter {
     func commit() {
         recorder.stop()
         session.commitUplink()
+    }
+
+    func receiveUplinkAck(_ ack: RealtimeUplinkAck) {
+        guard session.acknowledgeUplink(ack) else { return }
+        WatchLog.info(
+            "realtime", "uplink_ack_received", requestId: ack.requestId,
+            detail: "sequence=\(ack.sequence) bytes=\(ack.byteCount)"
+        )
     }
 
     /// Called when the user starts speaking again mid-response.
@@ -239,9 +291,13 @@ final class WatchRealtimeMediaAdapter {
         session.openGeneration(generation)
     }
 
-    /// ESS-404 §3.4: called by the outer timer service when the 2.0 s
-    /// done-barrier expires without the barrier releasing. Delegated to
-    /// the coordinator, which absorbs into a single fallback.
+    /// ESS-404 §3.4 / ESS-527: called by the internal barrier timer (or
+    /// manually from tests) when the 2.0 s done-barrier expires without the
+    /// barrier releasing. Delegated to the coordinator, which absorbs into a
+    /// single fallback. Prior to ESS-527 this was dead code — no caller ever
+    /// scheduled the timer, so a `done_barrier_waiting` state persisted
+    /// indefinitely and no fallback was surfaced. See `BarrierTimer` and the
+    /// `.doneArrived(.waiting)` branch in `handle(_:)` for the wiring.
     func doneBarrierTimeout() {
         session.doneBarrierTimeout()
     }
@@ -283,6 +339,9 @@ final class WatchRealtimeMediaAdapter {
                 fullFileFallback(handle, reason)
                 logger("uplink_fallback reason=\(reason) request=\(handle.requestId)")
             }
+            // ESS-532: uplink fallback resolves the pending state so the
+            // VoiceSessionKeeper can release.
+            onRealtimePendingResolved?()
         case .playbackReady(let playables):
             player.enqueue(playables: playables)
         case .playbackCleared(let bytesDropped):
@@ -293,8 +352,15 @@ final class WatchRealtimeMediaAdapter {
                 detail: "bytes_dropped=\(bytesDropped)"
             )
         case .playbackFallback(let reason, _):
+            // Any playback fallback ends the barrier's relevance for this
+            // turn. Cancel the timer so a late fire does not stack a second
+            // fallback on top (the buffer would absorb it, but the log noise
+            // is R-02 evidence pollution).
+            barrierTimer.cancel()
             player.stop(barge: false)
             logger("downlink_fallback reason=\(reason)")
+            // ESS-532: downlink fallback resolves pending so the keeper releases.
+            onRealtimePendingResolved?()
             if case .doneBarrierTimedOut(let missing) = reason {
                 WatchLog.error(
                     "realtime", "done_barrier_timeout",
@@ -333,6 +399,7 @@ final class WatchRealtimeMediaAdapter {
                 // Synchronous release: seq 0…final already there when done
                 // arrived. Drain the player now (this is the previous
                 // `player.finish(...)` call, but gated by the barrier).
+                barrierTimer.cancel()
                 player.finish(responseId: responseId)
                 WatchLog.info(
                     "realtime", "done_barrier_released",
@@ -342,12 +409,20 @@ final class WatchRealtimeMediaAdapter {
             case .zeroAudio(let responseId):
                 // -1 zero-audio contract. No `.ended` is expected; no
                 // `player.finish(...)` because there is nothing to drain.
+                barrierTimer.cancel()
                 WatchLog.info(
                     "realtime", "done_zero_audio",
                     requestId: currentTurn?.requestId,
                     detail: "response_id=\(responseId ?? "nil") final_seq=-1"
                 )
             case .waiting(let missing, let responseId):
+                // ESS-527: arm the outer timer so a barrier that never
+                // fills is bounded. `checkBarrierRelease` on the coordinator
+                // side re-enters this branch as `.doneBarrierReleased` (async)
+                // as soon as the missing seqs land, at which point we cancel.
+                barrierTimer.arm(
+                    after: Self.doneBarrierTimeoutSeconds
+                ) { [weak self] in self?.session.doneBarrierTimeout() }
                 WatchLog.info(
                     "realtime", "done_barrier_waiting",
                     requestId: currentTurn?.requestId,
@@ -358,6 +433,7 @@ final class WatchRealtimeMediaAdapter {
                 // `final_sequence`): degrade to `n = max emitted seq` and
                 // still drain the player so the tail renders. The
                 // structured error is what surfaces the contract violation.
+                barrierTimer.cancel()
                 WatchLog.error(
                     "realtime", "done_missing_final_sequence",
                     requestId: currentTurn?.requestId,
@@ -388,6 +464,10 @@ final class WatchRealtimeMediaAdapter {
                 )
             }
         case .doneBarrierReleased(_, let final, let responseId):
+            // Async release: late deltas filled the missing set. Cancel the
+            // pending 2 s timer so it does not stack a redundant fallback on
+            // an already-drained response.
+            barrierTimer.cancel()
             player.finish(responseId: responseId)
             WatchLog.info(
                 "realtime", "done_barrier_released",
@@ -395,6 +475,11 @@ final class WatchRealtimeMediaAdapter {
                 detail: "response_id=\(responseId ?? "nil") final_seq=\(final)"
             )
         case .bargeInRequested(let handle, let fromGeneration):
+            // Barge-in dumps every buffered downlink byte and moves the gate
+            // into `.pending`; whatever the barrier was waiting on is now
+            // moot. Cancel so the pending window does not inherit an armed
+            // fallback from the prior generation.
+            barrierTimer.cancel()
             WatchLog.info(
                 "realtime", "bargein_requested",
                 requestId: handle.requestId,
@@ -412,11 +497,49 @@ final class WatchRealtimeMediaAdapter {
                 detail: "from_gen=\(from.map(String.init) ?? "nil") to_gen=\(to)"
             )
         case .turnFinished(let handle, let reason):
+            // Turn is over; any armed barrier belongs to a session that no
+            // longer exists. Cancel so a subsequent turn does not inherit a
+            // stray fire from the previous one.
+            barrierTimer.cancel()
             if handle == currentTurn {
                 currentTurn = nil
                 currentResponseId = nil
             }
+            // ESS-532: turn finished (audio.done + playback complete, or
+            // cancel/interrupt) clears the pending hold so the
+            // ExtendedRuntimeSession can be released.
+            onRealtimePendingResolved?()
             logger("turn_finished request=\(handle.requestId) reason=\(reason)")
         }
+    }
+}
+
+/// ESS-527 default `BarrierTimer` implementation. Mirrors the
+/// `WatchStreamReceiver.scheduleGapTimer` pattern (`Task { Task.sleep }`)
+/// so the barrier timer plays nicely with the same runtime and lifecycle
+/// as the existing gap timer. `arm(...)` cancels any prior scheduling so
+/// re-arming while waiting is safe.
+@MainActor
+final class TaskBasedBarrierTimer: WatchRealtimeMediaAdapter.BarrierTimer {
+    private var task: Task<Void, Never>?
+
+    /// Non-isolated init so the adapter's `barrierTimer:` default value can
+    /// construct one from a nonisolated context. The stored `task` is only
+    /// touched from `arm` / `cancel`, both of which are `@MainActor`.
+    nonisolated init() {}
+
+    func arm(after seconds: TimeInterval, fire: @escaping @MainActor () -> Void) {
+        task?.cancel()
+        let nanos = UInt64(max(0, seconds) * 1_000_000_000)
+        task = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: nanos)
+            guard !Task.isCancelled else { return }
+            fire()
+        }
+    }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
     }
 }

@@ -148,6 +148,45 @@ final class RealtimeUplinkStreamTests: XCTestCase {
         }
     }
 
+    func testSustainedAcksAllowMoreThanDefaultBudgetAndCommit() {
+        var stream = makeStream(maxInFlightBytes: 256 * 1024)
+        _ = stream.start(capturedAtMs: 0)
+        let frameBytes = 3_200
+        let frameCount = 100 // 320 KB total, greater than the 256 KB window.
+        for sequence in 0..<frameCount {
+            let outcome = stream.appendPCM(
+                Data(repeating: UInt8(sequence % 255), count: frameBytes),
+                capturedAtMs: Int64(sequence + 1)
+            )
+            guard case .emitted = outcome else {
+                return XCTFail("frame \(sequence) should remain on realtime path")
+            }
+            stream.acknowledge(sequence: sequence, byteCount: frameBytes)
+        }
+        XCTAssertEqual(stream.inFlightBytes, 0)
+        guard case .emitted(let frames) = stream.commit(capturedAtMs: 1_000),
+              case .audioCommit(let commit)? = frames.first else {
+            return XCTFail("audio.commit should be emitted after sustained ACKs")
+        }
+        XCTAssertEqual(commit.sequence, frameCount - 1)
+    }
+
+    func testDuplicateOutOfOrderAndMalformedAcksDoNotDoubleRelease() {
+        var stream = makeStream(maxInFlightBytes: 128)
+        _ = stream.start(capturedAtMs: 0)
+        _ = stream.appendPCM(Data(repeating: 1, count: 32), capturedAtMs: 1)
+        _ = stream.appendPCM(Data(repeating: 2, count: 48), capturedAtMs: 2)
+
+        stream.acknowledge(sequence: 1, byteCount: 48) // out of order
+        XCTAssertEqual(stream.inFlightBytes, 32)
+        stream.acknowledge(sequence: 1, byteCount: 48) // duplicate
+        stream.acknowledge(sequence: 0, byteCount: 999) // untrusted size
+        stream.acknowledge(sequence: 99, byteCount: 32) // unknown sequence
+        XCTAssertEqual(stream.inFlightBytes, 32)
+        stream.acknowledge(sequence: 0, byteCount: 32)
+        XCTAssertEqual(stream.inFlightBytes, 0)
+    }
+
     func testMarkTransportFailedIsIdempotent() {
         var stream = makeStream()
         _ = stream.start(capturedAtMs: 0)

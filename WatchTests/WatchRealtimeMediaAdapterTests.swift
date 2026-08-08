@@ -39,6 +39,42 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         XCTAssertEqual(attempts, 2)
     }
 
+    func testRenderRecoveryAlwaysRestartsOnFirstDeltaAfterSessionActivation() {
+        XCTAssertTrue(RealtimeRenderRecoveryPolicy.shouldRestartEngine(
+            firstDeltaAfterSessionActivation: true,
+            engineIsRunning: true
+        ), "AVAudioEngine may report running after the shared session lost its output route")
+    }
+
+    func testRenderRecoveryRestartsStoppedEngineOnLaterDelta() {
+        XCTAssertTrue(RealtimeRenderRecoveryPolicy.shouldRestartEngine(
+            firstDeltaAfterSessionActivation: false,
+            engineIsRunning: false
+        ))
+    }
+
+    func testRenderRecoveryDoesNotRestartHealthyEngineOrNode() {
+        XCTAssertFalse(RealtimeRenderRecoveryPolicy.shouldRestartEngine(
+            firstDeltaAfterSessionActivation: false,
+            engineIsRunning: true
+        ))
+        XCTAssertFalse(RealtimeRenderRecoveryPolicy.shouldRestartNode(
+            engineWasRestarted: false,
+            nodeIsPlaying: true
+        ))
+    }
+
+    func testRenderRecoveryRestartsNodeWheneverEngineWasRestarted() {
+        XCTAssertTrue(RealtimeRenderRecoveryPolicy.shouldRestartNode(
+            engineWasRestarted: true,
+            nodeIsPlaying: true
+        ))
+        XCTAssertTrue(RealtimeRenderRecoveryPolicy.shouldRestartNode(
+            engineWasRestarted: false,
+            nodeIsPlaying: false
+        ))
+    }
+
     private final class MockRecorder: WatchRealtimeMediaAdapter.Recorder {
         var onFrame: ((Data) -> Void)?
         var onFailure: ((Error) -> Void)?
@@ -114,7 +150,47 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         }
     }
 
-    private func makeAdapter(sessionIds: [String]) -> (
+    /// ESS-527 test double for the internal barrier timer. Captures the most
+    /// recent `arm(...)` callback so the test can fire it synchronously
+    /// without depending on wall-clock `Task.sleep`. `@MainActor` because
+    /// `BarrierTimer` requirements are actor-isolated and the callback the
+    /// tests want to fire is `@MainActor () -> Void`.
+    @MainActor
+    final class ManualBarrierTimer: WatchRealtimeMediaAdapter.BarrierTimer {
+        private(set) var armCount = 0
+        private(set) var cancelCount = 0
+        private(set) var lastRequestedInterval: TimeInterval?
+        private var pending: (@MainActor () -> Void)?
+
+        var isArmed: Bool { pending != nil }
+
+        nonisolated init() {}
+
+        func arm(after seconds: TimeInterval, fire: @escaping @MainActor () -> Void) {
+            armCount += 1
+            lastRequestedInterval = seconds
+            pending = fire
+        }
+
+        func cancel() {
+            cancelCount += 1
+            pending = nil
+        }
+
+        /// Simulate the sleep expiring. Returns whether a callback fired.
+        @discardableResult
+        func fire() -> Bool {
+            guard let callback = pending else { return false }
+            pending = nil
+            callback()
+            return true
+        }
+    }
+
+    private func makeAdapter(
+        sessionIds: [String],
+        barrierTimer: WatchRealtimeMediaAdapter.BarrierTimer = TaskBasedBarrierTimer()
+    ) -> (
         WatchRealtimeMediaAdapter, MockRecorder, MockPlayer, MockTransport, FallbackCounter
     ) {
         let recorder = MockRecorder()
@@ -137,7 +213,8 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         )
         let adapter = WatchRealtimeMediaAdapter(
             session: session, recorder: recorder, player: player, transport: transport,
-            fullFileFallback: { handle, reason in counter.record(handle, reason) }
+            fullFileFallback: { handle, reason in counter.record(handle, reason) },
+            barrierTimer: barrierTimer
         )
         return (adapter, recorder, player, transport, counter)
     }
@@ -166,6 +243,36 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         )
         adapter.ingestDownlink(downlinkChunk)
         XCTAssertEqual(player.enqueuedChunks.map(\.sequence), [0])
+    }
+
+    func testUplinkAckReleasesBudgetAndLogsRuntimeReceipt() {
+        let requestId = "44444444-4444-4444-4444-444444444444"
+        let (adapter, recorder, _, transport, _) = makeAdapter(sessionIds: [
+            "55555555-5555-5555-5555-555555555555"
+        ])
+        let handle = adapter.beginTurn(requestId: requestId)
+        recorder.feed(Data(repeating: 0x11, count: 64))
+        let chunk = try! XCTUnwrap(transport.appendEvents.first)
+
+        adapter.receiveUplinkAck(RealtimeUplinkAck(
+            requestId: handle.requestId,
+            sessionId: handle.sessionId,
+            sequence: chunk.sequence,
+            byteCount: chunk.payload.count
+        ))
+        // Duplicate receipt is ignored by the byte ledger and produces no
+        // second accepted-ACK log event.
+        adapter.receiveUplinkAck(RealtimeUplinkAck(
+            requestId: handle.requestId,
+            sessionId: handle.sessionId,
+            sequence: chunk.sequence,
+            byteCount: chunk.payload.count
+        ))
+
+        recorder.feed(Data(repeating: 0x22, count: 64))
+        adapter.commit()
+        XCTAssertEqual(transport.appendEvents.map(\.sequence), [0, 1])
+        XCTAssertEqual(transport.commitEvents.first?.sequence, 1)
     }
 
     func testTransportFailureTriggersOneShotCompleteFileFallback() {
@@ -455,5 +562,211 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
             detail.contains("final_seq=2"),
             "the unique done_barrier_released line must carry final_seq=2; got detail=\(detail)"
         )
+    }
+
+    // MARK: - ESS-527 outer timer regressions
+
+    /// ESS-527 acceptance 1: barrier armed + missing tail + timeout → exactly
+    /// one `.doneBarrierTimedOut` fallback surfaces, with the structured
+    /// `done_barrier_timeout` log carrying the missing seq list. Before this
+    /// fix the internal timer was never armed so this trace produced 13
+    /// minutes of silence and zero fallback events (bridge.log evidence in
+    /// ESS-527 body).
+    func testEss527_BarrierTimeoutTriggersExactlyOneFallback() {
+        let requestId = "44444444-4444-4444-4444-444444444527"
+        let sessionId = "55555555-5555-5555-5555-555555555527"
+        let timer = ManualBarrierTimer()
+        let (adapter, _, _, _, _) = makeAdapter(
+            sessionIds: [sessionId], barrierTimer: timer
+        )
+
+        struct LogEvent { let module: String; let event: String; let detail: String? }
+        final class LogSink { var events: [LogEvent] = [] }
+        let sink = LogSink()
+        WatchLog.setObserver { module, event, detail, _ in
+            sink.events.append(LogEvent(module: module, event: event, detail: detail))
+        }
+        defer { WatchLog.setObserver(nil) }
+
+        let handle = adapter.beginTurn(requestId: requestId)
+        adapter.openGeneration(1)
+        // Only seq 0..1 arrive. final_sequence=3 leaves 2..3 pending forever.
+        for i in 0..<2 {
+            adapter.ingestDownlink(
+                VoiceStreamChunk(
+                    requestId: handle.requestId, streamId: handle.sessionId,
+                    direction: .downlink, sequence: i,
+                    capturedAtMs: 1_800_000_000_000 + Int64(i),
+                    codec: "pcm_s16le", sampleRate: 24_000,
+                    payload: Data(repeating: UInt8(i), count: 64)
+                ),
+                responseId: "r-527A", generation: 1
+            )
+        }
+        adapter.markDownlinkComplete(
+            responseId: "r-527A", generation: 1, finalSequence: 3
+        )
+
+        // The waiting branch must arm the timer at exactly the 2.0 s budget.
+        XCTAssertTrue(timer.isArmed, "barrier waiting must arm the outer timer — this is the ESS-527 dead-code fix")
+        XCTAssertEqual(timer.armCount, 1)
+        XCTAssertEqual(
+            timer.lastRequestedInterval,
+            WatchRealtimeMediaAdapter.doneBarrierTimeoutSeconds
+        )
+
+        // Fire the timer. Adapter routes it through `session.doneBarrierTimeout()`
+        // → `.playbackFallback(.doneBarrierTimedOut([2,3]))` → single
+        // structured error log; a second fire is a no-op (buffer absorbs).
+        XCTAssertTrue(timer.fire())
+        XCTAssertFalse(timer.fire(), "second fire must be absorbed; the buffer's alreadyFellBack path swallows it")
+
+        let timeoutLogs = sink.events.filter {
+            $0.module == "realtime" && $0.event == "done_barrier_timeout"
+        }
+        XCTAssertEqual(
+            timeoutLogs.count, 1,
+            "done_barrier_timeout must surface exactly once — ESS-527 acceptance"
+        )
+        let detail = timeoutLogs.first?.detail ?? ""
+        XCTAssertTrue(
+            detail.contains("missing_seq=[2, 3]"),
+            "done_barrier_timeout must carry the missing seq list; got detail=\(detail)"
+        )
+    }
+
+    /// ESS-527 acceptance 2: barrier armed + late deltas fill the missing
+    /// set → coordinator emits `.doneBarrierReleased` and the adapter
+    /// cancels the timer BEFORE it can fire. `player.finish` is called
+    /// exactly once (the async release path) and no fallback is surfaced.
+    func testEss527_LateDeltasReleaseBarrierAndCancelTimer() {
+        let requestId = "44444444-4444-4444-4444-444444444528"
+        let sessionId = "55555555-5555-5555-5555-555555555528"
+        let timer = ManualBarrierTimer()
+        let (adapter, _, player, _, _) = makeAdapter(
+            sessionIds: [sessionId], barrierTimer: timer
+        )
+
+        struct LogEvent { let module: String; let event: String; let detail: String? }
+        final class LogSink { var events: [LogEvent] = [] }
+        let sink = LogSink()
+        WatchLog.setObserver { module, event, detail, _ in
+            sink.events.append(LogEvent(module: module, event: event, detail: detail))
+        }
+        defer { WatchLog.setObserver(nil) }
+
+        let handle = adapter.beginTurn(requestId: requestId)
+        adapter.openGeneration(1)
+        // Head deltas 0..1 arrive first.
+        for i in 0..<2 {
+            adapter.ingestDownlink(
+                VoiceStreamChunk(
+                    requestId: handle.requestId, streamId: handle.sessionId,
+                    direction: .downlink, sequence: i,
+                    capturedAtMs: 1_800_000_000_000 + Int64(i),
+                    codec: "pcm_s16le", sampleRate: 24_000,
+                    payload: Data(repeating: UInt8(i), count: 64)
+                ),
+                responseId: "r-527B", generation: 1
+            )
+        }
+        // Done arrives BEFORE tail deltas — barrier waits, timer arms.
+        adapter.markDownlinkComplete(
+            responseId: "r-527B", generation: 1, finalSequence: 3
+        )
+        XCTAssertTrue(timer.isArmed, "waiting branch must arm the timer")
+        XCTAssertEqual(player.finishCount, 0, "player must NOT drain while the barrier is waiting")
+        let cancelsBefore = timer.cancelCount
+
+        // Tail deltas 2..3 land — this should trigger the coordinator's
+        // async `checkBarrierRelease()` → `.doneBarrierReleased` and the
+        // adapter must cancel the pending timer.
+        for i in 2...3 {
+            adapter.ingestDownlink(
+                VoiceStreamChunk(
+                    requestId: handle.requestId, streamId: handle.sessionId,
+                    direction: .downlink, sequence: i,
+                    capturedAtMs: 1_800_000_000_000 + Int64(i),
+                    codec: "pcm_s16le", sampleRate: 24_000,
+                    payload: Data(repeating: UInt8(i), count: 64)
+                ),
+                responseId: "r-527B", generation: 1
+            )
+        }
+        XCTAssertFalse(timer.isArmed, "async release must cancel the pending barrier timer")
+        XCTAssertGreaterThan(timer.cancelCount, cancelsBefore)
+
+        // Exactly one drain, and it is the async-release path (no waited_ms=0
+        // marker; that string belongs to the sync path exclusively).
+        XCTAssertEqual(
+            player.finishCount, 1,
+            "player.finish must be invoked exactly once even after a late release"
+        )
+        XCTAssertEqual(player.finishInvocations.first as? String, "r-527B")
+
+        let releaseLogs = sink.events.filter {
+            $0.module == "realtime" && $0.event == "done_barrier_released"
+        }
+        XCTAssertEqual(releaseLogs.count, 1, "done_barrier_released must be emitted exactly once")
+        XCTAssertFalse(
+            releaseLogs.first?.detail?.contains("waited_ms=0") ?? true,
+            "the async release path must not carry the sync-only waited_ms=0 marker"
+        )
+
+        // Timer firing after cancellation is a no-op — this guards against
+        // a stray real-time task racing the cancel and stacking a fallback.
+        XCTAssertFalse(timer.fire())
+        let fallbackLogs = sink.events.filter {
+            $0.module == "realtime" && $0.event == "done_barrier_timeout"
+        }
+        XCTAssertTrue(fallbackLogs.isEmpty, "no barrier-timeout fallback must fire on the async-release path")
+    }
+
+    /// ESS-527: synchronous barrier release (all seqs present before done)
+    /// must not arm the timer at all. Guards against a regression where
+    /// the sync path accidentally lands in the waiting branch first.
+    func testEss527_SyncBarrierReleaseDoesNotArmTimer() {
+        let requestId = "44444444-4444-4444-4444-444444444529"
+        let sessionId = "55555555-5555-5555-5555-555555555529"
+        let timer = ManualBarrierTimer()
+        let (adapter, _, _, _, _) = makeAdapter(
+            sessionIds: [sessionId], barrierTimer: timer
+        )
+        let handle = adapter.beginTurn(requestId: requestId)
+        adapter.openGeneration(1)
+        for i in 0...2 {
+            adapter.ingestDownlink(
+                VoiceStreamChunk(
+                    requestId: handle.requestId, streamId: handle.sessionId,
+                    direction: .downlink, sequence: i,
+                    capturedAtMs: 1_800_000_000_000 + Int64(i),
+                    codec: "pcm_s16le", sampleRate: 24_000,
+                    payload: Data(repeating: UInt8(i), count: 64)
+                ),
+                responseId: "r-527C", generation: 1
+            )
+        }
+        adapter.markDownlinkComplete(
+            responseId: "r-527C", generation: 1, finalSequence: 2
+        )
+        XCTAssertEqual(timer.armCount, 0, "sync release must not arm the barrier timer")
+        XCTAssertFalse(timer.isArmed)
+    }
+
+    /// ESS-527: `-1` zero-audio done contract must not arm the timer — there
+    /// are no missing seqs to wait for and nothing to drain.
+    func testEss527_ZeroAudioContractDoesNotArmTimer() {
+        let requestId = "44444444-4444-4444-4444-444444444530"
+        let sessionId = "55555555-5555-5555-5555-555555555530"
+        let timer = ManualBarrierTimer()
+        let (adapter, _, _, _, _) = makeAdapter(
+            sessionIds: [sessionId], barrierTimer: timer
+        )
+        _ = adapter.beginTurn(requestId: requestId)
+        adapter.openGeneration(1)
+        adapter.markDownlinkComplete(
+            responseId: "r-527D", generation: 1, finalSequence: -1
+        )
+        XCTAssertEqual(timer.armCount, 0)
     }
 }

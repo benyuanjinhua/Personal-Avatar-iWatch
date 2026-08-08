@@ -22,6 +22,18 @@ export class QwenAgentTransport {
   }
 
   openTurn({ requestId, sessionId, generation, responseId, onEvent }) {
+    // ESS-537: a Watch conversation session may issue a new request before
+    // the provider has finished draining the prior response.  The upstream
+    // voice service is ownership-oriented, so leaving both sockets alive can
+    // deliver a late prior response on the newly-taken-over connection.  At
+    // that point this adapter would (incorrectly) stamp those bytes with the
+    // new request's responseId.  Enforce one active request per session and
+    // cancel/close the old upstream socket before opening the replacement.
+    for (const prior of this.turns.values()) {
+      if (prior.sessionId === sessionId && prior.requestId !== requestId) {
+        prior.supersede?.(requestId)
+      }
+    }
     const upstreamSessionId = `watch-direct-${sessionId}-${generation}`
     const url = new URL(this.gatewayUrl)
     url.searchParams.set('sessionId', upstreamSessionId)
@@ -30,6 +42,20 @@ export class QwenAgentTransport {
       ws: null, ready: false, terminal: false, committed: false,
       pending: [], pendingBytes: 0, nextOutputSequence: 0,
       connectTimer: null,
+    }
+    turn.supersede = nextRequestId => {
+      if (turn.terminal) return
+      turn.terminal = true
+      clearTimeout(turn.connectTimer)
+      this.log('upstream_turn_superseded', {
+        request_id: requestId, session_id: sessionId, generation,
+        superseded_by_request_id: nextRequestId,
+      })
+      if (turn.ws?.readyState === WebSocket.OPEN) {
+        try { turn.ws.send(JSON.stringify({ type: 'response.cancel' })) } catch { /* closing */ }
+      }
+      try { turn.ws?.close(1000, 'superseded') } catch { /* best effort */ }
+      this.turns.delete(requestId)
     }
     this.turns.set(requestId, turn)
     this.log('upstream_connecting', { request_id: requestId, session_id: sessionId, generation })
@@ -97,6 +123,10 @@ export class QwenAgentTransport {
           const sequence = Number.isInteger(event.sequence)
             ? event.sequence : turn.nextOutputSequence
           turn.nextOutputSequence = Math.max(turn.nextOutputSequence, sequence + 1)
+          this.log('upstream_event_received', {
+            request_id: requestId, session_id: sessionId, generation,
+            upstream_event_type: 'audio.delta', sequence,
+          })
           this.log('upstream_audio_delta', {
             request_id: requestId, session_id: sessionId, generation, sequence,
           })
@@ -108,6 +138,10 @@ export class QwenAgentTransport {
         }
         if (event.type === 'audio.done') {
           const finalSequence = turn.nextOutputSequence - 1
+          this.log('upstream_event_received', {
+            request_id: requestId, session_id: sessionId, generation,
+            upstream_event_type: 'audio.done', final_sequence: finalSequence,
+          })
           this.log('upstream_audio_done', {
             request_id: requestId, session_id: sessionId, generation,
             final_sequence: finalSequence,

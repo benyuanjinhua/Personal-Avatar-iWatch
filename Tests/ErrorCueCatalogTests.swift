@@ -12,6 +12,16 @@ final class ErrorCueCatalogTests: XCTestCase {
         XCTAssertEqual(entry.clip, "ErrorCue_AudioTooShort")
     }
 
+    /// ESS-538：录音中断截断走族 A（重说），文案与「按太短」明确区分，
+    /// 且不允许出缓存重试按钮（残片已本地丢弃，无缓存可重发）。
+    func testRecordingInterruptedIsReRecordFamilyWithoutCachedRetry() {
+        let entry = ErrorCueCatalog.cue(for: "ERR_RECORDING_INTERRUPTED")
+        XCTAssertEqual(entry.code, "ERR_RECORDING_INTERRUPTED")
+        XCTAssertTrue(entry.text.contains("被打断"), "interrupted 要说明是录音被打断，不是按太短")
+        XCTAssertEqual(entry.recoveryFamily, .reRecord)
+        XCTAssertFalse(entry.recoveryFamily.allowsCachedRetry)
+    }
+
     func testTranscriptDiscardedHintsClarity() {
         let entry = ErrorCueCatalog.cue(for: "ERR_TRANSCRIPT_DISCARDED")
         XCTAssertTrue(entry.text.contains("离麦"))
@@ -241,6 +251,7 @@ final class ErrorCueCatalogTests: XCTestCase {
             "ERR_REALTIME_STALLED",
             "ERR_REALTIME_NO_EVENTS",
             "ERR_REALTIME_TIMEOUT",
+            "ERR_RECORDING_INTERRUPTED",
         ] {
             let entry = ErrorCueCatalog.cue(for: code)
             XCTAssertEqual(entry.recoveryFamily, .reRecord, "\(code) → 族 A")

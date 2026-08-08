@@ -24,6 +24,11 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
         category: "AgentTransport"
     )
 
+    /// Log module for `PhoneAgentClientLog` entries emitted by this
+    /// enqueue-to-Watch adapter (ESS-525 §1 requires
+    /// `downlink_enqueued` / `play_started` / `play_finished`).
+    private static let logModule = "agent_bridge"
+
     /// Caller-provided sink that pushes decoded downlink envelopes back to
     /// `PhoneConnectivity.forwardRealtimeDownlink`.
     var onDownlink: ((RealtimeDownlinkEnvelope) -> Void)?
@@ -203,20 +208,48 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
     private func wireAgentSession() {
         agentSession.onAudioDelta = { [weak self] chunk, responseId, gen in
             guard let self else { return }
-            guard gen == self.gate.generation else { return }
+            guard gen == self.gate.generation else {
+                PhoneAgentClientLog.info(
+                    module: Self.logModule,
+                    event: "downlink_audio_delta_stale_generation",
+                    requestId: self.requestId, sessionId: self.sessionId,
+                    detail: "seq=\(chunk.sequence) frame_gen=\(gen) current_gen=\(self.gate.generation)"
+                )
+                return
+            }
             let envelope = RealtimeDownlinkEnvelope.audioDelta(
                 chunk, responseId: responseId, generation: gen
+            )
+            PhoneAgentClientLog.info(
+                module: Self.logModule,
+                event: "downlink_enqueued",
+                requestId: self.requestId, sessionId: self.sessionId,
+                detail: "type=audio.delta seq=\(chunk.sequence) bytes=\(chunk.payload.count) gen=\(gen)"
             )
             self.onDownlink?(envelope)
         }
         agentSession.onAudioDone = { [weak self] rid, responseId, gen, finalSeq in
             guard let self else { return }
-            guard gen == self.gate.generation else { return }
+            guard gen == self.gate.generation else {
+                PhoneAgentClientLog.info(
+                    module: Self.logModule,
+                    event: "downlink_audio_done_stale_generation",
+                    requestId: rid, sessionId: self.sessionId,
+                    detail: "final_seq=\(finalSeq) frame_gen=\(gen) current_gen=\(self.gate.generation)"
+                )
+                return
+            }
             let envelope = RealtimeDownlinkEnvelope.audioDone(
                 requestId: rid, sessionId: self.sessionId,
                 responseId: responseId,
                 generation: gen,
                 finalSequence: finalSeq
+            )
+            PhoneAgentClientLog.info(
+                module: Self.logModule,
+                event: "downlink_enqueued",
+                requestId: rid, sessionId: self.sessionId,
+                detail: "type=audio.done final_seq=\(finalSeq) gen=\(gen)"
             )
             self.onDownlink?(envelope)
         }

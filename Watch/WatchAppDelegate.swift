@@ -40,6 +40,8 @@ final class WatchAppServices {
             debugSettings?.isStreamingActive ?? VoiceStreamingGate.defaultEnabled
         }
         pushToTalk.onAutoPlayStarted = { [welcome] in welcome.interrupt() }
+        // ESS-535: stop welcome speech immediately when user presses to talk.
+        pushToTalk.onPressBegan = { [welcome] in welcome.interrupt() }
         // ESS-321: pre-warm the adapter so the settings store's downlink
         // dispatch has somewhere to send `audio.delta` payloads even before
         // the first press has fired.

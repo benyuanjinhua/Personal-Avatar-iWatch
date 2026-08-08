@@ -1,5 +1,7 @@
 # 腕语 WristAgent
 
+开发与 PR 复审的 Watch 模拟器门禁见 [Watch 模拟器回归门禁](Docs/WATCH_SIMULATOR_REGRESSION.md)。
+
 Apple Watch 上的语音 Agent 遥控器。Watch 负责录音、状态反馈、TTS 和风险确认；ASR、Agent 与业务工具运行在服务端。公司内网场景采用 iPhone Companion Relay，经 iPhone 上的 Tailscale 访问 Agent。
 
 当前工程包含：
