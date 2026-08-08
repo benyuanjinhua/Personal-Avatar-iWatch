@@ -121,10 +121,17 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         private(set) var fallbackEvents: [(RealtimeMediaSession.TurnHandle,
                                           RealtimeUplinkStream.FallbackReason)] = []
         private(set) var bargeInRequests: [RealtimeBargeInRequest] = []
+        private(set) var identities: [(String?, String?)] = []
 
-        func sendStreamStart(_ start: RealtimeStreamStart) { startEvents.append(start) }
-        func sendAudioAppend(_ chunk: VoiceStreamChunk) { appendEvents.append(chunk) }
-        func sendAudioCommit(_ commit: RealtimeStreamCommit) { commitEvents.append(commit) }
+        func sendStreamStart(_ start: RealtimeStreamStart, conversationId: String?, turnId: String?) {
+            startEvents.append(start); identities.append((conversationId, turnId))
+        }
+        func sendAudioAppend(_ chunk: VoiceStreamChunk, conversationId: String?, turnId: String?) {
+            appendEvents.append(chunk); identities.append((conversationId, turnId))
+        }
+        func sendAudioCommit(_ commit: RealtimeStreamCommit, conversationId: String?, turnId: String?) {
+            commitEvents.append(commit); identities.append((conversationId, turnId))
+        }
         func sendPlaybackStarted(handle: RealtimeMediaSession.TurnHandle, responseId: String) {
             playbackStartEvents.append((handle, responseId))
         }

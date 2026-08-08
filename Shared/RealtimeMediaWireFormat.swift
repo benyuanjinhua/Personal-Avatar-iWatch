@@ -25,12 +25,18 @@ struct RealtimeUplinkAck: Codable, Sendable, Equatable {
     let sessionId: String
     let sequence: Int
     let byteCount: Int
+    /// ESS-571: optional conversation-level identity (Phase 0 dual-write).
+    var conversationId: String?
+    /// ESS-571: optional turn-level identity (Phase 0 dual-write).
+    var turnId: String?
 
     enum CodingKeys: String, CodingKey {
         case requestId = "request_id"
         case sessionId = "session_id"
         case sequence
         case byteCount = "byte_count"
+        case conversationId = "conversation_id"
+        case turnId = "turn_id"
     }
 }
 
@@ -57,6 +63,10 @@ struct RealtimeUplinkEnvelope: Codable, Sendable, Equatable {
     let fallback: RealtimeUplinkFallbackDescriptor?
     /// ESS-404 A4: only present when `kind == .bargeInRequest`.
     let bargeIn: RealtimeBargeInRequest?
+    /// ESS-571: optional conversation-level identity (Phase 0 dual-write).
+    var conversationId: String?
+    /// ESS-571: optional turn-level identity (Phase 0 dual-write).
+    var turnId: String?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
@@ -67,6 +77,8 @@ struct RealtimeUplinkEnvelope: Codable, Sendable, Equatable {
         case playback
         case fallback
         case bargeIn = "bargein"
+        case conversationId = "conversation_id"
+        case turnId = "turn_id"
     }
 
     init(
@@ -77,7 +89,9 @@ struct RealtimeUplinkEnvelope: Codable, Sendable, Equatable {
         commit: RealtimeStreamCommit?,
         playback: RealtimePlaybackReceipt?,
         fallback: RealtimeUplinkFallbackDescriptor?,
-        bargeIn: RealtimeBargeInRequest? = nil
+        bargeIn: RealtimeBargeInRequest? = nil,
+        conversationId: String? = nil,
+        turnId: String? = nil
     ) {
         self.protocolVersion = protocolVersion
         self.kind = kind
@@ -87,10 +101,14 @@ struct RealtimeUplinkEnvelope: Codable, Sendable, Equatable {
         self.playback = playback
         self.fallback = fallback
         self.bargeIn = bargeIn
+        self.conversationId = conversationId
+        self.turnId = turnId
     }
 
     /// Explicit initializer used by the JSON decoder: the `bargein` key is
     /// optional on the wire so pre-ESS-404 messages still decode cleanly.
+    /// ESS-571: conversation_id / turn_id are optional so pre-migration
+    /// messages also decode.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.protocolVersion = try c.decode(Int.self, forKey: .protocolVersion)
@@ -101,29 +119,34 @@ struct RealtimeUplinkEnvelope: Codable, Sendable, Equatable {
         self.playback = try c.decodeIfPresent(RealtimePlaybackReceipt.self, forKey: .playback)
         self.fallback = try c.decodeIfPresent(RealtimeUplinkFallbackDescriptor.self, forKey: .fallback)
         self.bargeIn = try c.decodeIfPresent(RealtimeBargeInRequest.self, forKey: .bargeIn)
+        self.conversationId = try c.decodeIfPresent(String.self, forKey: .conversationId)
+        self.turnId = try c.decodeIfPresent(String.self, forKey: .turnId)
     }
 
-    static func start(_ start: RealtimeStreamStart) -> Self {
+    static func start(_ start: RealtimeStreamStart, conversationId: String? = nil, turnId: String? = nil) -> Self {
         RealtimeUplinkEnvelope(
             protocolVersion: RealtimeWireVersion.uplink,
             kind: .streamStart, start: start, append: nil, commit: nil,
-            playback: nil, fallback: nil
+            playback: nil, fallback: nil,
+            conversationId: conversationId, turnId: turnId
         )
     }
 
-    static func append(_ chunk: VoiceStreamChunk) -> Self {
+    static func append(_ chunk: VoiceStreamChunk, conversationId: String? = nil, turnId: String? = nil) -> Self {
         RealtimeUplinkEnvelope(
             protocolVersion: RealtimeWireVersion.uplink,
             kind: .audioAppend, start: nil, append: chunk, commit: nil,
-            playback: nil, fallback: nil
+            playback: nil, fallback: nil,
+            conversationId: conversationId, turnId: turnId
         )
     }
 
-    static func commit(_ commit: RealtimeStreamCommit) -> Self {
+    static func commit(_ commit: RealtimeStreamCommit, conversationId: String? = nil, turnId: String? = nil) -> Self {
         RealtimeUplinkEnvelope(
             protocolVersion: RealtimeWireVersion.uplink,
             kind: .audioCommit, start: nil, append: nil, commit: commit,
-            playback: nil, fallback: nil
+            playback: nil, fallback: nil,
+            conversationId: conversationId, turnId: turnId
         )
     }
 
@@ -169,11 +192,17 @@ struct RealtimeBargeInRequest: Codable, Sendable, Equatable {
     let requestId: String
     let sessionId: String
     let fromGeneration: Int
+    /// ESS-571: optional conversation-level identity.
+    var conversationId: String?
+    /// ESS-571: optional turn-level identity.
+    var turnId: String?
 
     enum CodingKeys: String, CodingKey {
         case requestId = "request_id"
         case sessionId = "session_id"
         case fromGeneration = "from_generation"
+        case conversationId = "conversation_id"
+        case turnId = "turn_id"
     }
 }
 
@@ -181,11 +210,17 @@ struct RealtimeUplinkFallbackDescriptor: Codable, Sendable, Equatable {
     let requestId: String
     let sessionId: String
     let reason: String
+    /// ESS-571: optional conversation-level identity.
+    var conversationId: String?
+    /// ESS-571: optional turn-level identity.
+    var turnId: String?
 
     enum CodingKeys: String, CodingKey {
         case requestId = "request_id"
         case sessionId = "session_id"
         case reason
+        case conversationId = "conversation_id"
+        case turnId = "turn_id"
     }
 }
 
@@ -194,12 +229,18 @@ struct RealtimePlaybackReceipt: Codable, Sendable, Equatable {
     let sessionId: String
     let responseId: String
     let bytesPlayed: Int?
+    /// ESS-571: optional conversation-level identity.
+    var conversationId: String?
+    /// ESS-571: optional turn-level identity.
+    var turnId: String?
 
     enum CodingKeys: String, CodingKey {
         case requestId = "request_id"
         case sessionId = "session_id"
         case responseId = "response_id"
         case bytesPlayed = "bytes_played"
+        case conversationId = "conversation_id"
+        case turnId = "turn_id"
     }
 }
 
@@ -268,6 +309,10 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
     /// means Gateway did not send the field — a contract violation that
     /// degrades to `n = max seq seen so far` under `done_missing_final_sequence`.
     let finalSequence: Int?
+    /// ESS-571: optional conversation-level identity (Phase 0 dual-write).
+    var conversationId: String?
+    /// ESS-571: optional turn-level identity (Phase 0 dual-write).
+    var turnId: String?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
@@ -281,6 +326,8 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         case responseId = "response_id"
         case generation
         case finalSequence = "final_sequence"
+        case conversationId = "conversation_id"
+        case turnId = "turn_id"
     }
 
     init(
@@ -294,7 +341,9 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         reason: String?,
         responseId: String?,
         generation: Int? = nil,
-        finalSequence: Int? = nil
+        finalSequence: Int? = nil,
+        conversationId: String? = nil,
+        turnId: String? = nil
     ) {
         self.protocolVersion = protocolVersion
         self.kind = kind
@@ -307,10 +356,13 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         self.responseId = responseId
         self.generation = generation
         self.finalSequence = finalSequence
+        self.conversationId = conversationId
+        self.turnId = turnId
     }
 
     /// Explicit decoder so pre-ESS-404 messages (no `generation`, no
-    /// `final_sequence`) still decode. Only mandatory keys are strict.
+    /// `final_sequence`) and pre-ESS-571 messages (no `conversation_id`,
+    /// no `turn_id`) still decode. Only mandatory keys are strict.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.protocolVersion = try c.decode(Int.self, forKey: .protocolVersion)
@@ -324,6 +376,8 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         self.responseId = try c.decodeIfPresent(String.self, forKey: .responseId)
         self.generation = try c.decodeIfPresent(Int.self, forKey: .generation)
         self.finalSequence = try c.decodeIfPresent(Int.self, forKey: .finalSequence)
+        self.conversationId = try c.decodeIfPresent(String.self, forKey: .conversationId)
+        self.turnId = try c.decodeIfPresent(String.self, forKey: .turnId)
     }
 
     /// Bridge PR #113 handshake ack. Carries no payload. Adapter treats this
