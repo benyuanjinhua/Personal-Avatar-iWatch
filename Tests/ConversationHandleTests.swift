@@ -132,19 +132,28 @@ final class ConversationHandleTests: XCTestCase {
 
     func testEquality() {
         let id = UUID(uuidString: "11111111-1111-4111-8111-111111111111")!.uuidString
-        var h1 = ConversationHandle(conversationId: id, firstTurnId: id)
-        var h2 = ConversationHandle(conversationId: id, firstTurnId: id)
+        let createdAt = Date(timeIntervalSince1970: 1_800_000_000)
+        var h1 = ConversationHandle(conversationId: id, firstTurnId: id, createdAt: createdAt)
+        let h2 = ConversationHandle(conversationId: id, firstTurnId: id, createdAt: createdAt)
         XCTAssertEqual(h1, h2)
 
         // Different after mutation
         _ = h1.nextTurn()
         XCTAssertNotEqual(h1, h2)
+
+        let createdLater = ConversationHandle(
+            conversationId: id,
+            firstTurnId: id,
+            createdAt: createdAt.addingTimeInterval(1)
+        )
+        XCTAssertNotEqual(h2, createdLater)
     }
 
     func testHashable() {
         let id = "11111111-1111-4111-8111-111111111111"
-        let h1 = ConversationHandle(conversationId: id, firstTurnId: id)
-        let h2 = ConversationHandle(conversationId: id, firstTurnId: id)
+        let createdAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let h1 = ConversationHandle(conversationId: id, firstTurnId: id, createdAt: createdAt)
+        let h2 = ConversationHandle(conversationId: id, firstTurnId: id, createdAt: createdAt)
         let set: Set<ConversationHandle> = [h1, h2]
         XCTAssertEqual(set.count, 1, "相等的 Handle Hashable 也必须退化为一个元素")
     }
