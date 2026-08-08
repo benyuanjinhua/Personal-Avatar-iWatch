@@ -81,6 +81,15 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     let sessionOwnerToken = UUID()
     static var sharedSessionOwner: UUID?
 
+    /// ESS-554：ConversationAudioController 持有会话期间（整个 conversation
+    /// `.playAndRecord` 全程激活）返回 true。此时 SpeechPlayer 既不重新
+    /// configure/activate（会把持有的 `.playAndRecord` 改成 `.playback`，
+    /// 踩塌会话级所有权），也不在收尾时 deactivate（会把别人持有的会话
+    /// 拆掉）。AVAudioPlayer 在已激活的 `.playAndRecord` 会话上直接可播。
+    /// 由 WatchAppServices.bootstrap 一次性接线；默认 false = 今天的
+    /// 回合级行为（回退路径）。
+    static var sessionExternallyOwned: () -> Bool = { false }
+
     var currentContext: String? { isPlaying ? context : nil }
 
     init(instanceTag: String = "unknown") {
@@ -202,6 +211,17 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
         // （见 AudioSessionPolicy.nextPlaybackActivationAction）。中断期间
         // 到来的 .began 会经 haltPlaybackForInterruption 收掉本次播放并使
         // generation 失效，无需在此处预判中断状态。
+        // ESS-554：会话级持有期间跳过激活——会话已是激活的 `.playAndRecord`，
+        // 直接起播；重配类别会踩塌 ConversationAudioController 的所有权。
+        if Self.sessionExternallyOwned() {
+            WatchLog.info(
+                "player", "session_activation_skipped", requestId: context,
+                detail: "reason=conversation_owned instance=\(instanceTag) "
+                    + activationEvidence()
+            )
+            beginPlayback(player, bytes: bytes)
+            return
+        }
         activateSession(context: context) { [weak self] activated in
             guard let self, self.playbackGeneration == generation, self.audioPlayer === player else { return }
             if activated {
@@ -483,6 +503,16 @@ final class SpeechPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     ///     校验偶然通过也不 deactivate（`skipped_reason=category_taken_over`）
     /// 跳过路径与真 release 都留取证事件，Bridge 侧可以对账两条路径的比例。
     private func releaseAudioSession(requestId: String?, reason: String) {
+        // ESS-554：会话级持有期间绝不 deactivate——会话归
+        // ConversationAudioController 所有，点 X 才由它真释放（PD-2）。
+        if Self.sessionExternallyOwned() {
+            WatchLog.info(
+                "player", "session_release_skipped", requestId: requestId,
+                detail: "reason=\(reason) skipped_reason=conversation_owned "
+                    + "instance=\(instanceTag) " + activationEvidence()
+            )
+            return
+        }
         let session = AVAudioSession.sharedInstance()
         let me = sessionOwnerToken
         guard SpeechPlayer.sharedSessionOwner == me else {

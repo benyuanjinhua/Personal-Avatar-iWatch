@@ -51,6 +51,12 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
     @Published private(set) var isRecording = false
     @Published private(set) var level: Float = 0
 
+    /// ESS-554：ConversationAudioController 持有会话期间（`.playAndRecord`
+    /// 会话级激活）返回 true——此时本类跳过每回合的 configure/deactivate：
+    /// 会话在会话开始时已配好，回合结束也不再交还（PD-2：点 X 才真 deactivate）。
+    /// 默认 false = 今天的回合级行为（回退路径）。
+    var sessionManagedExternally: () -> Bool = { false }
+
     private var recorder: AVAudioRecorder?
     private var meterTimer: Timer?
     private var streamTimer: Timer?
@@ -139,6 +145,14 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         // ESS-61：上一次播放会把共享会话设成 .longFormAudio 路由策略（ESS-58），
         // 该策略是粘性的且与 .playAndRecord 不相容，不显式复位则 setCategory/
         // setActive 抛 -50（paramErr），录音全灭。尝试序列见 AudioSessionPolicy。
+        // ESS-554：会话级持有时跳过本段——ConversationAudioController 已在
+        // conversation 开始时用同一阶梯配好 `.playAndRecord` 并保持激活。
+        if sessionManagedExternally() {
+            WatchLog.info(
+                "recorder", "session_config_skipped",
+                detail: "reason=conversation_owned"
+            )
+        } else {
         let session = AVAudioSession.sharedInstance()
         var attempt = AudioSessionPolicy.nextRecordingAttempt(after: nil)
         var configured = false
@@ -161,6 +175,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         guard configured else {
             // 原始 OSStatus 只进上面的日志；用户看到的是可行动中文文案（F3）。
             throw RecorderError.sessionActivationFailed
+        }
         }
 
         let url = FileManager.default.temporaryDirectory
@@ -240,7 +255,16 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         recordingStartUptime = nil
         stopMetering()
         isRecording = false
-        releaseSession(reason: "finish")
+        if sessionManagedExternally() {
+            // ESS-554：会话级持有时回合结束不交还会话（AI 回答紧接着要在
+            // 同一会话上播放；点 X 才由 controller 真 deactivate）。
+            WatchLog.info(
+                "recorder", "session_release_skipped",
+                detail: "reason=conversation_owned trigger=finish"
+            )
+        } else {
+            releaseSession(reason: "finish")
+        }
 
         let assetMs = currentURL.flatMap { Self.audioAssetDurationMs(url: $0) }
         let durationMs = Self.sanitizeDurationMs(rawMs: assetMs ?? wallClockMs)
@@ -361,7 +385,14 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         recordingStartUptime = nil
         isRecording = false
         stopMetering()
-        releaseSession(reason: "cancel")
+        if sessionManagedExternally() {
+            WatchLog.info(
+                "recorder", "session_release_skipped",
+                detail: "reason=conversation_owned trigger=cancel"
+            )
+        } else {
+            releaseSession(reason: "cancel")
+        }
     }
 
     private func emitStreamBytes(end: Bool) {

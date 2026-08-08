@@ -31,6 +31,10 @@ final class PCMFrameRecorder: WatchRealtimeMediaAdapter.Recorder {
     private let configuration: Configuration
     private let audioEngine: AVAudioEngine
     private let tapBus: AVAudioNodeBus
+    /// ESS-554：`.conversation` 时引擎生命周期归 ConversationAudioController
+    /// （会话级一次性起停），本类每回合只装卸 tap；`.turn` 为旧路径
+    /// （每回合 prepare+start / stop）。运行期动态读取，出厂默认旧路径。
+    private let lifecycleOwner: () -> RealtimeAudioLifecycleOwner
     private var converter: AVAudioConverter?
     private var isRunning = false
     private var accumulated = Data()
@@ -42,10 +46,12 @@ final class PCMFrameRecorder: WatchRealtimeMediaAdapter.Recorder {
     /// signal and hands off to the one-shot fallback.
     var onFailure: ((Error) -> Void)?
 
-    init(configuration: Configuration = Configuration(), audioEngine: AVAudioEngine = AVAudioEngine(), bus: AVAudioNodeBus = 0) {
+    init(configuration: Configuration = Configuration(), audioEngine: AVAudioEngine = AVAudioEngine(), bus: AVAudioNodeBus = 0,
+         lifecycleOwner: @escaping () -> RealtimeAudioLifecycleOwner = { .turn }) {
         self.configuration = configuration
         self.audioEngine = audioEngine
         self.tapBus = bus
+        self.lifecycleOwner = lifecycleOwner
     }
 
     var frameByteSize: Int {
@@ -106,13 +112,21 @@ final class PCMFrameRecorder: WatchRealtimeMediaAdapter.Recorder {
         inputNode.installTap(onBus: tapBus, bufferSize: bufferSize, format: inputFormat) { [weak self] buffer, _ in
             Task { @MainActor in self?.consume(buffer: buffer, targetFormat: targetFormat) }
         }
-        audioEngine.prepare()
-        do {
-            try audioEngine.start()
-        } catch {
-            inputNode.removeTap(onBus: tapBus)
-            converter = nil
-            throw error
+        // ESS-554：会话级模式下引擎由 ConversationAudioController 在
+        // acquire 时启动并跨回合保持运行——此处只在它不在跑时兜底启动
+        // （例如首回合与 acquire 竞态），绝不在回合边界起停引擎。
+        let conversationOwned = lifecycleOwner() == .conversation
+        if conversationOwned, audioEngine.isRunning {
+            // 引擎已在跑：tap 装上即开始产出帧，无引擎启动开销。
+        } else {
+            audioEngine.prepare()
+            do {
+                try audioEngine.start()
+            } catch {
+                inputNode.removeTap(onBus: tapBus)
+                converter = nil
+                throw error
+            }
         }
         isRunning = true
         accumulated.removeAll(keepingCapacity: true)
@@ -121,7 +135,11 @@ final class PCMFrameRecorder: WatchRealtimeMediaAdapter.Recorder {
     func stop() {
         guard isRunning else { return }
         audioEngine.inputNode.removeTap(onBus: tapBus)
-        audioEngine.stop()
+        // ESS-554：会话级模式下回合结束只摘 tap（AI 回答期间无上行帧），
+        // 引擎与会话都由 ConversationAudioController 继续持有。
+        if lifecycleOwner() == .turn {
+            audioEngine.stop()
+        }
         converter = nil
         isRunning = false
         if !accumulated.isEmpty {
