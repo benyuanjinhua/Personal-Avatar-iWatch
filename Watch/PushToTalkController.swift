@@ -75,6 +75,14 @@ final class PushToTalkController: ObservableObject {
     var onAutoPlayStarted: (() -> Void)?
     /// ESS-535: 用户按住说话时立即触发，用于打断欢迎语音释放音频会话。
     var onPressBegan: (() -> Void)?
+    /// ESS-573: 实时通道**真实就绪**——首个被对端（iPhone WSS 实际发出后
+    /// 回发）接受的 uplink ack 到达。SessionController 据此把 connecting
+    /// 推进到 listening；绝不在 pressBegan 后同步宣告 ready（复审硬约束）。
+    var onRealtimeChannelReady: (() -> Void)?
+    /// ESS-573: 实时通道**真实失败**——录音启动失败 / 上行发送失败
+    /// （WCSession 不可达或 sendMessage 报错）/ 适配器单发回退。
+    /// 仅 SessionController 在会话中消费；PTT 自身错误链不变。
+    var onRealtimeChannelFailed: ((SessionController.ChannelFailure) -> Void)?
 
     private static let logger = Logger(subsystem: "com.benyuan.wristagent.watch", category: "PlaybackTrigger")
     private let recorder = AudioRecorder()
@@ -138,6 +146,11 @@ final class PushToTalkController: ObservableObject {
     /// stays hot while downlink deltas are in flight.
     @Published private(set) var realtimePlaybackPending = false
 
+    /// ESS-573: 上行发送失败通知的观察者令牌（WCSession 不可达 / sendMessage
+    /// 报错）。该通知此前**没有观察者**——发帖即丢；接入后成为会话模式
+    /// 「通道建立失败/中途断开」的真实事件源之一。
+    private var realtimeUplinkFailedObserver: NSObjectProtocol?
+
     /// ESS-522：主屏封锁起点（ASR final / accepted 时刻），用于计算 main_screen_blocked_ms。
     private var mainScreenBlockedAt: Date?
     /// ESS-522：进度事件是否发生过——任何 progress spoken 计数。恒为 0 才合格。
@@ -184,6 +197,20 @@ final class PushToTalkController: ObservableObject {
         recorder.$level
             .receive(on: RunLoop.main)
             .assign(to: &$recordingLevel)
+
+        // ESS-573：上行发送失败（WCSession 未激活/不可达、sendMessage 报错）
+        // 是「通道建立失败/中途断开」的真实事件。该通知此前无观察者（发帖
+        // 即丢）；这里转发给 SessionController——只有会话中才会消费，PTT
+        // 路径的完整文件回退行为不变。
+        realtimeUplinkFailedObserver = NotificationCenter.default.addObserver(
+            forName: WatchVoiceTransport.realtimeUplinkFailedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.onRealtimeChannelFailed?(.channelEvent)
+            }
+        }
 
         // ESS-554：会话级持有期间 AudioRecorder 跳过每回合的会话 configure
         // 与 deactivate（PD-2：点 X 才真 deactivate，由 controller 兑现）。
@@ -604,6 +631,10 @@ final class PushToTalkController: ObservableObject {
                 // ESS-180：录音启动失败也是一次「秒失败」，走分身卡片 + 触觉，
                 // 不让手表只有底部一行灰字，然后就没了。
                 presentAvatarError(code: "ERR_RECORDER_START", requestId: nil)
+                // ESS-573：真实失败事件上抛——会话模式据此退出 connecting，
+                // 不再静默卡在「建立中」。卡片与 .failure 触觉已由上面既
+                // 有链呈现，SessionController 不再重复。
+                onRealtimeChannelFailed?(.recorderStart)
             }
         }
     }
@@ -684,6 +715,8 @@ final class PushToTalkController: ObservableObject {
             pendingFallbackReason.removeValue(forKey: requestIdString)
             isRealtimeStreaming = false
             clearStreamStateAfterAbort()
+            // ESS-573：实时通道在启动点即回退 = 建立失败的真实事件。
+            onRealtimeChannelFailed?(.channelEvent)
             return
         }
         realtimePlaybackPending = true
@@ -966,6 +999,15 @@ final class PushToTalkController: ObservableObject {
             WatchLog.info("realtime", "streaming_hold_released",
                           detail: "reason=turn_finished adapter_turn_active=false")
         }
+        // ESS-573: 真实通道事件透传给 SessionController——就绪只认首个
+        // 被对端接受的 uplink ack；快速上行死亡如实上报。PTT 路径本身
+        // 不消费这两个回调，行为不变。
+        adapter.onChannelReady = { [weak self] _ in
+            self?.onRealtimeChannelReady?()
+        }
+        adapter.onUplinkFallback = { [weak self] _ in
+            self?.onRealtimeChannelFailed?(.channelEvent)
+        }
         realtimeAdapter = adapter
         return adapter
     }
@@ -1153,9 +1195,40 @@ final class PushToTalkController: ObservableObject {
         recorder.cancel()
         releaseRequestedWhileStarting = false
         state = .idle
+        // ESS-573：取消未提交的实时回合——与 finishRecording 错误路径
+        // 同一清理口径，不让 PCM tap 挂到下次按压才停。
+        abortUnsubmittedRealtimeTurn()
         // ESS-554：按压被取消 = 本轮不会发起，会话随之显式收口（PD-2）。
         endConversationAudio(reason: .userExit)
         flushPendingAutoPlay()
+    }
+
+    /// ESS-573 / PRD F1：会话模式点 X / 下滑退出的统一拆链入口——
+    /// 「点 X 必须真正释放麦克风」：
+    /// - 录音中 → pressCancelled（不提交、停采集、取消实时回合、deactivate）
+    /// - 有进行中回合 → cancelActiveTurn（上行取消 + 本地投影 + deactivate）
+    /// - 其余（回合已终态/仅会话级音频持有）→ 幂等 deactivate。
+    /// 「≤300ms 麦克风释放」按 AVAudioSession deactivate 完成计，证据见
+    /// `conversation_audio_released` 的 duration_ms。
+    func endSessionChannel() {
+        if state == .recording {
+            pressCancelled()
+            return
+        }
+        if let turn = journal.activeTurn, turn.isActive {
+            cancelActiveTurn()
+            return
+        }
+        endConversationAudio(reason: .userExit)
+    }
+
+    /// ESS-573 / PRD F2 异常（单轮 60s 上限）：会话模式到点视同松手，
+    /// 走与 pressEnded 完全相同的 finishRecording → submit 链路。
+    /// VAD 自动断句（F2）在后续 Wave 接管后本入口退居上限兜底。
+    func endSessionTurn() {
+        guard state == .recording else { return }
+        guard recorder.isRecording else { return }
+        finishRecording()
     }
 
     /// 权限确认（§5.3）：只对当前回合生效；先本地记账（UI 立即反馈），再上行给 iPhone 签名转发。

@@ -95,6 +95,20 @@ final class WatchRealtimeMediaAdapter {
     var onRealtimePendingResolved: (@MainActor () -> Void)?
     var onVADEvent: (@MainActor (LocalVADEvent) -> Void)?
 
+    /// ESS-573: 真实通道就绪事件——本回合**首个被对端接受的 uplink ack**
+    /// 到达时触发一次。该 ack 由 iPhone 在 WSS 实际发出音频后回发
+    /// （PhoneConnectivity.acknowledgeRealtimeAppendIfNeeded），因此它证明
+    /// Watch→iPhone→Bridge 全链路已通，而不是本地「录音开始了」。
+    /// ESS-573 复审硬性要求：会话 UI 的 connecting → listening 只能由
+    /// 这个真实事件驱动，不得在发起录音后同步宣告 ready。
+    var onChannelReady: (@MainActor (_ requestId: String) -> Void)?
+
+    /// ESS-573: 快速上行通道死亡事件（传输失败 / 缓冲溢出 / 采集 tap
+    /// 失败等，经 RealtimeMediaSession 单发兜底）。会话模式据此刻意
+    /// 告知并退出——「不假装还在对话」。PTT 路径不受影响（完整文件
+    /// 回退照常交付）。
+    var onUplinkFallback: (@MainActor (_ requestId: String) -> Void)?
+
     let session: RealtimeMediaSession
     private let recorder: Recorder
     private let player: Player
@@ -107,6 +121,8 @@ final class WatchRealtimeMediaAdapter {
     private let automaticallyCommitOnSpeechFinal: Bool
     private var vadFrameStartedAtMs: Int64 = 0
     private(set) var didTriggerCompleteFileFallback = false
+    /// ESS-573: 每回合只向上一层宣告一次「通道就绪」（首个 ack）。
+    private var didSignalChannelReady = false
     private(set) var currentTurn: RealtimeMediaSession.TurnHandle?
     /// ESS-330: latest `response_id` observed on `audio.delta` for the current
     /// turn. Bridge PR #113 (`realtime-media-session.mjs:67-70`) tags every
@@ -209,6 +225,7 @@ final class WatchRealtimeMediaAdapter {
     /// cannot start.
     func beginTurn(requestId: String) -> RealtimeMediaSession.TurnHandle {
         didTriggerCompleteFileFallback = false
+        didSignalChannelReady = false
         currentResponseId = nil
         vadFrameStartedAtMs = Self.uptimeMs()
         vadEndpointer?.reset(atMs: vadFrameStartedAtMs)
@@ -273,6 +290,11 @@ final class WatchRealtimeMediaAdapter {
             "realtime", "uplink_ack_received", requestId: ack.requestId,
             detail: "sequence=\(ack.sequence) bytes=\(ack.byteCount)"
         )
+        // ESS-573: 首个被对端接受的 ack = 通道就绪的唯一真实信号。
+        if !didSignalChannelReady {
+            didSignalChannelReady = true
+            onChannelReady?(ack.requestId)
+        }
     }
 
     /// Called when the user starts speaking again mid-response.
@@ -396,6 +418,9 @@ final class WatchRealtimeMediaAdapter {
         case .uplinkFallback(let reason, let handle):
             recorder.stop()
             player.stop(barge: false)
+            // ESS-573: 快速上行已死——无论完整文件回退是否执行，都向
+            // 会话层如实上报（PTT 层忽略此回调，行为不变）。
+            onUplinkFallback?(handle.requestId)
             if !didTriggerCompleteFileFallback {
                 didTriggerCompleteFileFallback = true
                 // Signal the peer (Bridge) that the fast channel is dead so

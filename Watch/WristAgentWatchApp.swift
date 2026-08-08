@@ -16,7 +16,8 @@ struct WristAgentWatchApp: App {
                 welcome: services.welcome,
                 selfCheck: services.selfCheck,
                 debugSettings: services.debugSettings,
-                settings: services.settings
+                settings: services.settings,
+                session: services.sessionController
             )
                 .task {
                     // ESS-56：版本号在本工程恒为 0.1.0/1，分不出新旧安装——R3 就是
@@ -65,6 +66,13 @@ struct WristAgentWatchApp: App {
                         // 残片按 RecordingInterruptionPolicy 丢弃并提示重说。
                         services.pushToTalk.noteScreenOffDuringRecording(phase: "inactive")
                     case .background:
+                        // ESS-573：会话中退到后台（含放腕）——先走会话显式收口
+                        // 并告知（pressCancelled 丢弃残片），不让用户「以为还在
+                        // 听、实际已断」（PRD 异常链 C 的 Wave 1 临时口径，A/B
+                        // 形态待 ESS-529 取证）。必须在 noteScreenOff 之前——
+                        // 后者会把会话中的残片提交出去再被取消，白费一轮。
+                        // 非会话时本调用是 no-op，PTT 路径行为不变。
+                        services.sessionController.noteEnteredBackground()
                         services.pushToTalk.noteScreenOffDuringRecording(phase: "background")
                         WatchLogShipper.shared.ship(reason: "background")
                     default: break
