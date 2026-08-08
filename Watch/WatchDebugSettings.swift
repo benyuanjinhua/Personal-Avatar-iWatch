@@ -21,9 +21,12 @@ final class WatchDebugSettings: ObservableObject {
     /// 迁移策略：ESS-279 下行先接入，上行接入时复用同一键，不改写既有
     /// 磁盘状态；未来若要拆二键再另迁移。
     static let streamingEnabledDefaultsKey = "wristagent.watch.debug.downlink-streaming-enabled"
+    static let vadEndpointSilenceMsDefaultsKey = "wristagent.watch.debug.vad-endpoint-silence-ms"
+    static let defaultVADEndpointSilenceMs = 700
 
     /// 观察值：SwiftUI Toggle 直接绑定。写入即持久化 + 落日志 + 触发回退回调。
     @Published private(set) var streamingEnabled: Bool
+    @Published private(set) var vadEndpointSilenceMs: Int
 
     /// 单调递增的「流式代」计数：每次从 ON → OFF 加 1。
     /// 未来 wire-up 的流式回合在开始时快照本值，投递前发现不一致即知
@@ -41,6 +44,10 @@ final class WatchDebugSettings: ObservableObject {
             // 缺 key → 与编译期 gate 对齐：默认跟随 VoiceStreamingGate.defaultEnabled。
             self.streamingEnabled = VoiceStreamingGate.defaultEnabled
         }
+        let storedEndpointMs = defaults.object(forKey: Self.vadEndpointSilenceMsDefaultsKey) as? Int
+        self.vadEndpointSilenceMs = Self.sanitizeVADEndpointSilenceMs(
+            storedEndpointMs ?? Self.defaultVADEndpointSilenceMs
+        )
     }
 
     // MARK: - 门禁
@@ -81,6 +88,22 @@ final class WatchDebugSettings: ObservableObject {
         }
     }
 
+    func setVADEndpointSilenceMs(_ milliseconds: Int, source: String = "user") {
+        let sanitized = Self.sanitizeVADEndpointSilenceMs(milliseconds)
+        guard sanitized != vadEndpointSilenceMs else { return }
+        let previous = vadEndpointSilenceMs
+        vadEndpointSilenceMs = sanitized
+        defaults.set(sanitized, forKey: Self.vadEndpointSilenceMsDefaultsKey)
+        WatchLog.info(
+            "settings", "vad_endpoint_toggled",
+            detail: "from_ms=\(previous) to_ms=\(sanitized) source=\(source)"
+        )
+    }
+
+    static func sanitizeVADEndpointSilenceMs(_ milliseconds: Int) -> Int {
+        min(2_000, max(300, milliseconds))
+    }
+
     // MARK: - 观测：冷启动补报当前值（PM 明确要求「排障时得知道他当时开没开」）
 
     /// App 冷启动路径调用一次，把当前开关状态补落一条运行时事件，供 Bridge
@@ -88,7 +111,7 @@ final class WatchDebugSettings: ObservableObject {
     func logStateAtLaunch() {
         WatchLog.info(
             "settings", "streaming_state_at_launch",
-            detail: "value=\(streamingEnabled)"
+            detail: "value=\(streamingEnabled) vad_endpoint_ms=\(vadEndpointSilenceMs)"
         )
     }
 

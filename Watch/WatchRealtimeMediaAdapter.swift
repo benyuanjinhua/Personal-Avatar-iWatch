@@ -93,6 +93,7 @@ final class WatchRealtimeMediaAdapter {
     /// wires this to clear `realtimePlaybackPending` so the VoiceSessionKeeper
     /// can release the ExtendedRuntimeSession.
     var onRealtimePendingResolved: (@MainActor () -> Void)?
+    var onVADEvent: (@MainActor (LocalVADEvent) -> Void)?
 
     let session: RealtimeMediaSession
     private let recorder: Recorder
@@ -101,6 +102,10 @@ final class WatchRealtimeMediaAdapter {
     private let fullFileFallback: FullFileFallback
     private let logger: (String) -> Void
     private let barrierTimer: BarrierTimer
+    private var vadEndpointer: LocalVADEndpointer?
+    private let vadSampleRate: Int
+    private let automaticallyCommitOnSpeechFinal: Bool
+    private var vadFrameStartedAtMs: Int64 = 0
     private(set) var didTriggerCompleteFileFallback = false
     private(set) var currentTurn: RealtimeMediaSession.TurnHandle?
     /// ESS-330: latest `response_id` observed on `audio.delta` for the current
@@ -117,7 +122,9 @@ final class WatchRealtimeMediaAdapter {
         transport: Transport,
         fullFileFallback: @escaping FullFileFallback = { _, _ in },
         logger: @escaping (String) -> Void = { _ in },
-        barrierTimer: BarrierTimer = TaskBasedBarrierTimer()
+        barrierTimer: BarrierTimer = TaskBasedBarrierTimer(),
+        vadConfiguration: LocalVADConfiguration? = nil,
+        automaticallyCommitOnSpeechFinal: Bool = false
     ) {
         self.session = session
         self.recorder = recorder
@@ -126,11 +133,18 @@ final class WatchRealtimeMediaAdapter {
         self.fullFileFallback = fullFileFallback
         self.logger = logger
         self.barrierTimer = barrierTimer
+        self.vadEndpointer = vadConfiguration.map(LocalVADEndpointer.init(configuration:))
+        self.vadSampleRate = vadConfiguration?.sampleRate ?? RealtimeMediaFormat.uplinkPCM16.sampleRate
+        self.automaticallyCommitOnSpeechFinal = automaticallyCommitOnSpeechFinal
         wire()
     }
 
     private func wire() {
-        recorder.onFrame = { [weak self] frame in self?.session.pushMicrophonePCM(frame) }
+        recorder.onFrame = { [weak self] frame in
+            guard let self else { return }
+            self.session.pushMicrophonePCM(frame)
+            self.consumeVAD(frame)
+        }
         recorder.onFailure = { [weak self] _ in self?.session.markUplinkTransportFailed() }
         player.onPlaybackEvent = { [weak self] event in
             guard let self else { return }
@@ -148,6 +162,7 @@ final class WatchRealtimeMediaAdapter {
                       let responseId else { break }
                 self.transport.sendPlaybackStarted(handle: handle, responseId: responseId)
             case .ended(let requestId, let sessionId, let responseId, let bytesPlayed):
+                self.playbackEndedForVADGuard()
                 if let handle = self.currentTurn,
                    handle.requestId == requestId, handle.sessionId == sessionId,
                    let responseId {
@@ -189,6 +204,8 @@ final class WatchRealtimeMediaAdapter {
     func beginTurn(requestId: String) -> RealtimeMediaSession.TurnHandle {
         didTriggerCompleteFileFallback = false
         currentResponseId = nil
+        vadFrameStartedAtMs = Self.uptimeMs()
+        vadEndpointer?.reset(atMs: vadFrameStartedAtMs)
         // `session.beginTurn(...)` fires a `.turnFinished(...)` for any
         // existing turn which already cancels; the explicit cancel here is a
         // defence for the first-ever call (no prior turn to fire finished).
@@ -210,6 +227,38 @@ final class WatchRealtimeMediaAdapter {
     func commit() {
         recorder.stop()
         session.commitUplink()
+    }
+
+    func playbackEndedForVADGuard(atMs: Int64? = nil) {
+        let effectiveAtMs = atMs ?? Self.uptimeMs()
+        vadEndpointer?.playbackEnded(atMs: effectiveAtMs)
+        vadFrameStartedAtMs = effectiveAtMs
+    }
+
+    private func consumeVAD(_ frame: Data) {
+        guard var endpointer = vadEndpointer else { return }
+        let events = endpointer.processPCM16(frame, frameStartedAtMs: vadFrameStartedAtMs)
+        vadFrameStartedAtMs += Int64(
+            frame.count / MemoryLayout<Int16>.size * 1_000 / vadSampleRate
+        )
+        vadEndpointer = endpointer
+        for event in events {
+            switch event {
+            case .speechStarted(let atMs):
+                WatchLog.info("vad", "speech_started", detail: "at_ms=\(atMs)")
+            case .speechFinal(let atMs, let reason):
+                WatchLog.info("vad", "speech_final", detail: "at_ms=\(atMs) reason=\(reason.rawValue)")
+                if automaticallyCommitOnSpeechFinal {
+                    recorder.stop()
+                    session.commitUplink()
+                }
+            }
+            onVADEvent?(event)
+        }
+    }
+
+    private static func uptimeMs() -> Int64 {
+        Int64(ProcessInfo.processInfo.systemUptime * 1_000)
     }
 
     func receiveUplinkAck(_ ack: RealtimeUplinkAck) {
