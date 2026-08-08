@@ -452,12 +452,14 @@ struct WatchContentView: View {
         player.isPlaying || welcome.stage == .playing
     }
 
-    /// ESS-180-B：语音球只有四态。所有中间等待态（sending / waitingForPhone /
-    /// waitingForMac / delivered / processing / needsConfirmation）统统合并到
+    /// ESS-572（Wave 0 / F7）：语音球五态映射。
+    /// 所有中间等待态（sending / waitingForPhone / waitingForMac /
+    /// delivered / processing / needsConfirmation）统统合并到
     /// `.thinking`——中间态的可视差异改由底部文案承担，球体只表达
     /// 「输入还是输出、正在还是空闲」。终态（completed/failed/cancelled）
     /// 一律回到 idle，失败的可见证据由 `AvatarErrorCardView` 承担；这样即使
     /// 卡片被用户手动关闭，屏幕也不会残留矛盾的失败/成功球。
+    /// `.establishing` 预留给后续实时对话 Session 建立流程（ESS-540 F1）。
     private var orbMode: VoiceOrbView.Mode {
         if isRecording { return .listening(level: pushToTalk.recordingLevel) }
         if isSpeaking { return .speaking }
