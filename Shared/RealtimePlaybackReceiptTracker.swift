@@ -18,6 +18,13 @@ import Foundation
 struct RealtimePlaybackReceiptTracker: Sendable {
     struct StartedReceipt: Equatable, Sendable { let responseId: String? }
     struct EndedReceipt: Equatable, Sendable { let responseId: String?; let bytesPlayed: Int }
+    /// ESS-531: emitted on every buffer completion so the Bridge can track
+    /// playback progress across the streaming 40+ chunk response.
+    struct ProgressReceipt: Equatable, Sendable {
+        let responseId: String?
+        let bytesPlayed: Int
+        let totalBytes: Int
+    }
     struct BargedInReceipt: Equatable, Sendable { let responseId: String?; let bytesDropped: Int }
 
     private struct Response {
@@ -55,10 +62,10 @@ struct RealtimePlaybackReceiptTracker: Sendable {
     /// Called from the player's real completion callback (`.dataPlayedBack`).
     /// Returns any receipts triggered by this completion.
     mutating func bufferCompleted(responseId: String?, bytes: Int) -> (
-        started: StartedReceipt?, ended: EndedReceipt?
+        started: StartedReceipt?, ended: EndedReceipt?, progress: ProgressReceipt?
     ) {
         let key = responseId ?? Self.anonymousKey
-        guard var state = byResponse[key] else { return (nil, nil) }
+        guard var state = byResponse[key] else { return (nil, nil, nil) }
         state.completedBuffers += 1
         state.playedBytes += bytes
         var started: StartedReceipt?
@@ -68,8 +75,6 @@ struct RealtimePlaybackReceiptTracker: Sendable {
         }
         var ended: EndedReceipt?
         if !state.endedEmitted, state.completedBuffers == state.queuedBuffers {
-            // Emit .ended when drain has been requested OR this response has
-            // been superseded (a newer response is now the latest in order).
             let superseded = order.last != key
             if state.drainRequested || superseded {
                 state.endedEmitted = true
@@ -78,8 +83,14 @@ struct RealtimePlaybackReceiptTracker: Sendable {
                 )
             }
         }
+        // ESS-531: emit progress on every completion for realtime tracking.
+        let progress = ProgressReceipt(
+            responseId: keyToResponseId(key),
+            bytesPlayed: state.playedBytes,
+            totalBytes: state.queuedBytes
+        )
         byResponse[key] = state
-        return (started, ended)
+        return (started, ended, progress)
     }
 
     /// Bridge sent `audio.done` — no more deltas coming for the latest
