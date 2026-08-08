@@ -472,10 +472,17 @@ export class QwenRealtimeSessionSupervisor {
 
   beginAnnouncement(event) {
     if (this.announcements.has(event.responseId)) return
+    // ESS-542: Qwen sometimes omits taskId on announcement response.started.
+    // Walk every available path to extract it before falling back to null.
+    const resolvedTaskId = event.taskId
+      ?? event.task?.id
+      ?? event.task?.taskId
+      ?? event.turn?.taskId
+      ?? null
     const capture = {
       responseId: event.responseId,
-      taskId: event.taskId ?? event.task?.id ?? null,
-      turnId: event.turnId ?? null,
+      taskId: resolvedTaskId,
+      turnId: event.turnId ?? event.turn?.id ?? null,
       chunks: [],
       pcmBytes: 0,
       truncated: false,
