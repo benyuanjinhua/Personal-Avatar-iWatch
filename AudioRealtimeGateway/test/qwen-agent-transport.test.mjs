@@ -75,3 +75,83 @@ test('upstream failure becomes one structured agent error', async () => {
   assert.equal(events[0].code, 'ERR_UPSTREAM_DISCONNECTED')
   assert.equal(logs.filter(item => item.evt === 'upstream_error').length, 1)
 })
+
+test('five turns in one session cancel prior requests and reject their late audio', async () => {
+  const sockets = []
+  const messages = []
+  const server = new WebSocketServer({ port: 0 })
+  servers.push(server)
+  server.on('connection', ws => {
+    const index = sockets.length
+    sockets.push(ws)
+    ws.on('message', raw => {
+      const message = JSON.parse(raw.toString())
+      messages.push({ index, message })
+      if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+      if (message.type === 'audio.commit') {
+        setTimeout(() => {
+          if (ws.readyState !== ws.OPEN) return
+          ws.send(JSON.stringify({
+            type: 'audio.delta',
+            audio: Buffer.from(`answer-${index + 1}`).toString('base64'),
+            sampleRate: 24_000,
+          }))
+          ws.send(JSON.stringify({ type: 'audio.done' }))
+        }, index === 4 ? 5 : 80)
+      }
+    })
+  })
+  await new Promise(resolve => server.once('listening', resolve))
+
+  const logs = []
+  const eventsByRequest = new Map()
+  const transport = new QwenAgentTransport({
+    gatewayUrl: `ws://127.0.0.1:${server.address().port}/api/realtime`,
+    log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+
+  let activeTurn
+  for (let turnNumber = 1; turnNumber <= 5; turnNumber += 1) {
+    const requestId = `request-${turnNumber}`
+    const events = []
+    eventsByRequest.set(requestId, events)
+    const turn = transport.openTurn({
+      requestId, sessionId: 'conversation-1', generation: turnNumber,
+      responseId: `${requestId}:gen${turnNumber}`,
+      onEvent: event => events.push(event),
+    })
+    turn.appendAudio({ sequence: 0, bytes: Buffer.from(`question-${turnNumber}`) })
+    turn.commit()
+    activeTurn = turn
+    await waitFor(() => sockets.length === turnNumber)
+  }
+
+  await waitFor(() => eventsByRequest.get('request-5')
+    .some(event => event.type === 'agent.audio.done'))
+  await new Promise(resolve => setTimeout(resolve, 120))
+
+  for (let turnNumber = 1; turnNumber < 5; turnNumber += 1) {
+    assert.deepEqual(eventsByRequest.get(`request-${turnNumber}`), [],
+      `late answer from request-${turnNumber} must be discarded`)
+  }
+  const finalEvents = eventsByRequest.get('request-5')
+  assert.deepEqual(finalEvents.map(event => event.type), [
+    'agent.audio.delta', 'agent.audio.done',
+  ])
+  assert.equal(
+    Buffer.from(finalEvents[0].audio, 'base64').toString(),
+    'answer-5',
+  )
+  assert.deepEqual(
+    logs.filter(item => item.evt === 'upstream_turn_superseded')
+      .map(item => [item.request_id, item.superseded_by_request_id]),
+    [
+      ['request-1', 'request-2'],
+      ['request-2', 'request-3'],
+      ['request-3', 'request-4'],
+      ['request-4', 'request-5'],
+    ],
+  )
+  assert.equal(messages.filter(item => item.message.type === 'response.cancel').length, 4)
+  activeTurn.close()
+})
