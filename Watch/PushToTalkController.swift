@@ -63,6 +63,10 @@ final class PushToTalkController: ObservableObject {
     /// ESS-180：屏幕分身错误卡片状态机；订阅 `errorPresenter.active` 即得 UI。
     let errorPresenter = AvatarErrorPresenter()
 
+    /// ESS-522：本地兜底确认计时器，专用播放器与结果/错误隔离。
+    let confirmPlayer = SpeechPlayer(instanceTag: "confirm")
+    private(set) var confirmTimer: VoiceConfirmTimer?
+
     /// 结果语音自动播放即将开始（App 层用来打断欢迎语）。
     var onAutoPlayStarted: (() -> Void)?
     /// ESS-535: 用户按住说话时立即触发，用于打断欢迎语音释放音频会话。
@@ -112,6 +116,11 @@ final class PushToTalkController: ObservableObject {
     /// stays hot while downlink deltas are in flight.
     @Published private(set) var realtimePlaybackPending = false
 
+    /// ESS-522：主屏封锁起点（ASR final / accepted 时刻），用于计算 main_screen_blocked_ms。
+    private var mainScreenBlockedAt: Date?
+    /// ESS-522：进度事件是否发生过——任何 progress spoken 计数。恒为 0 才合格。
+    private(set) var progressSpokenCount = 0
+
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         journal = VoiceTurnJournal(
@@ -143,6 +152,13 @@ final class PushToTalkController: ObservableObject {
             directory: base.appendingPathComponent("NotificationLedger", isDirectory: true)
         ))
 
+        // ESS-522：确认计时器——本地兜底语音在 1.5s 无后端确认时触发。
+        let cfm = VoiceConfirmTimer(player: confirmPlayer)
+        confirmTimer = cfm
+        cfm.onConfirmComplete = { [weak self] requestId, outcome in
+            self?.handleConfirmComplete(requestId: requestId, outcome: outcome)
+        }
+
         recorder.$level
             .receive(on: RunLoop.main)
             .assign(to: &$recordingLevel)
@@ -152,6 +168,8 @@ final class PushToTalkController: ObservableObject {
         // 未被判失败（语音后到时这三个条件都可能已不成立，旧 onChange 触发
         // 会静默漏播）。
         journal.onSpeechAttached = { [weak self] requestId in
+            // ESS-522：后台语音到了，取消本地兜底确认计时器。
+            self?.confirmTimer?.cancel(reason: "speech_attached")
             self?.autoPlayResult(requestId: requestId)
         }
 
@@ -175,6 +193,13 @@ final class PushToTalkController: ObservableObject {
         // turnFailed 触觉的落点从此处下沉到 presenter 内部，避免同一次失败震两下。
         journal.onStateApplied = { [weak self] requestId, state in
             guard let self else { return }
+            // ESS-522 S-2：收到 accepted（后端已确认受理，ASR final 之后），
+            // 启动 1.5 秒确认计时器。同时记录主屏封锁起点。
+            if state == .accepted {
+                self.mainScreenBlockedAt = Date()
+                self.confirmTimer?.arm(requestId: requestId)
+                self.setSpawnConfirmSpoken(requestId: requestId, value: false)
+            }
             if state == .failed {
                 let code = self.journal.turn(withId: requestId)?.errorCode
                 self.presentAvatarError(code: code, requestId: requestId)
@@ -188,11 +213,17 @@ final class PushToTalkController: ObservableObject {
                 self.notifier.longTaskAccepted(requestId: requestId)
             case .failed, .cancelled:
                 self.notifier.cancelProvisional(requestId: requestId)
+                // ESS-522：终态释放主屏封锁。
+                self.releaseMainScreenBlock(requestId: requestId)
             default:
                 break
             }
             if state == .completed || state == .cancelled {
                 self.retryStore.clear(requestId: requestId)
+                // ESS-522：终态释放主屏封锁（completed 路径）。
+                if state == .completed {
+                    self.releaseMainScreenBlock(requestId: requestId)
+                }
             }
         }
 
@@ -1105,4 +1136,59 @@ final class PushToTalkController: ObservableObject {
 
     /// 当前续聊上下文，供提交语音请求时附加 `parent_request_id`。
     private(set) var continuationContext: ContinuationContext?
+
+    // MARK: - ESS-522 确认计时与主屏释放
+
+    /// 确认流程结束后回调（本地兜底或后端确认到达）。
+    /// 写 telemetry、释放主屏封锁。
+    private func handleConfirmComplete(requestId: String, outcome: VoiceConfirmTimer.Outcome) {
+        switch outcome {
+        case .backendConfirmationArrived:
+            // 后端确认来得及时——语音是从后台来的真实语音，记为已播。
+            setSpawnConfirmSpoken(requestId: requestId, value: true)
+        case .localFallbackPlayed:
+            // 本地兜底语音播出——记为已播。
+            setSpawnConfirmSpoken(requestId: requestId, value: true)
+        case .localFallbackMissing:
+            // 本地资源缺失，只落日志 + 触觉，不计为「已播」。
+            // spawnConfirmSpoken 保持 false——确实没有语音可播。
+            break
+        }
+        releaseMainScreenBlock(requestId: requestId)
+    }
+
+    /// 释放主屏封锁，计算并写入 `main_screen_blocked_ms`。
+    private func releaseMainScreenBlock(requestId: String) {
+        guard let blockedAt = mainScreenBlockedAt else { return }
+        mainScreenBlockedAt = nil
+        let elapsedMs = Int(Date().timeIntervalSince(blockedAt) * 1_000)
+        setMainScreenBlockedMs(requestId: requestId, value: elapsedMs)
+        WatchLog.info(
+            "confirm", "main_screen_released", requestId: requestId,
+            detail: "blocked_ms=\(elapsedMs)"
+        )
+    }
+
+    /// ESS-522 埋点：写入确认语音已播标记。
+    private func setSpawnConfirmSpoken(requestId: String, value: Bool) {
+        journal.setSpawnConfirmSpoken(requestId: requestId, value: value)
+    }
+
+    /// ESS-522 埋点：写入主屏封锁时长。
+    private func setMainScreenBlockedMs(requestId: String, value: Int) {
+        journal.setMainScreenBlockedMs(requestId: requestId, value: value)
+    }
+
+    /// ESS-522 S-3 进度静默：记录任意一次试图将进度转为语音的调用为「已违规」。
+    /// 调用方（WatchVoiceTransport / relay handler）在收到进度事件时调用此方法，
+    /// 确保 `progress_spoken` 恒为 0——进度只占角落一行，永远不出声。
+    func recordProgressEvent(requestId: String) {
+        journal.setProgressSpoken(requestId: requestId, value: true)
+        progressSpokenCount += 1
+        WatchLog.error(
+            "confirm", "progress_spoken_violation", requestId: requestId,
+            detail: "count=\(progressSpokenCount)",
+            code: "ERR_PROGRESS_SPOKEN"
+        )
+    }
 }

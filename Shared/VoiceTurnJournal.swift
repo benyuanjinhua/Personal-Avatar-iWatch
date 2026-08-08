@@ -54,6 +54,12 @@ struct VoiceTurnRecord: Codable, Equatable, Identifiable {
     /// ESS-307 / Gap-6：下行投递状态。nil = 未知，true = 已送达 Watch，false = 仍在 iPhone 队列。
     /// 由 Gap-6 折叠逻辑写入，供时间线「待手动重播」标识消费。
     var downlinkDelivered: Bool? = nil
+    /// ESS-522：确认环节是否播放了语音（本地兜底或后台确认）。false = 静默等待。
+    var spawnConfirmSpoken: Bool = false
+    /// ESS-522：主屏被封锁的毫秒数（从 ASR final 到确认播完主屏释放）。
+    var mainScreenBlockedMs: Int = 0
+    /// ESS-522：进度事件是否触发了语音播放。必须恒为 false——进度只占角落一行。
+    var progressSpoken: Bool = false
 
     var id: String { requestId }
     var currentState: VoiceTurnState { events.last?.state ?? .recorded }
@@ -390,6 +396,29 @@ final class VoiceTurnJournal: ObservableObject {
     }
 
     private static let retentionLogger = Logger(subsystem: "com.benyuan.wristagent.shared", category: "Retention")
+
+    // MARK: - ESS-522 telemetry setters
+
+    /// ESS-522：写入确认语音已播标记。
+    func setSpawnConfirmSpoken(requestId: String, value: Bool) {
+        guard let index = turns.firstIndex(where: { $0.requestId == requestId }) else { return }
+        turns[index].spawnConfirmSpoken = value
+        save()
+    }
+
+    /// ESS-522：写入主屏封锁时长。
+    func setMainScreenBlockedMs(requestId: String, value: Int) {
+        guard let index = turns.firstIndex(where: { $0.requestId == requestId }) else { return }
+        turns[index].mainScreenBlockedMs = value
+        save()
+    }
+
+    /// ESS-522：标记进度事件触发了语音（应恒为 false）。
+    func setProgressSpoken(requestId: String, value: Bool) {
+        guard let index = turns.firstIndex(where: { $0.requestId == requestId }) else { return }
+        turns[index].progressSpoken = value
+        save()
+    }
 
     /// ESS-317：清理超过 24 小时的轮次。调用方应传入 vault 用于同步清理
     /// 加密音频文件。
