@@ -491,6 +491,30 @@ final class WatchDownlinkOutbox {
         return expired
     }
 
+    /// ESS-539 v2: remove all realtime downlink envelopes from previous
+    /// sessions. These accumulate from `done_emitted=false` Gateway sessions
+    /// and survive app restarts on disk. On cold start, any queued
+    /// `relayStatus` entry belongs to a dead session — delivering them
+    /// would pollute the Watch with stale audio.
+    @discardableResult
+    mutating func purgeRealtimeDownlink() -> Int {
+        let removable = items.filter { $0.kind == .relayStatus }
+        guard !removable.isEmpty else { return 0 }
+        let doomed = removable.map { (id: $0.id, stagedFileName: $0.stagedFileName) }
+        let snapshot = items
+        let removedIds = Set(removable.map(\.id))
+        items.removeAll { removedIds.contains($0.id) }
+        guard persistIndexReportingFailure(operation: "purge-realtime-downlink") else {
+            items = snapshot
+            return 0
+        }
+        for entry in doomed {
+            discardFiles(id: entry.id, stagedFileName: entry.stagedFileName)
+            pendingPayloadDiscards.remove(entry.id)
+        }
+        return removable.count
+    }
+
     // MARK: - 私有
 
     /// ESS-306 / D5 Gap-6：下行语音积压上限。

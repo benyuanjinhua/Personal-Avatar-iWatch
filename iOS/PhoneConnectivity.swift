@@ -118,6 +118,14 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         // downlink event still lands (PhoneAgentClientLog no-ops without a
         // sink), just doesn't ship to bridge.log until this point.
         phoneClientLog.start()
+        // ESS-539 v2: purge stale realtime downlink envelopes from previous
+        // sessions before flushing anything to the Watch.
+        if let purged = downlink?.purgeRealtimeDownlink(), purged > 0 {
+            Self.logger.info(
+                "purged \(purged) stale realtime downlink envelopes on cold start"
+            )
+            pendingDownlinkCount = downlink?.pendingCount() ?? 0
+        }
         // 冷启动补投：上次进程排队/在途未确认的下行，App 一打开就重投。
         flushDownlink(trigger: "activate")
     }
