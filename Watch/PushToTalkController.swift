@@ -544,6 +544,16 @@ final class PushToTalkController: ObservableObject {
         finishRecording()
     }
 
+    /// ESS-575: VAD detected silence endpoint — auto-commit the turn.
+    /// The adapter has already stopped the PCM recorder and committed the
+    /// uplink via `automaticallyCommitOnSpeechFinal`. Here we finish the
+    /// AAC recording and transition the UI state.
+    private func handleVADAutoCommit() {
+        guard state == .recording, recorder.isRecording else { return }
+        WatchLog.info("vad", "auto_commit_triggered")
+        finishRecording()
+    }
+
     private func finishRecording() {
         guard state == .recording else { return }
         state = .finishing
@@ -680,6 +690,12 @@ final class PushToTalkController: ObservableObject {
         if let adapter = realtimeAdapter { return adapter }
         let pcmRecorder = PCMFrameRecorder()
         let playbackEngine = RealtimePlaybackEngine()
+        // ESS-575: enable VAD-based automatic turn detection. When the user
+        // stops speaking for endpointSilenceMs, the adapter automatically
+        // commits the uplink — no press-and-release gesture needed.
+        let vadConfig = LocalVADConfiguration(
+            endpointSilenceMs: Int64(WatchDebugSettings().vadEndpointSilenceMs)
+        )
         let adapter = WatchRealtimeMediaAdapter(
             recorder: pcmRecorder,
             player: playbackEngine,
@@ -689,7 +705,9 @@ final class PushToTalkController: ObservableObject {
             },
             logger: { message in
                 WatchLog.info("realtime", "adapter", detail: message)
-            }
+            },
+            vadConfiguration: vadConfig,
+            automaticallyCommitOnSpeechFinal: true
         )
         // ESS-509: track turn lifecycle so WCSession keep-alive releases
         // exactly when the realtime path is done — no premature release
@@ -697,6 +715,13 @@ final class PushToTalkController: ObservableObject {
         // fallback/cancel that would burn battery.
         adapter.onTurnFinished = { [weak self] _, _ in
             self?.isRealtimeStreaming = false
+        }
+        // ESS-575: when VAD detects speech end, trigger the same flow as
+        // user releasing the gesture — finish the AAC recording and submit.
+        adapter.onVADEvent = { [weak self] event in
+            guard let self, case .speechFinal = event else { return }
+            self.handleVADAutoCommit()
+        }
             WatchLog.info("realtime", "streaming_hold_released",
                           detail: "reason=turn_finished adapter_turn_active=false")
         }
