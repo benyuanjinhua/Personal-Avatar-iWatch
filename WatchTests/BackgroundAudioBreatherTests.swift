@@ -126,4 +126,23 @@ final class BackgroundAudioBreatherTests: XCTestCase {
         breather.stop(reason: "test")
         XCTAssertFalse(breather.isActive)
     }
+
+    // MARK: - Controller 接线
+
+    func testSubmitStartsBreatherAfterTransportDispatch() {
+        let controller = PushToTalkController()
+        var startCount = 0
+        controller.voiceStreamingEnabled = { false }
+        controller.startBreatherAfterSubmit = { startCount += 1 }
+        let recording = AudioRecorder.Recording(
+            fileURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("ess587-\(UUID().uuidString).m4a"),
+            data: Data(repeating: 0x33, count: 128),
+            durationMs: 1_500
+        )
+
+        controller.simulateSubmitForTests(recording: recording)
+
+        XCTAssertEqual(startCount, 1, "submit must start the background breather exactly once")
+    }
 }
