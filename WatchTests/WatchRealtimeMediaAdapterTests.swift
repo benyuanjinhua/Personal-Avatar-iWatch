@@ -8,6 +8,42 @@ import XCTest
 @MainActor
 final class WatchRealtimeMediaAdapterTests: XCTestCase {
 
+    func testVADFinalAutomaticallyCommitsExactlyOnce() {
+        let recorder = MockRecorder()
+        let player = MockPlayer()
+        let transport = MockTransport()
+        let adapter = WatchRealtimeMediaAdapter(
+            recorder: recorder,
+            player: player,
+            transport: transport,
+            vadConfiguration: LocalVADConfiguration(),
+            automaticallyCommitOnSpeechFinal: true
+        )
+        var vadEvents: [LocalVADEvent] = []
+        adapter.onVADEvent = { vadEvents.append($0) }
+
+        adapter.beginTurn(requestId: "vad-auto-commit")
+        recorder.feed(Self.pcmFrame(rms: 0.08))
+        recorder.feed(Self.pcmFrame(rms: 0.08))
+        for _ in 0..<7 { recorder.feed(Self.pcmFrame(rms: 0)) }
+        recorder.feed(Self.pcmFrame(rms: 0))
+
+        XCTAssertTrue(recorder.didStop)
+        XCTAssertEqual(transport.commitEvents.count, 1)
+        XCTAssertEqual(vadEvents.count, 2)
+        guard case .speechFinal(_, .silence) = vadEvents.last else {
+            return XCTFail("expected silence speech.final")
+        }
+    }
+
+    private static func pcmFrame(rms: Double) -> Data {
+        var sample = Int16((rms * Double(Int16.max)).rounded()).littleEndian
+        let bytes = withUnsafeBytes(of: &sample) { Data($0) }
+        var data = Data(capacity: 3_200)
+        for _ in 0..<1_600 { data.append(bytes) }
+        return data
+    }
+
     func testRealtimePlaybackAudioSessionGateActivatesOncePerTurn() throws {
         var gate = RealtimePlaybackAudioSessionGate()
         var activations = 0
