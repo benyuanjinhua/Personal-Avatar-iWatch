@@ -35,6 +35,21 @@ final class WatchDebugSettingsTests: XCTestCase {
         XCTAssertTrue(settings.streamingEnabled, "无历史 key 时必须默认 ON（跟随 VoiceStreamingGate.defaultEnabled）")
         XCTAssertTrue(settings.isStreamingActive, "门禁 API 默认返回 true")
         XCTAssertEqual(settings.streamingGeneration, 0, "无翻转时 generation 保持 0")
+        XCTAssertEqual(settings.vadEndpointSilenceMs, 700)
+    }
+
+    func testVADEndpointSilencePersistsAndClamps() {
+        let defaults = makeIsolatedDefaults("vad_endpoint")
+        let settings = WatchDebugSettings(defaults: defaults)
+
+        settings.setVADEndpointSilenceMs(900)
+        XCTAssertEqual(settings.vadEndpointSilenceMs, 900)
+        XCTAssertEqual(WatchDebugSettings(defaults: defaults).vadEndpointSilenceMs, 900)
+
+        settings.setVADEndpointSilenceMs(100)
+        XCTAssertEqual(settings.vadEndpointSilenceMs, 300)
+        settings.setVADEndpointSilenceMs(5_000)
+        XCTAssertEqual(settings.vadEndpointSilenceMs, 2_000)
     }
 
     func testRestoresPersistedTrueFromDefaults() {
