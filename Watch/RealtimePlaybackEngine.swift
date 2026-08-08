@@ -3,37 +3,42 @@ import Foundation
 
 /// Turn-scoped guard that keeps audio-session activation idempotent while
 /// leaving a failed activation retryable on the next playable chunk.
+///
+/// ESS-509: gate now also manages the shared AVAudioSession so the realtime
+/// playback engine and the SpeechPlayer don't fight over the same session.
 struct RealtimePlaybackAudioSessionGate {
     private(set) var isActivated = false
 
+    /// Activate the audio session for playback. Idempotent within a turn;
+    /// `reset()` between turns makes it retryable on activation failure.
     mutating func activate(using operation: () throws -> Void) throws {
         guard !isActivated else { return }
         try operation()
         isActivated = true
     }
 
+    /// ESS-509: activate the shared AVAudioSession for realtime playback.
+    /// Uses `.playback` (not `.playAndRecord`) because this gate only guards
+    /// the downlink playback side — the uplink mic tap owns `.playAndRecord`
+    /// during recording. Deactivation is the caller's responsibility.
+    mutating func activateAudioSession() throws {
+        guard !isActivated else { return }
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playback, mode: .default)
+        try session.setActive(true)
+        isActivated = true
+    }
+
+    /// ESS-509: deactivate the playback audio session. Called when the turn
+    /// ends so the SpeechPlayer (or the next recording) can take over.
+    mutating func deactivateAudioSession() {
+        guard isActivated else { return }
+        isActivated = false
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
     mutating func reset() {
         isActivated = false
-    }
-}
-
-/// ESS-534: decide whether the render path must be rebuilt after the recorder
-/// releases the shared AVAudioSession. The first downlink after activation is
-/// always rebuilt because AVAudioEngine may still report `isRunning == true`
-/// even though the session deactivation has detached it from the output route.
-struct RealtimeRenderRecoveryPolicy {
-    static func shouldRestartEngine(
-        firstDeltaAfterSessionActivation: Bool,
-        engineIsRunning: Bool
-    ) -> Bool {
-        firstDeltaAfterSessionActivation || !engineIsRunning
-    }
-
-    static func shouldRestartNode(
-        engineWasRestarted: Bool,
-        nodeIsPlaying: Bool
-    ) -> Bool {
-        engineWasRestarted || !nodeIsPlaying
     }
 }
 
@@ -83,15 +88,13 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
     private let audioEngine: AVAudioEngine
     private let playerNode: AVAudioPlayerNode
     private let format: AVAudioFormat
-    /// ESS-532: the recorder activates `.playAndRecord` during recording then
-    /// deactivates it in `finish()`. If the engine was started under the
-    /// recorder's session, it keeps running after deactivation but produces
-    /// silence — every delta enqueued thereafter is silently lost.
-    /// Activating `.playback` on the first buffer closes that gap.
-    private var audioSessionGate = RealtimePlaybackAudioSessionGate()
 
     private(set) var currentTurn: RealtimeMediaSession.TurnHandle?
     private(set) var isRunning = false
+    /// ESS-509: audio session gate that prevents the engine from stomping
+    /// on another player's session (SpeechPlayer, StreamingAudioPlayer)
+    /// and ensures deactivation happens exactly once per turn.
+    private var audioSessionGate = RealtimePlaybackAudioSessionGate()
     /// ESS-335 receipt state machine lives in Shared/ for unit testability
     /// without AVFoundation. Every real completion callback pokes it; the
     /// tracker's returned receipts become the `.started/.ended` events we
@@ -124,6 +127,10 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         stop(barge: false)
         currentTurn = turn
         tracker.reset()
+        // ESS-509: activate the playback audio session idempotently per turn.
+        // If another player (SpeechPlayer) owns the session, this will fail
+        // and the caller (WatchRealtimeMediaAdapter) catches it as a fallback.
+        try audioSessionGate.activateAudioSession()
         if !isRunning {
             audioEngine.prepare()
             try audioEngine.start()
@@ -134,87 +141,6 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
 
     func enqueue(playables: [RealtimeDownlinkPlayback.PlayableChunk]) {
         guard let turn = currentTurn else { return }
-        // ESS-532/ESS-535: the recorder deactivates the shared AVAudioSession
-        // when recording ends. Re-activate it for playback before the first
-        // buffer lands, then rebuild the real render path.
-        let engineWasRunning = audioEngine.isRunning
-        let nodeWasPlaying = playerNode.isPlaying
-        // A later system interruption can stop the engine after this turn's
-        // first activation. Re-open the gate so the same recovery path also
-        // reactivates AVAudioSession instead of trying to start an engine on
-        // an inactive session.
-        if audioSessionGate.isActivated && !engineWasRunning {
-            audioSessionGate.reset()
-        }
-        let sessionActivationRequired = !audioSessionGate.isActivated
-        do {
-            try audioSessionGate.activate {
-                let session = AVAudioSession.sharedInstance()
-                // Yield the session in case the recorder's async deactivation
-                // hasn't completed — this is a no-op if already inactive.
-                try? session.setActive(false, options: .notifyOthersOnDeactivation)
-                try session.setCategory(.playback, mode: .default)
-                try session.setActive(true)
-            }
-
-            // ESS-534: AudioRecorder.finish() deactivates the shared
-            // AVAudioSession after prepare() has already started this engine.
-            // Re-activating the session alone does not reliably reconnect an
-            // existing engine to the output route. Rebuild once on the first
-            // delta, before any buffer for this turn has been scheduled.
-            let restartEngine = RealtimeRenderRecoveryPolicy.shouldRestartEngine(
-                firstDeltaAfterSessionActivation: sessionActivationRequired,
-                engineIsRunning: audioEngine.isRunning
-            )
-            if restartEngine {
-                playerNode.stop()
-                audioEngine.stop()
-                audioEngine.prepare()
-                try audioEngine.start()
-                isRunning = true
-                WatchLog.info(
-                    "realtime", "playback_engine_restarted",
-                    requestId: turn.requestId,
-                    detail: "session_reactivated=\(sessionActivationRequired) was_running=\(engineWasRunning)"
-                )
-            }
-
-            if RealtimeRenderRecoveryPolicy.shouldRestartNode(
-                engineWasRestarted: restartEngine,
-                nodeIsPlaying: playerNode.isPlaying
-            ) {
-                playerNode.play()
-                WatchLog.info(
-                    "realtime", "playback_node_restarted",
-                    requestId: turn.requestId,
-                    detail: "engine_restarted=\(restartEngine) was_playing=\(nodeWasPlaying)"
-                )
-            }
-
-            if sessionActivationRequired {
-                let session = AVAudioSession.sharedInstance()
-                let route = session.currentRoute.outputs
-                    .map { "\($0.portType.rawValue)(\($0.portName))" }
-                    .joined(separator: ",")
-                WatchLog.info(
-                    "realtime", "playback_first_delta_state",
-                    requestId: turn.requestId,
-                    detail: "engine_running=\(audioEngine.isRunning) node_playing=\(playerNode.isPlaying) category=\(session.category.rawValue) route=\(route)"
-                )
-            }
-        } catch {
-            WatchLog.error(
-                "realtime", "playback_audio_session_failed",
-                requestId: turn.requestId,
-                detail: "category=playback active=true engine_running=\(audioEngine.isRunning) node_playing=\(playerNode.isPlaying)",
-                code: "ERR_AUDIO_SESSION", error: error
-            )
-            onPlaybackEvent?(.failed(
-                requestId: turn.requestId, sessionId: turn.sessionId,
-                responseId: nil, code: "ERR_AUDIO_SESSION"
-            ))
-            return
-        }
         for playable in playables where
             playable.chunk.requestId == turn.requestId &&
             playable.chunk.streamId == turn.sessionId {
@@ -277,6 +203,9 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         }
         currentTurn = nil
         tracker.reset()
+        // ESS-509: release the playback audio session so other players can
+        // activate. Idempotent — gate won't double-deactivate.
+        audioSessionGate.deactivateAudioSession()
         audioSessionGate.reset()
     }
 
