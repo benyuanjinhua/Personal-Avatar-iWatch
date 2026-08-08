@@ -1,5 +1,69 @@
 import Foundation
 
+/// ESS-541: hard ownership key for result-audio playback.
+///
+/// Full-file result delivery is durable and may be redelivered long after a
+/// newer recording starts.  The playback queue therefore cannot use arrival
+/// order as ownership: only the request that opened the current generation is
+/// admitted.  Keeping this policy in Shared makes the Watch decision directly
+/// executable in simulator/unit tests without AVFoundation.
+struct ResultPlaybackIsolation: Equatable {
+    struct Key: Equatable {
+        let requestId: String
+        let generation: Int
+    }
+
+    enum DropReason: String, Equatable {
+        case missingRequestId = "missing_request_id"
+        case staleRequest = "stale_request"
+        case staleGeneration = "stale_generation"
+    }
+
+    enum Decision: Equatable {
+        case accept(Key)
+        case drop(incomingRequestId: String?, incomingGeneration: Int?, current: Key?, reason: DropReason)
+    }
+
+    private(set) var current: Key?
+    private(set) var generation = 0
+    private var generationsByRequestId: [String: Int] = [:]
+
+    @discardableResult
+    mutating func begin(requestId: String) -> Key {
+        generation += 1
+        let key = Key(requestId: requestId, generation: generation)
+        current = key
+        generationsByRequestId[requestId] = generation
+        return key
+    }
+
+    mutating func cancelCurrent() {
+        current = nil
+    }
+
+    func decide(requestId: String?) -> Decision {
+        guard let requestId, !requestId.isEmpty else {
+            return .drop(incomingRequestId: requestId, incomingGeneration: nil,
+                         current: current, reason: .missingRequestId)
+        }
+        let incomingGeneration = generationsByRequestId[requestId]
+        guard let current else {
+            return .drop(incomingRequestId: requestId, incomingGeneration: incomingGeneration,
+                         current: nil, reason: .staleRequest)
+        }
+        guard requestId == current.requestId else {
+            let reason: DropReason = incomingGeneration == nil ? .staleRequest : .staleGeneration
+            return .drop(incomingRequestId: requestId, incomingGeneration: incomingGeneration,
+                         current: current, reason: reason)
+        }
+        guard incomingGeneration == current.generation else {
+            return .drop(incomingRequestId: requestId, incomingGeneration: incomingGeneration,
+                         current: current, reason: .staleGeneration)
+        }
+        return .accept(current)
+    }
+}
+
 /// ESS-154 T2「播放终局」告知决策（纯函数，可 macOS 单测）。
 ///
 /// 背景：告知只在结果入账时发生一次（`ResultNotificationPolicy` = T1），
