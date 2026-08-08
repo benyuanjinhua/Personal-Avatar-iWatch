@@ -479,26 +479,32 @@ final class RealtimeSessionReducerTests: XCTestCase {
     }
 
     // MARK: - N2：新会话状态机不复用 VoiceTurnState 的 rank 单调语义
+    //
+    // ESS-567：本用例已改为**全程走 action**驱动——不再在 reducer 体外改写
+    // `state.currentTurn`。第 2 轮的 capturing turn 由 `.beginNextTurn` 装载，
+    // 从而证明 §1.2 环路 `playing → listening → committing → …` 的第 2 圈
+    // 可由 reducer API 闭合。N2 的证明力（listening ↔ playing 往返，不适用
+    // rank 单调）不变。
 
     func testRealtimeSessionStateHasNoRankMonotonyAndAllowsRoundTrips() {
-        // 用「同一会话内多次回到 listening」证明 rank 单调不适用于会话层。
+        // 第 1 轮：走到 audio_done 收尾，回到 listening。
         var state = warmToPlaying().state
         state = drive([
             .audioDone(turnId: turn1, generation: gen1, atMs: t0 + 1500)
         ], from: state).state
         XCTAssertEqual(state.session, .listening)   // playing → listening（第一次回）
+        XCTAssertNil(state.currentTurn, "audio_done 后 currentTurn 清空；等 beginNextTurn 装载下一轮")
 
-        // 再走一轮
+        // 试图重发 enter：已在 listening，必须被拒不改状态。
         state = drive([
-            .enter(conversationId: UUID(), firstTurnId: turn2, atMs: t0 + 2000)  // 应被拒（已在 listening）
+            .enter(conversationId: UUID(), firstTurnId: turn2, atMs: t0 + 2000)
         ], from: state).state
         XCTAssertEqual(state.session, .listening, "enter 只能在 idle；重复 enter 被拒不改状态")
+        XCTAssertNil(state.currentTurn)
 
-        // 用 explicit 的下一 turn 继续
-        state.currentTurn = RealtimeTurnRuntime(
-            turnId: turn2, generation: nil, phase: .capturing, enteredAtMs: t0 + 2000
-        )
+        // 第 2 轮：由 action 显式装载 turn2，然后走完整个回合。
         state = drive([
+            .beginNextTurn(turnId: turn2, atMs: t0 + 2000),
             .vadFinal(turnId: turn2, atMs: t0 + 2100),
             .commitAcked(turnId: turn2, atMs: t0 + 2200),
             .generationOpened(turnId: turn2, generation: gen2, atMs: t0 + 2300),
@@ -507,6 +513,233 @@ final class RealtimeSessionReducerTests: XCTestCase {
         ], from: state).state
         XCTAssertEqual(state.session, .listening,
                        "会话层 listening ↔ playing 允许多次往返；证明未沿用 rank 单调")
+        XCTAssertNil(state.currentTurn, "第 2 轮 audio_done 后同样清空，等第 3 轮 beginNextTurn")
+    }
+
+    // MARK: - ESS-567：beginNextTurn 契约
+
+    /// 完整两轮 turn **全程走 action**——不得再在 reducer 体外改写 state.currentTurn。
+    /// listening →（vadFinal/…）→ playing → listening →（beginNextTurn）→ capturing → …
+    func testFullTwoTurnRoundTripDrivenPurelyByActions() {
+        let trace = drive([
+            // 第 1 轮
+            .enter(conversationId: conversationId, firstTurnId: turn1, atMs: t0),
+            .channelReady(atMs: t0 + 100),
+            .vadFinal(turnId: turn1, atMs: t0 + 300),
+            .commitAcked(turnId: turn1, atMs: t0 + 400),
+            .generationOpened(turnId: turn1, generation: gen1, atMs: t0 + 500),
+            .firstAudio(turnId: turn1, generation: gen1, atMs: t0 + 800),
+            .audioDone(turnId: turn1, generation: gen1, atMs: t0 + 1500),
+            // 第 2 轮：由 beginNextTurn 装载新 turn
+            .beginNextTurn(turnId: turn2, atMs: t0 + 1600),
+            .vadFinal(turnId: turn2, atMs: t0 + 1800),
+            .commitAcked(turnId: turn2, atMs: t0 + 1900),
+            .generationOpened(turnId: turn2, generation: gen2, atMs: t0 + 2000),
+            .firstAudio(turnId: turn2, generation: gen2, atMs: t0 + 2300),
+            .audioDone(turnId: turn2, generation: gen2, atMs: t0 + 3000)
+        ])
+
+        // 终态：第 2 轮 audio_done 收尾，回到 listening 且 currentTurn 清空。
+        XCTAssertEqual(trace.state.session, .listening)
+        XCTAssertNil(trace.state.currentTurn)
+        XCTAssertTrue(trace.state.retiredGenerations.contains(gen1))
+        XCTAssertTrue(trace.state.retiredGenerations.contains(gen2))
+
+        // beginNextTurn 必须显式产出 beginTurn(turn2) 与 logTurnTransition(→capturing, reason=begin_next_turn)。
+        let began2 = trace.effects.contains {
+            if case let .beginTurn(id, _) = $0 { return id == self.turn2 }
+            return false
+        }
+        XCTAssertTrue(began2, "beginNextTurn 必须发 .beginTurn 副作用")
+
+        let logged2 = trace.effects.contains { effect in
+            if case let .logTurnTransition(id, _, to, reason, gen) = effect,
+               id == self.turn2, to == .capturing, reason == "begin_next_turn", gen == nil {
+                return true
+            }
+            return false
+        }
+        XCTAssertTrue(logged2, "beginNextTurn 必须发 logTurnTransition(→capturing, begin_next_turn)")
+
+        // 中间态：观察到第 2 轮的 playing 已走通（§1.2 环路第 2 圈闭合）。
+        let secondPlaying = trace.effects.contains { effect in
+            if case let .logSessionTransition(from, to, reason, _, _, tid, _) = effect,
+               from == .waitingFirstAudio, to == .playing, reason == "first_audio_rendered",
+               tid == self.turn2 {
+                return true
+            }
+            return false
+        }
+        XCTAssertTrue(secondPlaying, "§1.2 环路第 2 圈：turn2 必须走通 waitingFirstAudio → playing")
+    }
+
+    /// 三轮回合也应能连续走通——证明 beginNextTurn 契约可稳定复用。
+    func testThreeTurnRoundTripAllViaBeginNextTurn() {
+        let trace = drive([
+            .enter(conversationId: conversationId, firstTurnId: turn1, atMs: t0),
+            .channelReady(atMs: t0 + 100),
+            .vadFinal(turnId: turn1, atMs: t0 + 300),
+            .commitAcked(turnId: turn1, atMs: t0 + 400),
+            .generationOpened(turnId: turn1, generation: gen1, atMs: t0 + 500),
+            .firstAudio(turnId: turn1, generation: gen1, atMs: t0 + 800),
+            .audioDone(turnId: turn1, generation: gen1, atMs: t0 + 1500),
+            .beginNextTurn(turnId: turn2, atMs: t0 + 1600),
+            .vadFinal(turnId: turn2, atMs: t0 + 1800),
+            .commitAcked(turnId: turn2, atMs: t0 + 1900),
+            .generationOpened(turnId: turn2, generation: gen2, atMs: t0 + 2000),
+            .firstAudio(turnId: turn2, generation: gen2, atMs: t0 + 2300),
+            .audioDone(turnId: turn2, generation: gen2, atMs: t0 + 3000),
+            .beginNextTurn(turnId: turn3, atMs: t0 + 3100),
+            .vadFinal(turnId: turn3, atMs: t0 + 3300)
+        ])
+        XCTAssertEqual(trace.state.session, .committing, "第 3 轮 vadFinal 后应进入 committing")
+        XCTAssertEqual(trace.state.currentTurn?.turnId, turn3)
+        XCTAssertEqual(trace.state.currentTurn?.phase, .vadFinal)
+    }
+
+    /// 非法前置 1：session != .listening 时全部 rejected（idle / establishing / committing /
+    /// waitingFirstAudio / playing / ending / suspended），state 不动，reason 明确。
+    func testBeginNextTurnRejectedOutsideListening() {
+        // 每个非法 session 状态的构造器：把 state 推到该状态，再发 beginNextTurn。
+        struct Case {
+            let name: String
+            let setup: [RealtimeReducerAction]
+            let expectedSession: RealtimeSessionState
+        }
+        let cases: [Case] = [
+            Case(name: "idle",
+                 setup: [],
+                 expectedSession: .idle),
+            Case(name: "establishing",
+                 setup: [.enter(conversationId: conversationId, firstTurnId: turn1, atMs: t0)],
+                 expectedSession: .establishing),
+            Case(name: "committing",
+                 setup: [
+                    .enter(conversationId: conversationId, firstTurnId: turn1, atMs: t0),
+                    .channelReady(atMs: t0 + 100),
+                    .vadFinal(turnId: turn1, atMs: t0 + 300)
+                 ],
+                 expectedSession: .committing),
+            Case(name: "waitingFirstAudio",
+                 setup: [
+                    .enter(conversationId: conversationId, firstTurnId: turn1, atMs: t0),
+                    .channelReady(atMs: t0 + 100),
+                    .vadFinal(turnId: turn1, atMs: t0 + 300),
+                    .commitAcked(turnId: turn1, atMs: t0 + 400)
+                 ],
+                 expectedSession: .waitingFirstAudio),
+            Case(name: "playing",
+                 setup: [
+                    .enter(conversationId: conversationId, firstTurnId: turn1, atMs: t0),
+                    .channelReady(atMs: t0 + 100),
+                    .vadFinal(turnId: turn1, atMs: t0 + 300),
+                    .commitAcked(turnId: turn1, atMs: t0 + 400),
+                    .generationOpened(turnId: turn1, generation: gen1, atMs: t0 + 500),
+                    .firstAudio(turnId: turn1, generation: gen1, atMs: t0 + 800)
+                 ],
+                 expectedSession: .playing),
+            Case(name: "ending",
+                 setup: [
+                    .enter(conversationId: conversationId, firstTurnId: turn1, atMs: t0),
+                    .channelReady(atMs: t0 + 100),
+                    .userExit(atMs: t0 + 200)
+                 ],
+                 expectedSession: .ending),
+            Case(name: "suspended",
+                 setup: [
+                    .enter(conversationId: conversationId, firstTurnId: turn1, atMs: t0),
+                    .channelReady(atMs: t0 + 100),
+                    .systemInterrupt(reason: "lock_screen", atMs: t0 + 200)
+                 ],
+                 expectedSession: .suspended)
+        ]
+
+        for c in cases {
+            let base = drive(c.setup)
+            XCTAssertEqual(base.state.session, c.expectedSession,
+                           "\(c.name) setup 未把 session 推到目标态")
+            let out = RealtimeSessionReducer.reduce(
+                base.state,
+                .beginNextTurn(turnId: turn2, atMs: t0 + 5000)
+            )
+            XCTAssertEqual(out.state, base.state,
+                           "\(c.name)：非法 beginNextTurn 不得改变 state")
+            let rejected = out.effects.contains { effect in
+                if case let .rejected(action, from, reason) = effect,
+                   action == "begin_next_turn",
+                   from == c.expectedSession,
+                   reason == "begin_next_turn_requires_listening" {
+                    return true
+                }
+                return false
+            }
+            XCTAssertTrue(rejected,
+                          "\(c.name)：必须产出 rejected(action=begin_next_turn, reason=begin_next_turn_requires_listening)")
+        }
+    }
+
+    /// 非法前置 2：session == .listening 但 currentTurn != nil（如 barge-in 或 explicitResume
+    /// 已自建下一轮），beginNextTurn 必须被 rejected 并给明确 reason，不得静默覆盖。
+    func testBeginNextTurnRejectedWhenCurrentTurnNotNil() {
+        // 场景：barge-in 后 state.session == .listening, currentTurn == turn2 (capturing)。
+        let base = warmToPlaying()
+        let bargein = drive([
+            .userBargeIn(nextTurnId: turn2, atMs: t0 + 900)
+        ], from: base.state)
+        XCTAssertEqual(bargein.state.session, .listening)
+        XCTAssertNotNil(bargein.state.currentTurn, "barge-in 后 currentTurn 已装载 turn2")
+
+        let out = RealtimeSessionReducer.reduce(
+            bargein.state,
+            .beginNextTurn(turnId: turn3, atMs: t0 + 1000)
+        )
+        XCTAssertEqual(out.state, bargein.state, "非法 beginNextTurn 不得覆盖已装载的 turn")
+        let rejected = out.effects.contains { effect in
+            if case let .rejected(action, from, reason) = effect,
+               action == "begin_next_turn",
+               from == .listening,
+               reason == "begin_next_turn_requires_no_current_turn" {
+                return true
+            }
+            return false
+        }
+        XCTAssertTrue(rejected,
+                      "listening + currentTurn != nil：必须产出 rejected(reason=begin_next_turn_requires_no_current_turn)")
+    }
+
+    /// audioDoneTimeout 与 turnFailed 收尾后也应留下 `session == .listening && currentTurn == nil`
+    /// 的稳态，beginNextTurn 同样可闭合下一轮——覆盖失败路径下 §1.2 环路的第 2 圈。
+    func testBeginNextTurnRecoversAfterAudioDoneTimeout() {
+        let base = warmToPlaying()
+        let timedOut = drive([
+            .audioDoneTimeout(turnId: turn1, generation: gen1, atMs: t0 + 3900)
+        ], from: base.state)
+        XCTAssertEqual(timedOut.state.session, .listening)
+        XCTAssertNil(timedOut.state.currentTurn)
+
+        let next = drive([
+            .beginNextTurn(turnId: turn2, atMs: t0 + 4000),
+            .vadFinal(turnId: turn2, atMs: t0 + 4200)
+        ], from: timedOut.state)
+        XCTAssertEqual(next.state.session, .committing)
+        XCTAssertEqual(next.state.currentTurn?.turnId, turn2)
+    }
+
+    func testBeginNextTurnRecoversAfterTurnFailed() {
+        // 先把 turn1 推到 playing，再让 turnFailed 收尾。
+        let base = warmToPlaying()
+        let failed = drive([
+            .turnFailed(turnId: turn1, generation: gen1, code: "gateway_error", atMs: t0 + 1000)
+        ], from: base.state)
+        XCTAssertEqual(failed.state.session, .listening)
+        XCTAssertNil(failed.state.currentTurn)
+
+        let next = drive([
+            .beginNextTurn(turnId: turn2, atMs: t0 + 1100),
+            .vadFinal(turnId: turn2, atMs: t0 + 1200)
+        ], from: failed.state)
+        XCTAssertEqual(next.state.session, .committing)
+        XCTAssertEqual(next.state.currentTurn?.turnId, turn2)
     }
 
     // MARK: - reducer 无外部依赖（这里靠 test target 编译面约束——本文件仅 import 见开头）
