@@ -42,6 +42,29 @@ struct RealtimePlaybackAudioSessionGate {
     }
 }
 
+/// ESS-534: decide whether the render path must be rebuilt after the recorder
+/// releases the shared AVAudioSession. The first downlink after activation is
+/// always rebuilt because AVAudioEngine may still report `isRunning == true`
+/// even though the session deactivation has detached it from the output route.
+/// ESS-554 rebase 注：enqueue 侧的调用点已随 main 的 ESS-509 架构移除
+///（激活收敛到 prepare()），本纯函数策略保留——WatchRealtimeMediaAdapterTests
+/// 仍在断言它的判定矩阵。
+struct RealtimeRenderRecoveryPolicy {
+    static func shouldRestartEngine(
+        firstDeltaAfterSessionActivation: Bool,
+        engineIsRunning: Bool
+    ) -> Bool {
+        firstDeltaAfterSessionActivation || !engineIsRunning
+    }
+
+    static func shouldRestartNode(
+        engineWasRestarted: Bool,
+        nodeIsPlaying: Bool
+    ) -> Bool {
+        engineWasRestarted || !nodeIsPlaying
+    }
+}
+
 /// ESS-321 real playback engine for streamed `audio.delta` chunks.
 ///
 /// The bridge/agent delivers 24 kHz mono PCM16 chunks. Rather than wait for
@@ -88,12 +111,19 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
     private let audioEngine: AVAudioEngine
     private let playerNode: AVAudioPlayerNode
     private let format: AVAudioFormat
+    /// ESS-554：`.conversation` 时会话与引擎生命周期归
+    /// ConversationAudioController——enqueue 不再做 `.playAndRecord →
+    /// .playback` 翻转与每轮引擎重启（ESS-535 重启逻辑上移为会话级）。
+    /// `.turn` 为旧路径（RealtimePlaybackAudioSessionGate）。
+    private let lifecycleOwner: () -> RealtimeAudioLifecycleOwner
 
     private(set) var currentTurn: RealtimeMediaSession.TurnHandle?
     private(set) var isRunning = false
     /// ESS-509: audio session gate that prevents the engine from stomping
     /// on another player's session (SpeechPlayer, StreamingAudioPlayer)
     /// and ensures deactivation happens exactly once per turn.
+    /// ESS-554 rebase：本声明保留 ESS-509 版本（分支曾上移到 lifecycleOwner
+    /// 旁，去重后只留这一份）。
     private var audioSessionGate = RealtimePlaybackAudioSessionGate()
     /// ESS-335 receipt state machine lives in Shared/ for unit testability
     /// without AVFoundation. Every real completion callback pokes it; the
@@ -105,7 +135,8 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
     /// into `playback.started` / `playback.ended` on the wire.
     var onPlaybackEvent: ((PlaybackEvent) -> Void)?
 
-    init(format: RealtimeMediaFormat = .downlinkPCM16, audioEngine: AVAudioEngine = AVAudioEngine()) {
+    init(format: RealtimeMediaFormat = .downlinkPCM16, audioEngine: AVAudioEngine = AVAudioEngine(),
+         lifecycleOwner: @escaping () -> RealtimeAudioLifecycleOwner = { .turn }) {
         guard let audioFormat = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
             sampleRate: Double(format.sampleRate),
@@ -118,6 +149,7 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         }
         self.format = audioFormat
         self.audioEngine = audioEngine
+        self.lifecycleOwner = lifecycleOwner
         self.playerNode = AVAudioPlayerNode()
         audioEngine.attach(playerNode)
         audioEngine.connect(playerNode, to: audioEngine.mainMixerNode, format: audioFormat)
@@ -127,10 +159,16 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         stop(barge: false)
         currentTurn = turn
         tracker.reset()
-        // ESS-509: activate the playback audio session idempotently per turn.
-        // If another player (SpeechPlayer) owns the session, this will fail
-        // and the caller (WatchRealtimeMediaAdapter) catches it as a fallback.
-        try audioSessionGate.activateAudioSession()
+        if lifecycleOwner() == .conversation {
+            // ESS-554：引擎由 controller 在会话 acquire 时启动并跨回合保持；
+            // 本地 isRunning 记账与引擎真实状态对齐，仅在未跑时兜底启动。
+            isRunning = audioEngine.isRunning
+        } else {
+            // ESS-509: activate the playback audio session idempotently per turn.
+            // If another player (SpeechPlayer) owns the session, this will fail
+            // and the caller (WatchRealtimeMediaAdapter) catches it as a fallback.
+            try audioSessionGate.activateAudioSession()
+        }
         if !isRunning {
             audioEngine.prepare()
             try audioEngine.start()
@@ -141,6 +179,16 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
 
     func enqueue(playables: [RealtimeDownlinkPlayback.PlayableChunk]) {
         guard let turn = currentTurn else { return }
+        // ESS-554: `.conversation` 模式下整段会话翻转与引擎重启都不存在——
+        // 会话由 ConversationAudioController 全程持有 `.playAndRecord`，
+        // 引擎自 acquire 起一直挂在该会话上；
+        // 只需保证 playerNode 在播（bargeIn 会停 node，新 delta 到来时恢复）。
+        // ESS-554 rebase 注：`.turn` 路径的 ESS-534/535 enqueue 重建块已被
+        // main 的 ESS-509 移除（激活收敛到 prepare() 的 audioSessionGate），
+        // 此处不再保留旧 else 分支。
+        if lifecycleOwner() == .conversation, !playerNode.isPlaying {
+            playerNode.play()
+        }
         for playable in playables where
             playable.chunk.requestId == turn.requestId &&
             playable.chunk.streamId == turn.sessionId {

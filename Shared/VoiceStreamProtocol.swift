@@ -9,6 +9,16 @@ enum VoiceStreamingGate {
     static let defaultEnabled = true
 }
 
+/// ESS-554 (Phase 0 / A2)：会话级音频所有权开关。
+/// ON = `ConversationAudioController` 在 conversation 生命周期内独占
+/// `.playAndRecord` 会话与两个实时引擎，回合间只停 tap/playerNode，
+/// 不再按回合翻转 `.playAndRecord ↔ .playback`（ESS-532/535 事故面）。
+/// OFF = 回退到今天的回合级路径（`RealtimePlaybackAudioSessionGate` +
+/// AudioRecorder 每回合 configure/release），按住说话降级入口不受影响。
+enum ConversationAudioGate {
+    static let defaultEnabled = true
+}
+
 /// Compile-time transport contract. `sendMessageData` is reachable-only and
 /// best-effort: it must never be used as a durable queue. A failed stream falls
 /// back once to the existing reliable complete-file path.

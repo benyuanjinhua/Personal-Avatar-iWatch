@@ -497,7 +497,7 @@ final class WatchDownlinkOutbox {
     /// `relayStatus` entry belongs to a dead session — delivering them
     /// would pollute the Watch with stale audio.
     @discardableResult
-    mutating func purgeRealtimeDownlink() -> Int {
+    func purgeRealtimeDownlink() -> Int {
         let removable = items.filter { $0.kind == .relayStatus }
         guard !removable.isEmpty else { return 0 }
         let doomed = removable.map { (id: $0.id, stagedFileName: $0.stagedFileName) }

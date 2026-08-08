@@ -42,6 +42,12 @@ final class WatchAppServices {
         pushToTalk.onAutoPlayStarted = { [welcome] in welcome.interrupt() }
         // ESS-535: stop welcome speech immediately when user presses to talk.
         pushToTalk.onPressBegan = { [welcome] in welcome.interrupt() }
+        // ESS-554：会话级持有期间，所有 SpeechPlayer（结果语音 / 错误语音 /
+        // 欢迎语 / 自检）既不重配会话也不 deactivate——会话归
+        // ConversationAudioController 独占，点 X 才由它真释放（PD-2）。
+        SpeechPlayer.sessionExternallyOwned = { [pushToTalk] in
+            pushToTalk.conversationAudioController?.isAcquired == true
+        }
         // ESS-321: pre-warm the adapter so the settings store's downlink
         // dispatch has somewhere to send `audio.delta` payloads even before
         // the first press has fired.
