@@ -680,6 +680,12 @@ final class PushToTalkController: ObservableObject {
         if let adapter = realtimeAdapter { return adapter }
         let pcmRecorder = PCMFrameRecorder()
         let playbackEngine = RealtimePlaybackEngine()
+        // ESS-575: enable VAD-based automatic turn endpointing. When the
+        // user stops speaking for endpointSilenceMs (default 700ms),
+        // the adapter automatically commits the PCM uplink — no gesture.
+        let vadConfig = LocalVADConfiguration(
+            endpointSilenceMs: Int64(WatchDebugSettings().vadEndpointSilenceMs)
+        )
         let adapter = WatchRealtimeMediaAdapter(
             recorder: pcmRecorder,
             player: playbackEngine,
@@ -689,8 +695,16 @@ final class PushToTalkController: ObservableObject {
             },
             logger: { message in
                 WatchLog.info("realtime", "adapter", detail: message)
-            }
+            },
+            vadConfiguration: vadConfig,
+            automaticallyCommitOnSpeechFinal: true
         )
+        // ESS-575: when VAD auto-commits, finish the AAC recording too.
+        adapter.onVADEvent = { [weak self] event in
+            guard let self, case .speechFinal = event,
+                  self.state == .recording, self.recorder.isRecording else { return }
+            self.finishRecording()
+        }
         // ESS-509: track turn lifecycle so WCSession keep-alive releases
         // exactly when the realtime path is done — no premature release
         // that would drop audio.delta delivery, no zombie hold after
