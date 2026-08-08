@@ -14,6 +14,39 @@ import XCTest
 @MainActor
 final class BackgroundAudioBreatherTests: XCTestCase {
 
+    private final class LogSink: @unchecked Sendable {
+        struct Entry {
+            let module: String
+            let event: String
+            let detail: String?
+        }
+
+        private let lock = NSLock()
+        private var entries: [Entry] = []
+
+        func record(module: String, event: String, detail: String?) {
+            lock.lock()
+            defer { lock.unlock() }
+            entries.append(Entry(module: module, event: event, detail: detail))
+        }
+
+        func detail(module: String, event: String) -> String? {
+            lock.lock()
+            defer { lock.unlock() }
+            return entries.last { $0.module == module && $0.event == event }?.detail
+        }
+    }
+
+    override func setUp() {
+        super.setUp()
+        WatchLog.setObserver(nil)
+    }
+
+    override func tearDown() {
+        WatchLog.setObserver(nil)
+        super.tearDown()
+    }
+
     // MARK: - WAV 结构
 
     func testSilentWAVHeaderAndPayload() {
@@ -55,6 +88,10 @@ final class BackgroundAudioBreatherTests: XCTestCase {
     // MARK: - 安全上限
 
     func testSafetyCapStopsActiveBreather() async throws {
+        let sink = LogSink()
+        WatchLog.setObserver { module, event, detail, _ in
+            sink.record(module: module, event: event, detail: detail)
+        }
         let breather = BackgroundAudioBreather(maxDuration: 0.3)
         breather.start()
         // 模拟器音频会话不可用时不硬失败——cap 逻辑在真机验证（R-02.5 关卡二）。
@@ -65,6 +102,11 @@ final class BackgroundAudioBreatherTests: XCTestCase {
             try await Task.sleep(nanoseconds: 50_000_000)
         }
         XCTAssertFalse(breather.isActive, "safety cap must stop the breather after maxDuration")
+        XCTAssertEqual(
+            sink.detail(module: "breather", event: "stopped"),
+            "reason=safety_cap",
+            "safety-cap runtime evidence must retain the concrete stop reason"
+        )
     }
 
     func testExplicitStopBeforeCapStaysStopped() async throws {

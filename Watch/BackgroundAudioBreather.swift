@@ -44,7 +44,7 @@ final class BackgroundAudioBreather {
         guard appState == .active else {
             WatchLog.info(
                 "breather", "start_skipped",
-                detail: "reason=app_not_active state=\\(Self.stateDescription(appState))"
+                detail: "reason=app_not_active state=\(Self.stateDescription(appState))"
             )
             return
         }
@@ -76,7 +76,7 @@ final class BackgroundAudioBreather {
         } catch {
             WatchLog.error(
                 "breather", "start_failed",
-                detail: "error=\\(error.localizedDescription)",
+                detail: "error=\(error.localizedDescription)",
                 error: error
             )
         }
@@ -91,7 +91,7 @@ final class BackgroundAudioBreather {
         player = nil
         try? session.setActive(false, options: .notifyOthersOnDeactivation)
         isActive = false
-        WatchLog.info("breather", "stopped", detail: "reason=\\(reason)")
+        WatchLog.info("breather", "stopped", detail: "reason=\(reason)")
     }
 
     // MARK: - Silent WAV generation
