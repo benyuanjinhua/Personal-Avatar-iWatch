@@ -97,6 +97,10 @@ export class QwenAgentTransport {
           const sequence = Number.isInteger(event.sequence)
             ? event.sequence : turn.nextOutputSequence
           turn.nextOutputSequence = Math.max(turn.nextOutputSequence, sequence + 1)
+          this.log('upstream_event_received', {
+            request_id: requestId, session_id: sessionId, generation,
+            upstream_event_type: 'audio.delta', sequence,
+          })
           this.log('upstream_audio_delta', {
             request_id: requestId, session_id: sessionId, generation, sequence,
           })
@@ -108,6 +112,10 @@ export class QwenAgentTransport {
         }
         if (event.type === 'audio.done') {
           const finalSequence = turn.nextOutputSequence - 1
+          this.log('upstream_event_received', {
+            request_id: requestId, session_id: sessionId, generation,
+            upstream_event_type: 'audio.done', final_sequence: finalSequence,
+          })
           this.log('upstream_audio_done', {
             request_id: requestId, session_id: sessionId, generation,
             final_sequence: finalSequence,

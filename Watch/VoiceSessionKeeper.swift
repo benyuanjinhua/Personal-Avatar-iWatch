@@ -33,16 +33,23 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
     private var deliveredRequestIds: Set<String> = []
     private var isRecording = false
     private var isPlaying = false
+    /// ESS-532: true when a realtime streaming turn has been committed
+    /// uplink and the first playback render event has not yet fired.
+    private var isRealtimePending = false
 
     private var reviewTimer: Timer?
     private var cancellables: Set<AnyCancellable> = []
 
     /// 输入全部走 publisher：@Published 在 willSet 时发布，直接读属性会拿到旧值，
     /// 所以这里只依赖发布出来的新值，不回读来源对象。
+    /// - Parameters:
+    ///   - realtimePending: ESS-532, true when a realtime streaming turn uplink
+    ///     has been committed and the first playback frame has not yet rendered.
     func bind(
         turns: AnyPublisher<[VoiceTurnRecord], Never>,
         playing: AnyPublisher<Bool, Never>,
-        recording: AnyPublisher<Bool, Never>
+        recording: AnyPublisher<Bool, Never>,
+        realtimePending: AnyPublisher<Bool, Never> = Just(false).eraseToAnyPublisher()
     ) {
         turns
             .sink { [weak self] value in
@@ -65,6 +72,13 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
                 if value { self.restartSuppressed = false }
                 self.isRecording = value
                 self.reevaluate()
+            }
+            .store(in: &cancellables)
+        realtimePending
+            .removeDuplicates()
+            .sink { [weak self] value in
+                self?.isRealtimePending = value
+                self?.reevaluate()
             }
             .store(in: &cancellables)
     }
@@ -109,7 +123,8 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
             deliveredRequestIds: deliveredRequestIds,
             isRecording: isRecording,
             isPlaying: isPlaying,
-            now: Date()
+            now: Date(),
+            realtimePending: isRealtimePending
         )
         scheduleReview(at: verdict.reviewAt)
         switch verdict.decision {
@@ -134,9 +149,18 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
     }
 
     private func startSessionIfNeeded(reason: String) {
-        if startPending { return }
-        if let session, session.state == .running || session.state == .scheduled { return }
-        guard !restartSuppressed else { return }
+        if startPending {
+            WatchLog.info("runtime", "session_start_skipped", detail: "reason=startPending")
+            return
+        }
+        if let session, session.state == .running || session.state == .scheduled {
+            WatchLog.info("runtime", "session_start_skipped", detail: "reason=already_running")
+            return
+        }
+        guard !restartSuppressed else {
+            WatchLog.info("runtime", "session_start_skipped", detail: "reason=restartSuppressed lastCode=\(lastInvalidationReasonCode ?? -1)")
+            return
+        }
 
         // ESS-363：WKExtendedRuntimeSession.start() 必须在 app active 时调用，
         // 否则系统直接抛 ERR_RUNTIME_SESSION 甚至崩进程。

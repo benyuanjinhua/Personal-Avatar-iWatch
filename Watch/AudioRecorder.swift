@@ -10,6 +10,10 @@ enum RecorderError: LocalizedError {
     /// ESS-375: 短按（tap-and-release）导致 AVAudioRecorder.record() 返回后
     /// 尚未开始采集就被 stop()，产出只有容器头（~24KB）的空文件。
     case recordingNeverStarted
+    /// ESS-538: 录音进行中被降腕息屏/会话中断截断，容器内只剩不可用残片
+    /// （裁决见 RecordingInterruptionPolicy）。残片不提交回合——真机实测
+    /// 316ms 残片走完上传+识别全程后「没听清，请重说」。
+    case recordingInterrupted
 
     static let recordingTooShortDescription = "按住时间太短，请按住不放再说。"
 
@@ -20,6 +24,7 @@ enum RecorderError: LocalizedError {
         case .cannotCreateRecorder: return "录音器启动失败，请松开后再按住重试。"
         case .noRecording: return "没有录到语音。"
         case .recordingNeverStarted: return RecorderError.recordingTooShortDescription
+        case .recordingInterrupted: return "刚才录音被打断了，请按住重新说一次。"
         }
     }
 }
@@ -58,6 +63,71 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
     /// 会话被抢占 / record(forDuration:) 到点自停后不返回文档承诺的 0，
     /// 而是给出与 deviceCurrentTime 混淆的值。改用 DispatchTime 自己算差值。
     private var recordingStartUptime: DispatchTime?
+    /// ESS-538：本次录音是否观测到断流（AVAudioSession 中断 .began，或
+    /// 录音期间 scene 离开 active——降腕息屏）。只打标记不主动 stop，
+    /// 收尾时交 RecordingInterruptionPolicy 裁决丢弃残片 / 放行完整录音。
+    private var wasInterrupted = false
+    private var interruptionObserver: NSObjectProtocol?
+
+    override init() {
+        super.init()
+        // ESS-538：录音中的会话中断此前零观测点——息屏断流后 recorder 仍按
+        // 手势照常收尾，316ms 残片被当正常录音提交。与 SpeechPlayer 同款
+        // 观察 interruptionNotification，began 打标记，ended 按系统建议续录。
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification, object: nil, queue: .main
+        ) { [weak self] notification in
+            Task { @MainActor in self?.handleSessionInterruption(notification) }
+        }
+    }
+
+    deinit {
+        if let interruptionObserver {
+            NotificationCenter.default.removeObserver(interruptionObserver)
+        }
+    }
+
+    /// ESS-538：外部断流标记（scene 离开 active / 会话中断 began）。
+    /// 不主动 stop——用户可能立即抬腕续上（见中断 ended 续录），且手势
+    /// 收尾路径必须保持原有语义；残片丢弃由 finish() 收尾时裁决。
+    func noteExternalInterruption(reason: String) {
+        guard isRecording else { return }
+        let alreadyMarked = wasInterrupted
+        wasInterrupted = true
+        WatchLog.info(
+            "recorder", "record_interrupted",
+            detail: "reason=\(reason) already_marked=\(alreadyMarked)"
+        )
+    }
+
+    /// ESS-538：录音中的会话中断处置。began 只打标记+留痕（系统此刻已断
+    /// 音频，是否丢弃等手势收尾时按 RecordingInterruptionPolicy 裁决）；
+    /// ended 且系统建议恢复时原地续录（快速降腕又抬腕、仍按着不放的场景
+    /// 能救回尾部）。续录用剩余额度重设 maxDuration，守住 60s 上限。
+    private func handleSessionInterruption(_ notification: Notification) {
+        let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+        guard let kind = raw.flatMap(AVAudioSession.InterruptionType.init(rawValue:)) else { return }
+        switch kind {
+        case .began:
+            noteExternalInterruption(reason: "audio_session_interruption")
+        case .ended:
+            guard isRecording, let recorder else { return }
+            let optionsRaw = notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+            let options = AVAudioSession.InterruptionOptions(rawValue: optionsRaw)
+            guard options.contains(.shouldResume) else {
+                WatchLog.info("recorder", "record_interruption_ended", detail: "resume=false")
+                return
+            }
+            let remainingMs = max(0, Int(Self.maxDuration * 1000) - elapsedRecordingMs())
+            let resumed = recorder.record(forDuration: TimeInterval(remainingMs) / 1_000)
+            WatchLog.info(
+                "recorder", "record_resumed",
+                detail: "result=\(resumed) remaining_ms=\(remainingMs)"
+            )
+        @unknown default:
+            return
+        }
+    }
 
     func start(streamHandler: ((Data, Bool) -> Void)? = nil) async throws {
         let granted = await requestPermission()
@@ -121,6 +191,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         recorder = audioRecorder
         recordingStartUptime = .now()
         isRecording = true
+        wasInterrupted = false
         self.streamHandler = streamHandler
         streamOffset = 0
         if streamHandler != nil {
@@ -228,6 +299,25 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
             throw RecorderError.recordingNeverStarted
         }
 
+        // ESS-538: 录音被降腕息屏/会话中断截断、容器内只剩不可用残片 →
+        // 丢弃并提示重说，不提交回合（真机实测 asset=316ms / wall=5.9s 的
+        // 残片越过 300ms 解码门，走完上传+识别全程后「没听清，请重说」）。
+        // 音频够长（用户说完才息屏）则照常提交——本 issue 验收的 fallback
+        // 语义是「已录片段安全收尾」，不是一刀切丢弃。
+        if RecordingInterruptionPolicy.shouldDiscardAsFragment(
+            assetMs: assetMs, wallClockMs: wallClockMs, wasInterrupted: wasInterrupted
+        ) {
+            WatchLog.error(
+                "recorder", "record_interrupted_discarded",
+                detail: "asset_ms=\(assetMs.map(String.init) ?? "-") wall_clock_ms=\(wallClockMs) bytes=\(data.count) was_interrupted=\(wasInterrupted)",
+                code: "ERR_RECORDING_INTERRUPTED"
+            )
+            try? FileManager.default.removeItem(at: url)
+            currentURL = nil
+            recorder = nil
+            throw RecorderError.recordingInterrupted
+        }
+
         currentURL = nil
         recorder = nil
 
@@ -244,7 +334,7 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
 
         WatchLog.info(
             "recorder", "record_finished",
-            detail: "duration_ms=\(durationMs) bytes=\(data.count) wall_clock_ms=\(wallClockMs) asset_ms=\(assetMs.map(String.init) ?? "-")"
+            detail: "duration_ms=\(durationMs) bytes=\(data.count) wall_clock_ms=\(wallClockMs) asset_ms=\(assetMs.map(String.init) ?? "-") interrupted=\(wasInterrupted)"
         )
         return Recording(fileURL: url, data: data, durationMs: max(1, durationMs))
     }
