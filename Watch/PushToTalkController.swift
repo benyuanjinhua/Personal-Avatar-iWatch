@@ -391,6 +391,18 @@ final class PushToTalkController: ObservableObject {
             logPlaybackIsolationDrop(incomingRequestId: requestId, source: "speech_attached")
             return
         }
+        // ESS-539 v3: suppress SpeechPlayer auto-play for old M4A results
+        // when realtime playback is pending or in progress. The SpeechPlayer
+        // and RealtimePlaybackEngine compete for the shared AVAudioSession,
+        // causing repeated interruptions and stuttering playback.
+        guard !realtimePlaybackPending, realtimeAdapter?.currentTurn == nil else {
+            WatchLog.info(
+                "player", "auto_play_suppressed_realtime_active",
+                requestId: requestId,
+                detail: "realtime_pending=\(realtimePlaybackPending) adapter_turn=\(realtimeAdapter?.currentTurn?.requestId ?? "nil")"
+            )
+            return
+        }
         guard state == .idle else {
             Self.logger.info("auto-play deferred: recording in progress (request_id=\(requestId, privacy: .public))")
             enqueueAutoPlay(requestId, reason: "recording")
