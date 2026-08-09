@@ -243,13 +243,12 @@ final class ConversationAudioControllerTests: XCTestCase {
             object: nil,
             userInfo: [AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.began.rawValue]
         )
-        let released = expectation(description: "conversation released on interruption")
-        Task { @MainActor in
-            // 观察者经 queue=.main + Task 跳主线程，等两个调度回合。
-            try? await Task.sleep(nanoseconds: 200_000_000)
-            released.fulfill()
+        // 观察者经 queue=.main + Task 跳主线程。轮询被测状态，而不是另起
+        // 一个与被测结果无关的定时 expectation；hosted CI 主线程繁忙时，
+        // 后者可能超时，即使中断处理已经正确完成。
+        for _ in 0..<20 where controller.isAcquired {
+            try await Task.sleep(for: .milliseconds(100))
         }
-        await fulfillment(of: [released], timeout: 2)
 
         XCTAssertFalse(controller.isAcquired)
         XCTAssertEqual(session.deactivations, 1)
