@@ -68,6 +68,15 @@ final class WatchAppServices {
             // 与 PTT 手势同一前置：自检让出音频会话（ESS-65 铁律 3）。
             interruptSelfCheck: { [selfCheck] in selfCheck.interrupt() }
         )
+        // ESS-650 F2-4：语音打断开关（默认 OFF）。gate 判定只在会话层读一次。
+        sessionController.voiceBargeInEnabled = { [weak debugSettings] in
+            debugSettings?.voiceBargeInEnabled ?? false
+        }
+        // gate 翻到 OFF 的瞬间必须**即时停采**——不能等本轮回答播完，
+        // 否则用户关了开关麦克风还开着。
+        debugSettings.onVoiceBargeInDisabled { [weak sessionController] in
+            sessionController?.noteVoiceBargeInGateChanged(enabled: false)
+        }
         // ESS-554：会话级持有期间，所有 SpeechPlayer（结果语音 / 错误语音 /
         // 欢迎语 / 自检）既不重配会话也不 deactivate——会话归
         // ConversationAudioController 独占，点 X 才由它真释放（PD-2）。

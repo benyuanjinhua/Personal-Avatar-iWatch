@@ -265,23 +265,35 @@ final class ConversationAudioController {
         )
     }
 
+    /// ESS-650：语音打断功能启用时使用 `.voiceChat` 替代 `.spokenAudio`。
+    /// `.voiceChat` 提供 AEC（声学回声消除），是语音打断得以实现的硬件前提——
+    /// 没有 AEC 时扬声器播放的回答音频会被麦克风拾取并误判为用户语音。
+    /// 但 `.voiceChat` 会改变路由、增益、播放音量与录音质量，必须经 R-02.2
+    /// 双向与并发冒烟验证。门禁：F2-1 真机 `setActive` 成功且自身回声能量
+    /// 相对 `.spokenAudio` 记录实测 dB 降低量。
+    var voiceBargeInEnabled: Bool = false
+
     /// 与 `AudioRecorder.configureSession` 同源的 ESS-61 配置序列：
     /// 先 setActive(false, .notifyOthersOnDeactivation) 清掉播放侧残留的
     /// 激活态，再用带 policy 参数的重载显式声明 .default 复位粘性
     /// .longFormAudio；minimal 回落去掉 mode/options 只留最简
     /// .playAndRecord。这条阶梯在真机上验证过（ESS-61/ESS-72），不要简化。
+    ///
+    /// ESS-650：voiceBargeInEnabled 为 true 时第一级阶梯使用 `.voiceChat`
+    /// 而非 `.spokenAudio`——这是 AEC 生效的唯一路径。回落阶梯保持不变。
     private func configureSession(attempt: AudioSessionPolicy.RecordingAttempt) throws {
         try? session.setActive(false, options: .notifyOthersOnDeactivation)
         switch attempt {
         case .resetRoutePolicy:
+            let mode: AVAudioSession.Mode = voiceBargeInEnabled ? .voiceChat : .spokenAudio
             if #available(watchOS 11.0, *) {
                 try session.setCategory(
-                    .playAndRecord, mode: .spokenAudio, policy: .default,
+                    .playAndRecord, mode: mode, policy: .default,
                     options: [.allowBluetooth]
                 )
             } else {
                 try session.setCategory(
-                    .playAndRecord, mode: .spokenAudio, policy: .default, options: []
+                    .playAndRecord, mode: mode, policy: .default, options: []
                 )
             }
         case .minimal:
