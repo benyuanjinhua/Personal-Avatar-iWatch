@@ -52,6 +52,7 @@ final class SessionAutoRelistenTests: XCTestCase {
         XCTAssertNotNil(pushToTalk.onSessionAnswerStarted, "起播事件未接 → 永远进不了 speaking")
         XCTAssertNotNil(pushToTalk.onSessionAnswerFinished, "播完事件未接 → 永远回不到 listening")
         XCTAssertNotNil(pushToTalk.onSessionTurnAborted, "零提交回合未接 → 会话停在死麦克风上")
+        XCTAssertNotNil(pushToTalk.onSessionAnswerInterim, "interim 未接 → interim 会被当成本轮答完")
         XCTAssertNotNil(pushToTalk.onLocalCaptureChanged)
     }
 
@@ -126,6 +127,89 @@ final class SessionAutoRelistenTests: XCTestCase {
             XCTAssertEqual(h.log.count(of: "session_answer_finished"), 0, "\(endgame) 不是播完")
             XCTAssertEqual(h.log.count(of: "session_answer_failed"), 1, "\(endgame) 必须记为失败")
         }
+    }
+
+    // MARK: - 二轮复审阻断 A：开 conversation 不得打死 touch-down 已起的首轮
+
+    /// 短按进会话：录音与实时回合在 touch-down 就起来了，`enterSession` 随后
+    /// 才开 conversation 边界。`RealtimeMediaSession.beginConversation` 开头是
+    /// `finishTurn(reason: .interrupted)`——若无条件调用，它会把**正在飞的首轮**
+    /// 打死，而 `pressBegan()` 因 state 已是 .recording 又把同一个 request_id
+    /// 交回会话层认领：会话盯着一个已被 interrupt 的回合，首轮永远等不到
+    /// play_started/finished。
+    func testBeginSessionConversationDoesNotKillInFlightFirstTurn() {
+        let (controller, adapter) = makeControllerWithMockAdapter()
+        let requestId = UUIDv7.generate().uuidString.lowercased()
+        // touch-down 已起首轮（只动会话层，不碰录音硬件——CI 无音频设备）。
+        let inFlight = adapter.session.beginTurn(requestId: requestId)
+        XCTAssertNotNil(adapter.session.activeTurn)
+
+        controller.beginSessionConversation()
+
+        XCTAssertEqual(
+            adapter.session.activeTurn?.requestId, requestId,
+            "在飞首轮不得被 beginConversation 的 finishTurn 打死"
+        )
+        XCTAssertEqual(
+            adapter.session.activeConversationId, inFlight.conversationId,
+            "首轮隐式开的 conversation 就是这段会话的 conversation，不得被换掉"
+        )
+    }
+
+    /// 反向：没有在飞回合时（长按松手后进会话等路径）仍必须真正开边界，
+    /// 否则 conversation_id 无从铸造。
+    func testBeginSessionConversationOpensBoundaryWhenNoTurnInFlight() {
+        let (controller, adapter) = makeControllerWithMockAdapter()
+        XCTAssertNil(adapter.session.activeTurn)
+
+        controller.beginSessionConversation()
+
+        XCTAssertNotNil(adapter.session.activeConversationId, "无在飞回合时必须真开 conversation")
+    }
+
+    // MARK: - 二轮复审阻断 B：interim 播完不是本轮答完
+
+    /// 完整文件路径的 interim 与最终回答**共用同一个 request_id**。回合尚未
+    /// 达终态时播完的是 interim，此刻开下一轮，最终回答会落进下一轮——
+    /// 跨轮 + 顺序错乱。相位必须退回 thinking 继续等最终回答。
+    func testInterimPlaybackDoesNotAdvanceToNextTurn() {
+        let h = makeHarness()
+        h.startFirstTurn()
+        h.commitCurrentTurn()
+        h.pushToTalk.onSessionAnswerStarted?(h.currentRequestId)
+        XCTAssertEqual(h.session.turnPhase, .speaking)
+        let turnsBefore = h.startedTurns.count
+
+        // 生产里 handlePlaybackEndgame 在 `turn.currentState.isTerminal == false`
+        // 时走的就是这一条。
+        h.pushToTalk.onSessionAnswerInterim?(h.currentRequestId)
+
+        XCTAssertEqual(h.session.turnPhase, .thinking, "interim 播完应回到等待最终回答")
+        XCTAssertEqual(h.startedTurns.count, turnsBefore, "interim 绝不能开下一轮")
+        XCTAssertEqual(h.log.count(of: "session_next_listening"), 1, "只有进会话那一次")
+        XCTAssertEqual(h.log.count(of: "session_answer_finished"), 0)
+        XCTAssertEqual(h.log.count(of: "session_answer_interim"), 1)
+
+        // 最终回答随后到达，仍在同一轮内正常收口。
+        h.pushToTalk.onSessionAnswerFinished?(h.currentRequestId, true, "endgame_success")
+        XCTAssertEqual(h.session.turnPhase, .listening)
+        XCTAssertEqual(h.startedTurns.count, turnsBefore + 1, "最终回答播完才开下一轮")
+    }
+
+    /// interim 之后最终回答永不到达时不许挂死：thinking 的有界超时必须被
+    /// 重新武装，到点把会话捞回聆听。
+    func testInterimReArmsThinkingTimeout() {
+        let h = makeHarness()
+        h.startFirstTurn()
+        h.commitCurrentTurn()
+        h.pushToTalk.onSessionAnswerStarted?(h.currentRequestId)
+        h.pushToTalk.onSessionAnswerInterim?(h.currentRequestId)
+        XCTAssertEqual(h.session.turnPhase, .thinking)
+
+        h.fireScheduled(withDelay: SessionController.thinkingTimeoutSeconds)
+
+        XCTAssertEqual(h.log.count(of: "session_thinking_timeout"), 1, "interim 后超时守卫必须仍在")
+        XCTAssertEqual(h.session.turnPhase, .listening)
     }
 
     // MARK: - 阻断 3：连续五轮的运行时关联证据
@@ -407,6 +491,23 @@ final class SessionAutoRelistenTests: XCTestCase {
 
     private func freshDefaults() -> UserDefaults {
         UserDefaults(suiteName: "SessionAutoRelistenTests.\(UUID().uuidString)")!
+    }
+
+    /// 装了替身 adapter 的真实 `PushToTalkController`。不能用
+    /// `ensureRealtimeAdapter()`：它会构造真实 `RealtimePlaybackEngine`，
+    /// 其 `AVAudioEngine.SetFormat` 在无音频硬件的 hosted CI 上直接 -10868
+    /// （ESS-498 家族，本单二轮 CI 实证）。经 `useRealtimeAdapterForTests`
+    /// 注入后，`beginSessionConversation()` 走的仍是**生产那一段代码**。
+    private func makeControllerWithMockAdapter() -> (PushToTalkController, WatchRealtimeMediaAdapter) {
+        let controller = PushToTalkController()
+        controller.voiceStreamingEnabled = { true }
+        let adapter = WatchRealtimeMediaAdapter(
+            recorder: MockRecorder(), player: MockPlayer(), transport: MockTransport(),
+            vadConfiguration: LocalVADConfiguration(),
+            automaticallyCommitOnSpeechFinal: true
+        )
+        controller.useRealtimeAdapterForTests(adapter)
+        return (controller, adapter)
     }
 
     private func makeHarness() -> Harness {
