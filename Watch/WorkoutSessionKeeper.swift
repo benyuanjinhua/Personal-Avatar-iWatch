@@ -51,8 +51,8 @@ final class WorkoutSessionKeeper: NSObject {
             session.delegate = self
             self.session = session
             self.builder = builder
-            session.startActivity(with: Date())
-            builder.beginCollection(withStart: Date()) { _, _ in }
+            try session.startActivity(with: Date())
+            try builder.beginCollection(withStart: Date()) { _, _ in }
             isActive = true
             Self.logger.info("workout_session_started")
         } catch {
@@ -66,9 +66,13 @@ final class WorkoutSessionKeeper: NSObject {
     func stop() {
         guard isActive, let session else { return }
         isActive = false
-        session.stopActivity(with: Date())
-        session.end()
-        builder?.endCollection(withEnd: Date()) { _, _ in }
+        do {
+            session.stopActivity(with: Date())
+            try session.end()
+            try builder?.endCollection(withEnd: Date()) { _, _ in }
+        } catch {
+            Self.logger.error("workout_session_stop_failed error=\(error.localizedDescription)")
+        }
         self.session = nil
         self.builder = nil
         Self.logger.info("workout_session_stopped")
