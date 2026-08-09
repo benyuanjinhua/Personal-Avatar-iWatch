@@ -457,6 +457,24 @@ extension WatchVoiceTransport: WatchRealtimeMediaAdapter.Transport {
         }
     }
 
+    /// ESS-551：会话终结信号（点 X / 超时 / 中断）。经 iPhone 向 Gateway
+    /// 发携带 meta.conversation_id 的 close 帧；该会话的迟到帧从此被拒。
+    /// 发送失败仅留日志——本地已先行关闭会话（Watch 侧零帧进入由
+    /// RealtimeMediaSession.closeConversation 保证），Gateway 侧的旧帧
+    /// 在 socket 拆连后自然死亡。
+    func sendConversationClose(conversationId: String, turnId: String?) {
+        WatchLog.info(
+            "transport", "conversation_close_sent",
+            detail: "conversation_id=\(conversationId) turn_id=\(turnId ?? "-")"
+        )
+        sendRealtimeUplink(.conversationClose(conversationId: conversationId, turnId: turnId)) {
+            WatchLog.error(
+                "transport", "conversation_close_send_failed",
+                detail: "conversation_id=\(conversationId)", code: "ERR_UPLINK_SEND"
+            )
+        }
+    }
+
     func sendPlaybackStarted(handle: RealtimeMediaSession.TurnHandle, responseId: String) {
         WatchLog.info(
             "transport", "realtime_playback_started",

@@ -51,6 +51,10 @@ enum RealtimeUplinkKind: String, Codable, Sendable {
     /// generation owner; it asks iPhone to advance `generation` and issue
     /// `cancel` on the WSS).
     case bargeInRequest = "bargein.request"
+    /// ESS-551: conversation 终结信号（Watch 点 X / 超时 / 中断）。不带
+    /// 音频载荷，仅 conversation_id/turn_id 有意义；iPhone 据此向 Gateway
+    /// 发携带 meta 的 close 帧。
+    case conversationClose = "conversation.close"
 }
 
 struct RealtimeUplinkEnvelope: Codable, Sendable, Equatable {
@@ -127,6 +131,17 @@ struct RealtimeUplinkEnvelope: Codable, Sendable, Equatable {
         RealtimeUplinkEnvelope(
             protocolVersion: RealtimeWireVersion.uplink,
             kind: .streamStart, start: start, append: nil, commit: nil,
+            playback: nil, fallback: nil,
+            conversationId: conversationId, turnId: turnId
+        )
+    }
+
+    /// ESS-551：会话终结信号。无音频载荷；conversationId 必填（信号的意义
+    /// 就是关闭这个 id），turnId 可选（最后回合的取证对照）。
+    static func conversationClose(conversationId: String, turnId: String? = nil) -> Self {
+        RealtimeUplinkEnvelope(
+            protocolVersion: RealtimeWireVersion.uplink,
+            kind: .conversationClose, start: nil, append: nil, commit: nil,
             playback: nil, fallback: nil,
             conversationId: conversationId, turnId: turnId
         )

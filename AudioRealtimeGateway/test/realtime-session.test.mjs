@@ -379,3 +379,117 @@ describe('RealtimeSession — heartbeat', () => {
     assert.equal(pong?.nonce, 'abc')
   })
 })
+
+// ESS-551 A4: conversation_id/turn_id 端到端 —— meta 子对象承载、关闭后
+// 拒绝迟到会话、注册表有界。对应 Watch 侧 ConversationHandle 生命周期。
+describe('RealtimeSession — ESS-551 conversation identity', () => {
+  const CONV = '0198c001-0000-7000-8000-0000000000c1'
+
+  function startWithMeta(session, scope, meta) {
+    session.onFrame(JSON.stringify({
+      type: 'session.start',
+      session_id: scope.session_id, request_id: scope.request_id,
+      generation: scope.generation, protocol_version: 1,
+      ...(meta ? { meta } : {}),
+    }))
+  }
+
+  it('accepts meta on session.start and logs conversation/turn identity', () => {
+    const { session, sent, logs, scope } = harness()
+    startWithMeta(session, scope, { conversation_id: CONV + '-a', turn_id: 't-1' })
+    assert.equal(sent[0]?.type, 'ready')
+    const ready = logs.find(l => l.evt === 'session_ready')
+    assert.equal(ready?.conversation_id, CONV + '-a')
+    assert.equal(ready?.turn_id, 't-1')
+  })
+
+  it('session.start without meta still works (fallback to requestId/sessionId baseline)', () => {
+    const { session, sent, logs, scope } = harness()
+    start(session, scope)
+    assert.equal(sent[0]?.type, 'ready')
+    const ready = logs.find(l => l.evt === 'session_ready')
+    assert.equal(ready?.conversation_id, null)
+  })
+
+  it('close frame carrying meta.conversation_id closes the conversation; later start is rejected', () => {
+    const first = harness()
+    startWithMeta(first.session, first.scope, { conversation_id: CONV + '-b', turn_id: 't-1' })
+    first.session.onFrame(JSON.stringify({
+      type: 'close', reason: 'conversation_end', meta: { conversation_id: CONV + '-b' },
+    }))
+    assert.ok(first.logs.some(l => l.evt === 'conversation_close_recorded'
+      && l.conversation_id === CONV + '-b'))
+
+    // 同一 conversation 的任何后续 session.start（迟到帧）必须被拒绝。
+    const second = harness({ scope: { device_id: 'jackson-iphone', session_id: 's-1', request_id: 'r-2', generation: 1 } })
+    startWithMeta(second.session, second.scope, { conversation_id: CONV + '-b', turn_id: 't-2' })
+    assert.equal(second.sent[0]?.type, 'error')
+    assert.equal(second.sent[0]?.code, 'ERR_CONVERSATION_CLOSED')
+    assert.ok(second.logs.some(l => l.evt === 'conversation_start_rejected'
+      && l.drop_reason === 'conversation_closed'))
+  })
+
+  it('plain socket teardown does NOT close the conversation (multi-round reuse)', () => {
+    const first = harness()
+    startWithMeta(first.session, first.scope, { conversation_id: CONV + '-c', turn_id: 't-1' })
+    first.session.onSocketClose(1000, 'peer_closed')
+
+    const second = harness({ scope: { device_id: 'jackson-iphone', session_id: 's-1', request_id: 'r-2', generation: 1 } })
+    startWithMeta(second.session, second.scope, { conversation_id: CONV + '-c', turn_id: 't-2' })
+    assert.equal(second.sent[0]?.type, 'ready')
+  })
+
+  it('close frame without meta does NOT close the conversation', () => {
+    const first = harness()
+    startWithMeta(first.session, first.scope, { conversation_id: CONV + '-d', turn_id: 't-1' })
+    first.session.onFrame(JSON.stringify({ type: 'close', reason: 'client_close' }))
+
+    const second = harness({ scope: { device_id: 'jackson-iphone', session_id: 's-1', request_id: 'r-2', generation: 1 } })
+    startWithMeta(second.session, second.scope, { conversation_id: CONV + '-d', turn_id: 't-2' })
+    assert.equal(second.sent[0]?.type, 'ready')
+  })
+
+  it('closed registry expires entries after TTL (24h)', () => {
+    const clock = controlledClock()
+    let now = 1_800_000_000_000
+    const first = harness({ now: () => now, ...clock })
+    startWithMeta(first.session, first.scope, { conversation_id: CONV + '-e', turn_id: 't-1' })
+    first.session.onFrame(JSON.stringify({
+      type: 'close', reason: 'conversation_end', meta: { conversation_id: CONV + '-e' },
+    }))
+
+    now += 24 * 60 * 60 * 1000 + 1 // 越过 TTL
+    const second = harness({ scope: { device_id: 'jackson-iphone', session_id: 's-1', request_id: 'r-2', generation: 1 }, now: () => now, ...clock })
+    startWithMeta(second.session, second.scope, { conversation_id: CONV + '-e', turn_id: 't-2' })
+    assert.equal(second.sent[0]?.type, 'ready')
+  })
+
+  it('closed registry is bounded (cap 1000, oldest evicted)', async () => {
+    const { _resetClosedConversationsForTests } = await import('../realtime-session.mjs')
+    _resetClosedConversationsForTests()
+    let now = 1_800_000_000_000
+    const clock = controlledClock()
+    for (let i = 0; i < 1001; i++) {
+      const h = harness({ now: () => now, ...clock })
+      const conv = `0198c001-0000-7000-8000-${String(i).padStart(12, '0')}`
+      startWithMeta(h.session, h.scope, { conversation_id: conv, turn_id: 't' })
+      h.session.onFrame(JSON.stringify({
+        type: 'close', reason: 'conversation_end', meta: { conversation_id: conv },
+      }))
+      now += 1
+    }
+    // 最早的一条应已被淘汰：重新 start 不再拒绝。
+    const oldest = harness({ scope: { device_id: 'jackson-iphone', session_id: 's-1', request_id: 'r-oldest', generation: 1 }, now: () => now, ...clock })
+    startWithMeta(oldest.session, oldest.scope, {
+      conversation_id: '0198c001-0000-7000-8000-000000000000', turn_id: 't',
+    })
+    assert.equal(oldest.sent[0]?.type, 'ready')
+    // 最新的一条仍在册：必须拒绝。
+    const newest = harness({ scope: { device_id: 'jackson-iphone', session_id: 's-1', request_id: 'r-newest', generation: 1 }, now: () => now, ...clock })
+    startWithMeta(newest.session, newest.scope, {
+      conversation_id: '0198c001-0000-7000-8000-000000001000', turn_id: 't',
+    })
+    assert.equal(newest.sent[0]?.code, 'ERR_CONVERSATION_CLOSED')
+    _resetClosedConversationsForTests()
+  })
+})

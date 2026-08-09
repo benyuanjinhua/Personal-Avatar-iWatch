@@ -41,6 +41,10 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
     private let replacementSession: (Int) async throws -> AudioRealtimeAgentSession
     private let requestId: String
     private let sessionId: String
+    /// ESS-551：会话级身份（可选）。随 session.start 的 meta 透传给
+    /// Gateway；iPhone 作为有界 relay 不得改写。
+    private let conversationId: String?
+    private let turnId: String?
 
     /// Current turn generation. iPhone owns this counter; Watch requests
     /// advancement via `bargein.request`.
@@ -58,15 +62,20 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
         requestId: String,
         sessionId: String,
         generation: Int = 0,
+        conversationId: String? = nil,
+        turnId: String? = nil,
         replacementSession: @escaping (Int) async throws -> AudioRealtimeAgentSession
     ) {
         self.agentSession = agentSession
         self.requestId = requestId
         self.sessionId = sessionId
+        self.conversationId = conversationId
+        self.turnId = turnId
         self.gate = BargeInGenerationCoordinator(generation: generation)
         self.replacementSession = replacementSession
         wireAgentSession()
-        _ = agentSession.connect(requestId: requestId, generation: generation)
+        _ = agentSession.connect(requestId: requestId, generation: generation,
+                                 conversationId: conversationId, turnId: turnId)
     }
 
     // MARK: - PhoneRealtimeSession.Transport
@@ -136,6 +145,11 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
             agentSession.disconnect(reason: reason)
             onStateChange?(.failed(reason: reason))
             completion(nil)
+
+        case .conversationClose:
+            // ESS-551：会话关闭信号由 PhoneRealtimeSession.forward 直接调
+            // closeConversation()，不经 send——这里仅作完备性兜底。
+            completion(nil)
         }
     }
 
@@ -153,6 +167,19 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
     func close(reason: String) {
         cancelTimeout?.cancel()
         agentSession.disconnect(reason: reason)
+    }
+
+    /// ESS-551：会话终结的显式关闭——向 Gateway 发携带 meta.conversation_id
+    /// 的 close 帧后再拆连；该 conversation 的迟到帧从此被 Gateway 拒绝。
+    func closeConversation() {
+        cancelTimeout?.cancel()
+        guard let conversationId else {
+            agentSession.disconnect(reason: "conversation_end")
+            return
+        }
+        agentSession.closeConversation(
+            reason: "conversation_end", conversationId: conversationId, turnId: turnId
+        )
     }
 
     // MARK: - Generation owner

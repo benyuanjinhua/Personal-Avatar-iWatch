@@ -115,8 +115,10 @@ final class AudioRealtimeAgentSession {
     // MARK: - Public API
 
     /// Open the WSS connection and send `session.start`.
+    /// ESS-551: conversation/turn 主键随 start 帧的 `meta` 下发（可选）。
     @discardableResult
-    func connect(requestId: String, generation: Int) -> Bool {
+    func connect(requestId: String, generation: Int,
+                 conversationId: String? = nil, turnId: String? = nil) -> Bool {
         guard case .disconnected = connectionState else {
             Self.logger.warning("agent session already in state \(self.connectionState.description, privacy: .public)")
             return false
@@ -138,7 +140,8 @@ final class AudioRealtimeAgentSession {
         // Send session.start — auth is in the HTTP header, not the JSON payload
         let startFrame = AudioRealtimeAgentCodec.UplinkFrame.sessionStart(
             sessionId: sessionId, requestId: requestId,
-            generation: generation, protocolVersion: 1
+            generation: generation, protocolVersion: 1,
+            conversationId: conversationId, turnId: turnId
         )
         transport.send(startFrame) { [weak self] error in
             if let error {
@@ -211,6 +214,19 @@ final class AudioRealtimeAgentSession {
         transport = nil
         pendingUplink.removeAll(keepingCapacity: false)
         transition(to: .closed)
+    }
+
+    /// ESS-551：会话级显式关闭——先发携带 `meta.conversation_id` 的 close
+    /// 帧（Gateway 据此拒绝该 conversation 的一切迟到帧），再拆连。
+    /// 每回合的普通拆连仍走 `disconnect(reason:)`，不带 meta。
+    func closeConversation(reason: String, conversationId: String, turnId: String?) {
+        transport?.send(.close(
+            reason: reason, conversationId: conversationId, turnId: turnId
+        )) { _ in }
+        Self.logger.info(
+            "agent conversation.close rid=\(conversationId.prefix(8), privacy: .public) reason=\(reason, privacy: .public)"
+        )
+        disconnect(reason: reason)
     }
 
     // MARK: - Receive loop

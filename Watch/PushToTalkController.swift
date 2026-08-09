@@ -128,6 +128,9 @@ final class PushToTalkController: ObservableObject {
     var makeConversationAudioController: () -> ConversationAudioController = {
         ConversationAudioController()
     }
+    /// ESS-551 A4：会话级身份句柄——conversation_id/turn_id 的唯一
+    /// 生成方。首个流式回合 mint，点 X/取消/超时/中断时关闭；nil = 无存活会话。
+    private(set) var conversationHandle: ConversationHandle?
     private var pendingRealtimeRecording: [String: AudioRecorder.Recording] = [:]
     /// ESS-331: fast-channel failures can arrive while the m4a is still being
     /// recorded (i.e. before `finishRecording()`). When that happens we keep
@@ -664,9 +667,13 @@ final class PushToTalkController: ObservableObject {
         guard conversationAudioEnabled() else { return }
         let controller = ensureConversationAudioController()
         guard !controller.isAcquired else { return }
-        let conversationId = UUIDv7.generate().uuidString.lowercased()
+        // ESS-551：conversation_id 由 ConversationHandle 统一生成，音频控制器
+        // 与实时会话共用同一 id——不再各自 mint。
+        let handle = ensureConversationHandleForStreaming()
+        let conversationId = handle.conversationId
         do {
             try controller.beginConversation(conversationId: conversationId)
+            realtimeAdapter?.session.beginConversation(handle)
         } catch {
             // 失败后果：本轮走回合级旧路径（AudioRecorder 自配会话、
             // RealtimePlaybackEngine 门内翻转），与关旗行为一致。
@@ -693,6 +700,39 @@ final class PushToTalkController: ObservableObject {
     /// deactivate 完成计。未持有时为空操作。
     func endConversationAudio(reason: ConversationAudioController.ReleaseReason = .userExit) {
         conversationAudioController?.endConversation(reason: reason)
+        closeConversationHandle(reason: "audio_\(reason.rawValue)")
+    }
+
+    /// ESS-551 A4：取当前会话的 ConversationHandle，没有则 mint。
+    /// 纯句柄操作（无 AVFoundation），测试可直接驱动——AC1 的「5 轮共享
+    /// 同一 conversation_id」接线证据由本方法 + RealtimeMediaSession 给出。
+    @discardableResult
+    func ensureConversationHandleForStreaming() -> ConversationHandle {
+        if let handle = conversationHandle, !handle.isClosed { return handle }
+        let handle = ConversationHandle()
+        conversationHandle = handle
+        WatchLog.info(
+            "realtime", "conversation_opened",
+            detail: "conversation_id=\(handle.conversationId)"
+        )
+        return handle
+    }
+
+    /// ESS-551 A4：会话终结（X/取消/超时/中断）——本地实时会话立即拒收
+    /// 迟到帧，并尽力通知 Gateway 关闭该 conversation（拒绝后续迟到帧）。
+    func closeConversationHandle(reason: String) {
+        guard let handle = conversationHandle else { return }
+        var closing = handle
+        closing.close()
+        conversationHandle = nil
+        realtimeAdapter?.session.closeConversation()
+        transport.sendConversationClose(
+            conversationId: closing.conversationId, turnId: nil
+        )
+        WatchLog.info(
+            "realtime", "conversation_closed",
+            detail: "conversation_id=\(closing.conversationId) turns=\(closing.turnCount) reason=\(reason)"
+        )
     }
 
     /// ESS-362: stand up the realtime coordinator turn once the audio session
@@ -1043,6 +1083,13 @@ final class PushToTalkController: ObservableObject {
         }
         adapter.onUplinkFallback = { [weak self] _ in
             self?.onRealtimeChannelFailed?(.channelEvent)
+        }
+        // ESS-551：adapter 创建时若已有存活会话（音频控制器先 acquire
+        // 成功的路径），把同一会话身份接入实时会话——保证 uplink 帧携带
+        // 的 conversation_id 与音频控制器、后续各轮一致。
+        if let handle = conversationHandle, !handle.isClosed,
+           adapter.session.activeConversationId == nil {
+            adapter.session.beginConversation(handle)
         }
         realtimeAdapter = adapter
         return adapter
