@@ -822,6 +822,11 @@ final class PushToTalkController: ObservableObject {
         streamSequence = 0
     }
 
+    /// ESS-653（F1-3）：**已不再由任何用户手势触发**。入口收敛后主屏长按
+    /// 不提交，全 UI 没有手动单条提交入口；提交只走会话内的
+    /// `endSessionTurn()`（含 `onSalvageTurn` 兜底）。保留本入口是因为
+    /// 「松手即收尾」的语义与 deferred-release 处理仍是底层能力的一部分
+    /// （AudioRecorder 的启动竞态口径引用它），不随 UI 收敛一起删除。
     func pressEnded() {
         guard state == .recording else { return }
         guard recorder.isRecording else {

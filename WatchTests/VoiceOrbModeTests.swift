@@ -86,4 +86,12 @@ final class VoiceOrbModeTests: XCTestCase {
     func testThinkingAndSpeakingAreDistinct() {
         XCTAssertNotEqual(VoiceOrbView.Mode.thinking, .speaking)
     }
+
+    // MARK: - ESS-653 待机图标
+
+    /// 设计稿 v2.0 P0：待机球图标是电话不是麦克风——「这不是按住说话」
+    /// 要在第一眼成立。
+    func testIdleSymbolIsPhone() {
+        XCTAssertEqual(VoiceOrbView.symbolName(for: .idle), "phone.fill")
+    }
 }

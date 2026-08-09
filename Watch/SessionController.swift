@@ -588,13 +588,51 @@ final class SessionController: ObservableObject {
         translation.height > 40 && translation.height > abs(translation.width) * 1.5
     }
 
-    /// 「点一下进会话」与「按住说话」的时长分界（PRD F1）：松手时
-    /// 按住不足该时长记为「点」——转会话常驻监听；达到则走 PTT 提交。
-    /// 0.35s【待调】：小于典型「按住说一个字」的最短按住，大于快速点按。
+    /// 进入电话模式的最长按住时长（PRD F1 / 设计稿 v2.0 §五 D1）。
+    ///
+    /// ESS-653 起长按不再有第二个语义，本阈值的角色也随之从「两个功能的
+    /// 分界线」降级为「**误触过滤阈值**」——超过它的按住视为误触（袖口
+    /// 压屏等），不进电话、不提交。
+    /// 0.35s【待调】：收紧到 0.2s 由 ESS-654（F5）负责，本单不动值。
     static let tapToEnterMaxHoldSeconds: TimeInterval = 0.35
 
     static func isTapToEnter(holdSeconds: TimeInterval) -> Bool {
         holdSeconds < tapToEnterMaxHoldSeconds
+    }
+
+    /// 主屏球松手被拒的原因（`session_enter_rejected.reason`）。
+    enum EnterRejection: String {
+        /// 按住超过 `tapToEnterMaxHoldSeconds` —— 误触，丢弃这次采集。
+        case holdTooLong = "hold_too_long"
+        /// 点按合法但 touch-down 那次采集没能开起来（上一轮还在收尾、
+        /// 录音启动失败等）。没有在飞的一轮可认领，进会话会当场空转。
+        case captureUnavailable = "capture_unavailable"
+    }
+
+    enum OrbReleaseAction: Equatable {
+        case enter
+        case reject(EnterRejection)
+    }
+
+    /// 主屏球松手的唯一判定点（纯函数，便于 WatchTests 钉死）。
+    ///
+    /// ESS-653：只有「按住 < 阈值 **且** touch-down 那轮确实在采集」才进
+    /// 电话模式；其余一律拒绝——**没有任何分支再回到 PTT 单条提交**。
+    static func orbReleaseAction(holdSeconds: TimeInterval, isCapturing: Bool) -> OrbReleaseAction {
+        guard isTapToEnter(holdSeconds: holdSeconds) else { return .reject(.holdTooLong) }
+        guard isCapturing else { return .reject(.captureUnavailable) }
+        return .enter
+    }
+
+    /// 留证一次被拒的进入。静默拒绝是设计口径（误触不该给反馈），但
+    /// 「用户按了却什么都没发生」必须在日志里可解释，否则真机复盘只剩猜。
+    func noteEnterRejected(reason: EnterRejection, holdSeconds: TimeInterval) {
+        // `holdSeconds` 在 touch-down 时刻缺失时是 .infinity，直接 Int() 会 trap。
+        let holdMs = holdSeconds.isFinite ? Int((holdSeconds * 1000).rounded()) : -1
+        WatchLog.info(
+            "session", "session_enter_rejected",
+            detail: "reason=\(reason.rawValue) hold_ms=\(holdMs)"
+        )
     }
 }
 
