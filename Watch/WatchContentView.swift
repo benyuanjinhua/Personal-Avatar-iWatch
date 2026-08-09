@@ -268,21 +268,21 @@ struct WatchContentView: View {
 
     // MARK: - 会话态主屏（ESS-573 / PRD §3.5.3 布局规格）
 
-    /// 会话模式整屏 UI。布局规格（45mm 基准，【待调】项真机体感定稿）：
-    /// 球直径 140pt、圆心位于垂直 62%（偏下，照 ChatGPT 视觉重心）、上方留白；
+    /// 会话模式整屏 UI。布局规格（45mm 基准）：
+    /// 球直径 125pt、圆心位于垂直 50%（v2.0 居中）、上方留白；
     /// X 常驻右下角、触控区 ≥44×44pt（Apple HIG 最小触控）、视觉 28pt；
     /// 建立中三点在球正下方 16pt（直径 4pt、间距 6pt）；异常一行文案在球
     /// 正下方 20pt、单行截断。全程无状态文字（PRD F7 硬约束），唯一例外是
     /// 异常链的一行可行动文案。
     private var sessionScreen: some View {
         GeometryReader { proxy in
-            let orbSize = min(140, proxy.size.width * 0.7)
+            let orbSize = min(125, proxy.size.width * 0.7)
             ZStack {
                 // ESS-600 F4：回答播放中点球 = 立刻打断并回到聆听。
                 // 只有 speaking 相位接手势——聆听/思考中点球无语义，
                 // 保持「会话中球不接手势」的原状，不造出误触面。
                 VoiceOrbView(mode: sessionOrbMode, size: orbSize)
-                    .position(x: proxy.size.width / 2, y: proxy.size.height * 0.62)
+                    .position(x: proxy.size.width / 2, y: proxy.size.height * 0.5)
                     .accessibilityLabel(session.turnPhase == .speaking ? "打断回答" : "实时对话中")
                     .allowsHitTesting(session.turnPhase == .speaking)
                     .onTapGesture { session.interruptSpeaking() }
@@ -300,7 +300,7 @@ struct WatchContentView: View {
                     connectingDots
                         .position(
                             x: proxy.size.width / 2,
-                            y: proxy.size.height * 0.62 + orbSize / 2 + 16
+                            y: proxy.size.height * 0.5 + orbSize / 2 + 16
                         )
                         .transition(.opacity)
                 }
@@ -315,7 +315,7 @@ struct WatchContentView: View {
                         .padding(.horizontal, 12)
                         .position(
                             x: proxy.size.width / 2,
-                            y: proxy.size.height * 0.62 + orbSize / 2 + 20
+                            y: proxy.size.height * 0.5 + orbSize / 2 + 20
                         )
                         .transition(.opacity)
                 }
@@ -329,7 +329,7 @@ struct WatchContentView: View {
                         .padding(.horizontal, 12)
                         .position(
                             x: proxy.size.width / 2,
-                            y: proxy.size.height * 0.62 + orbSize / 2 + 20
+                            y: proxy.size.height * 0.5 + orbSize / 2 + 20
                         )
                         .transition(.opacity)
                 }
@@ -408,7 +408,7 @@ struct WatchContentView: View {
             switch session.turnPhase {
             case .listening: return .listening(level: pushToTalk.recordingLevel)
             case .thinking: return .thinking
-            case .speaking: return .speaking
+            case .speaking: return .speaking(level: 0)
             case .idle: return .idle
             }
         case .disconnecting, .idle:
@@ -654,7 +654,7 @@ struct WatchContentView: View {
     /// `.establishing` 预留给后续实时对话 Session 建立流程（ESS-540 F1）。
     private var orbMode: VoiceOrbView.Mode {
         if isRecording { return .listening(level: pushToTalk.recordingLevel) }
-        if isSpeaking { return .speaking }
+        if isSpeaking { return .speaking(level: 0) }
         guard let phase = activeTurn?.phase, activeTurn?.isActive == true else { return .idle }
         switch phase {
         case .sending, .waitingForPhone, .waitingForMac,

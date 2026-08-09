@@ -24,7 +24,7 @@ struct VoiceOrbView: View {
         case establishing
         case listening(level: Float)
         case thinking
-        case speaking
+        case speaking(level: Float)
     }
 
     var mode: Mode
@@ -32,32 +32,37 @@ struct VoiceOrbView: View {
 
     var body: some View {
         ZStack {
-            Circle()
-                .fill(
-                    RadialGradient(
-                        colors: colors,
-                        center: .topLeading,
-                        startRadius: 2,
-                        endRadius: size * 0.72
-                    )
-                )
-                .frame(width: size, height: size)
-                .shadow(color: colors.last?.opacity(0.55) ?? .clear, radius: size * 0.2)
-                .modifier(BreathingScale(hertz: Self.breathHertz(for: mode),
-                                         amplitude: Self.breathAmplitude(for: mode)))
+            // Dual energy rings outside the orb (listening + speaking).
+            if showEnergyRings {
+                energyRings
+            }
 
-            if case .listening = mode {
-                WaveformBars(level: listeningLevel)
-            } else {
+            // Orb with semantic icon always at center.
+            ZStack {
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: colors,
+                            center: .topLeading,
+                            startRadius: 2,
+                            endRadius: size * 0.72
+                        )
+                    )
+                    .frame(width: size, height: size)
+                    .shadow(color: colors.last?.opacity(0.55) ?? .clear, radius: size * 0.2)
+                    .modifier(BreathingScale(hertz: Self.breathHertz(for: mode),
+                                             amplitude: Self.breathAmplitude(for: mode)))
+
                 Image(systemName: symbol)
                     .font(.system(size: size * 0.3, weight: .bold))
                     .foregroundStyle(.white)
+                    .contentTransition(.opacity)
                     .modifier(BreathingScale(hertz: Self.breathHertz(for: mode),
                                              amplitude: Self.breathAmplitude(for: mode) * 0.3))
             }
         }
-        .frame(width: size + 16, height: size + 16)
-        .animation(.easeInOut(duration: 0.18), value: modeTag)
+        .frame(width: size + 28, height: size + 28)
+        .animation(.easeInOut(duration: 0.3), value: modeTag)
         .onChange(of: modeTag) { _, newTag in
             // AC-6: 每次状态切换落一条 WatchLog 事件
             let name = modeName(for: newTag)
@@ -71,9 +76,62 @@ struct VoiceOrbView: View {
         }
     }
 
-    private var listeningLevel: Float {
-        if case .listening(let level) = mode { return level }
-        return 0
+    private var activeLevel: Float {
+        switch mode {
+        case .listening(let level): return level
+        case .speaking(let level): return level
+        default: return 0
+        }
+    }
+
+    private var showEnergyRings: Bool {
+        switch mode {
+        case .listening, .speaking: return true
+        default: return false
+        }
+    }
+
+    /// Dual concentric energy rings that pulse with audio level.
+    /// Inner ring sits 10pt outside orb edge; outer ring at 20pt.
+    private var energyRings: some View {
+        let lvl = CGFloat(activeLevel)
+        return ZStack {
+            Circle()
+                .stroke(
+                    ringGradient,
+                    style: StrokeStyle(lineWidth: 2, lineCap: .round)
+                )
+                .frame(width: size + 10, height: size + 10)
+                .opacity(0.2 + Double(lvl) * 0.8)
+                .scaleEffect(1.0 + Double(lvl) * 0.04)
+
+            Circle()
+                .stroke(
+                    ringGradient,
+                    style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
+                )
+                .frame(width: size + 20, height: size + 20)
+                .opacity(0.15 + Double(lvl) * 0.6)
+                .scaleEffect(1.0 + Double(lvl) * 0.06)
+        }
+        .animation(.easeInOut(duration: 0.12), value: activeLevel)
+    }
+
+    private var ringGradient: AngularGradient {
+        switch mode {
+        case .listening:
+            return AngularGradient(
+                colors: [.purple, .indigo, .purple.opacity(0.6), .indigo],
+                center: .center
+            )
+        case .speaking:
+            return AngularGradient(
+                colors: [.yellow, .orange, .yellow.opacity(0.6), .orange],
+                center: .center
+            )
+        default:
+            return AngularGradient(colors: [.clear, .clear], center: .center)
+        }
     }
 
     private func modeName(for tag: Int) -> String {
@@ -124,22 +182,18 @@ struct VoiceOrbView: View {
         }
     }
 
-    private var symbol: String { Self.symbolName(for: mode) }
-
-    /// 每态图标（static 便于 WatchTests 直接钉住，无需渲染视图）。
-    ///
-    /// ESS-653 / 设计稿 v2.0 P0：待机图标 `mic.fill` → `phone.fill`——长按
-    /// 语义移除后，「这不是按住说话」要在第一眼就成立，换图标是最低成本
-    /// 的手段。
-    static func symbolName(for mode: Mode) -> String {
+    /// Symbol for each mode — exposed as `internal static` for test assertions.
+    static func symbol(for mode: Mode) -> String {
         switch mode {
         case .idle: return "phone.fill"
         case .establishing: return "antenna.radiowaves.left.and.right"
-        case .listening: return "waveform"
-        case .thinking: return "ellipsis"
+        case .listening: return "ear.fill"
+        case .thinking: return "ellipsis.bubble.fill"
         case .speaking: return "speaker.wave.2.fill"
         }
     }
+
+    private var symbol: String { Self.symbol(for: mode) }
 
     /// `.animation(_:value:)` 需要 Equatable 且稳定的判别值。
     /// listening 电平变化不改变 modeTag，不触发转场动画重建（AC-4）。
@@ -233,23 +287,5 @@ private struct BreathingScale: ViewModifier {
         }
         RunLoop.main.add(timer, forMode: .common)
         rampTimer = timer
-    }
-}
-
-/// 录音时随音量起伏的波形条（H5 波形的原生复刻）。
-private struct WaveformBars: View {
-    let level: Float
-
-    private static let profiles: [CGFloat] = [0.45, 0.8, 1.0, 0.7, 0.55]
-
-    var body: some View {
-        HStack(spacing: 3) {
-            ForEach(Array(Self.profiles.enumerated()), id: \.offset) { _, profile in
-                Capsule()
-                    .fill(.white)
-                    .frame(width: 4, height: 8 + profile * CGFloat(level) * 26)
-            }
-        }
-        .animation(.easeInOut(duration: 0.12), value: level)
     }
 }
