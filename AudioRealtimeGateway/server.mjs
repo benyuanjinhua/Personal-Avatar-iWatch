@@ -297,6 +297,9 @@ function createAgentTransport(CONFIG, { log }) {
       connectTimeoutMs: CONFIG.agent_connect_timeout_ms ?? 10_000,
       maxPendingBytes: CONFIG.agent_max_pending_bytes ?? 2 * 1024 * 1024,
       takeover: CONFIG.agent_takeover_voice !== false,
+      // ESS-551 A3: config-gated escape hatch for the server-side VAD kill
+      // switch (default ON — see qwen-agent-transport.mjs).
+      disableServerTurnDetection: CONFIG.agent_disable_server_turn_detection !== false,
       log: (evt, extra) => log(evt, extra),
     })
   }

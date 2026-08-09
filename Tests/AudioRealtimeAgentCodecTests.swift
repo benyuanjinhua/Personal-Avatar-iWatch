@@ -36,6 +36,32 @@ final class AudioRealtimeAgentCodecTests: XCTestCase {
         XCTAssertEqual(obj["protocol_version"] as? Int, 1)
         // Token must NOT be in the JSON payload (it's in HTTP header)
         XCTAssertNil(obj["token"])
+        // ESS-551 A4: meta omitted entirely when nil (backward compatible).
+        XCTAssertNil(obj["meta"])
+    }
+
+    /// ESS-551 A4: session.start with meta carries conversation_id / turn_id
+    /// verbatim in the `meta` sub-object, and the log tag surfaces them.
+    func testSessionStartWithMetaEncodes() throws {
+        let meta: [String: Any] = [
+            "conversation_id": "0198c001-0000-7000-8000-0000000000aa",
+            "turn_id": "0198c001-0000-7000-8000-0000000000bb",
+        ]
+        let frame = AudioRealtimeAgentCodec.UplinkFrame.sessionStart(
+            sessionId: sessionId, requestId: requestId,
+            generation: 1, protocolVersion: 1, meta: meta
+        )
+        let text = try XCTUnwrap(AudioRealtimeAgentCodec.encode(frame))
+        let obj = try XCTUnwrap(decodedJSON(text))
+        let encodedMeta = try XCTUnwrap(obj["meta"] as? [String: Any])
+        XCTAssertEqual(encodedMeta["conversation_id"] as? String,
+                       "0198c001-0000-7000-8000-0000000000aa")
+        XCTAssertEqual(encodedMeta["turn_id"] as? String,
+                       "0198c001-0000-7000-8000-0000000000bb")
+
+        let tag = AudioRealtimeAgentCodec.logTag(frame)
+        XCTAssertTrue(tag.contains("cid=0198c001"), "logTag must surface the conversation prefix: \(tag)")
+        XCTAssertTrue(tag.contains("turn=0198c001"), "logTag must surface the turn prefix: \(tag)")
     }
 
     func testAudioAppendEncodes() throws {

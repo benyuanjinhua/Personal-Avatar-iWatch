@@ -11,12 +11,20 @@ export class QwenAgentTransport {
     connectTimeoutMs = 10_000,
     maxPendingBytes = 2 * 1024 * 1024,
     takeover = true,
+    // ESS-551 A3: explicitly disable Qwen server-side turn detection so the
+    // Watch-side VAD stays the single authoritative turn boundary (方案 §2.1).
+    // Escape hatch per the issue's exit plan: if the Qwen service ever
+    // rejects the `turnDetection` parameter, flip this to false (config key
+    // `agent_disable_server_turn_detection: false`) and record L1 evidence
+    // on ESS-551 before reopening the discussion.
+    disableServerTurnDetection = true,
     log = () => {},
   } = {}) {
     this.gatewayUrl = gatewayUrl
     this.connectTimeoutMs = connectTimeoutMs
     this.maxPendingBytes = maxPendingBytes
     this.takeover = takeover
+    this.disableServerTurnDetection = disableServerTurnDetection
     this.log = log
     this.turns = new Map()
   }
@@ -95,10 +103,20 @@ export class QwenAgentTransport {
       turn.connectTimer.unref?.()
 
       ws.on('open', () => {
+        // ESS-551 A3: open log must record the effective turn-detection
+        // posture so real-device evidence can prove server-side VAD is off.
+        this.log('turn_detection_config', {
+          request_id: requestId, session_id: sessionId, generation,
+          turn_detection: this.disableServerTurnDetection ? 'off' : 'upstream_default',
+        })
         ws.send(JSON.stringify({
           type: 'connect', clientType: 'cli', clientLabel: 'watch-direct-gateway',
           clientInstanceId: `gateway_${randomUUID()}`, voiceEnabled: true,
           manualTurnDetection: true, takeover: this.takeover,
+          // ESS-551 A3: explicit null → server-side VAD disabled. Without
+          // this, Qwen Realtime may emit its own `final` events, creating a
+          // dual-authority VAD conflict with the Watch (方案 §2.1).
+          ...(this.disableServerTurnDetection ? { turnDetection: null } : {}),
           timeZone: 'Asia/Shanghai', locale: 'zh-CN',
         }))
       })

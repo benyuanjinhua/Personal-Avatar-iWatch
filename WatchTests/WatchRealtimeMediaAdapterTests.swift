@@ -111,6 +111,50 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         ))
     }
 
+    /// ESS-551 AC1/AC2 (adapter 层): 会话内多轮共享 conversation_id；
+    /// endConversation（点 X/下滑/后台/取消的统一出口）销毁后下一轮重铸
+    /// 新 id，且迟到 delta 零帧进播放。
+    func testEndConversationRotatesConversationAndDropsLateFrames() {
+        let recorder = MockRecorder()
+        let player = MockPlayer()
+        let transport = MockTransport()
+        let adapter = WatchRealtimeMediaAdapter(
+            recorder: recorder,
+            player: player,
+            transport: transport
+        )
+
+        // 同一会话的两轮：共享 conversation_id，turn_id 不复用。
+        let first = adapter.beginTurn(requestId: "67555100-0000-7000-8000-000000000001")
+        adapter.cancel(reason: .audioDone)
+        let second = adapter.beginTurn(requestId: "67555100-0000-7000-8000-000000000002")
+        XCTAssertEqual(first.conversationId, second.conversationId)
+        XCTAssertNotEqual(first.turnId, second.turnId)
+        adapter.cancel(reason: .audioDone)
+
+        // 会话销毁 → 下一轮必须重铸 conversation_id。
+        adapter.endConversation(reason: .cancelled)
+
+        // AC2：已销毁会话旧 request 的迟到 delta —— 零帧进入播放。
+        let lateChunk = VoiceStreamChunk(
+            requestId: second.requestId,
+            streamId: second.sessionId,
+            direction: .downlink,
+            sequence: 0,
+            capturedAtMs: 1_800_000_000_000,
+            codec: "pcm_s16le",
+            sampleRate: 24_000,
+            payload: Data(repeating: 0x55, count: 128)
+        )
+        adapter.ingestDownlink(lateChunk, responseId: "resp-late", generation: 0)
+        XCTAssertTrue(player.enqueuedPlayables.isEmpty,
+                      "conversation 销毁后迟到帧不得进入播放")
+
+        let third = adapter.beginTurn(requestId: "67555100-0000-7000-8000-000000000003")
+        XCTAssertNotEqual(third.conversationId, first.conversationId)
+        adapter.cancel(reason: .cancelled)
+    }
+
     private final class MockRecorder: WatchRealtimeMediaAdapter.Recorder {
         var onFrame: ((Data) -> Void)?
         var onFailure: ((Error) -> Void)?

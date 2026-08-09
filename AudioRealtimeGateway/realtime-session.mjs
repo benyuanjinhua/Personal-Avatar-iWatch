@@ -13,6 +13,58 @@
 const OPEN = 'open'
 const CLOSED = 'closed'
 
+// ESS-551 A4: closed-conversation registry. When a client sends `close`
+// with `meta.conversation_id`, that id is registered here; any subsequent
+// `session.start` carrying the same conversation_id is rejected with
+// `ERR_CONVERSATION_CLOSED` and a `conversation_closed_drop` log.
+//
+// IMPORTANT — wire discipline: a conversation spans MANY turns, and every
+// turn opens its own WSS (and sends its own per-turn close). Attaching
+// conversation meta to an ordinary per-turn close would wrongly register a
+// still-alive conversation and reject its next turn. Clients MUST only send
+// `meta.conversation_id` on close when the conversation is truly destroyed
+// (Watch: tap-X / timeout / interrupt), never on a per-turn socket close.
+//
+// Eviction: entries expire after CLOSED_CONVERSATION_TTL_MS and the map is
+// capped at CLOSED_CONVERSATION_MAX (oldest-first). The Gateway is a
+// long-lived process — an unbounded set would grow one UUID per finished
+// conversation forever. The TTL only needs to outlive the longest plausible
+// late-frame window, not the retention of history.
+//
+// Restart semantics (intentional, do NOT "fix"): the registry is in-memory
+// only, so a Gateway restart forgets closed conversations. That is safe
+// because the Watch mints conversation ids as UUIDv7 and never reuses them —
+// a stale id colliding with a fresh conversation is impossible.
+const CLOSED_CONVERSATION_TTL_MS = 15 * 60 * 1000
+const CLOSED_CONVERSATION_MAX = 4096
+const closedConversations = new Map() // conversation_id → expiresAtMs (insertion-ordered)
+
+function sweepClosedConversations(nowMs) {
+  // Full scan: entries may carry expiries from injected clocks (tests), so
+  // insertion order is not guaranteed to track expiry order. n is capped by
+  // CLOSED_CONVERSATION_MAX and this runs only on meta-carrying
+  // session.start / close frames, so the scan stays cheap.
+  for (const [cid, expiresAt] of closedConversations) {
+    if (expiresAt <= nowMs) closedConversations.delete(cid)
+  }
+}
+
+function isConversationClosed(cid, nowMs) {
+  sweepClosedConversations(nowMs)
+  return closedConversations.has(cid)
+}
+
+function markConversationClosed(cid, nowMs) {
+  // Refresh-on-remark so a doubly-closed conversation keeps the later expiry.
+  closedConversations.delete(cid)
+  closedConversations.set(cid, nowMs + CLOSED_CONVERSATION_TTL_MS)
+  sweepClosedConversations(nowMs)
+  while (closedConversations.size > CLOSED_CONVERSATION_MAX) {
+    // Map iteration is insertion-ordered: the first key is the oldest.
+    closedConversations.delete(closedConversations.keys().next().value)
+  }
+}
+
 const CLIENT_SCHEMAS = {
   'session.start': ['session_id', 'request_id', 'generation', 'protocol_version'],
   'audio.append': ['session_id', 'request_id', 'generation', 'sequence', 'audio'],
@@ -27,14 +79,19 @@ const CLIENT_SCHEMAS = {
 // Fields the schema explicitly permits (used to reject unknown keys with
 // ERR_UNKNOWN_FIELD — strict contract is part of ESS-403 acceptance #2).
 const ALLOWED_KEYS = {
-  'session.start': new Set(['type', 'session_id', 'request_id', 'generation', 'protocol_version']),
+  // ESS-551 A4: `meta` is a free-form sub-object carrying conversation_id /
+  // turn_id without breaking the strict field-level schema. Dedicated
+  // top-level envelope keys are deferred to S2-6 (A5).
+  'session.start': new Set(['type', 'session_id', 'request_id', 'generation', 'protocol_version', 'meta']),
   'audio.append': new Set(['type', 'session_id', 'request_id', 'generation', 'sequence', 'audio', 'sample_rate', 'codec']),
   'audio.commit': new Set(['type', 'session_id', 'request_id', 'generation', 'sequence']),
   'cancel':       new Set(['type', 'session_id', 'request_id', 'generation', 'reason']),
   'playback.started': new Set(['type', 'session_id', 'request_id', 'response_id']),
   'playback.ended':   new Set(['type', 'session_id', 'request_id', 'response_id']),
   'ping':         new Set(['type', 'nonce']),
-  'close':        new Set(['type', 'reason']),
+  // ESS-551 A4: close accepts `meta` so the client can pin the
+  // conversation_id being torn down (see the wire-discipline note above).
+  'close':        new Set(['type', 'reason', 'meta']),
 }
 
 export class RealtimeSession {
@@ -164,7 +221,7 @@ export class RealtimeSession {
       case 'playback.started': return this._handlePlayback(message, 'started')
       case 'playback.ended':   return this._handlePlayback(message, 'ended')
       case 'ping': return this._sendJson({ type: 'pong', nonce: message.nonce })
-      case 'close': return this._gracefulClose(message.reason)
+      case 'close': return this._gracefulClose(message.reason, message.meta)
     }
   }
 
@@ -202,6 +259,31 @@ export class RealtimeSession {
     if (message.protocol_version !== this.protocolVersion) {
       return this.fail('ERR_PROTOCOL_VERSION')
     }
+
+    // ESS-551 A4: reject session.start for a closed conversation. A late
+    // retry of an old request (e.g. queued while the Watch tore the
+    // conversation down) must not open a new upstream turn.
+    const meta = message.meta && typeof message.meta === 'object' ? message.meta : null
+    const cid = typeof meta?.conversation_id === 'string' ? meta.conversation_id : null
+    if (cid && isConversationClosed(cid, this.now())) {
+      this.log('conversation_closed_drop', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation, conversation_id: cid,
+        reason: 'conversation already closed',
+      })
+      return this.fail('ERR_CONVERSATION_CLOSED', { detail: `conversation ${cid} is closed` })
+    }
+    // Log the presence (or absence) of conversation metadata on open so
+    // real-device evidence (关卡二) can trace one conversation across turns.
+    if (meta) {
+      this.log('session_open_meta', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
+        conversation_id: cid,
+        turn_id: typeof meta?.turn_id === 'string' ? meta.turn_id : null,
+      })
+    }
+
     this.started = true
     this.agentTurn = this.agent.openTurn({
       requestId: this.scope.request_id,
@@ -573,7 +655,20 @@ export class RealtimeSession {
     this.onSocketClose(1008, code)
   }
 
-  _gracefulClose(reason) {
+  _gracefulClose(reason, meta) {
+    // ESS-551 A4: a close carrying meta.conversation_id marks the whole
+    // conversation destroyed — register it so late frames from any of its
+    // requests are rejected. See the wire-discipline note at the top of
+    // this file: per-turn closes MUST NOT carry conversation meta.
+    const closeMeta = meta && typeof meta === 'object' ? meta : null
+    const cid = typeof closeMeta?.conversation_id === 'string' ? closeMeta.conversation_id : null
+    if (cid) {
+      markConversationClosed(cid, this.now())
+      this.log('conversation_closed', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation, conversation_id: cid,
+      })
+    }
     this.closeSocket(1000, typeof reason === 'string' ? reason.slice(0, 120) : 'client_close')
   }
 

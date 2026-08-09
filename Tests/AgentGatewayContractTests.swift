@@ -15,15 +15,17 @@ import XCTest
 final class AgentGatewayContractTests: XCTestCase {
 
     // Gateway ALLOWED_KEYS as Set per type (must match exactly)
+    // ESS-551 A4: `session.start` and `close` admit a free-form `meta`
+    // sub-object carrying conversation_id / turn_id.
     private let allowedKeys: [String: Set<String>] = [
-        "session.start":    ["type", "session_id", "request_id", "generation", "protocol_version"],
+        "session.start":    ["type", "session_id", "request_id", "generation", "protocol_version", "meta"],
         "audio.append":     ["type", "session_id", "request_id", "generation", "sequence", "audio", "sample_rate", "codec"],
         "audio.commit":     ["type", "session_id", "request_id", "generation", "sequence"],
         "cancel":           ["type", "session_id", "request_id", "generation", "reason"],
         "playback.started": ["type", "session_id", "request_id", "response_id"],
         "playback.ended":   ["type", "session_id", "request_id", "response_id"],
         "ping":             ["type", "nonce"],
-        "close":            ["type", "reason"],
+        "close":            ["type", "reason", "meta"],
     ]
 
     // Gateway CLIENT_SCHEMAS (required fields) per type
@@ -138,6 +140,42 @@ final class AgentGatewayContractTests: XCTestCase {
 
     func testGW_schema_closeMinimal() {
         assertGWSchemaCompliant(.close(reason: nil))
+    }
+
+    // MARK: - ESS-551 A4: meta sub-object
+
+    /// session.start carrying conversation_id / turn_id inside `meta` must
+    /// pass the Gateway ALLOWED_KEYS schema (top-level keys unchanged).
+    func testGW_schema_sessionStartWithMeta() throws {
+        let meta: [String: Any] = [
+            "conversation_id": "0198c001-0000-7000-8000-000000000001",
+            "turn_id": "0198c001-0000-7000-8000-000000000002",
+        ]
+        assertGWSchemaCompliant(.sessionStart(
+            sessionId: sessionId, requestId: requestId,
+            generation: generation, protocolVersion: 1, meta: meta
+        ))
+        // …and the meta content must survive encoding verbatim (bounded
+        // relay: iPhone MUST NOT rewrite it).
+        let text = try XCTUnwrap(AudioRealtimeAgentCodec.encode(.sessionStart(
+            sessionId: sessionId, requestId: requestId,
+            generation: generation, protocolVersion: 1, meta: meta
+        )))
+        let obj = try XCTUnwrap(
+            (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any]
+        )
+        let encodedMeta = try XCTUnwrap(obj["meta"] as? [String: Any])
+        XCTAssertEqual(encodedMeta["conversation_id"] as? String, meta["conversation_id"] as? String)
+        XCTAssertEqual(encodedMeta["turn_id"] as? String, meta["turn_id"] as? String)
+    }
+
+    /// close carrying `meta.conversation_id` (conversation destroy signal)
+    /// must pass the Gateway ALLOWED_KEYS schema.
+    func testGW_schema_closeWithMeta() {
+        assertGWSchemaCompliant(.close(
+            reason: "conversation_destroyed",
+            meta: ["conversation_id": "0198c001-0000-7000-8000-000000000001"]
+        ))
     }
 
     // MARK: - F3.2: Gateway downlink fixtures → client decodes as .event(_)

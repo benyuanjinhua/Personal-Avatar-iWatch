@@ -310,6 +310,26 @@ final class WatchRealtimeMediaAdapter {
         player.stop(barge: reason == .interrupted)
     }
 
+    /// ESS-551 A4: destroy the conversation boundary — 点 X / 下滑退出 /
+    /// 后台超时 / 通道失败 / 按压取消 all funnel here from
+    /// `PushToTalkController.endConversationAudio`. After this call the next
+    /// `beginTurn` mints a FRESH `conversation_id` (AC1), and any late
+    /// downlink frame of the dead conversation is dropped in
+    /// `receiveDownlink` (no active turn → `.staleSession`), so zero frames
+    /// reach the player (AC2).
+    func endConversation(reason: RealtimeMediaSession.FinishReason = .cancelled) {
+        let cid = session.activeConversationId
+        // `closeConversation` finishes any in-flight turn first; the
+        // `.turnFinished` event clears `currentTurn` via `handle(_:)`.
+        session.closeConversation(reason: reason)
+        if let cid {
+            WatchLog.info(
+                "realtime", "conversation_closed",
+                detail: "conversation_id=\(cid) reason=\(reason)"
+            )
+        }
+    }
+
     /// Feed a downlink chunk received from the iPhone. Called by
     /// `PhoneConnectivity` after WSS parses the `audio.delta` off the wire.
     ///

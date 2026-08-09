@@ -47,6 +47,18 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
     private var gate: BargeInGenerationCoordinator
     private var cancelTimeout: Task<Void, Never>?
 
+    /// ESS-551 A4: conversation identity relayed from the Watch-side
+    /// `stream.start` envelope into the Gateway `session.start` `meta`
+    /// sub-object. nil until the first `.streamStart` arrives (or forever,
+    /// for pre-ESS-571 Watches — the Gateway then falls back to the legacy
+    /// `(request_id, session_id)` isolation, per the issue's exit plan).
+    /// The iPhone is a bounded relay: these values are forwarded verbatim,
+    /// never rewritten.
+    private var conversationMeta: [String: Any]?
+    /// Whether the Agent session WSS connect has been fired (deferred until
+    /// the first `.streamStart` so `meta` rides the very first frame).
+    private var sessionConnected = false
+
     /// Pending completion for the latest `send` call — the Agent transport
     /// is asynchronous (WSS), so `send` reports completion via this pending
     /// closure on error or next success.
@@ -66,7 +78,10 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
         self.gate = BargeInGenerationCoordinator(generation: generation)
         self.replacementSession = replacementSession
         wireAgentSession()
-        _ = agentSession.connect(requestId: requestId, generation: generation)
+        // ESS-551 A4: connect() is deferred to the first `.streamStart` so
+        // the Watch-side conversation_id / turn_id can ride the Gateway
+        // session.start `meta`. Audio chunks arriving earlier are queued by
+        // `AudioRealtimeAgentSession.pendingUplink` and flushed on ready.
     }
 
     // MARK: - PhoneRealtimeSession.Transport
@@ -75,9 +90,28 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
         pendingSendCompletion = completion
         switch envelope.kind {
         case .streamStart:
-            // Agent path: stream.start is already sent by `connect()`. If
-            // Watch re-sends, it's idempotent — no WSS frame needed.
-            Self.logger.debug("agent stream.start (idempotent) rid=\(self.requestId.prefix(8), privacy: .public)")
+            // ESS-551 A4: capture the Watch conversation identity and fire
+            // the deferred Agent connect with it. The Watch always sends
+            // stream.start before any audio, so the Gateway session.start
+            // is still the first frame on the wire.
+            if conversationMeta == nil, let cid = envelope.conversationId {
+                var meta: [String: Any] = ["conversation_id": cid]
+                if let tid = envelope.turnId { meta["turn_id"] = tid }
+                conversationMeta = meta
+            }
+            if !sessionConnected {
+                sessionConnected = true
+                _ = agentSession.connect(
+                    requestId: requestId, generation: gate.generation,
+                    meta: conversationMeta
+                )
+                Self.logger.info(
+                    "agent session.start (deferred) rid=\(self.requestId.prefix(8), privacy: .public) cid=\((self.conversationMeta?["conversation_id"] as? String)?.prefix(8) ?? "nil", privacy: .public)"
+                )
+            } else {
+                // Watch re-sent stream.start — idempotent, no WSS frame needed.
+                Self.logger.debug("agent stream.start (idempotent) rid=\(self.requestId.prefix(8), privacy: .public)")
+            }
             completion(nil)
 
         case .audioAppend:
@@ -183,7 +217,9 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
                 agentSession.disconnect(reason: "generation_replaced")
                 agentSession = fresh
                 wireAgentSession()
-                guard fresh.connect(requestId: requestId, generation: next) else {
+                // ESS-551 A4: the replacement session continues the SAME
+                // turn — forward the captured conversation meta verbatim.
+                guard fresh.connect(requestId: requestId, generation: next, meta: conversationMeta) else {
                     failReplacement("wss_upgrade_failed")
                     return
                 }

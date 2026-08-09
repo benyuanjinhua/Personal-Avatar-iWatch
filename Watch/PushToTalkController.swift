@@ -680,6 +680,13 @@ final class PushToTalkController: ObservableObject {
     /// deactivate 完成计。未持有时为空操作。
     func endConversationAudio(reason: ConversationAudioController.ReleaseReason = .userExit) {
         conversationAudioController?.endConversation(reason: reason)
+        // ESS-551 A4：会话销毁必须同源——音频会话释放的每个入口（点 X /
+        // 下滑 / 后台 / 超时 / 取消 / 启动失败）同时销毁
+        // ConversationHandle，下一轮 beginTurn 重铸 conversation_id，
+        // 迟到帧由 receiveDownlink 的 .staleSession 路径丢弃（零帧进播放）。
+        let finishReason: RealtimeMediaSession.FinishReason =
+            reason == .interrupted || reason == .mediaReset ? .interrupted : .cancelled
+        realtimeAdapter?.endConversation(reason: finishReason)
     }
 
     /// ESS-362: stand up the realtime coordinator turn once the audio session

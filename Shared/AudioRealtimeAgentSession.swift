@@ -115,8 +115,16 @@ final class AudioRealtimeAgentSession {
     // MARK: - Public API
 
     /// Open the WSS connection and send `session.start`.
+    ///
+    /// - Parameters:
+    ///   - requestId: per-turn request identifier.
+    ///   - generation: turn generation counter (iPhone is the generation owner).
+    ///   - meta: optional free-form sub-object carried in `session.start`
+    ///     (ESS-551 A4: `conversation_id` / `turn_id`). The Gateway logs it
+    ///     on open and uses `conversation_id` for its closed-conversation
+    ///     registry. Relayed verbatim — the iPhone MUST NOT rewrite it.
     @discardableResult
-    func connect(requestId: String, generation: Int) -> Bool {
+    func connect(requestId: String, generation: Int, meta: [String: Any]? = nil) -> Bool {
         guard case .disconnected = connectionState else {
             Self.logger.warning("agent session already in state \(self.connectionState.description, privacy: .public)")
             return false
@@ -138,7 +146,7 @@ final class AudioRealtimeAgentSession {
         // Send session.start — auth is in the HTTP header, not the JSON payload
         let startFrame = AudioRealtimeAgentCodec.UplinkFrame.sessionStart(
             sessionId: sessionId, requestId: requestId,
-            generation: generation, protocolVersion: 1
+            generation: generation, protocolVersion: 1, meta: meta
         )
         transport.send(startFrame) { [weak self] error in
             if let error {
@@ -147,7 +155,7 @@ final class AudioRealtimeAgentSession {
             }
         }
         Self.logger.info(
-            "agent session.start sid=\(self.sessionId.prefix(8), privacy: .public) rid=\(requestId.prefix(8), privacy: .public) gen=\(generation)"
+            "agent session.start sid=\(self.sessionId.prefix(8), privacy: .public) rid=\(requestId.prefix(8), privacy: .public) gen=\(generation) cid=\((meta?["conversation_id"] as? String)?.prefix(8) ?? "nil", privacy: .public)"
         )
         return true
     }
@@ -205,8 +213,23 @@ final class AudioRealtimeAgentSession {
     }
 
     /// Tear down.
-    func disconnect(reason: String) {
+    ///
+    /// - Parameters:
+    ///   - reason: human/ops-readable close reason.
+    ///   - conversationCloseMeta: ESS-551 A4 — when the WHOLE conversation is
+    ///     being destroyed (not just this turn's socket), pass
+    ///     `["conversation_id": cid]` so the Gateway registers the id and
+    ///     rejects late frames from any request of the closed conversation.
+    ///     MUST be nil for ordinary per-turn closes (a conversation spans
+    ///     many turns; registering on a per-turn close would reject the next
+    ///     turn's `session.start`).
+    func disconnect(reason: String, conversationCloseMeta: [String: Any]? = nil) {
         stopHeartbeat()
+        if let conversationCloseMeta, let transport {
+            // Best-effort: the registry frame must leave before the socket
+            // goes away; the transport close below still runs regardless.
+            transport.send(.close(reason: reason, meta: conversationCloseMeta)) { _ in }
+        }
         transport?.close(reason: reason)
         transport = nil
         pendingUplink.removeAll(keepingCapacity: false)

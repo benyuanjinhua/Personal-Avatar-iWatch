@@ -36,7 +36,11 @@ enum AudioRealtimeAgentCodec {
     enum UplinkFrame {
         /// Maps to Gateway `session.start`. Auth token is sent via HTTP header,
         /// NOT in the JSON payload (ESS-388 A1: token never in JSON).
-        case sessionStart(sessionId: String, requestId: String, generation: Int, protocolVersion: Int)
+        /// ESS-551 A4: optional `meta` sub-object carries conversation_id /
+        /// turn_id (Gateway `ALLOWED_KEYS` admits `meta`; dedicated top-level
+        /// keys are deferred to S2-6/A5).
+        case sessionStart(sessionId: String, requestId: String, generation: Int,
+                          protocolVersion: Int, meta: [String: Any]? = nil)
         /// Maps to Gateway `audio.append`.
         case audioAppend(sessionId: String, requestId: String, generation: Int,
                          sequence: Int, sampleRate: Int?, codec: String?, audioBase64: String)
@@ -51,7 +55,11 @@ enum AudioRealtimeAgentCodec {
         /// Maps to Gateway `ping`.
         case ping(nonce: String)
         /// Maps to Gateway `close`.
-        case close(reason: String?)
+        /// ESS-551 A4: optional `meta` sub-object. Wire discipline: attach
+        /// `conversation_id` ONLY when the whole conversation is destroyed
+        /// (never on a per-turn socket close) — the Gateway registers the id
+        /// in its closed-conversation registry and rejects later starts.
+        case close(reason: String?, meta: [String: Any]? = nil)
     }
 
     /// Encode an uplink frame into the flat JSON string the Gateway expects.
@@ -59,12 +67,14 @@ enum AudioRealtimeAgentCodec {
     static func encode(_ frame: UplinkFrame) -> String? {
         var payload: [String: Any] = [:]
         switch frame {
-        case .sessionStart(let sessionId, let requestId, let generation, let protocolVersion):
+        case .sessionStart(let sessionId, let requestId, let generation,
+                           let protocolVersion, let meta):
             payload["type"] = "session.start"
             payload["session_id"] = sessionId
             payload["request_id"] = requestId
             payload["generation"] = generation
             payload["protocol_version"] = protocolVersion
+            if let meta { payload["meta"] = meta }
         case .audioAppend(let sessionId, let requestId, let generation,
                           let sequence, let sampleRate, let codec, let audioBase64):
             payload["type"] = "audio.append"
@@ -100,9 +110,10 @@ enum AudioRealtimeAgentCodec {
         case .ping(let nonce):
             payload["type"] = "ping"
             payload["nonce"] = nonce
-        case .close(let reason):
+        case .close(let reason, let meta):
             payload["type"] = "close"
             if let reason { payload["reason"] = reason }
+            if let meta { payload["meta"] = meta }
         }
         guard let data = try? JSONSerialization.data(
             withJSONObject: payload,
@@ -116,8 +127,10 @@ enum AudioRealtimeAgentCodec {
     /// with `privacy: .public`.
     static func logTag(_ frame: UplinkFrame) -> String {
         switch frame {
-        case .sessionStart(let sid, let rid, let gen, _):
-            return "SEND type=session.start sid=\(sid.prefix(8)) rid=\(rid.prefix(8)) gen=\(gen)"
+        case .sessionStart(let sid, let rid, let gen, _, let meta):
+            let cidTag = (meta?["conversation_id"] as? String).map { " cid=\($0.prefix(8))" } ?? ""
+            let tidTag = (meta?["turn_id"] as? String).map { " turn=\($0.prefix(8))" } ?? ""
+            return "SEND type=session.start sid=\(sid.prefix(8)) rid=\(rid.prefix(8)) gen=\(gen)\(cidTag)\(tidTag)"
         case .audioAppend(let sid, let rid, let gen, let seq, _, _, let audioB64):
             return "SEND type=audio.append sid=\(sid.prefix(8)) rid=\(rid.prefix(8)) gen=\(gen) seq=\(seq) audio_bytes=\(audioB64.count)"
         case .audioCommit(let sid, let rid, let gen, let seq):

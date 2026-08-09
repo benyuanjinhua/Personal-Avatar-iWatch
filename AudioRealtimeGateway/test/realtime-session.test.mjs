@@ -379,3 +379,153 @@ describe('RealtimeSession — heartbeat', () => {
     assert.equal(pong?.nonce, 'abc')
   })
 })
+
+describe('RealtimeSession — ESS-551 conversation meta', () => {
+  it('accepts meta in session.start and emits session_open_meta log', () => {
+    const { session, sent, logs, scope } = harness()
+    session.onFrame(JSON.stringify({
+      type: 'session.start', session_id: scope.session_id, request_id: scope.request_id,
+      generation: scope.generation, protocol_version: 1,
+      meta: { conversation_id: 'cid-meta-accept', turn_id: 'turn-3' },
+    }))
+    const ready = sent.find(e => e.type === 'ready')
+    assert.ok(ready, 'ready must be emitted when meta is present')
+    const metaLog = logs.find(l => l.evt === 'session_open_meta')
+    assert.ok(metaLog, 'session_open_meta log must be emitted')
+    assert.equal(metaLog.conversation_id, 'cid-meta-accept')
+    assert.equal(metaLog.turn_id, 'turn-3')
+  })
+
+  it('accepts session.start without meta (backward compatible)', () => {
+    const { session, sent, scope } = harness()
+    start(session, scope)
+    assert.ok(sent.find(e => e.type === 'ready'), 'ready must be emitted even without meta')
+  })
+
+  it('rejects session.start for a closed conversation with ERR_CONVERSATION_CLOSED', () => {
+    // First connection — open then close with a conversation_id.
+    const h1 = harness()
+    start(h1.session, h1.scope)
+    h1.session.onFrame(JSON.stringify({
+      type: 'close', reason: 'done',
+      meta: { conversation_id: 'cid-closed-reject' },
+    }))
+    assert.ok(h1.logs.some(l => l.evt === 'conversation_closed' && l.conversation_id === 'cid-closed-reject'))
+
+    // Second connection — same conversation_id, must be rejected.
+    const h2 = harness({
+      scope: { device_id: 'jackson-iphone', session_id: 's-2', request_id: 'r-2', generation: 1 },
+    })
+    h2.session.onFrame(JSON.stringify({
+      type: 'session.start', session_id: 's-2', request_id: 'r-2',
+      generation: 1, protocol_version: 1,
+      meta: { conversation_id: 'cid-closed-reject', turn_id: 'turn-4' },
+    }))
+    const dropLog = h2.logs.find(l => l.evt === 'conversation_closed_drop')
+    assert.ok(dropLog, 'conversation_closed_drop log must be emitted')
+    assert.equal(dropLog.conversation_id, 'cid-closed-reject')
+    assert.equal(dropLog.reason, 'conversation already closed')
+    const err = h2.sent.find(e => e.type === 'error')
+    assert.ok(err, 'error frame must be emitted')
+    assert.equal(err.code, 'ERR_CONVERSATION_CLOSED')
+    assert.equal(h2.sent.filter(e => e.type === 'ready').length, 0, 'no ready for a closed conversation')
+  })
+
+  it('close without meta does not register any conversation', () => {
+    const h1 = harness()
+    start(h1.session, h1.scope)
+    h1.session.onFrame(JSON.stringify({ type: 'close', reason: 'done' }))
+    assert.equal(h1.logs.filter(l => l.evt === 'conversation_closed').length, 0)
+
+    const h2 = harness({
+      scope: { device_id: 'jackson-iphone', session_id: 's-2', request_id: 'r-2', generation: 1 },
+    })
+    h2.session.onFrame(JSON.stringify({
+      type: 'session.start', session_id: 's-2', request_id: 'r-2',
+      generation: 1, protocol_version: 1,
+      meta: { conversation_id: 'cid-unrelated-after-plain-close', turn_id: 'turn-1' },
+    }))
+    assert.ok(h2.sent.find(e => e.type === 'ready'), 'new conversation must succeed after old close w/o meta')
+  })
+
+  it('expires closed conversations after the TTL (late frame window is bounded)', () => {
+    let nowMs = 1_000_000
+    const h1 = harness({ now: () => nowMs })
+    start(h1.session, h1.scope)
+    h1.session.onFrame(JSON.stringify({
+      type: 'close', reason: 'done',
+      meta: { conversation_id: 'cid-ttl-expiry' },
+    }))
+    assert.ok(h1.logs.some(l => l.evt === 'conversation_closed'))
+
+    // Within the TTL the conversation is still rejected…
+    const h2 = harness({
+      now: () => nowMs,
+      scope: { device_id: 'jackson-iphone', session_id: 's-2', request_id: 'r-2', generation: 1 },
+    })
+    h2.session.onFrame(JSON.stringify({
+      type: 'session.start', session_id: 's-2', request_id: 'r-2',
+      generation: 1, protocol_version: 1,
+      meta: { conversation_id: 'cid-ttl-expiry' },
+    }))
+    assert.equal(h2.sent.filter(e => e.type === 'ready').length, 0)
+    assert.ok(h2.logs.some(l => l.evt === 'conversation_closed_drop'))
+
+    // …and once the TTL has passed the entry is evicted and the id no
+    // longer blocks starts (safe because Watch UUIDv7 ids are never reused).
+    nowMs += 15 * 60 * 1000 + 1
+    const h3 = harness({
+      now: () => nowMs,
+      scope: { device_id: 'jackson-iphone', session_id: 's-3', request_id: 'r-3', generation: 1 },
+    })
+    h3.session.onFrame(JSON.stringify({
+      type: 'session.start', session_id: 's-3', request_id: 'r-3',
+      generation: 1, protocol_version: 1,
+      meta: { conversation_id: 'cid-ttl-expiry' },
+    }))
+    assert.ok(h3.sent.find(e => e.type === 'ready'), 'expired registry entry must not block a start')
+  })
+
+  it('evicts the oldest closed conversation beyond the capacity cap', () => {
+    // Drive the registry over its 4096-entry cap with real close frames;
+    // the first-closed id must fall out while the newest stays registered.
+    const nowMs = 2_000_000
+    const closeConversation = (cid) => {
+      const h = harness({
+        now: () => nowMs,
+        scope: { device_id: 'jackson-iphone', session_id: `s-${cid}`, request_id: `r-${cid}`, generation: 1 },
+      })
+      start(h.session, h.scope)
+      h.session.onFrame(JSON.stringify({
+        type: 'close', reason: 'done', meta: { conversation_id: cid },
+      }))
+    }
+    closeConversation('cid-cap-oldest')
+    for (let i = 0; i < 4096; i += 1) closeConversation(`cid-cap-filler-${i}`)
+
+    // Oldest evicted → its start is accepted again.
+    const hOld = harness({
+      now: () => nowMs,
+      scope: { device_id: 'jackson-iphone', session_id: 's-old', request_id: 'r-old', generation: 1 },
+    })
+    hOld.session.onFrame(JSON.stringify({
+      type: 'session.start', session_id: 's-old', request_id: 'r-old',
+      generation: 1, protocol_version: 1,
+      meta: { conversation_id: 'cid-cap-oldest' },
+    }))
+    assert.ok(hOld.sent.find(e => e.type === 'ready'), 'evicted oldest entry must not block a start')
+
+    // Newest still registered → still rejected.
+    const hNew = harness({
+      now: () => nowMs,
+      scope: { device_id: 'jackson-iphone', session_id: 's-new', request_id: 'r-new', generation: 1 },
+    })
+    hNew.session.onFrame(JSON.stringify({
+      type: 'session.start', session_id: 's-new', request_id: 'r-new',
+      generation: 1, protocol_version: 1,
+      meta: { conversation_id: 'cid-cap-filler-4095' },
+    }))
+    assert.equal(hNew.sent.filter(e => e.type === 'ready').length, 0)
+    assert.ok(hNew.logs.some(l => l.evt === 'conversation_closed_drop'))
+  })
+})
