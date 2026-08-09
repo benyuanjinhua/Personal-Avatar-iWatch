@@ -22,6 +22,9 @@ final class WatchAppServices {
     /// ESS-573（Wave 1 / F1）：会话态主屏生命周期控制器。与其他控制器
     /// 同级持有在服务图——视图挂载与否不影响会话态与计时器存活。
     let sessionController = SessionController()
+    /// ESS-540 F6: HKWorkoutSession keep-alive. Starts when entering
+    /// conversation, stops when exiting. Keeps app foregrounded on wrist-down.
+    let workoutKeeper = WorkoutSessionKeeper()
     private var bootstrapped = false
     /// ESS-650：gate 订阅令牌。服务图与 debugSettings 同生命周期（都挂在
     /// `shared` 上）所以不需要反注册；持有它是为了让「订阅确实建立了」可断言。
@@ -71,6 +74,17 @@ final class WatchAppServices {
             // 与 PTT 手势同一前置：自检让出音频会话（ESS-65 铁律 3）。
             interruptSelfCheck: { [selfCheck] in selfCheck.interrupt() }
         )
+        // ESS-540 F6: HKWorkoutSession keeps app foregrounded during calls.
+        sessionController.onSessionStateChange = { [weak self] state in
+            switch state {
+            case .connecting, .listening:
+                self?.workoutKeeper.start()
+            case .idle, .disconnecting:
+                self?.workoutKeeper.stop()
+            case .failed, .hungup:
+                break  // keep alive in failed/hungup — user may retry
+            }
+        }
         // ESS-650 F2-4：语音打断开关（默认 OFF）。gate 判定只在会话层读一次。
         sessionController.voiceBargeInEnabled = { [weak debugSettings] in
             debugSettings?.voiceBargeInEnabled ?? false

@@ -78,7 +78,12 @@ final class SessionController: ObservableObject {
         case channelEvent
     }
 
-    @Published private(set) var state: State = .idle
+    @Published private(set) var state: State = .idle {
+        didSet {
+            guard state != oldValue else { return }
+            onSessionStateChange?(state)
+        }
+    }
     /// ESS-600：当前回合相位。`state != .listening` 时恒为 `.idle`。
     @Published private(set) var turnPhase: TurnPhase = .idle
     /// ESS-600：本地采集是否真的在跑。与「网络通道是否 ready」**独立呈现**——
@@ -130,6 +135,9 @@ final class SessionController: ObservableObject {
     /// 该返回值就是那一轮已在飞的 id，本控制器据此把它认领为第 1 轮，
     /// 绝不重复发起（重复发起会当场把用户正在说的话打断）。
     var onBeginChannel: (() -> String?)?
+    /// ESS-540 F6: fired on every state transition so external keep-alive
+    /// (e.g. HKWorkoutSession) can start/stop in sync with the session.
+    var onSessionStateChange: ((State) -> Void)?
     /// ESS-600：自动开启下一轮采集。生产接
     /// `PushToTalkController.beginSessionTurn()`（程序化 pressBegan）。
     /// 返回新一轮的 `request_id`；nil = 启动失败，本控制器如实记账并停在
