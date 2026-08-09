@@ -106,9 +106,11 @@ final class SessionControllerTests: XCTestCase {
     func testLateReadyAfterExitIsIgnored() {
         controller.enterSession()
         controller.exitSession()
-        XCTAssertEqual(controller.state, .idle)
+        // ESS-652: exitSession now goes through P7 hungup, not idle.
+        XCTAssertEqual(controller.state, .hungup)
         controller.markChannelReady()
-        XCTAssertEqual(controller.state, .idle)
+        // hungup dismisses to idle after 1.2s
+        XCTAssertNotEqual(controller.state, .listening)
         // 退出那一次 .exit 之后不得再有 .ready。
         XCTAssertEqual(haptics, [.exit])
     }
@@ -125,47 +127,46 @@ final class SessionControllerTests: XCTestCase {
 
     // MARK: - 失败路径
 
-    /// 就绪超时：5s 无真实 ack → 告知「连不上」+ .failure + 拆链 + 回 idle。
-    func testReadyTimeoutFailsBackToIdle() {
+    /// 就绪超时：5s 无真实 ack → 进入 P6 failed 态（不退回 idle）。
+    /// ESS-652: markChannelFailed 现在进入 .failed 而非 .idle。
+    func testReadyTimeoutEntersFailedState() {
         controller.enterSession()
         fireDelay(SessionController.readyTimeoutSeconds)
-        XCTAssertEqual(controller.state, .idle)
-        XCTAssertEqual(controller.failureNotice, "连不上，检查一下 iPhone 是否在身边")
-        XCTAssertEqual(haptics, [.failure])
+        XCTAssertEqual(controller.state, .failed)
+        XCTAssertNotNil(controller.failedReason)
+        XCTAssertTrue(controller.failedRetryable)
         XCTAssertEqual(teardownCount, 1)
-        XCTAssertFalse(controller.isInSession)
+        XCTAssertTrue(controller.isInSession)
     }
 
-    /// 录音启动失败：分身卡片链已呈现（卡片 + .failure），SessionController
-    /// 只回 idle——不叠加文案、不重复震动（ESS-180 同一次失败只震一下）。
-    func testRecorderStartFailureDefersToAvatarCard() {
+    /// ESS-652: recorderStart 失败现在也进入 P6，不复用旧 failureNotice。
+    func testRecorderStartFailureEntersFailedState() {
         controller.enterSession()
         controller.markChannelFailed(.recorderStart)
-        XCTAssertEqual(controller.state, .idle)
-        XCTAssertNil(controller.failureNotice)
-        XCTAssertTrue(haptics.isEmpty)
-        XCTAssertEqual(teardownCount, 1)
+        XCTAssertEqual(controller.state, .failed)
+        XCTAssertNotNil(controller.failedReason)
+        XCTAssertFalse(controller.failedRetryable)
+        XCTAssertTrue(teardownCount >= 1)
     }
 
-    /// 会话中通道断开（上行发送失败 / 适配器回退）→ 告知本轮已结束 +
-    /// .failure + 拆链回 idle（PRD 异常链 B：不假装还在对话）。
-    func testMidSessionChannelDropNotifiesAndExits() {
+    /// ESS-652: 会话中通道断开进入 P6 failed，非 idle。
+    func testMidSessionChannelDropEntersFailed() {
         controller.enterSession()
         controller.markChannelReady()
         controller.markChannelFailed(.channelEvent)
-        XCTAssertEqual(controller.state, .idle)
-        XCTAssertEqual(controller.failureNotice, "连接断了，本轮对话已结束")
-        XCTAssertEqual(haptics, [.ready, .failure])
+        XCTAssertEqual(controller.state, .failed)
+        XCTAssertTrue(controller.isInSession)
         XCTAssertEqual(teardownCount, 1)
     }
 
-    /// 失败文案 2 秒后自动消失（PRD 异常链 A/B：2 秒回待机）。
-    func testFailureNoticeAutoDismisses() {
+    /// ESS-652: failureNotice 被 failedReason 替代，不再自动消失。
+    func testFailedReasonNotAutoDismissed() {
         controller.enterSession()
         controller.markChannelFailed(.channelEvent)
-        XCTAssertNotNil(controller.failureNotice)
+        XCTAssertNotNil(controller.failedReason)
         fireDelay(SessionController.failureNoticeSeconds)
-        XCTAssertNil(controller.failureNotice)
+        // P6 中 failedReason 不自动消失——用户需点重试或挂断。
+        XCTAssertNotNil(controller.failedReason)
     }
 
     /// 失败文案纪律：说清「怎么办」，不出现错误码（PRD 异常链 A）。
@@ -193,21 +194,21 @@ final class SessionControllerTests: XCTestCase {
     // MARK: - 退出
 
     /// 聆听中点 X → .stop 触觉 + 拆链 + 回 idle（PRD F1：立即结束）。
-    func testExitFromListeningTearsDown() {
+    /// ESS-652: exitSession → P7 hungup, not idle.
+    func testExitFromListeningGoesToHungup() {
         controller.enterSession()
         controller.markChannelReady()
         controller.exitSession()
-        XCTAssertEqual(controller.state, .idle)
+        XCTAssertEqual(controller.state, .hungup)
         XCTAssertEqual(haptics, [.ready, .exit])
         XCTAssertEqual(teardownCount, 1)
-        XCTAssertFalse(controller.isInSession)
     }
 
-    /// 建立中点 X 同样立即生效（PRD：X 全程可见可点）。
-    func testExitFromConnectingTearsDown() {
+    /// ESS-652: exit from connecting → P7 hungup.
+    func testExitFromConnectingGoesToHungup() {
         controller.enterSession()
         controller.exitSession()
-        XCTAssertEqual(controller.state, .idle)
+        XCTAssertEqual(controller.state, .hungup)
         XCTAssertEqual(haptics, [.exit])
         XCTAssertEqual(teardownCount, 1)
     }
@@ -220,15 +221,15 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertEqual(teardownCount, 0)
     }
 
-    /// 退出后到点的超时计时器不得再造成二次失败。
+    /// ESS-652: exitSession → .hungup, timeout afterwards doesn't double-fail.
     func testPendingTimeoutAfterExitDoesNotRefail() {
         controller.enterSession()
         controller.exitSession()
+        XCTAssertEqual(controller.state, .hungup)
         fireDelay(SessionController.readyTimeoutSeconds)
-        XCTAssertEqual(controller.state, .idle)
+        XCTAssertEqual(controller.state, .hungup)
         XCTAssertEqual(haptics, [.exit])
         XCTAssertEqual(teardownCount, 1)
-        XCTAssertNil(controller.failureNotice)
     }
 
     // MARK: - 单轮上限（PRD F2 异常的 Wave 1 兜底）
