@@ -411,7 +411,9 @@ struct WatchContentView: View {
             case .speaking: return .speaking(level: 0)
             case .idle: return .idle
             }
-        case .disconnecting, .idle:
+        // ESS-674：`.failed` / `.hungup`（ESS-652 新增）都不在采也不在播，
+        // 球如实回 idle；P6/P7 的专属视图由 ESS-652 自己接，这里不代它造。
+        case .disconnecting, .idle, .failed, .hungup:
             return .idle
         }
     }
@@ -430,6 +432,12 @@ struct WatchContentView: View {
             }
         case .disconnecting:
             return "正在结束…"
+        // ESS-674：直接用 ESS-652 已发布的那两个字符串，不另起第二份文案；
+        // 为空时退回 ""，宁可不显示也不编一句。
+        case .failed:
+            return session.failedReason ?? ""
+        case .hungup:
+            return session.hungupSummary ?? ""
         case .idle:
             return ""
         }
