@@ -213,15 +213,36 @@ final class BackgroundAudioBreatherTests: XCTestCase {
 
         controller.simulateSubmitForTests(recording: makeRecording())
 
-        XCTAssertTrue(controller.breather.isActive, "submit must invoke the production breather wiring")
+        // ESS-587 要保护的是**调用方还在**（submit 必须打到 breather.start()），
+        // 不是「一定起得来」——起不起得来由 ESS-519 的 app 状态门决定，而
+        // 宿主状态是环境事实：GitHub hosted runner 的 xctest host 为 .inactive，
+        // 本地 mac 模拟器为 .active（CI 实证 `start_skipped reason=app_not_active
+        // state=inactive`）。断言绑死在 isActive 上等于把环境写进契约，
+        // 这正是 ESS-598 合入后 main 变红的那一条。
+        // 判据改为：start() 必被调用一次 —— 要么 started，要么 start_skipped。
+        let started = sink.count(module: "breather", event: "started")
+        let skipReason = sink.detail(module: "breather", event: "start_skipped")
+        XCTAssertEqual(
+            started + sink.count(module: "breather", event: "start_skipped"), 1,
+            "submit must invoke the production breather wiring（ESS-587 接线不得被删）"
+        )
+        // 无 owner：跳过只允许是 app 状态原因，绝不能是 ESS-603 的所有权分支。
+        if let skipReason {
+            XCTAssertTrue(
+                skipReason.hasPrefix("reason=app_not_active"),
+                "gate OFF 下唯一允许的跳过原因是宿主 app 未激活，实际=\(skipReason)"
+            )
+            XCTAssertEqual(started, 0)
+            XCTAssertFalse(controller.breather.isActive)
+            return
+        }
+
+        // 宿主 active：ESS-519 完整契约照旧断言（本地 mac / 真机模拟器路径）。
+        XCTAssertTrue(controller.breather.isActive)
         XCTAssertEqual(
             sink.detail(module: "breather", event: "started"),
             "sample_rate=8000 duration_s=2 loops=-1",
             "submit must produce runtime evidence from the real breather"
-        )
-        XCTAssertEqual(
-            sink.count(module: "breather", event: "start_skipped"), 0,
-            "无 owner 时不得走 ESS-603 的跳过分支"
         )
         controller.breather.stop(reason: "test_cleanup")
         XCTAssertEqual(
