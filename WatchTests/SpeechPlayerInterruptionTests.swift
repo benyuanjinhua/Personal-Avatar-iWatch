@@ -65,7 +65,7 @@ final class SpeechPlayerInterruptionTests: XCTestCase {
     /// 即使运行时已经明确落出 play_started，等待完成会在 20 秒后杀测试宿主。
     func testNewPlaybackProceedsDespiteStaleInterruptionFlag() async throws {
         let sink = LogSink()
-        WatchLog.setObserver { _, event, detail, _ in
+        WatchLog.setObserver { _, event, _, detail, _ in
             sink.record(event: event, detail: detail)
         }
         let player = SpeechPlayer()
@@ -105,7 +105,7 @@ final class SpeechPlayerInterruptionTests: XCTestCase {
     /// 「播放中」态并按未播完收尾（retainForReplay 入口由上层渲染）。
     func testInterruptionBeganHaltsPlaybackAsUnfinished() async throws {
         let sink = LogSink()
-        WatchLog.setObserver { _, event, detail, _ in
+        WatchLog.setObserver { _, event, _, detail, _ in
             sink.record(event: event, detail: detail)
         }
         let player = SpeechPlayer()

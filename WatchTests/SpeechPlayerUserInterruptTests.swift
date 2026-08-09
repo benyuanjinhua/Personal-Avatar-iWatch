@@ -45,7 +45,7 @@ final class SpeechPlayerUserInterruptTests: XCTestCase {
         super.setUp()
         collector = EventCollector()
         let sink = collector!
-        WatchLog.setObserver { module, event, detail, errorCode in
+        WatchLog.setObserver { module, event, _, detail, errorCode in
             sink.append(CapturedEvent(module: module, event: event, detail: detail, errorCode: errorCode))
         }
         // ESS-277: 不在 setUp 中清 sharedSessionOwner——本类唯一测试

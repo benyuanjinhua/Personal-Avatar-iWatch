@@ -57,7 +57,7 @@ final class SelfCheckYieldBarrierTests: XCTestCase {
         XCTAssertEqual(session.category, .playAndRecord, "前置态：会话应为 .playAndRecord")
 
         let events = EventLog()
-        WatchLog.setObserver { _, event, detail, code in events.record(event: event, detail: detail, code: code) }
+        WatchLog.setObserver { _, event, _, detail, code in events.record(event: event, detail: detail, code: code) }
         defer { WatchLog.setObserver(nil) }
 
         let runner = SelfCheckRunner()
@@ -112,7 +112,7 @@ final class SelfCheckYieldBarrierTests: XCTestCase {
         // 失败），验证 failing_stage 字段的存在与取值。
         try await waitForHostWelcomeToFinish()
         let events = EventLog()
-        WatchLog.setObserver { _, event, detail, code in events.record(event: event, detail: detail, code: code) }
+        WatchLog.setObserver { _, event, _, detail, code in events.record(event: event, detail: detail, code: code) }
         defer { WatchLog.setObserver(nil) }
 
         // 用一个已知不会立即触发 category 拒绝的路径反向验证：正常路径应无

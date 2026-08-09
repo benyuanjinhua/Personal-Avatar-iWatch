@@ -19,7 +19,7 @@ final class AudioRecorderDurationTests: XCTestCase {
     /// 并落 `record_duration_out_of_range` 事件（可 grep 的取证锚点）。
     func testSanitizeClampsOverflowAndLogs() {
         let events = EventLog()
-        WatchLog.setObserver { module, event, detail, code in
+        WatchLog.setObserver { module, event, _, detail, code in
             events.record(module: module, event: event, detail: detail, code: code)
         }
         defer { WatchLog.setObserver(nil) }
@@ -76,7 +76,7 @@ final class AudioRecorderDurationTests: XCTestCase {
     /// 不越出上限、不生成误报事件。
     func testSanitizePassesNormalDurations() {
         let events = EventLog()
-        WatchLog.setObserver { module, event, detail, code in
+        WatchLog.setObserver { module, event, _, detail, code in
             events.record(module: module, event: event, detail: detail, code: code)
         }
         defer { WatchLog.setObserver(nil) }
@@ -111,7 +111,7 @@ final class AudioRecorderDurationTests: XCTestCase {
         try HostedCITestGate.skipIfHostedCI("recorder.start() hangs in testFinishedDurationIsBoundedAndSelfConsistent")
         try await Task.sleep(for: .seconds(4)) // 让宿主欢迎语播完，避免抢会话
         let events = EventLog()
-        WatchLog.setObserver { module, event, detail, code in
+        WatchLog.setObserver { module, event, _, detail, code in
             events.record(module: module, event: event, detail: detail, code: code)
         }
         defer { WatchLog.setObserver(nil) }
@@ -234,7 +234,7 @@ final class AudioRecorderDurationTests: XCTestCase {
         try HostedCITestGate.skipIfHostedCI("recorder.start() hangs in testFinishReturnsAssetDurationEvenWhenWallClockIsTiny")
         try await Task.sleep(for: .seconds(4)) // 让宿主欢迎语播完
         let events = EventLog()
-        WatchLog.setObserver { module, event, detail, code in
+        WatchLog.setObserver { module, event, _, detail, code in
             events.record(module: module, event: event, detail: detail, code: code)
         }
         defer { WatchLog.setObserver(nil) }

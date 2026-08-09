@@ -28,7 +28,7 @@ final class RelayFailureProjectionTests: XCTestCase {
         XCTAssertTrue(journal.recordLocal(.waitingForMac, requestId: requestId))
 
         var captured: (event: String, detail: String?, code: String?)?
-        WatchLog.setObserver { _, event, detail, errorCode in
+        WatchLog.setObserver { _, event, _, detail, errorCode in
             if event == "relay_terminal_failure_projected" {
                 captured = (event, detail, errorCode)
             }

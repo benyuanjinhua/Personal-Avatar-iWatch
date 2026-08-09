@@ -162,7 +162,7 @@ final class BackgroundAudioBreatherTests: XCTestCase {
 
     func testSafetyCapStopsActiveBreather() async throws {
         let sink = LogSink()
-        WatchLog.setObserver { module, event, detail, _ in
+        WatchLog.setObserver { module, event, _, detail, _ in
             sink.record(module: module, event: event, detail: detail)
         }
         let breather = BackgroundAudioBreather(maxDuration: 0.3)
@@ -220,7 +220,7 @@ final class BackgroundAudioBreatherTests: XCTestCase {
     func testSubmitStartsBreatherAfterTransportDispatch() throws {
         let controller = PushToTalkController()
         let sink = LogSink()
-        WatchLog.setObserver { module, event, detail, _ in
+        WatchLog.setObserver { module, event, _, detail, _ in
             sink.record(module: module, event: event, detail: detail)
         }
         controller.voiceStreamingEnabled = { false }
@@ -272,7 +272,7 @@ final class BackgroundAudioBreatherTests: XCTestCase {
     /// 首帧 stop 仍必须去激活，`.playback` 会话不能留给真实播放。
     func testRealtimeFirstFrameStopDeactivatesWhenNoOwner() throws {
         let sink = LogSink()
-        WatchLog.setObserver { module, event, detail, _ in
+        WatchLog.setObserver { module, event, _, detail, _ in
             sink.record(module: module, event: event, detail: detail)
         }
         let breather = BackgroundAudioBreather()
@@ -295,7 +295,7 @@ final class BackgroundAudioBreatherTests: XCTestCase {
     func testSubmitDoesNotStartBreatherWhileConversationOwnsSession() throws {
         let sink = LogSink()
         let (controller, session) = try makeControllerHoldingConversation()
-        WatchLog.setObserver { module, event, detail, _ in
+        WatchLog.setObserver { module, event, _, detail, _ in
             sink.record(module: module, event: event, detail: detail)
         }
 
@@ -323,7 +323,7 @@ final class BackgroundAudioBreatherTests: XCTestCase {
     func testRealtimeFirstFrameStopDoesNotDeactivateConversationOwner() throws {
         let sink = LogSink()
         let (controller, session) = try makeControllerHoldingConversation()
-        WatchLog.setObserver { module, event, detail, _ in
+        WatchLog.setObserver { module, event, _, detail, _ in
             sink.record(module: module, event: event, detail: detail)
         }
 
@@ -343,7 +343,7 @@ final class BackgroundAudioBreatherTests: XCTestCase {
     /// 证据落在 `stopped ... deactivated=false`。
     func testStopDoesNotDeactivateWhenOwnerAppearsAfterStart() throws {
         let sink = LogSink()
-        WatchLog.setObserver { module, event, detail, _ in
+        WatchLog.setObserver { module, event, _, detail, _ in
             sink.record(module: module, event: event, detail: detail)
         }
         let breather = BackgroundAudioBreather()
@@ -365,7 +365,7 @@ final class BackgroundAudioBreatherTests: XCTestCase {
     /// gate 开关是 breather 行为的唯一分水岭：同一个实例，谓词翻转即换契约。
     func testOwnershipPredicateIsTheOnlyGate() {
         let sink = LogSink()
-        WatchLog.setObserver { module, event, detail, _ in
+        WatchLog.setObserver { module, event, _, detail, _ in
             sink.record(module: module, event: event, detail: detail)
         }
         let breather = BackgroundAudioBreather()

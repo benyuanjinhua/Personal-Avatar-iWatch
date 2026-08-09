@@ -279,11 +279,14 @@ struct WatchContentView: View {
         GeometryReader { proxy in
             let orbSize = min(140, proxy.size.width * 0.7)
             ZStack {
-                // 语音球：会话中只投影、不接手势（F4 手动打断降级在后续
-                // Wave 决定是否给球加点击语义；X 与下滑是 Wave 1 全部出口）。
+                // ESS-600 F4：回答播放中点球 = 立刻打断并回到聆听。
+                // 只有 speaking 相位接手势——聆听/思考中点球无语义，
+                // 保持「会话中球不接手势」的原状，不造出误触面。
                 VoiceOrbView(mode: sessionOrbMode, size: orbSize)
                     .position(x: proxy.size.width / 2, y: proxy.size.height * 0.62)
-                    .accessibilityLabel("实时对话中")
+                    .accessibilityLabel(session.turnPhase == .speaking ? "打断回答" : "实时对话中")
+                    .allowsHitTesting(session.turnPhase == .speaking)
+                    .onTapGesture { session.interruptSpeaking() }
 
                 // ESS-598：球体动画不能成为唯一反馈。真机强光、抬腕与连接
                 // 建立期都可能让动画差异不可辨，明确显示当前主链路阶段。
@@ -387,24 +390,28 @@ struct WatchContentView: View {
     /// 回合在跑/提交中 → thinking；播放中（含实时 PCM）→ speaking；
     /// 回合已终态且未在录/播 → idle（诚实表达「此刻没在采」，多轮
     /// 自动回聆听是 F2/F5 Wave 的事）。
+    /// ESS-600：回合相位改由 `SessionController.turnPhase` 承担唯一真相——
+    /// 它由真实链路事件（提交 / 首帧渲染 / 播完）推进，而从 PTT 可观察量
+    /// 反推相位会在「已提交但 journal 还没落 activeTurn」这种间隙里读出
+    /// 错误相位。球的能量条仍取 PTT 的实时电平（那是采集层事实）。
     private var sessionOrbMode: VoiceOrbView.Mode {
         switch session.state {
         case .connecting:
             // ESS-573 rebase 注：orb 侧的「建立中」态收敛到 ESS-572 已合入的
             // `.establishing`（0.6Hz 同一规格）；分支曾命名为 `.connecting`，
             // 与 #244 重复实现，rebase 时统一走 main 的命名与视觉。
-            return .establishing
+            // ESS-600：建立中若本地已在采集，如实显示聆听能量——「网络还没通」
+            // 不等于「表没在听」，两者必须独立可见（ESS-598 无反馈的根因之一）。
+            return session.isCapturingLocally
+                ? .listening(level: pushToTalk.recordingLevel)
+                : .establishing
         case .listening:
-            if pushToTalk.state == .recording {
-                return .listening(level: pushToTalk.recordingLevel)
+            switch session.turnPhase {
+            case .listening: return .listening(level: pushToTalk.recordingLevel)
+            case .thinking: return .thinking
+            case .speaking: return .speaking
+            case .idle: return .idle
             }
-            if isSpeaking || pushToTalk.realtimePlaybackPending {
-                return .speaking
-            }
-            if pushToTalk.state == .finishing || activeTurn?.isActive == true {
-                return .thinking
-            }
-            return .idle
         case .disconnecting, .idle:
             return .idle
         }
@@ -413,15 +420,15 @@ struct WatchContentView: View {
     private var sessionStatusText: String {
         switch session.state {
         case .connecting:
-            return "正在连接…"
+            // 本地输入态与网络 ready 分开呈现。
+            return session.isCapturingLocally ? "正在听…（连接中）" : "正在连接…"
         case .listening:
-            if isSpeaking || pushToTalk.realtimePlaybackPending {
-                return "正在回答…"
+            switch session.turnPhase {
+            case .listening: return "正在听…"
+            case .thinking: return "正在思考…"
+            case .speaking: return "正在回答…（点球打断）"
+            case .idle: return "稍等…"
             }
-            if pushToTalk.state == .finishing || activeTurn?.isActive == true {
-                return "正在思考…"
-            }
-            return pushToTalk.state == .recording ? "正在听…" : "可以说话"
         case .disconnecting:
             return "正在结束…"
         case .idle:
