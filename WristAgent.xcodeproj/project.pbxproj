@@ -96,6 +96,7 @@
 		6E29B7205156CA2469859086 /* ConfirmFallback_README.md in Resources */ = {isa = PBXBuildFile; fileRef = 55FC31B2EB4E09E810DB3EA8 /* ConfirmFallback_README.md */; };
 		6F68B5E709EADBD0A814A163 /* LocalVADEndpointer.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEE83E69A84D0788F31329E4 /* LocalVADEndpointer.swift */; };
 		6FB34EA4C12FC1D5FFE06F94 /* WatchSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DAF03C2F2C11D4CBC8D9587 /* WatchSettingsView.swift */; };
+		6FC7DD8CDED2FC4F48C4D782 /* WorkoutSessionKeeper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 873CEEDCC164019112A771BF /* WorkoutSessionKeeper.swift */; };
 		7045B87E2347FCA6BB2FFE4F /* ErrorCue_VoiceBusy.m4a in Resources */ = {isa = PBXBuildFile; fileRef = 69D850E7D15B7525D07D9DBF /* ErrorCue_VoiceBusy.m4a */; };
 		707A59AAF2C9619F3909A162 /* RecorderErrorCopyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD573B88FBB9CCE341ED1513 /* RecorderErrorCopyTests.swift */; };
 		7249351A21B20AAC649807D9 /* RealtimeMediaFormat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CEDAB5F3CD7B29B993F0FA2 /* RealtimeMediaFormat.swift */; };
@@ -336,6 +337,7 @@
 		825EC2CED4ACE4E583D94864 /* WatchStreamReceiver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchStreamReceiver.swift; sourceTree = "<group>"; };
 		827B4FDF631BEBEFA13118A9 /* PersistHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PersistHelper.swift; sourceTree = "<group>"; };
 		837F0B1D0B26EA8AFCAAC4A0 /* WristAgentWatch.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = WristAgentWatch.entitlements; sourceTree = "<group>"; };
+		873CEEDCC164019112A771BF /* WorkoutSessionKeeper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkoutSessionKeeper.swift; sourceTree = "<group>"; };
 		88E0836FA054B69DBE4F3E16 /* RetryRecordingStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RetryRecordingStore.swift; sourceTree = "<group>"; };
 		8A1B0A3BF7CF87587B6FF3EB /* WatchDebugSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchDebugSettings.swift; sourceTree = "<group>"; };
 		8C9AAAB5A0024E09F0F7ED66 /* VoiceDateDecoding.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceDateDecoding.swift; sourceTree = "<group>"; };
@@ -558,6 +560,7 @@
 				1DAF03C2F2C11D4CBC8D9587 /* WatchSettingsView.swift */,
 				825EC2CED4ACE4E583D94864 /* WatchStreamReceiver.swift */,
 				F16E394DC77EF14BAE142B32 /* WatchVoiceTransport.swift */,
+				873CEEDCC164019112A771BF /* WorkoutSessionKeeper.swift */,
 				837F0B1D0B26EA8AFCAAC4A0 /* WristAgentWatch.entitlements */,
 				C10B09D1AD3BA287A3856E6E /* WristAgentWatchApp.swift */,
 			);
@@ -933,6 +936,7 @@
 				6FB34EA4C12FC1D5FFE06F94 /* WatchSettingsView.swift in Sources */,
 				18C00E8A4DDBDF394954DE30 /* WatchStreamReceiver.swift in Sources */,
 				9FE3E5082197E2851CD75F30 /* WatchVoiceTransport.swift in Sources */,
+				6FC7DD8CDED2FC4F48C4D782 /* WorkoutSessionKeeper.swift in Sources */,
 				487F199E241E68A3B8696D31 /* WristAgentWatchApp.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
