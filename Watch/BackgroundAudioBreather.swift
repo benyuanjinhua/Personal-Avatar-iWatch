@@ -16,6 +16,15 @@ import WatchKit
 ///   Activates a `.playback` audio session and plays silent WAV on loop.
 /// - `stop()`: called when real playback starts or the app becomes active
 ///   again. Releases the audio session.
+///
+/// ESS-603 音频所有权：本器只在**无人持有会话**时才可动共享
+/// `AVAudioSession`。会话级路径（ESS-554 `ConversationAudioController`，
+/// gate ON）已把 `.playAndRecord` 全程激活并持有两个引擎，那既是
+/// 保活来源也是播放来源——此时 breather 若 `setCategory(.playback)`
+/// 就改写了 owner 的类别，若 `setActive(false)` 就替 owner 退了会话，
+/// 直接导致回复无声。故 `isSessionOwnedExternally` 为真时：
+/// 不启动、也不去激活。gate OFF / 普通 PTT 时该闭包恒 false，
+/// ESS-519 行为逐字不变。
 @MainActor
 final class BackgroundAudioBreather {
     /// ESS-519 复审加固：静音保活的绝对上限。回合以非播放方式终结
@@ -30,6 +39,12 @@ final class BackgroundAudioBreather {
     private var capTask: Task<Void, Never>?
     private(set) var isActive = false
 
+    /// ESS-603：共享 `AVAudioSession` 是否已被会话级 owner
+    /// （`ConversationAudioController`）持有。生产接线见
+    /// `PushToTalkController.init`，与 `AudioRecorder.sessionManagedExternally`
+    /// 同一口径；默认 false = 无 owner = ESS-519 原行为。
+    var isSessionOwnedExternally: () -> Bool = { false }
+
     init(maxDuration: TimeInterval = BackgroundAudioBreather.defaultMaxDuration) {
         self.maxDuration = maxDuration
     }
@@ -40,6 +55,15 @@ final class BackgroundAudioBreather {
     /// long_form and foreground policies).
     func start() {
         guard !isActive else { return }
+        // ESS-603：会话级 owner 在场时不得启动——保活由它持有的
+        // `.playAndRecord` 激活态提供，这里再动会话就是改写他人类别。
+        guard !isSessionOwnedExternally() else {
+            WatchLog.info(
+                "breather", "start_skipped",
+                detail: "reason=conversation_session_owned"
+            )
+            return
+        }
         let appState = WKApplication.shared().applicationState
         guard appState == .active else {
             WatchLog.info(
@@ -83,15 +107,27 @@ final class BackgroundAudioBreather {
     }
 
     /// Stop silent audio playback and release the audio session.
+    ///
+    /// ESS-603：去激活只在**本器自己激活过会话**时发生。若会话级 owner
+    /// 在我们启动之后接管（先起 breather 再进 conversation），本器仍要
+    /// 停掉静音循环，但绝不能替 owner 调 `setActive(false)`——首帧回调
+    /// `stop(reason: "realtime_playback")` 正是走这条路，一旦去激活，
+    /// 回复音频当场失声。`deactivated=` 是该分支的可对账证据（R-02.1）。
     func stop(reason: String = "explicit") {
         guard isActive else { return }
         capTask?.cancel()
         capTask = nil
         player?.stop()
         player = nil
-        try? session.setActive(false, options: .notifyOthersOnDeactivation)
+        let ownedExternally = isSessionOwnedExternally()
+        if !ownedExternally {
+            try? session.setActive(false, options: .notifyOthersOnDeactivation)
+        }
         isActive = false
-        WatchLog.info("breather", "stopped", detail: "reason=\(reason)")
+        WatchLog.info(
+            "breather", "stopped",
+            detail: "reason=\(reason) deactivated=\(!ownedExternally)"
+        )
     }
 
     // MARK: - Silent WAV generation
