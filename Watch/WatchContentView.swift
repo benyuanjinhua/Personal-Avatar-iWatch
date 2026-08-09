@@ -131,13 +131,12 @@ struct WatchContentView: View {
                         .padding(.top, 4)
                         .gesture(
                             // ESS-653（F1 入口收敛，设计稿 v2.0 §五 D1 方案 B）：
-                            // 主屏球**只有一个语义——点一下打电话给分身**。长按
-                            // 不再提交 PTT，视为误触（袖口压屏等），丢弃这次采集
-                            // 并留证 `session_enter_rejected`。
+                            // 主屏球**只有一个语义——进入持续对话**。按下立即起采，
+                            // 松手只负责确认进入；按住时长不再复用旧 PTT 门槛。
                             //
                             // touch-down 起采保留（不是为 PTT 抢那几百毫秒，而是
-                            // 用户点完立刻开口时首句不丢）：松手判定为「点」时
-                            // enterSession 认领**已经在飞**的那一轮，不重起。
+                            // 用户按下立刻开口时首句不丢）：松手后 enterSession
+                            // 认领**已经在飞**的那一轮，不重起。
                             DragGesture(minimumDistance: 0)
                                 .onChanged { _ in
                                     guard orbTouchDownAt == nil else { return }
@@ -162,8 +161,8 @@ struct WatchContentView: View {
                                         session.enterSession()
                                     case .reject(let reason):
                                         session.noteEnterRejected(reason: reason, holdSeconds: heldSeconds)
-                                        // 丢弃 touch-down 起的这次采集：不提交、停采集、
-                                        // 取消未提交的实时回合、释放音频会话。
+                                        // 只有起采失败才拒绝：不提交、停采集、取消未提交
+                                        // 的实时回合并释放音频会话。
                                         pushToTalk.pressCancelled()
                                     }
                                 }
