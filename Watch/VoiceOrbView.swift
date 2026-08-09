@@ -124,9 +124,16 @@ struct VoiceOrbView: View {
         }
     }
 
-    private var symbol: String {
+    private var symbol: String { Self.symbolName(for: mode) }
+
+    /// 每态图标（static 便于 WatchTests 直接钉住，无需渲染视图）。
+    ///
+    /// ESS-653 / 设计稿 v2.0 P0：待机图标 `mic.fill` → `phone.fill`——长按
+    /// 语义移除后，「这不是按住说话」要在第一眼就成立，换图标是最低成本
+    /// 的手段。
+    static func symbolName(for mode: Mode) -> String {
         switch mode {
-        case .idle: return "mic.fill"
+        case .idle: return "phone.fill"
         case .establishing: return "antenna.radiowaves.left.and.right"
         case .listening: return "waveform"
         case .thinking: return "ellipsis"
