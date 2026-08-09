@@ -93,6 +93,10 @@ final class WatchRealtimeMediaAdapter {
     /// wires this to clear `realtimePlaybackPending` so the VoiceSessionKeeper
     /// can release the ExtendedRuntimeSession.
     var onRealtimePendingResolved: (@MainActor () -> Void)?
+    /// First PCM frame reached the realtime playback engine. This is distinct
+    /// from `onRealtimePendingResolved`, which also fires for fallback/cancel
+    /// paths where background keep-alive must remain active.
+    var onRealtimePlaybackStarted: (@MainActor () -> Void)?
     var onVADEvent: (@MainActor (LocalVADEvent) -> Void)?
 
     /// ESS-573: 真实通道就绪事件——本回合**首个被对端接受的 uplink ack**
@@ -173,6 +177,7 @@ final class WatchRealtimeMediaAdapter {
             case .started(let requestId, let sessionId, let responseId):
                 // ESS-532: first frame rendered — playback is live now, the
                 // ExtendedRuntimeSession can be released.
+                self.onRealtimePlaybackStarted?()
                 self.onRealtimePendingResolved?()
                 // ESS-330 v3: forward the response_id the player emitted
                 // (which was preserved per chunk through the reorder buffer).
