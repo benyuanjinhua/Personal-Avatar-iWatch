@@ -165,7 +165,6 @@
 		C0C2D4425ABBD56621171848 /* AudioRealtimeAgentCodec.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFCE4F8E6894C97A571F6634 /* AudioRealtimeAgentCodec.swift */; };
 		C121E758FE9B93839C35CF64 /* SessionControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CE7D156C2B00E047F8D59BB /* SessionControllerTests.swift */; };
 		C2DD31347EF19DFDA9187ABB /* PhoneRealtimeSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = F824A2078CC9EF4E32AEA011 /* PhoneRealtimeSession.swift */; };
-		C2FE93AC9C1274EE211A3714 /* WelcomeGreeter.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9FA489FA1C53D0A43298601 /* WelcomeGreeter.swift */; };
 		C3D8984AB14E3ECEB93542E0 /* OpenWristAgentIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F9C01710FDC8C90D754460F /* OpenWristAgentIntent.swift */; };
 		C46BB1D490E314A5F2FD6696 /* AgentTokenFallbackReason.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3E3EF41FD4D1B3D4ACB250F /* AgentTokenFallbackReason.swift */; };
 		C8D3D2E8D0626D66145B3C31 /* RealtimeDownlinkPlayback.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C41457A27FD24A41133AFFE /* RealtimeDownlinkPlayback.swift */; };
@@ -395,7 +394,6 @@
 		F824A2078CC9EF4E32AEA011 /* PhoneRealtimeSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneRealtimeSession.swift; sourceTree = "<group>"; };
 		F928ACBF6FA59402D5EB1275 /* VoiceTurnState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceTurnState.swift; sourceTree = "<group>"; };
 		F9C49719F53E734FE041D10B /* VoiceOrbModeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceOrbModeTests.swift; sourceTree = "<group>"; };
-		F9FA489FA1C53D0A43298601 /* WelcomeGreeter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeGreeter.swift; sourceTree = "<group>"; };
 		FA723C972910467E39E5B5DE /* PhoneClientLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneClientLog.swift; sourceTree = "<group>"; };
 		FB2E60002E10BE69094D9C53 /* ConversationAudioControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationAudioControllerTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -544,7 +542,6 @@
 				1DAF03C2F2C11D4CBC8D9587 /* WatchSettingsView.swift */,
 				825EC2CED4ACE4E583D94864 /* WatchStreamReceiver.swift */,
 				F16E394DC77EF14BAE142B32 /* WatchVoiceTransport.swift */,
-				F9FA489FA1C53D0A43298601 /* WelcomeGreeter.swift */,
 				837F0B1D0B26EA8AFCAAC4A0 /* WristAgentWatch.entitlements */,
 				C10B09D1AD3BA287A3856E6E /* WristAgentWatchApp.swift */,
 			);
@@ -912,7 +909,6 @@
 				6FB34EA4C12FC1D5FFE06F94 /* WatchSettingsView.swift in Sources */,
 				18C00E8A4DDBDF394954DE30 /* WatchStreamReceiver.swift in Sources */,
 				9FE3E5082197E2851CD75F30 /* WatchVoiceTransport.swift in Sources */,
-				C2FE93AC9C1274EE211A3714 /* WelcomeGreeter.swift in Sources */,
 				487F199E241E68A3B8696D31 /* WristAgentWatchApp.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

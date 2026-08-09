@@ -5,7 +5,6 @@ import SwiftUI
 /// 半双工：录完即传；退出 App 任务继续，重开从 VoiceTurnJournal 恢复。
 struct WatchContentView: View {
     @ObservedObject private var pushToTalk: PushToTalkController
-    @ObservedObject private var welcome: WelcomeGreeter
     @ObservedObject private var selfCheck: SelfCheckRunner
     @ObservedObject private var transport: WatchVoiceTransport
     @ObservedObject private var journal: VoiceTurnJournal
@@ -32,14 +31,12 @@ struct WatchContentView: View {
 
     init(
         pushToTalk: PushToTalkController,
-        welcome: WelcomeGreeter,
         selfCheck: SelfCheckRunner,
         debugSettings: WatchDebugSettings,
         settings: WatchSettingsStore,
         session: SessionController
     ) {
         self.pushToTalk = pushToTalk
-        self.welcome = welcome
         self.selfCheck = selfCheck
         self.transport = pushToTalk.transport
         self.journal = pushToTalk.journal
@@ -143,7 +140,6 @@ struct WatchContentView: View {
                                 .onChanged { _ in
                                     guard orbTouchDownAt == nil else { return }
                                     orbTouchDownAt = Date()
-                                    welcome.interrupt()
                                     // ESS-65 铁律 3：自检绝不锁死 App——用户按住说话
                                     // 即打断自检让出音频会话，结论记 inconclusive。
                                     selfCheck.interrupt()
@@ -165,10 +161,6 @@ struct WatchContentView: View {
                                     }
                                 }
                         )
-
-                    if showWelcomeBanner {
-                        welcomeBanner
-                    }
 
                     if let reChatText = pushToTalk.reChatContextText {
                         Text(reChatText)
@@ -436,29 +428,6 @@ struct WatchContentView: View {
         }
     }
 
-    // MARK: - 欢迎语（ESS-40）
-
-    private var showWelcomeBanner: Bool {
-        welcome.isActive && !isRecording && activeTurn == nil
-    }
-
-    private var welcomeBanner: some View {
-        VStack(spacing: 3) {
-            Text(WelcomeGreeter.welcomeText)
-                .font(.footnote.bold())
-                .multilineTextAlignment(.center)
-
-            if welcome.stage == .playing {
-                Label("欢迎语播放中", systemImage: "speaker.wave.2.fill")
-                    .font(.caption2)
-                    .foregroundStyle(.cyan)
-            }
-        }
-        .frame(maxWidth: .infinity)
-        .padding(8)
-        .background(Color.cyan.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
-    }
-
     // MARK: - iPhone Relay 15s 无回执提示（ESS-258 / Gap-2）
 
     /// 当前活跃回合被 15s watchdog 判为「iPhone 侧无回执」的 requestId。
@@ -665,7 +634,7 @@ struct WatchContentView: View {
     }
 
     private var isSpeaking: Bool {
-        player.isPlaying || welcome.stage == .playing
+        player.isPlaying
     }
 
     /// ESS-572（Wave 0 / F7）：语音球五态映射。
@@ -706,7 +675,7 @@ struct WatchContentView: View {
         guard let turn = activeTurn, turn.isActive else {
             return MainStatusCopy(
                 title: "按住说话",
-                subtitle: showWelcomeBanner ? "按住语音球开始对话" : "松开即发送，结果回来会震动提醒"
+                subtitle: "松开即发送，结果回来会震动提醒"
             )
         }
         if let progress = currentProgress(for: turn) {
