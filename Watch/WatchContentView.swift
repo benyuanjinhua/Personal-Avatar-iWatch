@@ -411,7 +411,8 @@ struct WatchContentView: View {
             case .speaking: return .speaking(level: 0)
             case .idle: return .idle
             }
-        case .disconnecting, .idle:
+        case .disconnecting, .idle, .failed, .hungup:
+            // ESS-652 新增 P6/P7 两态：球回到静止，可见证据由失败/挂断卡片承担。
             return .idle
         }
     }
@@ -428,6 +429,10 @@ struct WatchContentView: View {
             case .speaking: return "正在回答…（点球打断）"
             case .idle: return "稍等…"
             }
+        case .failed:
+            return "回答超时，要再试一次吗？"
+        case .hungup:
+            return "本次通话已结束"
         case .disconnecting:
             return "正在结束…"
         case .idle:
