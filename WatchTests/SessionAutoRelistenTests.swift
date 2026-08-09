@@ -137,11 +137,19 @@ final class SessionAutoRelistenTests: XCTestCase {
     /// 打死，而 `pressBegan()` 因 state 已是 .recording 又把同一个 request_id
     /// 交回会话层认领：会话盯着一个已被 interrupt 的回合，首轮永远等不到
     /// play_started/finished。
+    ///
+    /// ESS-642 收紧后口径：可复用的前提是这一轮**确实由本次 touch-down 的
+    /// `pressBegan` 起的**（边界闸门为真且 request_id 一致），所以本用例必须
+    /// 经生产入口 `pressBegan()` 建立前置，而不是直接戳会话层——直接戳出来的
+    /// 回合与「上一会话遗留」不可区分，正是 ESS-642 那次事故。
     func testBeginSessionConversationDoesNotKillInFlightFirstTurn() {
         let (controller, adapter) = makeControllerWithMockAdapter()
-        let requestId = UUIDv7.generate().uuidString.lowercased()
-        // touch-down 已起首轮（只动会话层，不碰录音硬件——CI 无音频设备）。
-        let inFlight = adapter.session.beginTurn(requestId: requestId)
+        guard let requestId = simulateTouchDown(on: controller) else {
+            return XCTFail("pressBegan 未返回 request_id")
+        }
+        XCTAssertTrue(controller.didStartTurnSinceConversationBoundary)
+        // touch-down 的实时回合就位（只动会话层，不碰录音硬件——CI 无音频设备）。
+        let inFlight = adapter.beginTurn(requestId: requestId)
         XCTAssertNotNil(adapter.session.activeTurn)
 
         controller.beginSessionConversation()
@@ -154,6 +162,7 @@ final class SessionAutoRelistenTests: XCTestCase {
             adapter.session.activeConversationId, inFlight.conversationId,
             "首轮隐式开的 conversation 就是这段会话的 conversation，不得被换掉"
         )
+        controller.pressCancelled()
     }
 
     /// 反向：没有在飞回合时（长按松手后进会话等路径）仍必须真正开边界，
@@ -165,6 +174,77 @@ final class SessionAutoRelistenTests: XCTestCase {
         controller.beginSessionConversation()
 
         XCTAssertNotNil(adapter.session.activeConversationId, "无在飞回合时必须真开 conversation")
+    }
+
+    // MARK: - ESS-642：会话边界——旧 conversation 的回合绝不可被新会话复用
+
+    /// 真机事故（ESS-642）：进入电话模式后 `session_next_listening` 认领了
+    /// **上一会话**的 request_id，紧接着 `play_started` 用同一个旧 id 播出上一轮
+    /// 答案。根因是 ESS-600 阻断 A 引入的复用只判「有没有 activeTurn」，区分不了
+    /// 「本次 touch-down 新起的首轮」与「上一会话遗留的回合」。
+    func testEntryDoesNotReuseTurnLeftOverFromPreviousConversation() {
+        let (controller, adapter) = makeControllerWithMockAdapter()
+        // 上一会话：起过一轮，并且退出时没能清干净（真机上的失败/异常退出路径）。
+        let staleRequestId = UUIDv7.generate().uuidString.lowercased()
+        _ = adapter.beginTurn(requestId: staleRequestId)
+        let staleConversationId = adapter.session.activeConversationId
+        XCTAssertNotNil(adapter.session.activeTurn)
+        // 会话边界已关闭 = 这一轮属于上一段 conversation。
+        controller.endSessionConversation()
+
+        // 新一次进入电话模式。
+        controller.beginSessionConversation()
+
+        XCTAssertNil(
+            adapter.session.activeTurn,
+            "旧回合必须在开新边界前被清掉，不得留给新会话认领"
+        )
+        XCTAssertNotNil(adapter.session.activeConversationId)
+        XCTAssertNotEqual(
+            adapter.session.activeConversationId, staleConversationId,
+            "新会话必须是新的 conversation 边界"
+        )
+    }
+
+    /// 更贴近事故的形态：上一会话的回合**还没结束**（边界未关，录音已停），
+    /// 此时进入新会话仍不得复用——闸门看的是「本次边界之后是否新起过一轮」。
+    func testEntryDiscardsInFlightTurnNotStartedAfterBoundary() {
+        let (controller, adapter) = makeControllerWithMockAdapter()
+        let staleRequestId = UUIDv7.generate().uuidString.lowercased()
+        _ = adapter.beginTurn(requestId: staleRequestId)
+        XCTAssertFalse(
+            controller.didStartTurnSinceConversationBoundary,
+            "该回合不是经 pressBegan 起的，闸门必须为假"
+        )
+
+        controller.beginSessionConversation()
+
+        XCTAssertNil(adapter.session.activeTurn, "边界之外的回合必须被丢弃")
+    }
+
+    /// 验收：连续进入/退出 5 次，每次都必须是新的 conversation 边界，
+    /// 且退出后不留 activeTurn——旧音频没有任何可依附的回合。
+    func testFiveEnterExitCyclesNeverLeakTurnAcrossBoundaries() {
+        let (controller, adapter) = makeControllerWithMockAdapter()
+        var conversationIds: [String] = []
+
+        for round in 1...5 {
+            controller.beginSessionConversation()
+            guard let conversationId = adapter.session.activeConversationId else {
+                return XCTFail("第 \(round) 次进入未开出 conversation")
+            }
+            conversationIds.append(conversationId)
+            // 本次会话里真的起一轮，退出时它必须被清掉。
+            _ = adapter.beginTurn(requestId: UUIDv7.generate().uuidString.lowercased())
+            XCTAssertNotNil(adapter.session.activeTurn)
+
+            controller.endSessionConversation()
+            XCTAssertNil(adapter.session.activeTurn, "第 \(round) 次退出后不得留下 activeTurn")
+            XCTAssertNil(adapter.session.activeConversationId, "第 \(round) 次退出后边界必须关闭")
+            XCTAssertFalse(controller.didStartTurnSinceConversationBoundary)
+        }
+
+        XCTAssertEqual(Set(conversationIds).count, 5, "5 次进入必须是 5 段不同的 conversation")
     }
 
     // MARK: - 二轮复审阻断 B：interim 播完不是本轮答完
@@ -498,9 +578,27 @@ final class SessionAutoRelistenTests: XCTestCase {
     /// 其 `AVAudioEngine.SetFormat` 在无音频硬件的 hosted CI 上直接 -10868
     /// （ESS-498 家族，本单二轮 CI 实证）。经 `useRealtimeAdapterForTests`
     /// 注入后，`beginSessionConversation()` 走的仍是**生产那一段代码**。
+    /// 模拟一次 touch-down：走生产入口 `pressBegan()` 置起 ESS-642 的边界闸门
+    /// 与 `streamRequestId`（两者都在 `pressBegan` 同步段完成）。
+    ///
+    /// 期间**临时关掉流式开关**：`pressBegan` 的异步 Task 在 streaming 为真时会
+    /// `ensureConversationAudioAcquired()` → 真实 `AVAudioEngine.start()`，无音频
+    /// 设备的环境下这会抛不可捕获的 ObjC 异常直接杀进程
+    /// （`AVAudioEngineGraph.mm:Initialize: (inputNode != nullptr || outputNode != nullptr)`，
+    /// ESS-362/488 家族——本单第一版就是这样把整个 xctest 宿主跑挂的）。
+    /// 关掉后该分支整段跳过，同步段的两个前置照常建立。
+    @discardableResult
+    private func simulateTouchDown(on controller: PushToTalkController) -> String? {
+        controller.voiceStreamingEnabled = { false }
+        defer { controller.voiceStreamingEnabled = { true } }
+        return controller.pressBegan()
+    }
+
     private func makeControllerWithMockAdapter() -> (PushToTalkController, WatchRealtimeMediaAdapter) {
         let controller = PushToTalkController()
         controller.voiceStreamingEnabled = { true }
+        // 无音频硬件环境下不得触发会话级引擎起停（同上，ESS-362/488 家族）。
+        controller.conversationAudioEnabled = { false }
         let adapter = WatchRealtimeMediaAdapter(
             recorder: MockRecorder(), player: MockPlayer(), transport: MockTransport(),
             vadConfiguration: LocalVADConfiguration(),
