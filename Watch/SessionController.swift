@@ -37,6 +37,8 @@ final class SessionController: ObservableObject {
         case idle
         case connecting
         case listening
+        case failed
+        case hungup
         case disconnecting
     }
 
@@ -92,12 +94,22 @@ final class SessionController: ObservableObject {
     /// 首次进入引导「说话就行，说完停一下」（PRD §3.5.7）——只出现一次，
     /// 3 秒淡出；持久化在 UserDefaults，重装前不再出现。
     @Published private(set) var showFirstRunGuide = false
+    /// ESS-652: P6 失败原因文案，由 `enterFailed(reason:)` 设置，
+    /// P6 视图据此显示一行说明。nil 时 P6 不可见。
+    @Published private(set) var failedReason: String?
+    /// ESS-652: P6 是否可重试。就绪超时类失败可选重试，后台/系统中断不可重试。
+    @Published private(set) var failedRetryable = false
+    /// ESS-652: P7 挂断摘要，由 `enterHungup(rounds:reason:)` 设置。
+    /// nil 时 P7 不可见。
+    @Published private(set) var hungupSummary: String?
+    /// ESS-652: 思考慢提示（25s 无回答），球下方文字。
+    @Published private(set) var thinkingSlowHint = false
 
     /// 会话是否存续（连接中/聆听中）。视图据此切换双模 UI 与手势集。
     var isInSession: Bool {
         switch state {
-        case .connecting, .listening: return true
-        case .idle, .disconnecting: return false
+        case .connecting, .listening, .failed: return true
+        case .idle, .hungup, .disconnecting: return false
         }
     }
 
@@ -134,16 +146,6 @@ final class SessionController: ObservableObject {
     /// `PushToTalkController.interruptAnswerPlayback()`（realtime 走
     /// barge-in 请求换代，m4a 走 player.stop），停播后本控制器直接开下一轮。
     var onInterruptSpeaking: (() -> Void)?
-    /// ESS-650（F2-2）：进入 speaking 时开启「只听不传」的打断监听。
-    /// 生产接 `PushToTalkController.beginVoiceBargeInListening()`。
-    var onBeginBargeInListening: (() -> Void)?
-    /// ESS-650：结束打断监听。`reason` 区分 `answer_finished` / `interrupted` /
-    /// `gate_off` / `session_exit`，让「gate 动态关闭即时停采」在日志里可判定。
-    var onEndBargeInListening: ((_ reason: String) -> Void)?
-    /// ESS-650（F2-4）：语音打断开关，**默认 OFF**。生产接
-    /// `WatchDebugSettings.voiceBargeInEnabled`；F2-5 未通过不得默认 ON。
-    var voiceBargeInEnabled: () -> Bool = { false }
-
     /// ESS-600：就绪超时的**抢救**出口——把已经录到的语音经可靠通道
     /// （完整文件 / WCSession transferFile）提交，而不是连人带话一起丢。
     /// 生产接 `PushToTalkController.endSessionTurn()`。
@@ -176,6 +178,21 @@ final class SessionController: ObservableObject {
     /// 声音再次触发 VAD，形成「太短 → 报错 → 又太短」的自激循环。
     /// 1.5s【待调】≈ 一句错误提示语音的长度。
     static let abortedTurnRelistenDelaySeconds: TimeInterval = 1.5
+    // MARK: ESS-652 超时与静默治理
+    /// 思考慢提示：提交后无回答 > 此值显示慢提示。
+    static let thinkingSlowHintSeconds: TimeInterval = 25.0
+    /// 思考硬超时：进入 P6。
+    static let thinkingHardTimeoutSeconds: TimeInterval = 45.0
+    /// 静默 1 级提示。
+    static let silenceHint1Seconds: TimeInterval = 30.0
+    /// 静默 2 级提示 + 触觉。
+    static let silenceHint2Seconds: TimeInterval = 75.0
+    /// 静默挂断。
+    static let silenceHangupSeconds: TimeInterval = 120.0
+    /// P6 无操作自动挂断。
+    static let failedAutoHangupSeconds: TimeInterval = 15.0
+    /// P7 挂断页停留后回 idle。
+    static let hungupDismissSeconds: TimeInterval = 1.2
     /// ESS-600【待调】：每轮自动回到聆听时是否复播 `.ready` 的 click。
     /// 打开的理由——ESS-598 真机反馈是「说话完全无反馈」，回答播完后麦克风
     /// 何时重开在无声无字的会话态里不可感知；复用用户在进会话时已经学会的
@@ -194,6 +211,14 @@ final class SessionController: ObservableObject {
     private var turnCapToken: SessionDelayToken?
     private var thinkingToken: SessionDelayToken?
     private var relistenToken: SessionDelayToken?
+    /// ESS-652: 思考慢提示 / 硬超时 / 静默 / P6 自动挂断计时器。
+    private var thinkingSlowToken: SessionDelayToken?
+    private var thinkingHardToken: SessionDelayToken?
+    private var silenceToken: SessionDelayToken?
+    private var failedAutoToken: SessionDelayToken?
+    private var hungupDismissToken: SessionDelayToken?
+    /// ESS-652: 会话内轮数。
+    private var completedRounds = 0
 
     /// ESS-600：当前**被认领**的回合 request_id。所有回合事件都必须携带
     /// request_id 并与它相等才被受理——这是「旧 request / 旧 generation 的
@@ -281,6 +306,8 @@ final class SessionController: ObservableObject {
             detail: "turn_index=\(turnIndex) reason=channel_ready"
         )
         armTurnCap()
+        // ESS-652: start silence governance on first entry to listening.
+        armSilenceTimer()
     }
 
     /// 单轮上限兜底：到点视同说完提交本轮，不让「聆听」悬在
@@ -327,20 +354,21 @@ final class SessionController: ObservableObject {
         armThinkingTimeout()
     }
 
-    /// 有界执行：回答永不到达时不许无限等。`markTurnCommitted` 与
-    /// `markAnswerInterim` 共用——interim 播完后仍在等最终回答，超时守卫
-    /// 必须重新武装，否则会话会永久挂在一个不会再有事件的相位上。
+    /// ESS-652: 提交后启动思考超时计时器。25s 软提示 + 45s 硬超时进入 P6。
     private func armThinkingTimeout() {
         thinkingToken?.cancel()
-        thinkingToken = scheduleDelay(Self.thinkingTimeoutSeconds) { [weak self] in
+        thinkingSlowHint = false
+        thinkingToken = scheduleDelay(Self.thinkingSlowHintSeconds) { [weak self] in
             guard let self, self.state == .listening, self.turnPhase == .thinking else { return }
-            WatchLog.error(
-                "session", "session_thinking_timeout", requestId: self.activeTurnRequestId,
-                detail: "turn_index=\(self.turnIndex) timeout_s=\(Int(Self.thinkingTimeoutSeconds))",
-                code: "ERR_SESSION_ANSWER_TIMEOUT"
-            )
-            self.presentFailureNotice("没等到回答，再说一次试试")
-            self.startNextTurn(reason: "thinking_timeout")
+            self.thinkingSlowHint = true
+            WatchLog.info("session", "session_thinking_slow", requestId: self.activeTurnRequestId,
+                          detail: "turn_index=\(self.turnIndex)")
+        }
+        thinkingHardToken?.cancel()
+        thinkingHardToken = scheduleDelay(Self.thinkingHardTimeoutSeconds) { [weak self] in
+            guard let self, self.isInSession, self.turnPhase == .thinking else { return }
+            WatchLog.info("session", "session_thinking_hard_timeout", requestId: self.activeTurnRequestId)
+            self.enterFailed(reason: "回答超时，要再试一次吗？", retryable: true)
         }
     }
 
@@ -356,8 +384,6 @@ final class SessionController: ObservableObject {
         guard turnPhase == .speaking || turnPhase == .thinking else { return }
         let fromPhase = turnPhase
         turnPhase = .thinking
-        // ESS-650：interim 播完退回等待态，已不在 speaking，停采。
-        stopBargeInListening(reason: "answer_interim")
         WatchLog.info(
             "session", "session_answer_interim", requestId: requestId,
             detail: "turn_index=\(turnIndex) from=\(fromPhase.logName) phase=thinking"
@@ -376,47 +402,6 @@ final class SessionController: ObservableObject {
             "session", "session_answer_started", requestId: requestId,
             detail: "turn_index=\(turnIndex) phase=speaking"
         )
-        // ESS-650 F2-2：gate ON 时 speaking 期间常开采集（只进 VAD、零上行）。
-        // gate OFF 时**根本不开麦**——「回答时也在听」是要给用户明确承诺的，
-        // 开关关着却在采集属于隐私违背，不是省事。
-        startBargeInListeningIfEnabled()
-    }
-
-    /// ESS-650：进入/离开 speaking 的打断监听闸门。gate 判定只在这一处，
-    /// 采集侧不再自己读一遍开关——两处各判一次必然分叉。
-    private func startBargeInListeningIfEnabled() {
-        guard turnPhase == .speaking, voiceBargeInEnabled() else { return }
-        onBeginBargeInListening?()
-    }
-
-    private func stopBargeInListening(reason: String) {
-        onEndBargeInListening?(reason)
-    }
-
-    /// ESS-650 F2-3：语音打断命中。走与点球**同一个** `interruptSpeaking`
-    /// 入口，只是 `source` 与 `detectMs` 不同——两条打断路径落到不同事件或
-    /// 不同状态机，误触发率就永远算不出来（ESS-655 口径 3）。
-    /// gate 在命中瞬间已被关掉时一律丢弃：用户刚关掉开关不该再被打断一次。
-    func handleVoiceBargeIn(detectMs: Int) {
-        guard voiceBargeInEnabled() else {
-            WatchLog.info(
-                "session", "voice_barge_in_ignored", requestId: activeTurnRequestId,
-                detail: "reason=gate_off detect_ms=\(detectMs)"
-            )
-            return
-        }
-        guard state == .listening, turnPhase == .speaking else { return }
-        interruptSpeaking(source: .voice, detectMs: detectMs)
-    }
-
-    /// ESS-650 F2-4：gate 被动态切换。关掉时必须**即时停止采集**——不能等
-    /// 本轮回答播完，否则开关关了麦克风还开着。
-    func noteVoiceBargeInGateChanged(enabled: Bool) {
-        if enabled {
-            startBargeInListeningIfEnabled()
-        } else {
-            stopBargeInListening(reason: "gate_off")
-        }
     }
 
     /// 回答**真实播完**。speaking → listening，并自动开下一轮采集。
@@ -440,8 +425,6 @@ final class SessionController: ObservableObject {
                 code: "ERR_SESSION_ANSWER_FAILED"
             )
         }
-        // ESS-650：离开 speaking 即停采（回答播完/失败都算）。
-        stopBargeInListening(reason: success ? "answer_finished" : "answer_failed")
         startNextTurn(reason: success ? "answer_finished" : "answer_failed:\(reason)")
     }
 
@@ -479,9 +462,6 @@ final class SessionController: ObservableObject {
     ) {
         guard state == .listening, turnPhase == .speaking else { return }
         let stopStartedAt = DispatchTime.now().uptimeNanoseconds
-        // ESS-650：打断即离开 speaking，先停采再停播——顺序有意：停采在前，
-        // 停播过程中的扬声器余音才不会再喂进检测器。
-        stopBargeInListening(reason: "interrupted")
         onInterruptSpeaking?()
         let stopMs = Int((DispatchTime.now().uptimeNanoseconds &- stopStartedAt) / 1_000_000)
         WatchLog.record(
@@ -499,6 +479,8 @@ final class SessionController: ObservableObject {
         guard state == .listening else { return }
         relistenToken?.cancel(); relistenToken = nil
         thinkingToken?.cancel(); thinkingToken = nil
+        // ESS-652: the previous round just completed.
+        markRoundCompleted()
         guard let requestId = onStartTurn?() else {
             // 启动失败不许假装还在听。真实失败事件（录音启动失败 /
             // 通道死亡）会经 markChannelFailed 把会话收口。
@@ -520,6 +502,8 @@ final class SessionController: ObservableObject {
         )
         if Self.hapticOnAutoRelisten { playHaptic(.ready) }
         armTurnCap()
+        // ESS-652: arm silence governance timer for the new turn.
+        armSilenceTimer()
     }
 
     /// 通道失败（建立期或会话期），全部来自真实事件：
@@ -532,30 +516,146 @@ final class SessionController: ObservableObject {
         let failedFrom = state
         cancelConnectingTimers()
         cancelTurnTimers()
-        stopBargeInListeningOnTeardown()
-        state = .idle
+        // ESS-652: enter P6 failed state instead of dropping to idle.
+        // The user stays in the call screen with failure UI.
+        enterFailed(reason: Self.failureCopy(forState: failedFrom),
+                    retryable: failure != .recorderStart)
         turnPhase = .idle
         activeTurnRequestId = nil
-        turnIndex = 0
         isCapturingLocally = false
-        enteredAt = nil
         WatchLog.info(
             "session", "session_channel_failed",
             detail: "reason=\(failure.logReason) from=\(failedFrom.logName)"
         )
         switch failure {
         case .recorderStart:
-            // 分身错误卡片 + .failure 触觉已由 PushToTalkController 的
-            // 既有错误链呈现（ESS-180），本控制器只负责把会话态收回 idle，
-            // 不叠加第二份文案与第二次震动。
             break
         case .channelEvent:
             playHaptic(.failure)
-            presentFailureNotice(Self.failureCopy(forState: failedFrom))
         }
-        // 通道死了，采集侧必须同步收口（建立期失败时 pressBegan 的
-        // 错误链已自行清理，endSessionChannel 幂等）。
         onTeardownChannel?()
+    }
+
+    // MARK: - ESS-652 P6/P7 生命周期
+
+    /// 进入 P6 失败态。回话内显示失败界面，不退回待机。
+    func enterFailed(reason: String, retryable: Bool) {
+        state = .failed
+        failedReason = reason
+        failedRetryable = retryable
+        thinkingSlowHint = false
+        cancelAllESS652Timers()
+        WatchLog.info("session", "session_failed_notice_shown",
+                      detail: "reason=\(reason) retryable=\(retryable)")
+        // P6 15s 无操作自动挂断
+        failedAutoToken = scheduleDelay(Self.failedAutoHangupSeconds) { [weak self] in
+            guard let self, self.state == .failed else { return }
+            WatchLog.info("session", "session_failed_auto_hangup")
+            self.enterHungup(rounds: self.completedRounds, reason: "auto")
+        }
+    }
+
+    /// P6 重试：回 P1 重新接通。
+    func retryFromFailed() {
+        guard state == .failed else { return }
+        WatchLog.info("session", "session_failed_retry_tapped")
+        state = .idle
+        failedReason = nil
+        failedRetryable = false
+        cancelAllESS652Timers()
+        enterSession()
+    }
+
+    /// P6 挂断：回 idle。
+    func hangupFromFailed() {
+        guard state == .failed else { return }
+        WatchLog.info("session", "session_failed_hangup_tapped")
+        enterHungup(rounds: completedRounds, reason: "user")
+    }
+
+    /// 进入 P7 挂断态。显示摘要，1.2s 后回 idle。
+    func enterHungup(rounds: Int, reason: String) {
+        state = .hungup
+        failedReason = nil
+        failedRetryable = false
+        thinkingSlowHint = false
+        cancelAllESS652Timers()
+        hungupSummary = "已结束 · \(rounds) 轮（\(reason)）"
+        WatchLog.info("session", "session_call_summary",
+                      detail: "rounds=\(rounds) reason=\(reason)")
+        onTeardownChannel?()
+        hungupDismissToken = scheduleDelay(Self.hungupDismissSeconds) { [weak self] in
+            guard let self, self.state == .hungup else { return }
+            self.state = .idle
+            self.hungupSummary = nil
+            self.completedRounds = 0
+        }
+    }
+
+    // MARK: - ESS-652 思考超时与静默治理
+
+    /// 提交后启动思考超时计时器。
+    func armThinkingTimeout() {
+        thinkingSlowToken?.cancel()
+        thinkingHardToken?.cancel()
+        thinkingSlowHint = false
+        thinkingSlowToken = scheduleDelay(Self.thinkingSlowHintSeconds) { [weak self] in
+            guard let self, self.state == .listening, self.turnPhase == .thinking else { return }
+            self.thinkingSlowHint = true
+            WatchLog.info("session", "session_thinking_slow")
+        }
+        thinkingHardToken = scheduleDelay(Self.thinkingHardTimeoutSeconds) { [weak self] in
+            guard let self, self.isInSession, self.turnPhase == .thinking else { return }
+            WatchLog.info("session", "session_thinking_hard_timeout")
+            self.enterFailed(reason: "回答超时，要再试一次吗？", retryable: true)
+        }
+    }
+
+    /// 聆听态启动静默计时器。每次新一轮聆听重置。
+    func armSilenceTimer() {
+        silenceToken?.cancel()
+        // Stage 1: 30s soft hint
+        silenceToken = scheduleDelay(Self.silenceHint1Seconds) { [weak self] in
+            guard let self, self.state == .listening, self.turnPhase == .listening else { return }
+            WatchLog.info("session", "session_idle_hint", requestId: self.activeTurnRequestId,
+                          detail: "level=1")
+            // Stage 2: 75s hint + haptic
+            self.silenceToken?.cancel()
+            self.silenceToken = self.scheduleDelay(Self.silenceHint2Seconds - Self.silenceHint1Seconds) { [weak self] in
+                guard let self, self.state == .listening, self.turnPhase == .listening else { return }
+                self.playHaptic(.failure)
+                WatchLog.info("session", "session_idle_hint", requestId: self.activeTurnRequestId,
+                              detail: "level=2")
+                // Stage 3: 120s hangup
+                self.silenceToken?.cancel()
+                self.silenceToken = self.scheduleDelay(Self.silenceHangupSeconds - Self.silenceHint2Seconds) { [weak self] in
+                    guard let self, self.isInSession else { return }
+                    WatchLog.info("session", "session_idle_hangup")
+                    self.enterHungup(rounds: self.completedRounds, reason: "静默超时")
+                }
+            }
+        }
+    }
+
+    /// 记录一轮完成并重置静默计时器。
+    func markRoundCompleted() {
+        completedRounds += 1
+        WatchLog.info("session", "session_round_completed",
+                      detail: "rounds=\(completedRounds)")
+    }
+
+    private func cancelAllESS652Timers() {
+        thinkingSlowToken?.cancel()
+        thinkingHardToken?.cancel()
+        silenceToken?.cancel()
+        failedAutoToken?.cancel()
+        hungupDismissToken?.cancel()
+        thinkingSlowToken = nil
+        thinkingHardToken = nil
+        silenceToken = nil
+        failedAutoToken = nil
+        hungupDismissToken = nil
+        thinkingSlowHint = false
     }
 
     /// 会话中系统进入后台。会话级 `.playAndRecord` 与前台延长已建立时，
@@ -571,22 +671,18 @@ final class SessionController: ObservableObject {
 
     // MARK: - 退出
 
-    /// 点 X 或下滑退出会话。任意会话态可触发；拆链完成后回 idle。
-    /// 「点 X 必须真正释放麦克风」由 onTeardownChannel 接到
-    /// `endSessionChannel()` 兑现（采集停 + 未提交实时回合取消 +
-    /// 会话级 AVAudioSession deactivate，≤300ms 口径见
-    /// `conversation_audio_released` 的 duration_ms）。
+    /// 点 X 或下滑退出会话。任意会话态可触发。
+    /// ESS-652: 走 P7 挂断页，显示摘要后回 idle。
     func exitSession() {
         guard isInSession else { return }
         WatchLog.info("session", "session_exit_requested", detail: "source=user")
         playHaptic(.exit)
-        teardownToIdle()
+        enterHungup(rounds: completedRounds, reason: "用户挂断")
     }
 
     private func teardownToIdle() {
         cancelConnectingTimers()
         cancelTurnTimers()
-        stopBargeInListeningOnTeardown()
         let turns = turnIndex
         state = .disconnecting
         turnPhase = .idle
@@ -599,15 +695,14 @@ final class SessionController: ObservableObject {
         WatchLog.info("session", "session_ended", detail: "mic_released=true turns=\(turns)")
     }
 
-    /// ESS-650：会话拆链/失败时一并停采，不把麦克风留在会话之外。
-    private func stopBargeInListeningOnTeardown() {
-        stopBargeInListening(reason: "session_exit")
-    }
-
     private func cancelTurnTimers() {
         turnCapToken?.cancel(); turnCapToken = nil
         thinkingToken?.cancel(); thinkingToken = nil
         relistenToken?.cancel(); relistenToken = nil
+        // ESS-652: cancel thinking slow/hard timers on turn reset.
+        thinkingSlowToken?.cancel(); thinkingSlowToken = nil
+        thinkingHardToken?.cancel(); thinkingHardToken = nil
+        thinkingSlowHint = false
     }
 
     // MARK: - 首次引导（PRD §3.5.7）
@@ -782,16 +877,6 @@ enum SessionTurnWiring {
         pushToTalk.onLocalCaptureChanged = { [weak session] active in
             session?.markLocalCapture(active: active)
         }
-        // ESS-650 F2-2 / F2-3：打断监听的起停与命中回调。
-        session.onBeginBargeInListening = { [weak pushToTalk] in
-            pushToTalk?.beginVoiceBargeInListening()
-        }
-        session.onEndBargeInListening = { [weak pushToTalk] reason in
-            pushToTalk?.endVoiceBargeInListening(reason: reason)
-        }
-        pushToTalk.onSessionVoiceBargeIn = { [weak session] detectMs in
-            session?.handleVoiceBargeIn(detectMs: detectMs)
-        }
     }
 }
 
@@ -845,6 +930,8 @@ private extension SessionController.State {
         case .idle: return "idle"
         case .connecting: return "connecting"
         case .listening: return "listening"
+        case .failed: return "failed"
+        case .hungup: return "hungup"
         case .disconnecting: return "disconnecting"
         }
     }
