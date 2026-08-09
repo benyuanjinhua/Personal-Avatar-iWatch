@@ -13,7 +13,6 @@ struct WristAgentWatchApp: App {
         WindowGroup {
             WatchContentView(
                 pushToTalk: services.pushToTalk,
-                welcome: services.welcome,
                 selfCheck: services.selfCheck,
                 debugSettings: services.debugSettings,
                 settings: services.settings,
@@ -36,10 +35,9 @@ struct WristAgentWatchApp: App {
                     // 结束前不放欢迎语/未读播放——两者会与自检抢同一个音频会话。
                     // 用户按住说话可随时打断自检（SelfCheckRunner.interrupt）。
                     await services.selfCheck.autoRunIfNeeded()
-                    // ESS-55 未读优先：有未读结果直接呈现（触觉 + 全文），欢迎语让路。
-                    if !services.pushToTalk.presentUnreadIfAny() {
-                        services.welcome.greetIfNeeded()
-                    }
+                    // ESS-55 未读优先：有未读结果直接呈现（触觉 + 全文）。
+                    // ESS-639：冷启动欢迎语已移除。
+                    services.pushToTalk.presentUnreadIfAny()
                 }
                 .onChange(of: scenePhase) { _, newPhase in
                     WatchLog.info("lifecycle", "scene_phase", detail: String(describing: newPhase))
