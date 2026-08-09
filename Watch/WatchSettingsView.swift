@@ -37,6 +37,7 @@ struct WatchSettingsView: View {
                 connectionStatusSection
                 downlinkBacklogSection
                 streamingSection
+                voiceBargeInSection
                 privacySection
                 selfCheckSection
                 buildSection
@@ -150,6 +151,37 @@ struct WatchSettingsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(9)
         .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    // MARK: - 语音打断（ESS-650 F2-4，Debug）
+
+    /// gate 的**唯一用户入口**。白梦林 R1「不许悄悄做潜规则、开关要可见可点」
+    /// 同样适用：`setVoiceBargeInEnabled` 此前没有任何调用点，等于这个功能
+    /// 只能靠改代码打开——F2-4「运行时切换」与全部真机验收都无从谈起
+    /// （ESS-667 复审阻断 2）。
+    ///
+    /// 默认 OFF，此处不改默认值：F2-5 真机零误触通过后要动的是
+    /// `WatchDebugSettings` 的默认值，不是这个 Toggle。
+    private var voiceBargeInSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            sectionHeader("语音打断（Debug）")
+
+            Toggle(isOn: Binding(
+                get: { debugSettings.voiceBargeInEnabled },
+                set: { debugSettings.setVoiceBargeInEnabled($0) }
+            )) {
+                Text("说话打断回答")
+                    .font(.caption2)
+            }
+            .tint(.teal)
+
+            Text("开启后分身回答时用 .voiceChat 回声消除并持续听你说话，说话即可打断；关掉时只能点球打断。仅本机生效。")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(9)
+        .background(Color.teal.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
     }
 
     // MARK: - 隐私（ESS-419 F1）

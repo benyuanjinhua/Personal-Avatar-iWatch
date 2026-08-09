@@ -44,6 +44,9 @@ final class WatchRealtimeMediaAdapter {
 
     protocol Player: AnyObject {
         var onPlaybackEvent: ((RealtimePlaybackEngine.PlaybackEvent) -> Void)? { get set }
+        /// ESS-650（F2-3）：播放器此刻是否还在出声。`stop_ms` 若只量到同步
+        /// 函数返回，量的是调用开销而不是停播延迟（ESS-667 复审阻断 4）。
+        var isRenderingDownlink: Bool { get }
         func prepare(for turn: RealtimeMediaSession.TurnHandle) throws
         /// ESS-330 v3: each playable carries its own response_id so per-response
         /// bookkeeping stays intact across out-of-order releases.
@@ -399,18 +402,47 @@ final class WatchRealtimeMediaAdapter {
         )
     }
 
+    /// ESS-650 F2-5：一轮打断监听的对账单。会话层拿它落
+    /// `session_barge_in_self_echo`（`turn_index` 只有会话层知道）。
+    struct BargeInRoundSummary: Equatable {
+        /// 本轮真的喂进检测器的帧数。**`frames > 0` 才说明监听跑过**——
+        /// 没有这个数，`self_echo_frames=0` 和「压根没在听」无法区分。
+        let frames: Int
+        /// 本轮守卫窗内的超阈帧数（自身回声）。F2-5 的门禁读数。
+        let selfEchoFrames: Int
+        /// 会话内累计自身回声帧数。
+        let cumulativeSelfEchoFrames: Int
+        /// 本轮守卫窗峰值能量（dB，满量程相对值）。无回声为 -120.0。
+        let peakGuardDB: Double
+    }
+
     /// 结束打断监听（回答播完 / 被打断 / gate 关掉 / 退出会话）。
     /// `reason` 进日志，便于把「gate 动态关闭即时停采」与其它停采区分开。
-    func endBargeInListening(reason: String) {
-        guard isBargeInListening else { return }
+    /// - Returns: 本轮对账单；本来就没在监听时返回 nil（幂等调用不产生假账）。
+    @discardableResult
+    func endBargeInListening(reason: String) -> BargeInRoundSummary? {
+        guard isBargeInListening else { return nil }
         isBargeInListening = false
         recorder.stop()
+        let summary = BargeInRoundSummary(
+            frames: bargeInDetector.roundFrameCount,
+            selfEchoFrames: bargeInDetector.roundSelfEchoFrameCount,
+            cumulativeSelfEchoFrames: bargeInDetector.selfEchoFrameCount,
+            peakGuardDB: bargeInDetector.roundPeakGuardDB
+        )
         bargeInDetector.playbackEnded()
         WatchLog.info(
             "realtime", "barge_in_listening_stopped", requestId: currentTurn?.requestId,
-            detail: "reason=\(reason) self_echo_frames=\(bargeInDetector.selfEchoFrameCount)"
+            detail: "reason=\(reason) frames=\(summary.frames) "
+                + "self_echo_frames=\(summary.selfEchoFrames) "
+                + "cumulative_self_echo_frames=\(summary.cumulativeSelfEchoFrames)"
         )
+        return summary
     }
+
+    /// ESS-650（F2-3）：下行播放器此刻是否还在出声。停播确认的唯一读点——
+    /// 「我们调用过 stop()」不是停播证据。
+    var isRenderingDownlink: Bool { player.isRenderingDownlink }
 
     /// 累计的疑似自身回声帧数（守卫窗内的高能量帧）。F2-5 的对账口径。
     var bargeInSelfEchoFrameCount: Int { bargeInDetector.selfEchoFrameCount }
@@ -428,11 +460,17 @@ final class WatchRealtimeMediaAdapter {
                     "realtime", "barge_in_energy_spike", requestId: currentTurn?.requestId,
                     detail: "at_ms=\(atMs)"
                 )
-            case .bargeInDetected(let atMs):
-                let detectMs = Int(max(0, atMs - bargeInPlaybackStartedAtMs))
+            case .bargeInDetected(let startedAtMs, let detectedAtMs):
+                // ESS-650：`detect_ms` 是**起说 → 判定命中**（ESS-655 契约，
+                // `PhoneModeTelemetry.swift` 的 speakingInterrupted 注释）。
+                // 早先这里算的是「起播 → 起说」——那是「用户第几秒插的话」，
+                // 用它冒充检测延迟会让 F2-3 的延迟口径整体失真。
+                let detectMs = Int(max(0, detectedAtMs - startedAtMs))
+                let sincePlaybackMs = Int(max(0, startedAtMs - bargeInPlaybackStartedAtMs))
                 WatchLog.info(
                     "realtime", "barge_in_detected", requestId: currentTurn?.requestId,
-                    detail: "at_ms=\(atMs) detect_ms=\(detectMs)"
+                    detail: "at_ms=\(startedAtMs) detect_ms=\(detectMs) "
+                        + "since_playback_ms=\(sincePlaybackMs)"
                 )
                 onVoiceBargeInDetected?(detectMs)
             }

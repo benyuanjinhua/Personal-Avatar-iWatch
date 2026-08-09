@@ -136,16 +136,25 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         var finished: Bool { !finishInvocations.isEmpty }
         var finishCount: Int { finishInvocations.count }
         private(set) var stopped = false
+        /// ESS-650：与真实引擎同语义——入队即出声，`bargeIn`/`stop` 即静音。
+        private(set) var isRenderingDownlink = false
 
         var enqueuedChunks: [VoiceStreamChunk] { enqueuedPlayables.map(\.chunk) }
 
         func prepare(for turn: RealtimeMediaSession.TurnHandle) throws { preparedFor = turn }
         func enqueue(playables: [RealtimeDownlinkPlayback.PlayableChunk]) {
             enqueuedPlayables.append(contentsOf: playables)
+            if !playables.isEmpty { isRenderingDownlink = true }
         }
-        func bargeIn(clearedBytes: Int) { bargedInBytes.append(clearedBytes) }
+        func bargeIn(clearedBytes: Int) {
+            bargedInBytes.append(clearedBytes)
+            isRenderingDownlink = false
+        }
         func finish(responseId: String?) { finishInvocations.append(responseId) }
-        func stop(barge: Bool) { stopped = true }
+        func stop(barge: Bool) {
+            stopped = true
+            isRenderingDownlink = false
+        }
     }
 
     private final class MockTransport: WatchRealtimeMediaAdapter.Transport {
