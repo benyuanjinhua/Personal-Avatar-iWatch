@@ -195,6 +195,15 @@ final class SessionController: ObservableObject {
     /// （唯一铸造点），本序号只是会话层日志的可读游标，不另铸 id。
     private(set) var turnIndex = 0
 
+    // MARK: - ESS-650 语音打断
+
+    var voiceBargeInEnabled: Bool = false
+    var onStartBargeInMonitoring: (() -> Void)?
+    var onStopBargeInMonitoring: (() -> Void)?
+    var onHandleBargeInPCM: ((Data) -> Void)?
+    private var bargeInDetector: VoiceBargeInDetector?
+    private(set) var bargeInSelfEchoFrames: Int = 0
+
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
     }
@@ -360,6 +369,8 @@ final class SessionController: ObservableObject {
         guard turnPhase == .thinking else { return }
         thinkingToken?.cancel(); thinkingToken = nil
         turnPhase = .speaking
+        // ESS-650: start VAD-only capture during speaking for voice barge-in.
+        if voiceBargeInEnabled { startBargeInMonitoring() }
         WatchLog.info(
             "session", "session_answer_started", requestId: requestId,
             detail: "turn_index=\(turnIndex) phase=speaking"
@@ -387,6 +398,8 @@ final class SessionController: ObservableObject {
                 code: "ERR_SESSION_ANSWER_FAILED"
             )
         }
+        // ESS-650: stop VAD-only capture before starting next turn.
+        stopBargeInMonitoring()
         startNextTurn(reason: success ? "answer_finished" : "answer_failed:\(reason)")
     }
 
@@ -426,6 +439,8 @@ final class SessionController: ObservableObject {
         let stopStartedAt = DispatchTime.now().uptimeNanoseconds
         onInterruptSpeaking?()
         let stopMs = Int((DispatchTime.now().uptimeNanoseconds &- stopStartedAt) / 1_000_000)
+        // ESS-650: stop VAD-only capture on any interrupt.
+        stopBargeInMonitoring()
         WatchLog.record(
             PhoneModeTelemetry.speakingInterrupted(
                 source: source, detectMs: detectMs, stopMs: stopMs, turnIndex: turnIndex
@@ -771,6 +786,65 @@ private extension SessionController.State {
         case .connecting: return "connecting"
         case .listening: return "listening"
         case .disconnecting: return "disconnecting"
+        }
+    }
+}
+
+// MARK: - ESS-650 Voice Barge-In
+
+extension SessionController {
+    private func startBargeInMonitoring() {
+        guard voiceBargeInEnabled else { return }
+        bargeInDetector = VoiceBargeInDetector()
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        bargeInDetector?.playbackStarted(atMs: nowMs)
+        WatchLog.info(
+            "session", "voice_barge_in_monitoring_started",
+            requestId: activeTurnRequestId,
+            detail: "turn_index=\(turnIndex)"
+        )
+        onStartBargeInMonitoring?()
+    }
+
+    private func stopBargeInMonitoring() {
+        guard bargeInDetector != nil else { return }
+        if let detector = bargeInDetector {
+            bargeInSelfEchoFrames += detector.selfEchoFrameCount
+            if detector.selfEchoFrameCount > 0 {
+                WatchLog.info(
+                    "session", "session_barge_in_self_echo",
+                    requestId: activeTurnRequestId,
+                    detail: "turn_index=\(turnIndex) self_echo_frames=\(detector.selfEchoFrameCount) cumulative=\(bargeInSelfEchoFrames)"
+                )
+            }
+        }
+        bargeInDetector = nil
+        onStopBargeInMonitoring?()
+        WatchLog.info(
+            "session", "voice_barge_in_monitoring_stopped",
+            requestId: activeTurnRequestId,
+            detail: "turn_index=\(turnIndex)"
+        )
+    }
+
+    func handleBargeInPCMFrame(_ pcm: Data) {
+        guard var detector = bargeInDetector, voiceBargeInEnabled else { return }
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let events = detector.processPCM16(pcm, frameStartedAtMs: nowMs)
+        bargeInDetector = detector
+        for event in events {
+            if case .bargeInDetected(let atMs) = event {
+                let detectMs = Int(atMs)
+                WatchLog.info(
+                    "session", "session_barge_in_detected",
+                    requestId: activeTurnRequestId,
+                    detail: "turn_index=\(turnIndex) source=voice detect_ms=\(detectMs)"
+                )
+                interruptSpeaking(
+                    source: .orbTap,
+                    detectMs: detectMs
+                )
+            }
         }
     }
 }
