@@ -830,11 +830,15 @@ enum SessionTurnWiring {
     ) {
         session.onBeginChannel = { [weak pushToTalk] in
             interruptSelfCheck()
-            // 先开 conversation 边界再起第一轮，让第 1 轮的 turn_id 就落在
-            // 这段 conversation 里。pressBegan 幂等——点球 touch-down 已经
-            // 开录时返回的是**在飞那一轮**的 request_id，不重复发起。
-            pushToTalk?.beginSessionConversation()
-            return pushToTalk?.pressBegan()
+            guard let pushToTalk else { return }
+            // ESS-601: force-reset any residual recording state from a
+            // previous session before starting a new one. If the prior
+            // session left state as .recording/.finishing, pressBegan()
+            // would silently return and the SessionController would wait
+            // forever for a markChannelReady that never arrives.
+            pushToTalk.pressCancelled()
+            pushToTalk.beginSessionConversation()
+            _ = pushToTalk.pressBegan()
         }
         session.onStartTurn = { [weak pushToTalk] in
             interruptSelfCheck()
