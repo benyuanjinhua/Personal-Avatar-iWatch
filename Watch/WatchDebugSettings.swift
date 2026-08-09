@@ -122,36 +122,47 @@ final class WatchDebugSettings: ObservableObject {
             "settings", "streaming_state_at_launch",
             detail: "value=\(streamingEnabled) vad_endpoint_ms=\(vadEndpointSilenceMs) voice_barge_in=\(voiceBargeInEnabled)"
         )
+        // ESS-650：gate 的冷启动快照，走 ESS-655 契约事件。没有它，一份真机
+        // 日志里「没触发语音打断」分不清是 gate 关着还是开着但没检测到。
+        WatchLog.record(PhoneModeTelemetry.voiceBargeInGate(
+            state: voiceBargeInEnabled ? .on : .off, reason: .launchSnapshot
+        ))
     }
 
     // MARK: - ESS-650 语音打断
 
-    /// 设置语音打断开关。副作用：
-    /// 1. 落 UserDefaults
-    /// 2. 发观测事件 `voice_barge_in_gate state=on|off`
-    /// 3. 触发已注册 gate-change 回调
-    func setVoiceBargeInEnabled(_ newValue: Bool, source: String = "user") {
-        let previous = voiceBargeInEnabled
-        guard previous != newValue else { return }
+    /// 设置语音打断开关。副作用（顺序不可换）：
+    /// 1. 落 UserDefaults（重启后保持）
+    /// 2. 发 ESS-655 契约事件 `voice_barge_in_gate state=on|off reason=…`
+    /// 3. 通知**全部**订阅者新值
+    ///
+    /// ESS-650 两处修正：
+    /// - 事件改走 `PhoneModeTelemetry.voiceBargeInGate`。手拼的
+    ///   `state=… previous=… source=user` 过不了 `PhoneModeTelemetry.validate`
+    ///   （`source` 不是契约字段、`reason` 缺失且 `user` 不是合法取值），
+    ///   `PhoneModeCallMetrics` 会把它整条丢进 `rejected`——发了等于没发。
+    /// - ON 也要通知。只在 OFF 时回调，等于「运行中打开」永远不闭环：
+    ///   本轮回答已经在放，监听要到下一轮才起得来。
+    func setVoiceBargeInEnabled(
+        _ newValue: Bool,
+        reason: PhoneModeTelemetry.GateReason = .userToggle
+    ) {
+        guard voiceBargeInEnabled != newValue else { return }
         voiceBargeInEnabled = newValue
         defaults.set(newValue, forKey: Self.voiceBargeInEnabledDefaultsKey)
-        WatchLog.info(
-            "settings", "voice_barge_in_gate",
-            detail: "state=\(newValue ? "on" : "off") previous=\(previous) source=\(source)"
-        )
-        if !newValue {
-            // Tear down any in-flight barge-in monitor when gate is turned off.
-            let handlers = Array(bargeInGateHandlers.values)
-            for handler in handlers { handler() }
-        }
+        WatchLog.record(PhoneModeTelemetry.voiceBargeInGate(
+            state: newValue ? .on : .off, reason: reason
+        ))
+        // 拷贝一份再遍历，防止回调内部反注册 mutating 迭代中的集合。
+        for handler in Array(bargeInGateHandlers.values) { handler(newValue) }
     }
 
-    private var bargeInGateHandlers: [UUID: () -> Void] = [:]
+    private var bargeInGateHandlers: [UUID: (Bool) -> Void] = [:]
 
-    /// 注册「语音打断开关翻到 OFF 瞬间」触发的回调，用于停止进行中的
-    /// VAD-only 采集。返回 token；调用方负责在生命周期终结前反注册。
+    /// 订阅 gate 变化（ON / OFF 都通知）。返回 token；调用方负责在生命周期
+    /// 终结前反注册。
     @discardableResult
-    func onVoiceBargeInDisabled(_ handler: @escaping () -> Void) -> UUID {
+    func onVoiceBargeInChanged(_ handler: @escaping (Bool) -> Void) -> UUID {
         let token = UUID()
         bargeInGateHandlers[token] = handler
         return token

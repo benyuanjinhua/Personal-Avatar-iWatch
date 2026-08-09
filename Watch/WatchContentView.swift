@@ -411,9 +411,12 @@ struct WatchContentView: View {
             case .speaking: return .speaking(level: 0)
             case .idle: return .idle
             }
-        case .disconnecting, .idle, .failed, .hungup:
-            // ESS-652 新增 P6/P7 两态：球回到静止，可见证据由失败/挂断卡片承担。
-            return .idle
+        // ESS-673：ESS-652 给 `State` 加了 `.failed` / `.hungup` 却没补这两个
+        // switch，main 编译不过。这里只做**最小可编译**的诚实映射：两态都不在
+        // 采/播，球回 idle。P6 失败屏与 P7 挂断屏的完整视觉是 ESS-652 自己的
+        // 交付物（控制器侧的 failureNotice / hungupSummary / retryFromFailed
+        // 已经在，视图侧还没落），本单不代做。
+        case .disconnecting, .idle, .failed, .hungup:            return .idle
         }
     }
 
@@ -426,14 +429,22 @@ struct WatchContentView: View {
             switch session.turnPhase {
             case .listening: return "正在听…"
             case .thinking: return "正在思考…"
-            case .speaking: return "正在回答…（点球打断）"
+            // ESS-650 F2-4：gate 决定这句话。OFF 时说「点球」就只能点球；
+            // ON 时必须把语音这条路说出来，否则用户不知道可以直接开口——
+            // 一个不被告知的交互等于不存在。读的是 gate 的同一个真相源
+            // （`WatchDebugSettings`，@Published），不另存一份投影。
+            case .speaking:
+                return debugSettings.voiceBargeInEnabled
+                    ? "正在回答…（说话或点球打断）"
+                    : "正在回答…（点球打断）"
             case .idle: return "稍等…"
             }
         case .failed:
-            return "回答超时，要再试一次吗？"
+            // 渲染控制器已经产出的那句话，不在这里另编一套文案（同上，
+            // P6 的完整形态归 ESS-652）。
+            return session.failureNotice ?? ""
         case .hungup:
-            return "本次通话已结束"
-        case .disconnecting:
+            return session.hungupSummary ?? ""        case .disconnecting:
             return "正在结束…"
         case .idle:
             return ""

@@ -195,8 +195,12 @@ final class ConversationAudioController {
         isAcquired = true
         WatchLog.info(
             Self.module, "conversation_audio_acquired",
+            // ESS-650 F2-1：mode 必须落在日志里——真机上「.voiceChat 到底有没有
+            // 配上」是 AEC 结论的前提，靠读代码推断不算运行时证据（R-02.1）。
             detail: "conversation_id=\(conversationId) "
-                + "duration_ms=\(Self.elapsedMs(since: started))"
+                + "duration_ms=\(Self.elapsedMs(since: started)) "
+                + "mode=\(lastConfiguredMode?.rawValue ?? "unknown") "
+                + "voice_barge_in=\(voiceBargeInEnabled())"
         )
     }
 
@@ -271,7 +275,17 @@ final class ConversationAudioController {
     /// 但 `.voiceChat` 会改变路由、增益、播放音量与录音质量，必须经 R-02.2
     /// 双向与并发冒烟验证。门禁：F2-1 真机 `setActive` 成功且自身回声能量
     /// 相对 `.spokenAudio` 记录实测 dB 降低量。
-    var voiceBargeInEnabled: Bool = false
+    /// ESS-650 整改：改为**实时读点**（闭包）而不是存一份布尔值。
+    /// 存值版本在 main 上一个写入方都没有——`.voiceChat` 分支从来不会
+    /// 被走到，F2-1 等于没落地。闭包由 `PushToTalkController` 在构造控制器时
+    /// 接到 `WatchDebugSettings`，运行期翻开关这里立刻读到新值。
+    ///
+    /// 生效时机是**下一次 `beginConversation`**：`.playAndRecord` 已激活时改
+    /// mode 要 deactivate→reconfigure→activate 一轮，正是 ESS-61/72 记录的
+    /// -50 paramErr 高发路径；通话中途改 AEC 不值得冒这个险。
+    var voiceBargeInEnabled: () -> Bool = { false }
+    /// 上一次 `beginConversation` 真正用上的 mode，供测试与真机日志对账。
+    private(set) var lastConfiguredMode: AVAudioSession.Mode?
 
     /// 与 `AudioRecorder.configureSession` 同源的 ESS-61 配置序列：
     /// 先 setActive(false, .notifyOthersOnDeactivation) 清掉播放侧残留的
@@ -285,7 +299,7 @@ final class ConversationAudioController {
         try? session.setActive(false, options: .notifyOthersOnDeactivation)
         switch attempt {
         case .resetRoutePolicy:
-            let mode: AVAudioSession.Mode = voiceBargeInEnabled ? .voiceChat : .spokenAudio
+            let mode: AVAudioSession.Mode = voiceBargeInEnabled() ? .voiceChat : .spokenAudio
             if #available(watchOS 11.0, *) {
                 try session.setCategory(
                     .playAndRecord, mode: mode, policy: .default,
@@ -296,8 +310,10 @@ final class ConversationAudioController {
                     .playAndRecord, mode: mode, policy: .default, options: []
                 )
             }
+            lastConfiguredMode = mode
         case .minimal:
             try session.setCategory(.playAndRecord, mode: .default, policy: .default, options: [])
+            lastConfiguredMode = .default
         }
         try session.setActive(true, options: [])
     }

@@ -145,14 +145,22 @@ final class SessionController: ObservableObject {
     /// ESS-600（F4 手动打断）：speaking 中点球 → 立刻停播。生产接
     /// `PushToTalkController.interruptAnswerPlayback()`（realtime 走
     /// barge-in 请求换代，m4a 走 player.stop），停播后本控制器直接开下一轮。
-    var onInterruptSpeaking: (() -> Void)?
+    /// ESS-650（F2-3）：入参是触发源（只影响停播日志——两种打断共用同一条
+    /// 停播路径，不另起第二条）；返回值 = **停播确认**（两个播放器都不再
+    /// 出声）。`stop_ms` 量到这个返回为止才是停播延迟。
+    var onInterruptSpeaking: ((PhoneModeTelemetry.InterruptSource) -> Bool)?
     /// ESS-650（F2-2）：进入 speaking 时开启「只听不传」的打断监听。
     /// 生产接 `PushToTalkController.beginVoiceBargeInListening()`。
+    ///
+    /// ESS-673：本组接缝由 PR #281 落地、被 PR #270 的冲突解决整段删掉，
+    /// 此处恢复。删掉之后 `WatchAppDelegate` 与 `VoiceBargeInWiringTests`
+    /// 的调用方失去被调方，main 连编译都过不去。
     var onBeginBargeInListening: (() -> Void)?
     /// ESS-650：结束打断监听。`reason` 区分 `answer_finished` / `interrupted` /
     /// `gate_off` / `session_exit`，让「gate 动态关闭即时停采」在日志里可判定。
-    var onEndBargeInListening: ((_ reason: String) -> Void)?
-    /// ESS-650（F2-4）：语音打断开关，**默认 OFF**。生产接
+    /// - Returns: 本轮对账单（帧数 / 自身回声帧数 / 峰值能量），会话层据此落
+    ///   F2-5 的两条证据（见 `stopBargeInListening`）；nil = 本来就没在监听。
+    var onEndBargeInListening: ((_ reason: String) -> WatchRealtimeMediaAdapter.BargeInRoundSummary?)?    /// ESS-650（F2-4）：语音打断开关，**默认 OFF**。生产接
     /// `WatchDebugSettings.voiceBargeInEnabled`；F2-5 未通过不得默认 ON。
     var voiceBargeInEnabled: () -> Bool = { false }
     /// ESS-600：就绪超时的**抢救**出口——把已经录到的语音经可靠通道
@@ -364,10 +372,18 @@ final class SessionController: ObservableObject {
     }
 
     /// ESS-652: 提交后启动思考超时计时器。25s 软提示 + 45s 硬超时进入 P6。
+    ///
+    /// ESS-673：PR #270 的冲突解决把本方法留了两份（`thinkingToken` 版与
+    /// `thinkingSlowToken` 版），Swift 直接判 invalid redeclaration，main 打不出包。
+    /// 这里按 ESS-671 的口径取并集留一份：**计时器用 ESS-652 的
+    /// `thinkingSlowToken`/`thinkingHardToken`**（拆链与失败路径只认这一对，
+    /// 见 cancelTurnTimers），**日志字段用带 `turn_index` 的这版**——
+    /// `session_thinking_slow` 的 `turn_index` 是 ESS-655 契约的必带字段，
+    /// 另一版没带，落进日志就过不了 `PhoneModeTelemetry.validate`。
     private func armThinkingTimeout() {
-        thinkingToken?.cancel()
+        thinkingSlowToken?.cancel()
         thinkingSlowHint = false
-        thinkingToken = scheduleDelay(Self.thinkingSlowHintSeconds) { [weak self] in
+        thinkingSlowToken = scheduleDelay(Self.thinkingSlowHintSeconds) { [weak self] in
             guard let self, self.state == .listening, self.turnPhase == .thinking else { return }
             self.thinkingSlowHint = true
             WatchLog.info("session", "session_thinking_slow", requestId: self.activeTurnRequestId,
@@ -378,43 +394,6 @@ final class SessionController: ObservableObject {
             guard let self, self.isInSession, self.turnPhase == .thinking else { return }
             WatchLog.info("session", "session_thinking_hard_timeout", requestId: self.activeTurnRequestId)
             self.enterFailed(reason: "回答超时，要再试一次吗？", retryable: true)
-        }
-    }
-
-    /// ESS-650：进入/离开 speaking 的打断监听闸门。gate 判定只在这一处，
-    /// 采集侧不再自己读一遍开关——两处各判一次必然分叉。
-    private func startBargeInListeningIfEnabled() {
-        guard turnPhase == .speaking, voiceBargeInEnabled() else { return }
-        onBeginBargeInListening?()
-    }
-
-    private func stopBargeInListening(reason: String) {
-        onEndBargeInListening?(reason)
-    }
-
-    /// ESS-650 F2-3：语音打断命中。走与点球**同一个** `interruptSpeaking`
-    /// 入口，只是 `source` 与 `detectMs` 不同——两条打断路径落到不同事件或
-    /// 不同状态机，误触发率就永远算不出来（ESS-655 口径 3）。
-    /// gate 在命中瞬间已被关掉时一律丢弃：用户刚关掉开关不该再被打断一次。
-    func handleVoiceBargeIn(detectMs: Int) {
-        guard voiceBargeInEnabled() else {
-            WatchLog.info(
-                "session", "voice_barge_in_ignored", requestId: activeTurnRequestId,
-                detail: "reason=gate_off detect_ms=\(detectMs)"
-            )
-            return
-        }
-        guard state == .listening, turnPhase == .speaking else { return }
-        interruptSpeaking(source: .voice, detectMs: detectMs)
-    }
-
-    /// ESS-650 F2-4：gate 被动态切换。关掉时必须**即时停止采集**——不能等
-    /// 本轮回答播完，否则开关关了麦克风还开着。
-    func noteVoiceBargeInGateChanged(enabled: Bool) {
-        if enabled {
-            startBargeInListeningIfEnabled()
-        } else {
-            stopBargeInListening(reason: "gate_off")
         }
     }
 
@@ -430,7 +409,7 @@ final class SessionController: ObservableObject {
         guard turnPhase == .speaking || turnPhase == .thinking else { return }
         let fromPhase = turnPhase
         turnPhase = .thinking
-        // ESS-650：interim 退回等待态，已不在 speaking，停采。
+        // ESS-650：interim 播完退回等待态，已不在 speaking，停采。
         stopBargeInListening(reason: "answer_interim")
         WatchLog.info(
             "session", "session_answer_interim", requestId: requestId,
@@ -451,8 +430,78 @@ final class SessionController: ObservableObject {
             detail: "turn_index=\(turnIndex) phase=speaking"
         )
         // ESS-650 F2-2：gate ON 时 speaking 期间常开采集（只进 VAD、零上行）。
+        // gate OFF 时**根本不开麦**——「回答时也在听」是要给用户明确承诺的，
+        // 开关关着却在采集属于隐私违背，不是省事。
         startBargeInListeningIfEnabled()
     }
+
+    // MARK: - ESS-650（F2）语音打断
+
+    /// 进入/离开 speaking 的打断监听闸门。gate 判定只在这一处，采集侧不再
+    /// 自己读一遍开关——两处各判一次必然分叉。
+    private func startBargeInListeningIfEnabled() {
+        guard turnPhase == .speaking, voiceBargeInEnabled() else { return }
+        onBeginBargeInListening?()
+    }
+
+    /// 停本轮监听并**结账**。幂等（没在监听时 `onEndBargeInListening` 返回
+    /// nil，不产生假账）。
+    ///
+    /// 两条事件，职责刻意分开（ESS-667 复审阻断 5 的处理口径）：
+    ///
+    /// - `voice_barge_in_round`：**每轮必发**，带 `frames`（本轮真的喂进了
+    ///   多少帧）与 `self_echo_frames=0`。它是「监听确实跑过而且干净」的正面
+    ///   证据——F2-5 要的那个「零」必须能与「压根没在听」区分开，而「事件
+    ///   缺席」区分不了这两者。
+    /// - `session_barge_in_self_echo`：**只在真的有自身回声时发**。
+    ///   `Shared/PhoneModeCallMetrics.swift` 把它的每次出现计为一次误触发
+    ///   （`selfEchoFalseTriggers` → `isEligibleForDefaultOnGate`）。每轮都发
+    ///   一条 `=0` 会把 5 轮干净跑成 5 次误触发，直接把 F2-5 门禁反转；所以
+    ///   「计数为 0」按 ESS-650 验收原文字面成立：这条事件一条都不出现。
+    private func stopBargeInListening(reason: String) {
+        guard let summary = onEndBargeInListening?(reason) else { return }
+        WatchLog.info(
+            "session", "voice_barge_in_round", requestId: activeTurnRequestId,
+            detail: "turn_index=\(turnIndex) reason=\(reason) "
+                + "frames=\(summary.frames) "
+                + "self_echo_frames=\(summary.selfEchoFrames) "
+                + "cumulative_self_echo_frames=\(summary.cumulativeSelfEchoFrames) "
+                + "peak_guard_db=\(String(format: "%.1f", summary.peakGuardDB))"
+        )
+        guard summary.selfEchoFrames > 0 else { return }
+        WatchLog.record(
+            PhoneModeTelemetry.bargeInSelfEcho(
+                turnIndex: turnIndex, energyDB: summary.peakGuardDB
+            ),
+            requestId: activeTurnRequestId
+        )
+    }
+
+    /// ESS-650 F2-3：语音打断命中。走与点球**同一个** `interruptSpeaking`
+    /// 入口，只是 `source` 与 `detectMs` 不同——两条打断路径落到不同事件或
+    /// 不同状态机，误触发率就永远算不出来（ESS-655 口径 3）。
+    /// gate 在命中瞬间已被关掉时一律丢弃：用户刚关掉开关不该再被打断一次。
+    func handleVoiceBargeIn(detectMs: Int) {
+        guard voiceBargeInEnabled() else {
+            WatchLog.info(
+                "session", "voice_barge_in_ignored", requestId: activeTurnRequestId,
+                detail: "reason=gate_off detect_ms=\(detectMs)"
+            )
+            return
+        }
+        guard state == .listening, turnPhase == .speaking else { return }
+        interruptSpeaking(source: .voice, detectMs: detectMs)
+    }
+
+    /// ESS-650 F2-4：gate 被动态切换。关掉时必须**即时停止采集**——不能等
+    /// 本轮回答播完，否则开关关了麦克风还开着。打开时若本轮正在回答，立刻
+    /// 开始监听（守卫窗按此刻重新起算：已经放过去的部分没被监听过）。
+    func noteVoiceBargeInGateChanged(enabled: Bool) {
+        if enabled {
+            startBargeInListeningIfEnabled()
+        } else {
+            stopBargeInListening(reason: "gate_off")
+        }    }
 
     /// 回答**真实播完**。speaking → listening，并自动开下一轮采集。
     ///
@@ -475,7 +524,7 @@ final class SessionController: ObservableObject {
                 code: "ERR_SESSION_ANSWER_FAILED"
             )
         }
-        // ESS-650：离开 speaking 即停采（播完 / 失败都算）。
+        // ESS-650：离开 speaking 即停采（回答播完 / 失败都算）。
         stopBargeInListening(reason: success ? "answer_finished" : "answer_failed")
         startNextTurn(reason: success ? "answer_finished" : "answer_failed:\(reason)")
     }
@@ -513,11 +562,12 @@ final class SessionController: ObservableObject {
         detectMs: Int = 0
     ) {
         guard state == .listening, turnPhase == .speaking else { return }
-        // ESS-650：打断即离开 speaking，先停采再停播——停采在前，停播过程中的
-        // 扬声器余音才不会再喂进检测器。
+        // ESS-650：打断即离开 speaking，先停采再停播——顺序有意：停采在前，
+        // 停播过程中的扬声器余音才不会再喂进检测器。
         stopBargeInListening(reason: "interrupted")
         let stopStartedAt = DispatchTime.now().uptimeNanoseconds
-        onInterruptSpeaking?()
+        // ESS-650 F2-3：`stop_ms` 量到**播放器确认停播**，不是量到闭包返回。
+        let stopConfirmed = onInterruptSpeaking?(source) ?? false
         let stopMs = Int((DispatchTime.now().uptimeNanoseconds &- stopStartedAt) / 1_000_000)
         WatchLog.record(
             PhoneModeTelemetry.speakingInterrupted(
@@ -525,6 +575,16 @@ final class SessionController: ObservableObject {
             ),
             requestId: activeTurnRequestId
         )
+        if !stopConfirmed {
+            // 没被播放器确认时 `stop_ms` 是个测量对象错了的数——必须留证，
+            // 否则「≤200ms 停播」这条验收会拿它蒙混过关。
+            WatchLog.error(
+                "session", "session_interrupt_stop_unconfirmed",
+                requestId: activeTurnRequestId,
+                detail: "turn_index=\(turnIndex) source=\(source.rawValue) stop_ms=\(stopMs)",
+                code: "ERR_SESSION_STOP_UNCONFIRMED"
+            )
+        }
         startNextTurn(reason: "user_interrupt")
     }
 
@@ -571,6 +631,7 @@ final class SessionController: ObservableObject {
         let failedFrom = state
         cancelConnectingTimers()
         cancelTurnTimers()
+        stopBargeInListeningOnTeardown()
         // ESS-652: enter P6 failed state instead of dropping to idle.
         // The user stays in the call screen with failure UI.
         enterFailed(reason: Self.failureCopy(forState: failedFrom),
@@ -654,7 +715,7 @@ final class SessionController: ObservableObject {
         }
     }
 
-    // MARK: - ESS-652 静默治理
+    // MARK: - ESS-652 思考超时与静默治理
     /// 聆听态启动静默计时器。每次新一轮聆听重置。
     func armSilenceTimer() {
         silenceToken?.cancel()
@@ -727,6 +788,7 @@ final class SessionController: ObservableObject {
     private func teardownToIdle() {
         cancelConnectingTimers()
         cancelTurnTimers()
+        stopBargeInListeningOnTeardown()
         let turns = turnIndex
         state = .disconnecting
         turnPhase = .idle
@@ -739,7 +801,9 @@ final class SessionController: ObservableObject {
         WatchLog.info("session", "session_ended", detail: "mic_released=true turns=\(turns)")
     }
 
+    /// ESS-650：会话拆链 / 失败时一并停采，不把麦克风留在会话之外（PD-2）。
     /// ESS-650：会话拆链/失败时一并停采，不把麦克风留在会话之外。
+
     /// ESS-652：会话以任何方式结束（挂断 / 失败 / 拆链）时统一收束回合状态。
     /// 不重置会让退出后的迟到事件被当成当前轮受理（ESS-642 事故面）。
     private func resetTurnStateOnExit() {
@@ -750,11 +814,9 @@ final class SessionController: ObservableObject {
         turnIndex = 0
         isCapturingLocally = false
     }
-
     private func stopBargeInListeningOnTeardown() {
         stopBargeInListening(reason: "session_exit")
     }
-
 
     private func cancelTurnTimers() {
         turnCapToken?.cancel(); turnCapToken = nil
@@ -796,6 +858,10 @@ final class SessionController: ObservableObject {
         switch state {
         case .connecting:
             return "连不上，检查一下 iPhone 是否在身边"
+        // ESS-673：ESS-652 给 `State` 加了 `.failed` / `.hungup` 两态却没补
+        // 这个 switch，编译不过（被同文件的 redeclaration 错误挡在后面，
+        // 修掉那条才暴露出来）。两态都是「已经聊过、链路在中途断的」，
+        // 与 listening 同一条文案，不新造第三种说法。
         case .listening, .disconnecting, .idle, .failed, .hungup:
             return "连接断了，本轮对话已结束"
         }
@@ -909,21 +975,12 @@ enum SessionTurnWiring {
         session.onTeardownChannel = { [weak pushToTalk] in
             pushToTalk?.endSessionChannel()
         }
-        // ESS-650 F2-2 / F2-3：打断监听起停与命中回调。
-        session.onBeginBargeInListening = { [weak pushToTalk] in
-            pushToTalk?.beginVoiceBargeInListening()
-        }
-        session.onEndBargeInListening = { [weak pushToTalk] reason in
-            pushToTalk?.endVoiceBargeInListening(reason: reason)
-        }
-        pushToTalk.onSessionVoiceBargeIn = { [weak session] detectMs in
-            session?.handleVoiceBargeIn(detectMs: detectMs)
-        }
         session.onCommitTurn = { [weak pushToTalk] in
             pushToTalk?.endSessionTurn()
         }
-        session.onInterruptSpeaking = { [weak pushToTalk] in
-            pushToTalk?.interruptAnswerPlayback()
+        session.onInterruptSpeaking = { [weak pushToTalk] source in
+            // ESS-650：两种触发源共用同一条停播路径，只在日志里分开。
+            pushToTalk?.interruptAnswerPlayback(source: source) ?? false
         }
         session.onSalvageTurn = { [weak pushToTalk] in
             pushToTalk?.endSessionTurn()
@@ -952,6 +1009,16 @@ enum SessionTurnWiring {
         }
         pushToTalk.onLocalCaptureChanged = { [weak session] active in
             session?.markLocalCapture(active: active)
+        }
+        // ESS-650 F2-2 / F2-3：打断监听的起停与命中回调。
+        session.onBeginBargeInListening = { [weak pushToTalk] in
+            pushToTalk?.beginVoiceBargeInListening()
+        }
+        session.onEndBargeInListening = { [weak pushToTalk] reason in
+            pushToTalk?.endVoiceBargeInListening(reason: reason)
+        }
+        pushToTalk.onSessionVoiceBargeIn = { [weak session] detectMs in
+            session?.handleVoiceBargeIn(detectMs: detectMs)
         }
     }
 }
