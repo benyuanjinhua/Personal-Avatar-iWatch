@@ -75,3 +75,31 @@ test('upstream failure becomes one structured agent error', async () => {
   assert.equal(events[0].code, 'ERR_UPSTREAM_DISCONNECTED')
   assert.equal(logs.filter(item => item.evt === 'upstream_error').length, 1)
 })
+
+// ESS-551 A3 契约测试：出站首帧（connect）必须显式携带 turnDetection 字段
+// （null = 关闭服务端 VAD，Watch 是唯一断句权威）。缺该字段本测试必须失败。
+test('connect frame always carries explicit turnDetection (off)', async () => {
+  const received = []
+  const logs = []
+  const url = await upstream((ws, message) => {
+    received.push(message)
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+  })
+  const transport = new QwenAgentTransport({ gatewayUrl: url, log: (evt, extra) => logs.push({ evt, ...extra }) })
+  const events = []
+  const turn = transport.openTurn({
+    requestId: 'r-551', sessionId: 's-551', generation: 1, responseId: 'r-551:gen1',
+    onEvent: e => events.push(e),
+  })
+  await waitFor(() => received.some(m => m.type === 'connect'))
+  const connect = received.find(m => m.type === 'connect')
+  assert.ok(
+    Object.prototype.hasOwnProperty.call(connect, 'turnDetection'),
+    'connect frame MUST carry turnDetection (null = off); missing field fails this contract'
+  )
+  assert.equal(connect.turnDetection, null)
+  // open 日志必须落 turn_detection=off（ESS-551 验收标准）。
+  await waitFor(() => logs.some(l => l.evt === 'upstream_open_sent'))
+  assert.equal(logs.find(l => l.evt === 'upstream_open_sent')?.turn_detection, 'off')
+  turn.close()
+})

@@ -19,8 +19,9 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     /// constructed on the first uplink envelope so households that never
     /// enable streaming do not pay for the WSS setup.
     private lazy var realtimeSession: PhoneRealtimeSession = {
-        let session = PhoneRealtimeSession(transportFactory: { [weak self] requestId, sessionId in
-            self?.makeRealtimeTransport(requestId: requestId, sessionId: sessionId)
+        let session = PhoneRealtimeSession(transportFactory: { [weak self] requestId, sessionId, conversationId, turnId in
+            self?.makeRealtimeTransport(requestId: requestId, sessionId: sessionId,
+                                        conversationId: conversationId, turnId: turnId)
         })
         session.onDownlink = { [weak self] envelope in
             self?.forwardRealtimeDownlink(envelope)
@@ -341,6 +342,9 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
             return envelope.bargeIn.map { ($0.requestId, $0.sessionId) }
         case .fallback:
             return nil
+        case .conversationClose:
+            // ESS-551：会话关闭信号不携带回合身份（令牌 mint 不需要它）。
+            return nil
         }
     }
 
@@ -428,7 +432,9 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     /// **Bridge path**: the existing `PhoneRealtimeWebSocketTransport` using
     /// the relay's signed WSS endpoint (PR #113).
     @MainActor
-    private func makeRealtimeTransport(requestId: String, sessionId: String) -> PhoneRealtimeSession.Transport? {
+    private func makeRealtimeTransport(requestId: String, sessionId: String,
+                                       conversationId: String? = nil,
+                                       turnId: String? = nil) -> PhoneRealtimeSession.Transport? {
         // ESS-391: try Agent direct path first when feature flag is enabled.
         if let credentials = RelayCredentialsStore.read(),
            let agentConfig = agentFlag.resolveConfig(
@@ -444,6 +450,8 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
                 requestId: requestId,
                 sessionId: sessionId,
                 generation: 1,
+                conversationId: conversationId,
+                turnId: turnId,
                 replacementSession: { [agentFlag] generation in
                     guard let credentials = RelayCredentialsStore.read(),
                           let gatewayURL = URL(string: agentFlag.gatewayURLString) else {

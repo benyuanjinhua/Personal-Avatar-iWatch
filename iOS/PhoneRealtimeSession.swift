@@ -24,6 +24,9 @@ final class PhoneRealtimeSession {
         func send(_ envelope: RealtimeUplinkEnvelope, completion: @escaping @MainActor (Error?) -> Void)
         func receive(handler: @escaping @MainActor (Result<RealtimeDownlinkEnvelope, Error>) -> Void)
         func close(reason: String)
+        /// ESS-551：会话终结的显式关闭（携带 conversation_id 通知对端拒绝
+        /// 迟到帧）。旧传输无此概念，默认退化为普通 close。
+        func closeConversation()
     }
 
     enum State: Equatable {
@@ -44,7 +47,8 @@ final class PhoneRealtimeSession {
     /// used for HMAC signing to match `request_id` — otherwise the socket
     /// closes with `ERR_STREAM_OWNERSHIP`. The factory therefore takes the
     /// (requestId, sessionId) tuple for the turn it will serve.
-    private let transportFactory: (_ requestId: String, _ sessionId: String) -> Transport?
+    private let transportFactory: (_ requestId: String, _ sessionId: String,
+                                   _ conversationId: String?, _ turnId: String?) -> Transport?
     private var currentTransport: Transport?
     private(set) var state: State = .idle
     private var pendingDownlink: [RealtimeDownlinkEnvelope] = []
@@ -59,7 +63,8 @@ final class PhoneRealtimeSession {
     /// Emits state transitions so callers can flip UI or log evidence.
     var onStateChange: ((State) -> Void)?
 
-    init(transportFactory: @escaping (_ requestId: String, _ sessionId: String) -> Transport?) {
+    init(transportFactory: @escaping (_ requestId: String, _ sessionId: String,
+                                      _ conversationId: String?, _ turnId: String?) -> Transport?) {
         self.transportFactory = transportFactory
     }
 
@@ -82,7 +87,9 @@ final class PhoneRealtimeSession {
                 )
                 pendingDownlink.removeAll(keepingCapacity: true)
             }
-            openIfNeeded(requestId: start.requestId, sessionId: start.sessionId)
+            // ESS-551: conversation/turn 主键随 start 透传（有界 relay 不改写）。
+            openIfNeeded(requestId: start.requestId, sessionId: start.sessionId,
+                         conversationId: envelope.conversationId, turnId: envelope.turnId)
         case .audioAppend:
             guard let append = envelope.append else { return }
             openIfNeeded(requestId: append.requestId, sessionId: append.streamId)
@@ -130,6 +137,16 @@ final class PhoneRealtimeSession {
                 }
                 completion?(error == nil)
             }
+            return
+        case .conversationClose:
+            // ESS-551：会话终结——当前 transport 显式关闭并携带
+            // conversation_id，Gateway 此后拒绝该会话的一切迟到帧。
+            guard let conversationId = envelope.conversationId else { return }
+            Self.logger.info(
+                "realtime conversation.close conv=\(conversationId.prefix(8), privacy: .public)"
+            )
+            currentTransport?.closeConversation()
+            completion?(true)
             return
         }
         guard let transport = currentTransport else {
@@ -205,7 +222,8 @@ final class PhoneRealtimeSession {
         onDownlink?(envelope)
     }
 
-    private func openIfNeeded(requestId: String, sessionId: String) {
+    private func openIfNeeded(requestId: String, sessionId: String,
+                              conversationId: String? = nil, turnId: String? = nil) {
         switch state {
         case .active(let activeRequest, let activeSession)
                 where activeRequest == requestId && activeSession == sessionId:
@@ -217,7 +235,7 @@ final class PhoneRealtimeSession {
             break
         }
         currentTransport?.close(reason: "supersede")
-        guard let transport = transportFactory(requestId, sessionId) else {
+        guard let transport = transportFactory(requestId, sessionId, conversationId, turnId) else {
             transition(to: .failed(reason: "no_transport"))
             return
         }
@@ -271,4 +289,11 @@ final class PhoneRealtimeSession {
             detail: "reason=\(reason) incoming_generation=\(incomingGeneration) \(active)"
         )
     }
+}
+
+/// ESS-551：旧传输（Bridge WebSocket）无会话关闭概念，默认退化为普通
+/// close；Agent 直连传输（PhoneRealtimeAgentTransport）重写为携带
+/// meta.conversation_id 的显式关闭。
+extension PhoneRealtimeSession.Transport {
+    func closeConversation() { close(reason: "conversation_end") }
 }

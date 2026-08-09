@@ -99,8 +99,17 @@ export class QwenAgentTransport {
           type: 'connect', clientType: 'cli', clientLabel: 'watch-direct-gateway',
           clientInstanceId: `gateway_${randomUUID()}`, voiceEnabled: true,
           manualTurnDetection: true, takeover: this.takeover,
+          // ESS-551 A3：显式关闭服务端 VAD——Watch 是唯一断句权威
+          // （方案 §2.1 单一 VAD 权威）。不下发此字段则上游默认策略可能
+          // 自行 final，出现 Watch 未 commit 却产生回答的双权威事故。
+          // 显式 null 而非省略：契约测试断言该 key 必须在场。
+          turnDetection: null,
           timeZone: 'Asia/Shanghai', locale: 'zh-CN',
         }))
+        this.log('upstream_open_sent', {
+          request_id: requestId, session_id: sessionId, generation,
+          turn_detection: 'off',
+        })
       })
       ws.on('message', raw => {
         let event

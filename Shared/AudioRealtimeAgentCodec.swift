@@ -36,7 +36,10 @@ enum AudioRealtimeAgentCodec {
     enum UplinkFrame {
         /// Maps to Gateway `session.start`. Auth token is sent via HTTP header,
         /// NOT in the JSON payload (ESS-388 A1: token never in JSON).
-        case sessionStart(sessionId: String, requestId: String, generation: Int, protocolVersion: Int)
+        /// ESS-551: conversation/turn 主键经 `meta` 子对象携带（可选；缺失时
+        /// Gateway 退回 (requestId, sessionId) 旧隔离基线）。
+        case sessionStart(sessionId: String, requestId: String, generation: Int, protocolVersion: Int,
+                          conversationId: String? = nil, turnId: String? = nil)
         /// Maps to Gateway `audio.append`.
         case audioAppend(sessionId: String, requestId: String, generation: Int,
                          sequence: Int, sampleRate: Int?, codec: String?, audioBase64: String)
@@ -51,7 +54,9 @@ enum AudioRealtimeAgentCodec {
         /// Maps to Gateway `ping`.
         case ping(nonce: String)
         /// Maps to Gateway `close`.
-        case close(reason: String?)
+        /// ESS-551: 仅会话终结时携带 meta.conversation_id——Gateway 据此拒绝
+        /// 该 conversation 下一切迟到帧（每回合拆连不带 meta）。
+        case close(reason: String?, conversationId: String? = nil, turnId: String? = nil)
     }
 
     /// Encode an uplink frame into the flat JSON string the Gateway expects.
@@ -59,12 +64,16 @@ enum AudioRealtimeAgentCodec {
     static func encode(_ frame: UplinkFrame) -> String? {
         var payload: [String: Any] = [:]
         switch frame {
-        case .sessionStart(let sessionId, let requestId, let generation, let protocolVersion):
+        case .sessionStart(let sessionId, let requestId, let generation, let protocolVersion,
+                           let conversationId, let turnId):
             payload["type"] = "session.start"
             payload["session_id"] = sessionId
             payload["request_id"] = requestId
             payload["generation"] = generation
             payload["protocol_version"] = protocolVersion
+            if let meta = Self.metaPayload(conversationId: conversationId, turnId: turnId) {
+                payload["meta"] = meta
+            }
         case .audioAppend(let sessionId, let requestId, let generation,
                           let sequence, let sampleRate, let codec, let audioBase64):
             payload["type"] = "audio.append"
@@ -100,9 +109,12 @@ enum AudioRealtimeAgentCodec {
         case .ping(let nonce):
             payload["type"] = "ping"
             payload["nonce"] = nonce
-        case .close(let reason):
+        case .close(let reason, let conversationId, let turnId):
             payload["type"] = "close"
             if let reason { payload["reason"] = reason }
+            if let meta = Self.metaPayload(conversationId: conversationId, turnId: turnId) {
+                payload["meta"] = meta
+            }
         }
         guard let data = try? JSONSerialization.data(
             withJSONObject: payload,
@@ -111,12 +123,21 @@ enum AudioRealtimeAgentCodec {
         return String(data: data, encoding: .utf8)
     }
 
+    /// ESS-551：conversation/turn 主键的 `meta` 子对象；两者皆 nil 时返回
+    /// nil（不下发空 meta，保持帧面与旧版完全一致）。
+    static func metaPayload(conversationId: String?, turnId: String?) -> [String: Any]? {
+        var meta: [String: Any] = [:]
+        if let conversationId { meta["conversation_id"] = conversationId }
+        if let turnId { meta["turn_id"] = turnId }
+        return meta.isEmpty ? nil : meta
+    }
+
     /// Structured log tag for an uplink frame — type + key identity fields
     /// only. Never includes raw audio payload or token bytes. Safe to log
     /// with `privacy: .public`.
     static func logTag(_ frame: UplinkFrame) -> String {
         switch frame {
-        case .sessionStart(let sid, let rid, let gen, _):
+        case .sessionStart(let sid, let rid, let gen, _, _, _):
             return "SEND type=session.start sid=\(sid.prefix(8)) rid=\(rid.prefix(8)) gen=\(gen)"
         case .audioAppend(let sid, let rid, let gen, let seq, _, _, let audioB64):
             return "SEND type=audio.append sid=\(sid.prefix(8)) rid=\(rid.prefix(8)) gen=\(gen) seq=\(seq) audio_bytes=\(audioB64.count)"

@@ -86,6 +86,10 @@ enum RealtimeBridgeWireCodec {
             ))
         case .bargeInRequest:
             return nil
+        case .conversationClose:
+            // ESS-551：会话关闭信号只走 Gateway 直连路径（PhoneRealtimeAgent
+            // Transport），Bridge 旧路无对应帧——返回 nil 不桥接。
+            return nil
         }
     }
 

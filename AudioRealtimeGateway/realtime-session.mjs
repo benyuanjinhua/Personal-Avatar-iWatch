@@ -13,6 +13,53 @@
 const OPEN = 'open'
 const CLOSED = 'closed'
 
+// ESS-551 A4: bounded registry of explicitly closed conversations.
+// A conversation_id lands here ONLY via an explicit `close` frame carrying
+// `meta.conversation_id` — per-turn socket teardown NEVER closes a
+// conversation (multi-round conversations reuse the id across connections).
+// Bounded: TTL 24h + cap 1000 (oldest evicted) — the Gateway is a
+// long-lived process; an unbounded Set grows one UUID per conversation
+// forever.
+// NOTE: on process restart this registry is empty, so a previously closed
+// conversation_id would be accepted again. Intentional for Phase 0: the
+// Watch mints UUIDv7 conversation ids and never reuses them, so a replayed
+// stale id cannot collide with a live conversation.
+const CLOSED_CONVERSATION_TTL_MS = 24 * 60 * 60 * 1000
+const CLOSED_CONVERSATION_MAX = 1000
+const closedConversations = new Map() // conversation_id -> closedAtMs
+
+function pruneClosedConversations(now) {
+  for (const [id, at] of closedConversations) {
+    if (now - at > CLOSED_CONVERSATION_TTL_MS) closedConversations.delete(id)
+  }
+  while (closedConversations.size > CLOSED_CONVERSATION_MAX) {
+    // Map iteration order is insertion order — evict the oldest entry.
+    closedConversations.delete(closedConversations.keys().next().value)
+  }
+}
+
+function markConversationClosed(conversationId, now) {
+  // Re-insert to refresh insertion order (LRU), then prune.
+  closedConversations.delete(conversationId)
+  closedConversations.set(conversationId, now)
+  pruneClosedConversations(now)
+}
+
+function isConversationClosed(conversationId, now) {
+  const at = closedConversations.get(conversationId)
+  if (at === undefined) return false
+  if (now - at > CLOSED_CONVERSATION_TTL_MS) {
+    closedConversations.delete(conversationId)
+    return false
+  }
+  return true
+}
+
+// Test seam: the registry is module state; tests reset it between cases.
+export function _resetClosedConversationsForTests() {
+  closedConversations.clear()
+}
+
 const CLIENT_SCHEMAS = {
   'session.start': ['session_id', 'request_id', 'generation', 'protocol_version'],
   'audio.append': ['session_id', 'request_id', 'generation', 'sequence', 'audio'],
@@ -27,14 +74,16 @@ const CLIENT_SCHEMAS = {
 // Fields the schema explicitly permits (used to reject unknown keys with
 // ERR_UNKNOWN_FIELD — strict contract is part of ESS-403 acceptance #2).
 const ALLOWED_KEYS = {
-  'session.start': new Set(['type', 'session_id', 'request_id', 'generation', 'protocol_version']),
-  'audio.append': new Set(['type', 'session_id', 'request_id', 'generation', 'sequence', 'audio', 'sample_rate', 'codec']),
-  'audio.commit': new Set(['type', 'session_id', 'request_id', 'generation', 'sequence']),
-  'cancel':       new Set(['type', 'session_id', 'request_id', 'generation', 'reason']),
-  'playback.started': new Set(['type', 'session_id', 'request_id', 'response_id']),
-  'playback.ended':   new Set(['type', 'session_id', 'request_id', 'response_id']),
+  // ESS-551: `meta`（可选子对象 {conversation_id, turn_id}）承载会话/回合
+  // 主键，不扩散顶层字段——ALLOWED_KEYS 收紧语义（ESS-403）保持不变。
+  'session.start': new Set(['type', 'session_id', 'request_id', 'generation', 'protocol_version', 'meta']),
+  'audio.append': new Set(['type', 'session_id', 'request_id', 'generation', 'sequence', 'audio', 'sample_rate', 'codec', 'meta']),
+  'audio.commit': new Set(['type', 'session_id', 'request_id', 'generation', 'sequence', 'meta']),
+  'cancel':       new Set(['type', 'session_id', 'request_id', 'generation', 'reason', 'meta']),
+  'playback.started': new Set(['type', 'session_id', 'request_id', 'response_id', 'meta']),
+  'playback.ended':   new Set(['type', 'session_id', 'request_id', 'response_id', 'meta']),
   'ping':         new Set(['type', 'nonce']),
-  'close':        new Set(['type', 'reason']),
+  'close':        new Set(['type', 'reason', 'meta']),
 }
 
 export class RealtimeSession {
@@ -164,7 +213,7 @@ export class RealtimeSession {
       case 'playback.started': return this._handlePlayback(message, 'started')
       case 'playback.ended':   return this._handlePlayback(message, 'ended')
       case 'ping': return this._sendJson({ type: 'pong', nonce: message.nonce })
-      case 'close': return this._gracefulClose(message.reason)
+      case 'close': return this._gracefulClose(message.reason, message.meta)
     }
   }
 
@@ -202,6 +251,21 @@ export class RealtimeSession {
     if (message.protocol_version !== this.protocolVersion) {
       return this.fail('ERR_PROTOCOL_VERSION')
     }
+    // ESS-551 A4: conversation/turn 主键经 `meta` 子对象进入（可选；
+    // 缺失时退回 (requestId, sessionId) 旧隔离基线）。已显式关闭的
+    // conversation 一律拒绝——该会话下任何 request 的迟到帧零帧进入。
+    const meta = (message.meta && typeof message.meta === 'object') ? message.meta : null
+    const conversationId = meta?.conversation_id ?? null
+    if (conversationId && isConversationClosed(conversationId, this.now())) {
+      this.log('conversation_start_rejected', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation, conversation_id: conversationId,
+        drop_reason: 'conversation_closed',
+      })
+      return this.fail('ERR_CONVERSATION_CLOSED', { detail: conversationId })
+    }
+    this.conversationId = conversationId
+    this.turnId = meta?.turn_id ?? null
     this.started = true
     this.agentTurn = this.agent.openTurn({
       requestId: this.scope.request_id,
@@ -223,6 +287,7 @@ export class RealtimeSession {
     this.log('session_ready', {
       request_id: this.scope.request_id, session_id: this.scope.session_id,
       generation: this.scope.generation, response_id: this.responseId,
+      conversation_id: this.conversationId, turn_id: this.turnId,
     })
   }
 
@@ -573,7 +638,18 @@ export class RealtimeSession {
     this.onSocketClose(1008, code)
   }
 
-  _gracefulClose(reason) {
+  _gracefulClose(reason, meta = null) {
+    // ESS-551 A4：仅当 close 帧显式携带 meta.conversation_id 时才把该会话
+    // 记入 closedConversations——每回合的 socket 拆连不关闭 conversation
+    // （多轮会话跨连接复用同一 id）。此后同 id 的 session.start 一律拒绝。
+    const conversationId = (meta && typeof meta === 'object') ? (meta.conversation_id ?? null) : null
+    if (conversationId) {
+      markConversationClosed(conversationId, this.now())
+      this.log('conversation_close_recorded', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation, conversation_id: conversationId,
+      })
+    }
     this.closeSocket(1000, typeof reason === 'string' ? reason.slice(0, 120) : 'client_close')
   }
 

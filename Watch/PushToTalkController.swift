@@ -86,29 +86,6 @@ final class PushToTalkController: ObservableObject {
     /// 仅 SessionController 在会话中消费；PTT 自身错误链不变。
     var onRealtimeChannelFailed: ((SessionController.ChannelFailure) -> Void)?
 
-    // MARK: - ESS-600 会话回合事件（全部携带 request_id，会话层据此闸门）
-
-    /// 本轮上行**真正提交**（realtime commit 或完整文件二选一，`submit` 走完）。
-    var onSessionTurnCommitted: ((_ requestId: String) -> Void)?
-    /// 回答音频**真实起播**。两条播放路径各自在真实起播点回调：
-    /// realtime = 首帧已渲染；完整文件 = `SpeechPlayer.play()` 返回 true。
-    var onSessionAnswerStarted: ((_ requestId: String) -> Void)?
-    /// 回答音频**真实播完**。`success=false` 表示播放以失败终局收场
-    /// （exhausted / playRejected / deferredTimeout…），绝不记成播完。
-    var onSessionAnswerFinished: ((_ requestId: String, _ success: Bool, _ reason: String) -> Void)?
-    /// ESS-600 复审阻断 B：完整文件路径的 **interim** 语音播完（回合尚未达终态，
-    /// 最终回答还在路上）。它不是本轮答完，不得开下一轮——会话据此回到等待态
-    /// 并重新武装有界超时。
-    var onSessionAnswerInterim: ((_ requestId: String) -> Void)?
-    /// 本轮**零提交**收场（太短 / 收尾抛错）——没有回答可等，会话需重开采集。
-    var onSessionTurnAborted: ((_ requestId: String, _ reason: String) -> Void)?
-    /// 本地采集起停（与网络 ready 独立呈现）。
-    var onLocalCaptureChanged: ((_ active: Bool) -> Void)?
-    /// ESS-650 F2-3：语音打断命中（携带 `detect_ms`）。会话层据此走与点球
-    /// **同一个** `interruptSpeaking` 入口，只是 `source` 不同——两条路径落到
-    /// 不同状态机，误触发率就永远算不出来（ESS-655 口径 3）。
-    var onSessionVoiceBargeIn: ((_ detectMs: Int) -> Void)?
-
     private static let logger = Logger(subsystem: "com.benyuan.wristagent.watch", category: "PlaybackTrigger")
     private let recorder = AudioRecorder()
     var voiceStreamingEnabled: () -> Bool = { VoiceStreamingGate.defaultEnabled }
@@ -127,11 +104,6 @@ final class PushToTalkController: ObservableObject {
     /// ESS-321 real-time adapter. Lazily created on first press when the
     /// streaming gate is on. Wiring lives in `ensureRealtimeAdapter()`.
     private(set) var realtimeAdapter: WatchRealtimeMediaAdapter?
-    /// ESS-642：会话边界闸门。`pressBegan` 真正新起一轮时置真，
-    /// `endSessionConversation`（退出会话）与开新 conversation 时置假。
-    /// `beginSessionConversation` 只在它为真时才允许复用在飞回合——
-    /// 上一会话遗留的 activeTurn 因此永远进不了复用分支。
-    private(set) var didStartTurnSinceConversationBoundary = false
 
     /// ESS-509: true when the realtime adapter owns an active turn (from
     /// `beginTurn` through `turnFinished`). Drives WCSession keep-alive by
@@ -156,6 +128,9 @@ final class PushToTalkController: ObservableObject {
     var makeConversationAudioController: () -> ConversationAudioController = {
         ConversationAudioController()
     }
+    /// ESS-551 A4：会话级身份句柄——conversation_id/turn_id 的唯一
+    /// 生成方。首个流式回合 mint，点 X/取消/超时/中断时关闭；nil = 无存活会话。
+    private(set) var conversationHandle: ConversationHandle?
     private var pendingRealtimeRecording: [String: AudioRecorder.Recording] = [:]
     /// ESS-331: fast-channel failures can arrive while the m4a is still being
     /// recorded (i.e. before `finishRecording()`). When that happens we keep
@@ -457,32 +432,6 @@ final class PushToTalkController: ObservableObject {
                 )
             }
         }
-        // ESS-600（复审阻断 2）：终局分流后再上报会话。`error-` 前缀是错误
-        // 提示音，不是回答，绝不驱动回合相位。`.success` 之外的一切终局
-        // （halted / exhausted / playRejected / deferredTimeout）都按失败上报——
-        // 无差别上报「播完」会让一次失败的播放照样开启下一轮。
-        if let requestId, !requestId.hasPrefix("error-") {
-            if endgame == .success {
-                // ESS-600 复审阻断 B：完整文件路径的 interim 与 final **共用同一个
-                // request_id**。interim（回合尚未达终态的 16.8KB fallback）播完不是
-                // 「这一轮答完了」——此时开下一轮，最终回答到达时会落在下一轮里，
-                // 造成跨轮与顺序错乱。终态判定复用 ESS-45×ESS-46 的同一口径
-                // （`turn.currentState.isTerminal`），不另立第二套真相。
-                if journal.turn(withId: requestId)?.currentState.isTerminal == true {
-                    onSessionAnswerFinished?(requestId, true, "endgame_success")
-                } else {
-                    WatchLog.info(
-                        "player", "interim_playback_not_final", requestId: requestId,
-                        detail: "endgame=success bytes=\(bytes) reason=turn_not_terminal"
-                    )
-                    // 回退到「等最终回答」而不是停在回答态：最终结果若永不到达，
-                    // thinking 的有界超时会把会话捞回聆听；停在 speaking 会永久挂死。
-                    onSessionAnswerInterim?(requestId)
-                }
-            } else {
-                onSessionAnswerFinished?(requestId, false, "endgame_\(endgame.logToken)")
-            }
-        }
         guard let outcome = PlaybackEndgamePolicy.outcome(for: endgame) else { return }
         WatchLog.info(
             "player", "playback_endgame", requestId: requestId,
@@ -616,23 +565,8 @@ final class PushToTalkController: ObservableObject {
         )
     }
 
-    /// ESS-600：自动重新聆听的程序化采集入口。与 `pressBegan()` 完全同一条
-    /// 录音 + 实时上行链（不另建第二条采集路径），只是没有「用户按下」这个
-    /// 手势语义——`.recordingStarted` 触觉由会话层的「可以开口」click 承担，
-    /// 不在同一时刻震两下。
-    /// - Returns: 本轮 `request_id`；nil = 采集未能开启。
-    func beginSessionTurn() -> String? {
-        pressBegan(programmatic: true)
-    }
-
-    /// - Parameter programmatic: true = 会话自动开轮（非用户手势），跳过
-    ///   按下触觉。
-    /// - Returns: 本轮 `request_id`。已在录音时返回**在飞那一轮**的 id——
-    ///   点球进会话时录音在 touch-down 已经开始，会话必须认领它而不是
-    ///   再起一轮（再起一轮会当场打断用户正在说的话）。
-    @discardableResult
-    func pressBegan(programmatic: Bool = false) -> String? {
-        guard state == .idle else { return streamRequestId?.uuidString.lowercased() }
+    func pressBegan() {
+        guard state == .idle else { return }
         errorMessage = nil
         releaseRequestedWhileStarting = false
         let requestId = UUIDv7.generate()
@@ -663,10 +597,7 @@ final class PushToTalkController: ObservableObject {
         streamId = streaming ? UUID() : nil
         streamSequence = 0
         streamAborted = false
-        if !programmatic { WatchHaptics.play(.recordingStarted) }
-        // ESS-642：本轮是在当前 conversation 边界之后新起的，可被会话入口复用。
-        didStartTurnSinceConversationBoundary = true
-        onLocalCaptureChanged?(true)
+        WatchHaptics.play(.recordingStarted)
         Task {
             // ESS-554：会话级路径下，首个流式回合在录音启动前完成
             // conversation acquire（`.playAndRecord` 会话级激活 + 播放引擎
@@ -691,7 +622,6 @@ final class PushToTalkController: ObservableObject {
                     WatchLog.info("recorder", "late_start_cancelled", detail: "state=\(String(describing: state))")
                     recorder.cancel()
                     clearStreamStateAfterAbort()
-                    onLocalCaptureChanged?(false)
                     return
                 }
                 // ESS-362: bring up the realtime PCM tap only AFTER
@@ -714,7 +644,6 @@ final class PushToTalkController: ObservableObject {
                 state = .idle
                 isRealtimeStreaming = false
                 clearStreamStateAfterAbort()
-                onLocalCaptureChanged?(false)
                 // ESS-554：会话级持有期间录音启动失败 = 持有的会话可疑
                 // （挂起期间被系统拆掉且中断通知丢失的场景靠这里收口），
                 // 释放后下次按压走完整 acquire 自愈。
@@ -729,7 +658,6 @@ final class PushToTalkController: ObservableObject {
                 onRealtimeChannelFailed?(.recorderStart)
             }
         }
-        return requestIdString
     }
 
     /// ESS-554：会话级音频 acquire 的唯一入口。仅在流式开关 +
@@ -739,9 +667,13 @@ final class PushToTalkController: ObservableObject {
         guard conversationAudioEnabled() else { return }
         let controller = ensureConversationAudioController()
         guard !controller.isAcquired else { return }
-        let conversationId = UUIDv7.generate().uuidString.lowercased()
+        // ESS-551：conversation_id 由 ConversationHandle 统一生成，音频控制器
+        // 与实时会话共用同一 id——不再各自 mint。
+        let handle = ensureConversationHandleForStreaming()
+        let conversationId = handle.conversationId
         do {
             try controller.beginConversation(conversationId: conversationId)
+            realtimeAdapter?.session.beginConversation(handle)
         } catch {
             // 失败后果：本轮走回合级旧路径（AudioRecorder 自配会话、
             // RealtimePlaybackEngine 门内翻转），与关旗行为一致。
@@ -768,6 +700,39 @@ final class PushToTalkController: ObservableObject {
     /// deactivate 完成计。未持有时为空操作。
     func endConversationAudio(reason: ConversationAudioController.ReleaseReason = .userExit) {
         conversationAudioController?.endConversation(reason: reason)
+        closeConversationHandle(reason: "audio_\(reason.rawValue)")
+    }
+
+    /// ESS-551 A4：取当前会话的 ConversationHandle，没有则 mint。
+    /// 纯句柄操作（无 AVFoundation），测试可直接驱动——AC1 的「5 轮共享
+    /// 同一 conversation_id」接线证据由本方法 + RealtimeMediaSession 给出。
+    @discardableResult
+    func ensureConversationHandleForStreaming() -> ConversationHandle {
+        if let handle = conversationHandle, !handle.isClosed { return handle }
+        let handle = ConversationHandle()
+        conversationHandle = handle
+        WatchLog.info(
+            "realtime", "conversation_opened",
+            detail: "conversation_id=\(handle.conversationId)"
+        )
+        return handle
+    }
+
+    /// ESS-551 A4：会话终结（X/取消/超时/中断）——本地实时会话立即拒收
+    /// 迟到帧，并尽力通知 Gateway 关闭该 conversation（拒绝后续迟到帧）。
+    func closeConversationHandle(reason: String) {
+        guard let handle = conversationHandle else { return }
+        var closing = handle
+        closing.close()
+        conversationHandle = nil
+        realtimeAdapter?.session.closeConversation()
+        transport.sendConversationClose(
+            conversationId: closing.conversationId, turnId: nil
+        )
+        WatchLog.info(
+            "realtime", "conversation_closed",
+            detail: "conversation_id=\(closing.conversationId) turns=\(closing.turnCount) reason=\(reason)"
+        )
     }
 
     /// ESS-362: stand up the realtime coordinator turn once the audio session
@@ -826,11 +791,6 @@ final class PushToTalkController: ObservableObject {
         streamSequence = 0
     }
 
-    /// ESS-653（F1-3）：**已不再由任何用户手势触发**。入口收敛后主屏长按
-    /// 不提交，全 UI 没有手动单条提交入口；提交只走会话内的
-    /// `endSessionTurn()`（含 `onSalvageTurn` 兜底）。保留本入口是因为
-    /// 「松手即收尾」的语义与 deferred-release 处理仍是底层能力的一部分
-    /// （AudioRecorder 的启动竞态口径引用它），不随 UI 收敛一起删除。
     func pressEnded() {
         guard state == .recording else { return }
         guard recorder.isRecording else {
@@ -883,17 +843,9 @@ final class PushToTalkController: ObservableObject {
     private func finishRecording() {
         guard state == .recording else { return }
         state = .finishing
-        onLocalCaptureChanged?(false)
-        // ESS-600：本轮零提交（太短 / 收尾抛错）时把 request_id 交回会话层，
-        // 由它退避后重开采集——否则会话会停在一个已经停录的死麦克风上。
-        let turnRequestId = streamRequestId?.uuidString.lowercased()
-        var abortReason: String?
         defer {
             state = .idle
             releaseRequestedWhileStarting = false
-            if let abortReason, let turnRequestId {
-                onSessionTurnAborted?(turnRequestId, abortReason)
-            }
             flushPendingAutoPlay()
         }
         do {
@@ -915,7 +867,6 @@ final class PushToTalkController: ObservableObject {
                 // 拟人化卡片；触觉在 presenter 内响一次，此处不再重复播放，
                 // 避免同一次「按太短」震两下。
                 presentAvatarError(code: "ERR_AUDIO_TOO_SHORT", requestId: nil)
-                abortReason = "too_short"
                 return
             }
             submit(recording: recording)
@@ -939,7 +890,6 @@ final class PushToTalkController: ObservableObject {
             // ESS-538：中断丢弃发生在屏灭/后台时不当场呈现——卡片最小停留
             // 5s 的自动收起会在抬腕前吞掉它（触觉也白费）。记账，回 .active
             // 由 presentInterruptedNoticeIfNeeded 补呈现。
-            abortReason = "finish_failed:\(code)"
             if case RecorderError.recordingInterrupted = error,
                WKApplication.shared().applicationState != .active {
                 pendingInterruptedNotice = true
@@ -1038,9 +988,6 @@ final class PushToTalkController: ObservableObject {
         streamRequestId = nil
         streamId = nil
         streamAborted = false
-        // ESS-600：上行**真的**提交完了才推进会话回合相位 listening → thinking。
-        // 放在最后：前面任何一条分支都已把音频交给某条真实通道。
-        onSessionTurnCommitted?(requestIdStr)
     }
 
     private func emitUplinkChunk(payload: Data, end: Bool) {
@@ -1128,206 +1075,24 @@ final class PushToTalkController: ObservableObject {
             WatchLog.info("realtime", "streaming_hold_released",
                           detail: "reason=turn_finished adapter_turn_active=false")
         }
-        attachSessionEvents(to: adapter)
-        realtimeAdapter = adapter
-        return adapter
-    }
-
-    /// 把 adapter 的真实链路事件透传到会话层。
-    ///
-    /// - ESS-573：通道就绪只认首个被对端接受的 uplink ack；快速上行死亡如实上报。
-    /// - ESS-600（复审阻断 1）：realtime 是**默认**播放路径，回合状态机必须
-    ///   由它的真实 `.started/.ended` 驱动——只接完整文件那条回退路径，等于
-    ///   默认路径下核心闭环根本没形成。
-    ///
-    /// 单独成函数是为了让 WatchTests 能用**同一段生产接线**驱动一个装了
-    /// mock player 的 adapter：把接线复制进测试就只能证明副本是对的，
-    /// 证明不了生产路径接上了（这正是本单第一次复审被打回的原因）。
-    /// PTT 路径本身不消费这些回调，行为不变。
-    /// ESS-600 test seam：注入一个已装好替身的 adapter（生产路径从不调用）。
-    /// `ensureRealtimeAdapter()` 会构造真实 `RealtimePlaybackEngine`，其
-    /// `AVAudioEngine` 在无音频硬件的 hosted CI 上 `SetFormat` 直接 -10868
-    /// （ESS-498 家族）。没有这条缝，「beginSessionConversation 不得打死在飞
-    /// 首轮」这条契约就只能靠跳过测试来回避，等于在 CI 上没有防线。
-    func useRealtimeAdapterForTests(_ adapter: WatchRealtimeMediaAdapter) {
-        realtimeAdapter = adapter
-        attachSessionEvents(to: adapter)
-    }
-
-    func attachSessionEvents(to adapter: WatchRealtimeMediaAdapter) {
+        // ESS-573: 真实通道事件透传给 SessionController——就绪只认首个
+        // 被对端接受的 uplink ack；快速上行死亡如实上报。PTT 路径本身
+        // 不消费这两个回调，行为不变。
         adapter.onChannelReady = { [weak self] _ in
             self?.onRealtimeChannelReady?()
         }
         adapter.onUplinkFallback = { [weak self] _ in
             self?.onRealtimeChannelFailed?(.channelEvent)
         }
-        adapter.onAnswerPlaybackStarted = { [weak self] handle in
-            self?.onSessionAnswerStarted?(handle.requestId)
+        // ESS-551：adapter 创建时若已有存活会话（音频控制器先 acquire
+        // 成功的路径），把同一会话身份接入实时会话——保证 uplink 帧携带
+        // 的 conversation_id 与音频控制器、后续各轮一致。
+        if let handle = conversationHandle, !handle.isClosed,
+           adapter.session.activeConversationId == nil {
+            adapter.session.beginConversation(handle)
         }
-        adapter.onAnswerPlaybackFinished = { [weak self] handle, bytes in
-            self?.onSessionAnswerFinished?(handle.requestId, true, "realtime_rendered:\(bytes)")
-        }
-        adapter.onAnswerPlaybackFailed = { [weak self] handle, code in
-            self?.onSessionAnswerFinished?(handle.requestId, false, "realtime_\(code)")
-        }
-        // ESS-650 F2-3：语音打断命中，透传 detect_ms 给会话层。会话层负责
-        // 就地量 stop_ms 并落 source=voice 的 session_speaking_interrupted。
-        adapter.onVoiceBargeInDetected = { [weak self] detectMs in
-            self?.onSessionVoiceBargeIn?(detectMs)
-        }
-    }
-
-    // MARK: - ESS-650 语音打断监听（F2-2 / F2-4）
-
-    /// 进入 speaking 时开启「只听不传」的打断监听。
-    /// gate 判定在会话层（`SessionController`）——本函数只在被调用时执行，
-    /// 不自己读 gate，避免两处各判一次导致口径分叉。
-    func beginVoiceBargeInListening() {
-        realtimeAdapter?.beginBargeInListening()
-    }
-
-    /// 结束打断监听。`reason` 进日志：`answer_finished` / `interrupted` /
-    /// `gate_off`（gate 动态关闭的即时停采）/ `session_exit`。
-    func endVoiceBargeInListening(reason: String) {
-        realtimeAdapter?.endBargeInListening(reason: reason)
-    }
-
-    /// 打断监听是否真的在采集——小梁复核「gate 动态切换能即时停止采集」
-    /// 的可断言口径。
-    var isVoiceBargeInListening: Bool { realtimeAdapter?.isBargeInListening ?? false }
-
-    /// F2-5 对账：守卫窗内的高能量帧累计数（疑似自身回声）。
-    var voiceBargeInSelfEchoFrames: Int { realtimeAdapter?.bargeInSelfEchoFrameCount ?? 0 }
-
-    // MARK: - ESS-600 会话边界与手动打断
-
-    /// ESS-600：会话开始——开一个 conversation 边界。`conversation_id` 在
-    /// 整段会话内不变，`turn_id` 每轮递增（唯一铸造点在 `ConversationHandle`，
-    /// 本控制器不另铸 id）。
-    func beginSessionConversation() {
-        guard voiceStreamingEnabled() else { return }
-        let adapter = ensureRealtimeAdapter()
-        // ESS-600 复审阻断 A：`RealtimeMediaSession.beginConversation` 开头就是
-        // `finishTurn(reason: .interrupted)`（`Shared/RealtimeMediaSession.swift`）。
-        // 短按进会话时，录音与实时回合在 touch-down 已经起来了——此刻再开一次
-        // conversation 会把**正在飞的首轮打死**，而 `pressBegan()` 因为 state
-        // 已是 .recording 又会把同一个 request_id 交回会话层认领：会话盯着一个
-        // realtime 回合已被 interrupt 的 id，首轮拿不到 play_started/finished。
-        //
-        // 在飞回合本身已经隐式开了 conversation（`beginTurn` 在 conversation
-        // 为 nil 时自建），它就是这段会话的 conversation——直接复用，不重开。
-        // 判据取 `session.activeTurn` 而非 adapter 的镜像：被
-        // `beginConversation` 的 `finishTurn` 打死的正是会话侧那一个。
-        //
-        // ESS-642（本条是上面那个复用的**边界修正**）：「有没有 activeTurn」
-        // 不足以判定可复用——它区分不了「本次 touch-down 新起的首轮」与
-        // 「上一会话遗留的回合」。真机 L1 证据：进入电话模式后
-        // `session_next_listening` 认领了上一会话的 request_id，紧接着
-        // `play_started` 用同一个旧 id 播出上一轮答案，同时刷
-        // `downlink_drop reason=staleSession`。
-        // 闸门收紧为两条同时成立：① 本次 conversation 边界之后确实由
-        // touch-down 起过一轮（`didStartTurnSinceConversationBoundary`，
-        // 上一会话退出时被 `endSessionConversation` 清掉）；② 在飞回合的
-        // request_id 与当前录音的 `streamRequestId` 一致。
-        let entryTurnRequestId = didStartTurnSinceConversationBoundary
-            ? streamRequestId?.uuidString.lowercased() : nil
-        if let inFlight = adapter.session.activeTurn,
-           let entryTurnRequestId, inFlight.requestId == entryTurnRequestId {
-            WatchLog.info(
-                "session", "conversation_reused", requestId: inFlight.requestId,
-                detail: "conversation_id=\(adapter.session.activeConversationId ?? "nil") "
-                    + "reason=turn_started_after_boundary turn_id=\(inFlight.turnId)"
-            )
-            return
-        }
-        // ESS-648：短按的真实时序里还有第三种形态——**本次 touch-down 已经起轮、
-        // 但 activeTurn 尚未异步建立**。`pressBegan()` 同步段只置 `state = .recording`
-        // 与 `streamRequestId`；`adapter.beginTurn` 要等 `recorder.start()` 返回后
-        // 才在 Task 里执行（ESS-362 的顺序约束，不能提前）。短按松手往往比这更快，
-        // 于是入口看到的是「gate 为真 + request_id 已铸 + activeTurn 仍为 nil」。
-        // 上面的复用分支要求 activeTurn 已存在，下面的遗留清理分支只看
-        // `state != .idle`——两条都不认这个窗口，结果把**本次合法首轮**当遗留物
-        // `pressCancelled()` 掉，正是 ESS-600 要保护的那一轮。
-        // 判据用 gate + `streamRequestId`（两者都在 `pressBegan` 同步段建立，
-        // `endSessionConversation` 退出时清 gate），因此上一会话遗留的录音状态
-        // gate 为假，仍走下面的清理分支，ESS-642 的边界隔离不受影响。
-        // 这里只开边界、不动录音与 request_id：随后异步落地的 `beginTurn` 会挂到
-        // 刚开的这段 conversation 上，gate 保持为真让它仍是「本次边界之后起的轮」。
-        if let entryTurnRequestId, adapter.session.activeTurn == nil, state != .idle {
-            let handle = adapter.beginConversation()
-            didStartTurnSinceConversationBoundary = true
-            WatchLog.info(
-                "session", "conversation_opened_awaiting_turn", requestId: entryTurnRequestId,
-                detail: "conversation_id=\(handle.conversationId) "
-                    + "ptt_state=\(String(describing: state)) reason=turn_start_pending"
-            )
-            return
-        }
-        // 走到这里 = 没有可复用的本轮回合。任何遗留物（上一会话的 activeTurn、
-        // 仍在跑的录音、未提交的实时回合）都必须在开新边界**之前**清掉，
-        // 否则新会话会继续认领旧 request_id。
-        if adapter.session.activeTurn != nil || state != .idle {
-            WatchLog.info(
-                "session", "stale_turn_discarded_at_entry",
-                requestId: adapter.session.activeTurn?.requestId,
-                detail: "ptt_state=\(String(describing: state)) "
-                    + "stream_request_id=\(streamRequestId?.uuidString.lowercased() ?? "nil") "
-                    + "started_after_boundary=\(didStartTurnSinceConversationBoundary)"
-            )
-            // 停录 + 清 stream 状态 + abort 未提交实时回合 + 回 .idle，
-            // 让紧随其后的 `pressBegan()` 真正新起一轮、铸新 request_id。
-            pressCancelled()
-            // pressCancelled 只处理 .recording；遗留回合可能停在别的相位，
-            // 这里补一次 adapter 级取消（停播放器 + finishTurn + 停采集）。
-            if adapter.session.activeTurn != nil {
-                adapter.cancel(reason: .cancelled)
-            }
-        }
-        let handle = adapter.beginConversation()
-        didStartTurnSinceConversationBoundary = false
-        WatchLog.info(
-            "session", "conversation_opened",
-            detail: "conversation_id=\(handle.conversationId)"
-        )
-    }
-
-    /// ESS-600：会话结束——关闭 conversation 边界，旧回合的迟到事件因无
-    /// conversation 存续而被拒，不会漏进下一次会话。
-    func endSessionConversation() {
-        // ESS-642：边界闸门先落。即便下面因为没有 adapter 而早退，也不能把
-        // 「上一会话起过一轮」这个事实留给下一次进入会话去复用。
-        didStartTurnSinceConversationBoundary = false
-        guard let adapter = realtimeAdapter else { return }
-        let conversationId = adapter.session.activeConversationId
-        // ESS-642：退出时把播放器一并停掉。`closeConversation` 只 finishTurn +
-        // 关边界，不动播放器——旧答案若正在渲染，它会继续播到下一次进入会话，
-        // 真机上表现为「刚进电话模式就听见上一轮的回答」。
-        if adapter.session.activeTurn != nil {
-            adapter.cancel(reason: .cancelled)
-        }
-        adapter.closeConversation()
-        WatchLog.info(
-            "session", "conversation_closed",
-            detail: "conversation_id=\(conversationId ?? "nil")"
-        )
-    }
-
-    /// ESS-600（F4）：speaking 中用户点球 → 立刻停播。
-    /// - realtime：走 `bargeIn()` 请求 iPhone 换代——清空已缓冲下行并让
-    ///   旧 generation 的迟到 delta 被拒，这正是「旧音频零补播」需要的语义；
-    ///   单纯 stop 会让换代前在途的 delta 继续灌进下一轮。
-    /// - 完整文件：走既有 `stopPlaybackByUser`（不派发终局、不改回合状态）。
-    func interruptAnswerPlayback() {
-        if let adapter = realtimeAdapter, let handle = adapter.currentTurn {
-            WatchLog.info(
-                "realtime", "playback_user_interrupted", requestId: handle.requestId,
-                detail: "source=orb_tap path=realtime"
-            )
-            adapter.bargeIn()
-        }
-        if let context = player.currentContext {
-            stopPlaybackByUser(requestId: context)
-        }
+        realtimeAdapter = adapter
+        return adapter
     }
 
     /// Called by the adapter when the fast channel dies. If the recording
@@ -1518,7 +1283,6 @@ final class PushToTalkController: ObservableObject {
         recorder.cancel()
         releaseRequestedWhileStarting = false
         state = .idle
-        onLocalCaptureChanged?(false)
         // ESS-573：取消未提交的实时回合——与 finishRecording 错误路径
         // 同一清理口径，不让 PCM tap 挂到下次按压才停。
         abortUnsubmittedRealtimeTurn()
@@ -1535,10 +1299,6 @@ final class PushToTalkController: ObservableObject {
     /// 「≤300ms 麦克风释放」按 AVAudioSession deactivate 完成计，证据见
     /// `conversation_audio_released` 的 duration_ms。
     func endSessionChannel() {
-        // ESS-600：先关 conversation 边界，再拆采集/回合。顺序有意——
-        // 边界关掉后，拆链过程中冒出来的迟到事件不会再被认成「某一轮」。
-        endSessionConversation()
-        onLocalCaptureChanged?(false)
         if state == .recording {
             pressCancelled()
             return
@@ -1665,14 +1425,6 @@ final class PushToTalkController: ObservableObject {
             subtitleSession = SubtitleSession(requestId: requestId, text: text, hasAudio: true)
         } else if !text.isEmpty {
             subtitleSession = SubtitleSession(requestId: requestId, text: text, hasAudio: false)
-        }
-        // ESS-600（复审阻断 2）：**起播成功才算开口**。`play()` 返回 false
-        // 意味着这段语音一个字都没出，此时上报 answer_started 会让会话在
-        // 一段根本没响的「回答」后自动开下一轮，用户以为分身答过了。
-        if started {
-            onSessionAnswerStarted?(requestId)
-        } else {
-            onSessionAnswerFinished?(requestId, false, "play_rejected")
         }
     }
 
