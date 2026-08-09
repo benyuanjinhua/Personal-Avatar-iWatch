@@ -119,6 +119,13 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
 
     private(set) var currentTurn: RealtimeMediaSession.TurnHandle?
     private(set) var isRunning = false
+
+    /// ESS-650（F2-3）：停播确认。读 `AVAudioPlayerNode.isPlaying`——节点的
+    /// **真实渲染状态**，不是「我们调用过 stop()」的意图。`bargeIn` / `stop`
+    /// 里的 `playerNode.stop()` 是同步的，所以调用返回后这里即为 false；
+    /// 万一某天不是（换实现、换节点），`session_interrupt_stop_unconfirmed`
+    /// 会当场把它暴露出来，而不是让 stop_ms 悄悄变成一个好看的假数字。
+    var isRenderingDownlink: Bool { playerNode.isPlaying }
     /// ESS-509: audio session gate that prevents the engine from stomping
     /// on another player's session (SpeechPlayer, StreamingAudioPlayer)
     /// and ensures deactivation happens exactly once per turn.

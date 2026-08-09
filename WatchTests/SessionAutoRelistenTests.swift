@@ -756,9 +756,12 @@ final class SessionAutoRelistenTests: XCTestCase {
             adapter.beginConversation()
             session.onBeginChannel = { [weak self] in self?.beginTurn() }
             session.onStartTurn = { [weak self] in self?.beginTurn() }
-            session.onInterruptSpeaking = { [weak self] in
-                self?.interruptCount += 1
-                self?.adapter.bargeIn()
+            session.onInterruptSpeaking = { [weak self] _ in
+                guard let self else { return false }
+                self.interruptCount += 1
+                self.adapter.bargeIn()
+                // ESS-650：停播确认与生产同源——读播放器的真实渲染状态。
+                return !self.adapter.isRenderingDownlink
             }
             session.onTeardownChannel = { [weak self] in self?.adapter.closeConversation() }
         }
@@ -931,12 +934,22 @@ final class SessionAutoRelistenTests: XCTestCase {
         private(set) var preparedTurns: [RealtimeMediaSession.TurnHandle] = []
         private(set) var stoppedCount = 0
         private(set) var bargedInBytes: [Int] = []
+        /// ESS-650：与真实引擎同语义——入队即出声，`bargeIn`/`stop` 即静音。
+        private(set) var isRenderingDownlink = false
 
         func prepare(for turn: RealtimeMediaSession.TurnHandle) throws { preparedTurns.append(turn) }
-        func enqueue(playables: [RealtimeDownlinkPlayback.PlayableChunk]) {}
-        func bargeIn(clearedBytes: Int) { bargedInBytes.append(clearedBytes) }
+        func enqueue(playables: [RealtimeDownlinkPlayback.PlayableChunk]) {
+            if !playables.isEmpty { isRenderingDownlink = true }
+        }
+        func bargeIn(clearedBytes: Int) {
+            bargedInBytes.append(clearedBytes)
+            isRenderingDownlink = false
+        }
         func finish(responseId: String?) {}
-        func stop(barge: Bool) { stoppedCount += 1 }
+        func stop(barge: Bool) {
+            stoppedCount += 1
+            isRenderingDownlink = false
+        }
 
         /// 播放引擎发出真实事件。语义与 `RealtimePlaybackEngine` 一致：
         /// `.started` = 首帧已渲染；`.ended` = 最后一个排队 buffer 已渲染。

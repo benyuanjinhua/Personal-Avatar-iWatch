@@ -23,6 +23,9 @@ final class WatchAppServices {
     /// 同级持有在服务图——视图挂载与否不影响会话态与计时器存活。
     let sessionController = SessionController()
     private var bootstrapped = false
+    /// ESS-650：gate 订阅令牌。服务图与 debugSettings 同生命周期（都挂在
+    /// `shared` 上）所以不需要反注册；持有它是为了让「订阅确实建立了」可断言。
+    private(set) var voiceBargeInGateToken: UUID?
 
     /// 幂等接线 + WCSession 激活；前台启动与后台唤醒共用。
     func bootstrap(reason: String) {
@@ -72,10 +75,16 @@ final class WatchAppServices {
         sessionController.voiceBargeInEnabled = { [weak debugSettings] in
             debugSettings?.voiceBargeInEnabled ?? false
         }
-        // gate 翻到 OFF 的瞬间必须**即时停采**——不能等本轮回答播完，
-        // 否则用户关了开关麦克风还开着。
-        debugSettings.onVoiceBargeInDisabled { [weak sessionController] in
-            sessionController?.noteVoiceBargeInGateChanged(enabled: false)
+        // ESS-650 F2-1：同一个 gate 也要喂给音频侧——`.voiceChat`（AEC）
+        // 是语音打断的硬件前提，缺这条接线 F2-1 就是死代码。
+        pushToTalk.voiceBargeInEnabled = { [weak debugSettings] in
+            debugSettings?.voiceBargeInEnabled ?? false
+        }
+        // gate 每次变化都要闭环：翻到 OFF 必须**即时停采**（不能等本轮回答
+        // 播完，否则用户关了开关麦克风还开着）；翻到 ON 时若本轮正在回答，
+        // 立刻开始监听，不用等下一轮。
+        voiceBargeInGateToken = debugSettings.onVoiceBargeInChanged { [weak sessionController] enabled in
+            sessionController?.noteVoiceBargeInGateChanged(enabled: enabled)
         }
         // ESS-554：会话级持有期间，所有 SpeechPlayer（结果语音 / 错误语音 /
         // 欢迎语 / 自检）既不重配会话也不 deactivate——会话归

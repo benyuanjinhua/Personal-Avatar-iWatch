@@ -41,9 +41,34 @@ WatchLog.record(
 | `session_background_cap` | `duration_ms` | 后台上限 | ESS-652 (F3-7) |
 | `session_call_summary` | `turns` `duration_ms` `end_reason` `conversation_id` | 进入 P7 | ESS-652 (F3-4) |
 | `session_enter_rejected` | `reason` `hold_ms` | 待机屏长按松手被拒 | ESS-653 (F1-1) / ESS-651 (F5) |
-| `session_speaking_interrupted` | `source` `detect_ms` `stop_ms` | 打断命中 | **已接**（点球）/ ESS-650（语音） |
-| `session_barge_in_self_echo` | `turn_index` `energy_db` | 判定为自身回声 | ESS-650 (F2-5) |
-| `voice_barge_in_gate` | `state` `reason` | gate 快照/变化 | ESS-650 (F2-4) |
+| `session_speaking_interrupted` | `source` `detect_ms` `stop_ms` | 打断命中 | **已接**（点球 + 语音，ESS-650） |
+| `session_barge_in_self_echo` | `turn_index` `energy_db` | 判定为自身回声 | **已接** ESS-650 (F2-5) |
+| `voice_barge_in_gate` | `state` `reason` | gate 快照/变化 | **已接** ESS-650 (F2-4) |
+
+### ESS-650 三条口径（踩过才写下来的）
+
+**1. `detect_ms` 是「起说 → 判定命中」，不是「起播 → 起说」。**
+前者恒等于 300ms 连续判据、量的是检测本身；后者是「用户听到第几秒才插话」。
+用后者冒充 detect_ms，一次听了 5 秒才插的话会报 `detect_ms=5000`，
+延迟指标整体失真。「第几秒插的话」另有 `barge_in_detected.since_playback_ms`。
+
+**2. `stop_ms` 量到播放器确认停播为止。**
+只量「同步闭包返回」量的是调用开销。停播确认读
+`WatchRealtimeMediaAdapter.isRenderingDownlink`（最终落到
+`AVAudioPlayerNode.isPlaying`）；未确认时另发
+`session_interrupt_stop_unconfirmed`（`ERR_SESSION_STOP_UNCONFIRMED`），
+不让一个测量对象错了的数字冒充达标。
+
+**3. `session_barge_in_self_echo` 只在计数 >0 时发。**
+`Shared/PhoneModeCallMetrics.swift` 把这条事件的**每次出现**计为一次误触发
+（`selfEchoFalseTriggers` → `isEligibleForDefaultOnGate`）。「无人说话 5 轮零误触」
+的通过态因此是**一条都不出现**；每轮发一条 `=0` 会把干净的 5 轮记成 5 次误触发，
+直接把 F2-5 门禁反转。
+
+「监听确实跑过而且干净」的正面证据由契约外的诊断事件 `voice_barge_in_round`
+承担（`turn_index` `reason` `frames` `self_echo_frames`
+`cumulative_self_echo_frames` `peak_guard_db`），**每轮必发**。它不进指标契约：
+它回答的是「这一轮到底有没有在听」，不是「误触发了几次」。
 
 契约里还有若干**可选**字段（`dwell_ms` / `elapsed_ms` / `silent_ms` / `turn_index`），
 带上更好，不带不算违约，带了会被校验。

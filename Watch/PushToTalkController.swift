@@ -112,6 +112,10 @@ final class PushToTalkController: ObservableObject {
     private static let logger = Logger(subsystem: "com.benyuan.wristagent.watch", category: "PlaybackTrigger")
     private let recorder = AudioRecorder()
     var voiceStreamingEnabled: () -> Bool = { VoiceStreamingGate.defaultEnabled }
+    /// ESS-650（F2-1/F2-4）：语音打断 gate 的实时读点。生产接
+    /// `WatchDebugSettings.voiceBargeInEnabled`；默认 OFF。转发给
+    /// `ConversationAudioController` 决定 `.voiceChat` vs `.spokenAudio`。
+    var voiceBargeInEnabled: () -> Bool = { false }
 /// ESS-383: the single request_id for this turn, shared between the streaming
     /// uplink and the complete-file fallback. Generated once in `pressBegan()`,
     /// consumed by `submit()`. Never cleared mid-recording — even after a streaming
@@ -759,6 +763,10 @@ final class PushToTalkController: ObservableObject {
     func ensureConversationAudioController() -> ConversationAudioController {
         if let controller = conversationAudioController { return controller }
         let controller = makeConversationAudioController()
+        // ESS-650：把 gate 的**实时读点**（不是当下的值）交给控制器。
+        // 在此之前 `ConversationAudioController.voiceBargeInEnabled` 没有任何
+        // 写入方，`.voiceChat` 分支永远走不到，F2-1 等于没接。
+        controller.voiceBargeInEnabled = { [weak self] in self?.voiceBargeInEnabled() ?? false }
         conversationAudioController = controller
         return controller
     }
@@ -1188,7 +1196,10 @@ final class PushToTalkController: ObservableObject {
 
     /// 结束打断监听。`reason` 进日志：`answer_finished` / `interrupted` /
     /// `gate_off`（gate 动态关闭的即时停采）/ `session_exit`。
-    func endVoiceBargeInListening(reason: String) {
+    /// - Returns: 本轮对账单（帧数 / 自身回声帧数 / 峰值能量）；本来就没在
+    ///   监听时为 nil。会话层据此落 `session_barge_in_self_echo`。
+    @discardableResult
+    func endVoiceBargeInListening(reason: String) -> WatchRealtimeMediaAdapter.BargeInRoundSummary? {
         realtimeAdapter?.endBargeInListening(reason: reason)
     }
 
@@ -1317,17 +1328,34 @@ final class PushToTalkController: ObservableObject {
     ///   旧 generation 的迟到 delta 被拒，这正是「旧音频零补播」需要的语义；
     ///   单纯 stop 会让换代前在途的 delta 继续灌进下一轮。
     /// - 完整文件：走既有 `stopPlaybackByUser`（不派发终局、不改回合状态）。
-    func interruptAnswerPlayback() {
+    ///
+    /// ESS-650（F2-3）：返回**停播确认**——两个播放器都报「已经不出声了」
+    /// 才为 true。调用方（`SessionController.interruptSpeaking`）据此把
+    /// `stop_ms` 量到确认停播为止；未确认时另发
+    /// `session_interrupt_stop_unconfirmed`，不把疑点埋进一个好看的数字里。
+    /// - Parameter source: 只进日志（`orb_tap` / `voice`）。两种触发源共用
+    ///   这同一条停播路径，不另起第二条。
+    @discardableResult
+    func interruptAnswerPlayback(
+        source: PhoneModeTelemetry.InterruptSource = .orbTap
+    ) -> Bool {
         if let adapter = realtimeAdapter, let handle = adapter.currentTurn {
             WatchLog.info(
                 "realtime", "playback_user_interrupted", requestId: handle.requestId,
-                detail: "source=orb_tap path=realtime"
+                detail: "source=\(source.rawValue) path=realtime"
             )
             adapter.bargeIn()
         }
         if let context = player.currentContext {
             stopPlaybackByUser(requestId: context)
         }
+        let realtimeQuiet = realtimeAdapter?.isRenderingDownlink != true
+        let fileQuiet = player.currentContext == nil
+        WatchLog.info(
+            "realtime", "playback_stop_confirmed",
+            detail: "source=\(source.rawValue) realtime_quiet=\(realtimeQuiet) file_quiet=\(fileQuiet)"
+        )
+        return realtimeQuiet && fileQuiet
     }
 
     /// Called by the adapter when the fast channel dies. If the recording

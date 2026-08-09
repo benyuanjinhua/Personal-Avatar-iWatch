@@ -132,6 +132,7 @@
 		960483A1ACBF2697522E5597 /* PhoneRealtimeAgentTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47E5A851D917B87AF55B3340 /* PhoneRealtimeAgentTransport.swift */; };
 		96CAA0EBFA4914CDC450105B /* VoiceConfirmTimerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49650776B8272C45D3CA35CB /* VoiceConfirmTimerTests.swift */; };
 		97AFD9059AF401EBE72670D9 /* PersistHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 827B4FDF631BEBEFA13118A9 /* PersistHelper.swift */; };
+		98D13B05E184C18CE1EDD2A2 /* VoiceBargeInEvidenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 15949530B1F5E7788C4B586D /* VoiceBargeInEvidenceTests.swift */; };
 		9907DDC5D22A3F0DF92F6985 /* VoiceStreamProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = E86C631B9730FD0A3CB91448 /* VoiceStreamProtocol.swift */; };
 		9A6B27223193C90C2117EB80 /* LocalVADEndpointer.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEE83E69A84D0788F31329E4 /* LocalVADEndpointer.swift */; };
 		9A74E38D11FFA15ECA305770 /* AgentTokenMintState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31098EE20AABA70A378A11DB /* AgentTokenMintState.swift */; };
@@ -268,6 +269,7 @@
 		10796288EEC2915673662B9E /* SelfCheckLatestOutcomeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfCheckLatestOutcomeTests.swift; sourceTree = "<group>"; };
 		13475F099EA8ADC39FB4651D /* ResultNotificationPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResultNotificationPolicy.swift; sourceTree = "<group>"; };
 		13F51C6DCBABB59C404B307D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		15949530B1F5E7788C4B586D /* VoiceBargeInEvidenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceBargeInEvidenceTests.swift; sourceTree = "<group>"; };
 		16A065FFB735532D201B2183 /* VoiceRequestEnvelope.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRequestEnvelope.swift; sourceTree = "<group>"; };
 		1AB8CD6D695437D845CE87AF /* VoiceRequestInbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRequestInbox.swift; sourceTree = "<group>"; };
 		1B1609E87036B6E0CEFB8C95 /* RealtimeBridgeWireCodec.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeBridgeWireCodec.swift; sourceTree = "<group>"; };
@@ -599,6 +601,7 @@
 				0D83133781FDC42821BB13DF /* SpeechPlayerInterruptionTests.swift */,
 				AAD9BD4DBA7700C65F134EF3 /* SpeechPlayerReleaseTests.swift */,
 				C8BFD3B8E68CD0ED9C78C500 /* SpeechPlayerUserInterruptTests.swift */,
+				15949530B1F5E7788C4B586D /* VoiceBargeInEvidenceTests.swift */,
 				230A70234A562482DDEA5AAC /* VoiceBargeInWiringTests.swift */,
 				49650776B8272C45D3CA35CB /* VoiceConfirmTimerTests.swift */,
 				F9C49719F53E734FE041D10B /* VoiceOrbModeTests.swift */,
@@ -962,6 +965,7 @@
 				7C465E62628112B008899B51 /* SpeechPlayerInterruptionTests.swift in Sources */,
 				68EF687B6F0F17A356355833 /* SpeechPlayerReleaseTests.swift in Sources */,
 				7CD3A14FB1B8F7A79D40B608 /* SpeechPlayerUserInterruptTests.swift in Sources */,
+				98D13B05E184C18CE1EDD2A2 /* VoiceBargeInEvidenceTests.swift in Sources */,
 				9F9F35D9BF7509E6A0AA6DA3 /* VoiceBargeInWiringTests.swift in Sources */,
 				96CAA0EBFA4914CDC450105B /* VoiceConfirmTimerTests.swift in Sources */,
 				BE736ADFC210C176CA197273 /* VoiceOrbModeTests.swift in Sources */,
