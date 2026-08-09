@@ -410,15 +410,28 @@ final class SessionController: ObservableObject {
     }
 
     /// F4 手动打断：speaking 中点球 → 立刻停播 → 直接开下一轮。
-    /// 语音 barge-in（全双工）不在本阶段承诺——AEC 未在真机证明可行前
-    /// 开语音打断等于伪装全双工，会把用户自己的回音当成新一轮输入。
-    func interruptSpeaking() {
+    ///
+    /// ESS-655：打断事件扩字段 `source` / `detect_ms` / `stop_ms`。
+    /// - `source`：点球恒 `.orbTap`；语音打断（ESS-650 / F2）复用这同一个
+    ///   入口传 `.voice`，**不另起第二条打断路径**——两条路径落到不同事件
+    ///   或不同状态机，误触发率就永远算不出来。
+    /// - `detectMs`：点球恒 0（点下去即判定）；语音路径填「起说 → 判定命中」。
+    /// - `stopMs`：本地停播动作的真实耗时，在这里就地量——把「慢在检测」和
+    ///   「慢在停播」分开，才对得上设计稿 ≤200ms 停播的口径。
+    func interruptSpeaking(
+        source: PhoneModeTelemetry.InterruptSource = .orbTap,
+        detectMs: Int = 0
+    ) {
         guard state == .listening, turnPhase == .speaking else { return }
-        WatchLog.info(
-            "session", "session_speaking_interrupted", requestId: activeTurnRequestId,
-            detail: "turn_index=\(turnIndex) source=orb_tap"
-        )
+        let stopStartedAt = DispatchTime.now().uptimeNanoseconds
         onInterruptSpeaking?()
+        let stopMs = Int((DispatchTime.now().uptimeNanoseconds &- stopStartedAt) / 1_000_000)
+        WatchLog.record(
+            PhoneModeTelemetry.speakingInterrupted(
+                source: source, detectMs: detectMs, stopMs: stopMs, turnIndex: turnIndex
+            ),
+            requestId: activeTurnRequestId
+        )
         startNextTurn(reason: "user_interrupt")
     }
 

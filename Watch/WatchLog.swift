@@ -90,3 +90,15 @@ enum WatchLog {
         currentObserver?(module, event, requestId, detail, error?.code)
     }
 }
+
+extension WatchLog {
+    /// ESS-655（F6）：电话模式事件的唯一写入口。
+    ///
+    /// 走 `PhoneModeTelemetry` 的类型化工厂造 `Record`，再由这里落盘——
+    /// 调用点因此拼不出错字段名、漏必需字段或非法枚举值。
+    /// 新增电话模式事件时**不要**绕过它直接 `WatchLog.info("session", "…")`，
+    /// 那条路径没有任何字段校验，指标会在事后静默算错。
+    static func record(_ record: PhoneModeTelemetry.Record, requestId: String? = nil) {
+        info(PhoneModeTelemetry.module, record.event, requestId: requestId, detail: record.detail)
+    }
+}
