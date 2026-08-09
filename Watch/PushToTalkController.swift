@@ -1128,6 +1128,16 @@ final class PushToTalkController: ObservableObject {
     /// mock player 的 adapter：把接线复制进测试就只能证明副本是对的，
     /// 证明不了生产路径接上了（这正是本单第一次复审被打回的原因）。
     /// PTT 路径本身不消费这些回调，行为不变。
+    /// ESS-600 test seam：注入一个已装好替身的 adapter（生产路径从不调用）。
+    /// `ensureRealtimeAdapter()` 会构造真实 `RealtimePlaybackEngine`，其
+    /// `AVAudioEngine` 在无音频硬件的 hosted CI 上 `SetFormat` 直接 -10868
+    /// （ESS-498 家族）。没有这条缝，「beginSessionConversation 不得打死在飞
+    /// 首轮」这条契约就只能靠跳过测试来回避，等于在 CI 上没有防线。
+    func useRealtimeAdapterForTests(_ adapter: WatchRealtimeMediaAdapter) {
+        realtimeAdapter = adapter
+        attachSessionEvents(to: adapter)
+    }
+
     func attachSessionEvents(to adapter: WatchRealtimeMediaAdapter) {
         adapter.onChannelReady = { [weak self] _ in
             self?.onRealtimeChannelReady?()

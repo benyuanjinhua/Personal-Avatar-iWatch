@@ -138,9 +138,7 @@ final class SessionAutoRelistenTests: XCTestCase {
     /// 交回会话层认领：会话盯着一个已被 interrupt 的回合，首轮永远等不到
     /// play_started/finished。
     func testBeginSessionConversationDoesNotKillInFlightFirstTurn() {
-        let controller = PushToTalkController()
-        controller.voiceStreamingEnabled = { true }
-        let adapter = controller.ensureRealtimeAdapter()
+        let (controller, adapter) = makeControllerWithMockAdapter()
         let requestId = UUIDv7.generate().uuidString.lowercased()
         // touch-down 已起首轮（只动会话层，不碰录音硬件——CI 无音频设备）。
         let inFlight = adapter.session.beginTurn(requestId: requestId)
@@ -161,9 +159,7 @@ final class SessionAutoRelistenTests: XCTestCase {
     /// 反向：没有在飞回合时（长按松手后进会话等路径）仍必须真正开边界，
     /// 否则 conversation_id 无从铸造。
     func testBeginSessionConversationOpensBoundaryWhenNoTurnInFlight() {
-        let controller = PushToTalkController()
-        controller.voiceStreamingEnabled = { true }
-        let adapter = controller.ensureRealtimeAdapter()
+        let (controller, adapter) = makeControllerWithMockAdapter()
         XCTAssertNil(adapter.session.activeTurn)
 
         controller.beginSessionConversation()
@@ -495,6 +491,23 @@ final class SessionAutoRelistenTests: XCTestCase {
 
     private func freshDefaults() -> UserDefaults {
         UserDefaults(suiteName: "SessionAutoRelistenTests.\(UUID().uuidString)")!
+    }
+
+    /// 装了替身 adapter 的真实 `PushToTalkController`。不能用
+    /// `ensureRealtimeAdapter()`：它会构造真实 `RealtimePlaybackEngine`，
+    /// 其 `AVAudioEngine.SetFormat` 在无音频硬件的 hosted CI 上直接 -10868
+    /// （ESS-498 家族，本单二轮 CI 实证）。经 `useRealtimeAdapterForTests`
+    /// 注入后，`beginSessionConversation()` 走的仍是**生产那一段代码**。
+    private func makeControllerWithMockAdapter() -> (PushToTalkController, WatchRealtimeMediaAdapter) {
+        let controller = PushToTalkController()
+        controller.voiceStreamingEnabled = { true }
+        let adapter = WatchRealtimeMediaAdapter(
+            recorder: MockRecorder(), player: MockPlayer(), transport: MockTransport(),
+            vadConfiguration: LocalVADConfiguration(),
+            automaticallyCommitOnSpeechFinal: true
+        )
+        controller.useRealtimeAdapterForTests(adapter)
+        return (controller, adapter)
     }
 
     private func makeHarness() -> Harness {
