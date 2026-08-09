@@ -363,10 +363,16 @@ final class SessionAutoRelistenTests: XCTestCase {
         h.pushToTalk.onSessionAnswerInterim?(h.currentRequestId)
         XCTAssertEqual(h.session.turnPhase, .thinking)
 
-        h.fireScheduled(withDelay: SessionController.thinkingTimeoutSeconds)
+        // ESS-652：思考超时由单级 120s 改为 25s 慢提示 + 45s 硬超时（进 P6）。
+        // interim 退回等待态后这两级都必须**重新武装**，否则最终回答永不到达时
+        // 会话会永久停在 thinking。
+        h.fireScheduled(withDelay: SessionController.thinkingSlowHintSeconds)
+        XCTAssertTrue(h.session.thinkingSlowHint, "interim 后慢提示守卫必须仍在")
 
-        XCTAssertEqual(h.log.count(of: "session_thinking_timeout"), 1, "interim 后超时守卫必须仍在")
-        XCTAssertEqual(h.session.turnPhase, .listening)
+        h.fireScheduled(withDelay: SessionController.thinkingHardTimeoutSeconds)
+        XCTAssertEqual(h.log.count(of: "session_thinking_hard_timeout"), 1,
+                       "interim 后硬超时守卫必须仍在")
+        XCTAssertEqual(h.session.state, .failed, "硬超时进 P6，可重试")
     }
 
     // MARK: - 阻断 3：连续五轮的运行时关联证据
@@ -591,12 +597,17 @@ final class SessionAutoRelistenTests: XCTestCase {
         h.commitCurrentTurn()
         XCTAssertEqual(h.session.turnPhase, .thinking)
 
-        h.fireScheduled(withDelay: SessionController.thinkingTimeoutSeconds)
+        // ESS-652：25s 先给慢提示（不打断等待），45s 才硬超时进 P6。
+        h.fireScheduled(withDelay: SessionController.thinkingSlowHintSeconds)
+        XCTAssertTrue(h.session.thinkingSlowHint, "25s 必须先给可见的慢提示")
+        XCTAssertEqual(h.session.turnPhase, .thinking, "慢提示不改变相位，仍在等")
 
-        XCTAssertEqual(h.log.count(of: "session_thinking_timeout"), 1)
-        XCTAssertEqual(h.session.turnPhase, .listening)
-        XCTAssertEqual(h.startedTurns.count, 2)
-        XCTAssertNotNil(h.session.failureNotice, "超时必须对用户可见，不能静默")
+        h.fireScheduled(withDelay: SessionController.thinkingHardTimeoutSeconds)
+
+        XCTAssertEqual(h.log.count(of: "session_thinking_hard_timeout"), 1)
+        XCTAssertEqual(h.session.state, .failed, "硬超时进 P6 而不是静默回聆听")
+        XCTAssertNotNil(h.session.failedReason, "超时必须对用户可见，不能静默")
+        XCTAssertEqual(h.session.turnPhase, .idle, "进 P6 即收束回合状态")
     }
 
     // MARK: - ready 超时不丢已录语音
@@ -614,8 +625,9 @@ final class SessionAutoRelistenTests: XCTestCase {
 
         XCTAssertEqual(salvaged, 1, "已录语音必须被抢救提交，不能无反馈丢弃")
         XCTAssertEqual(h.log.count(of: "session_ready_timeout_salvage"), 1)
-        XCTAssertEqual(h.session.state, .idle)
-        XCTAssertNotNil(h.session.failureNotice)
+        // ESS-652：就绪超时改为进 P6（可重试），不再直接回 idle。
+        XCTAssertEqual(h.session.state, .failed)
+        XCTAssertNotNil(h.session.failedReason)
     }
 
     /// 本地采集态与网络 ready 独立呈现：建立中就能如实显示「表在听」。
@@ -638,7 +650,10 @@ final class SessionAutoRelistenTests: XCTestCase {
 
         h.session.exitSession()
 
-        XCTAssertEqual(h.session.state, .idle)
+        // ESS-652：退出进 P7 挂断态；回合状态必须在此收束（不收束会让退出后的
+        // 迟到事件被当成当前轮受理，ESS-642 事故面）。
+        XCTAssertEqual(h.session.state, .hungup)
+        XCTAssertFalse(h.session.isInSession)
         XCTAssertEqual(h.session.turnPhase, .idle)
         XCTAssertNil(h.session.activeTurnRequestId)
         XCTAssertEqual(h.session.turnIndex, 0)

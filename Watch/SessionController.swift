@@ -430,6 +430,8 @@ final class SessionController: ObservableObject {
         guard turnPhase == .speaking || turnPhase == .thinking else { return }
         let fromPhase = turnPhase
         turnPhase = .thinking
+        // ESS-650：interim 退回等待态，已不在 speaking，停采。
+        stopBargeInListening(reason: "answer_interim")
         WatchLog.info(
             "session", "session_answer_interim", requestId: requestId,
             detail: "turn_index=\(turnIndex) from=\(fromPhase.logName) phase=thinking"
@@ -473,6 +475,8 @@ final class SessionController: ObservableObject {
                 code: "ERR_SESSION_ANSWER_FAILED"
             )
         }
+        // ESS-650：离开 speaking 即停采（播完 / 失败都算）。
+        stopBargeInListening(reason: success ? "answer_finished" : "answer_failed")
         startNextTurn(reason: success ? "answer_finished" : "answer_failed:\(reason)")
     }
 
@@ -509,6 +513,9 @@ final class SessionController: ObservableObject {
         detectMs: Int = 0
     ) {
         guard state == .listening, turnPhase == .speaking else { return }
+        // ESS-650：打断即离开 speaking，先停采再停播——停采在前，停播过程中的
+        // 扬声器余音才不会再喂进检测器。
+        stopBargeInListening(reason: "interrupted")
         let stopStartedAt = DispatchTime.now().uptimeNanoseconds
         onInterruptSpeaking?()
         let stopMs = Int((DispatchTime.now().uptimeNanoseconds &- stopStartedAt) / 1_000_000)
@@ -590,6 +597,8 @@ final class SessionController: ObservableObject {
     func enterFailed(reason: String, retryable: Bool) {
         state = .failed
         failedReason = reason
+        // 同 enterHungup：失败也必须收束回合状态与采集。
+        resetTurnStateOnExit()
         failedRetryable = retryable
         thinkingSlowHint = false
         cancelAllESS652Timers()
@@ -628,6 +637,11 @@ final class SessionController: ObservableObject {
         failedRetryable = false
         thinkingSlowHint = false
         cancelAllESS652Timers()
+        // ESS-652 用 enterHungup 取代 teardownToIdle 作为退出路径，但没有把
+        // 回合状态重置搬过来：退出后 turnPhase/activeTurnRequestId/turnIndex
+        // 仍是上一轮的值，迟到事件会被 acceptsTurnEvent 放行——正是 ESS-642
+        // 修过的「旧回合污染新会话」事故面。这里补齐。
+        resetTurnStateOnExit()
         hungupSummary = "已结束 · \(rounds) 轮（\(reason)）"
         WatchLog.info("session", "session_call_summary",
                       detail: "rounds=\(rounds) reason=\(reason)")
@@ -726,6 +740,17 @@ final class SessionController: ObservableObject {
     }
 
     /// ESS-650：会话拆链/失败时一并停采，不把麦克风留在会话之外。
+    /// ESS-652：会话以任何方式结束（挂断 / 失败 / 拆链）时统一收束回合状态。
+    /// 不重置会让退出后的迟到事件被当成当前轮受理（ESS-642 事故面）。
+    private func resetTurnStateOnExit() {
+        cancelTurnTimers()
+        stopBargeInListening(reason: "session_exit")
+        turnPhase = .idle
+        activeTurnRequestId = nil
+        turnIndex = 0
+        isCapturingLocally = false
+    }
+
     private func stopBargeInListeningOnTeardown() {
         stopBargeInListening(reason: "session_exit")
     }
@@ -867,12 +892,11 @@ enum SessionTurnWiring {
         session.onBeginChannel = { [weak pushToTalk] in
             interruptSelfCheck()
             guard let pushToTalk else { return nil }
-            // ESS-601: force-reset any residual recording state from a
-            // previous session before starting a new one. If the prior
-            // session left state as .recording/.finishing, pressBegan()
-            // would silently return and the SessionController would wait
-            // forever for a markChannelReady that never arrives.
-            pushToTalk.pressCancelled()
+            // ESS-601 的「清理上一次会话残留」意图由 ESS-642 的会话边界闸门
+            // 承担（beginSessionConversation 只在回合**不属于本次 touch-down**
+            // 时才丢弃）。此处不得无条件 pressCancelled()——那会把本次
+            // touch-down 正在飞的首轮一并杀掉，会话随后认领到的是重起的那一轮，
+            // 首句丢失且 request_id 对不上（ESS-648 已钉住的用例）。
             pushToTalk.beginSessionConversation()
             // ESS-600：必须把 request_id 交回会话层认领首轮；丢掉返回值会让
             // 会话认领不到在飞那一轮，首轮永远等不到 play_started/finished。
