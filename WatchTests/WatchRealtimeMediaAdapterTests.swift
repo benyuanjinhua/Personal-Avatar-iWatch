@@ -513,6 +513,25 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
                           "session_id must not be used as response_id")
     }
 
+    func testRealtimePlaybackStartedHasDedicatedLifecycleCallback() {
+        let requestId = "44444444-4444-4444-4444-4444444444b0"
+        let sessionId = "55555555-5555-5555-5555-55555555b000"
+        let (adapter, recorder, player, _, _) = makeAdapter(sessionIds: [sessionId])
+        var playbackStartedCount = 0
+        adapter.onRealtimePlaybackStarted = { playbackStartedCount += 1 }
+        let handle = adapter.beginTurn(requestId: requestId)
+
+        // A fallback resolves the pending hold but must not claim that real
+        // playback started; the breather still protects the fallback wait.
+        recorder.fail(NSError(domain: "test", code: 1))
+        XCTAssertEqual(playbackStartedCount, 0)
+
+        player.onPlaybackEvent?(.started(
+            requestId: handle.requestId, sessionId: handle.sessionId, responseId: "resp-start"
+        ))
+        XCTAssertEqual(playbackStartedCount, 1)
+    }
+
     func testPlaybackReceiptsAreForwardedToTransport() {
         let requestId = "44444444-4444-4444-4444-444444444440"
         let (adapter, _, player, transport, _) = makeAdapter(sessionIds: [

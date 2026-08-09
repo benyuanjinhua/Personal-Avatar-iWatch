@@ -131,9 +131,11 @@ final class BackgroundAudioBreatherTests: XCTestCase {
 
     func testSubmitStartsBreatherAfterTransportDispatch() {
         let controller = PushToTalkController()
-        var startCount = 0
+        let sink = LogSink()
+        WatchLog.setObserver { module, event, detail, _ in
+            sink.record(module: module, event: event, detail: detail)
+        }
         controller.voiceStreamingEnabled = { false }
-        controller.startBreatherAfterSubmit = { startCount += 1 }
         let recording = AudioRecorder.Recording(
             fileURL: FileManager.default.temporaryDirectory
                 .appendingPathComponent("ess587-\(UUID().uuidString).m4a"),
@@ -143,6 +145,12 @@ final class BackgroundAudioBreatherTests: XCTestCase {
 
         controller.simulateSubmitForTests(recording: recording)
 
-        XCTAssertEqual(startCount, 1, "submit must start the background breather exactly once")
+        XCTAssertTrue(controller.breather.isActive, "submit must invoke the production breather wiring")
+        XCTAssertEqual(
+            sink.detail(module: "breather", event: "started"),
+            "sample_rate=8000 duration_s=2 loops=-1",
+            "submit must produce runtime evidence from the real breather"
+        )
+        controller.breather.stop(reason: "test_cleanup")
     }
 }

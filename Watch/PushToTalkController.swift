@@ -996,6 +996,12 @@ final class PushToTalkController: ObservableObject {
         adapter.onRealtimePendingResolved = { [weak self] in
             self?.realtimePlaybackPending = false
         }
+        // ESS-587: realtime is the default production playback path. Stop the
+        // silent keep-alive before its shared AVAudioSession is repurposed by
+        // real playback, keeping the breather state in sync with the session.
+        adapter.onRealtimePlaybackStarted = { [weak self] in
+            self?.breather.stop(reason: "realtime_playback")
+        }
         // ESS-509: track turn lifecycle so WCSession keep-alive releases
         // exactly when the realtime path is done — no premature release
         // that would drop audio.delta delivery, no zombie hold after
