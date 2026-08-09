@@ -203,7 +203,21 @@ final class BackgroundAudioBreatherTests: XCTestCase {
 
     // MARK: - 契约 A：gate OFF / 普通 PTT（无会话级 owner，ESS-519 原样）
 
-    func testSubmitStartsBreatherAfterTransportDispatch() {
+    /// ESS-604：本用例的断言目标只有一件事——`submit()` 必须调到
+    /// `breather.start()`，且**不得**走 ESS-603 的 owner 跳过分支。
+    ///
+    /// 「是否真的激活成功」不属于本用例：它取决于宿主 App 运行态。GitHub
+    /// hosted runner 上 xctest 宿主是 `.inactive`，`start()` 按 ESS-519
+    /// 设计早退并落 `start_skipped reason=app_not_active`（run 31301694820
+    /// 的 L1 证据）。硬断言 `isActive` 把这个环境差异记成了产品缺陷——
+    /// main 自 `21b5f07d`（PR #253）起 CI 连红即由此而来，同套件的兄弟用例
+    /// 一律用 `XCTSkipUnless` 让开，唯独这条没有。
+    ///
+    /// 接线保护不削弱：submit 若不再调 breather，`started` 与
+    /// `start_skipped` 都不会出现，用例照样失败；owner 误判同样被
+    /// `conversation_session_owned` 断言挡住。激活成功的环境（本地 mac /
+    /// 真机模拟器）仍走完整的 started → stop → `deactivated=true` 断言链。
+    func testSubmitStartsBreatherAfterTransportDispatch() throws {
         let controller = PushToTalkController()
         let sink = LogSink()
         WatchLog.setObserver { module, event, detail, _ in
@@ -218,15 +232,33 @@ final class BackgroundAudioBreatherTests: XCTestCase {
 
         controller.simulateSubmitForTests(recording: makeRecording())
 
-        XCTAssertTrue(controller.breather.isActive, "submit must invoke the production breather wiring")
-        XCTAssertEqual(
-            sink.detail(module: "breather", event: "started"),
-            "sample_rate=8000 duration_s=2 loops=-1",
-            "submit must produce runtime evidence from the real breather"
+        let started = sink.detail(module: "breather", event: "started")
+        let skipped = sink.detail(module: "breather", event: "start_skipped")
+        XCTAssertTrue(
+            started != nil || skipped != nil,
+            "submit must invoke the production breather wiring"
+        )
+        XCTAssertNotEqual(
+            skipped, "reason=conversation_session_owned",
+            "无 owner 时不得走 ESS-603 的跳过分支"
+        )
+
+        guard let started else {
+            XCTAssertEqual(
+                skipped, "reason=app_not_active state=inactive",
+                "唯一可接受的未启动原因是宿主 App 非 active（ESS-519 早退）"
+            )
+            XCTAssertFalse(controller.breather.isActive)
+            return
+        }
+
+        XCTAssertTrue(
+            controller.breather.isActive,
+            "submit must invoke the production breather wiring"
         )
         XCTAssertEqual(
-            sink.count(module: "breather", event: "start_skipped"), 0,
-            "无 owner 时不得走 ESS-603 的跳过分支"
+            started, "sample_rate=8000 duration_s=2 loops=-1",
+            "submit must produce runtime evidence from the real breather"
         )
         controller.breather.stop(reason: "test_cleanup")
         XCTAssertEqual(
