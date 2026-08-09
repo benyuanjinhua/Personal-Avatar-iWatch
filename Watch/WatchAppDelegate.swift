@@ -74,6 +74,22 @@ final class WatchAppServices {
         SpeechPlayer.sessionExternallyOwned = { [pushToTalk] in
             pushToTalk.conversationAudioController?.isAcquired == true
         }
+        // ESS-650：语音打断功能接线。默认 OFF——F2-5 真机零误触通过后才可
+        // 默认 ON。gate 同时控三个落点：
+        // 1. ConversationAudioController 的 mode（.voiceChat vs .spokenAudio）
+        // 2. SessionController 的 barge-in 监听启停
+        // 3. PushToTalkController 的 barge-in VAD 采集
+        sessionController.voiceBargeInEnabled = debugSettings.voiceBargeInEnabled
+        pushToTalk.voiceBargeInEnabled = { [weak debugSettings] in
+            debugSettings?.voiceBargeInEnabled ?? false
+        }
+        // ConversationAudioController 在 lazy-init 后才存在，但它的
+        // voiceBargeInEnabled 会在首次 ensureConversationAudioController
+        // 时同步设置；这里只保底：每次 bootstrap 时若已存在则同步。
+        if let cac = pushToTalk.conversationAudioController {
+            cac.voiceBargeInEnabled = debugSettings.voiceBargeInEnabled
+        }
+
         // ESS-321: pre-warm the adapter so the settings store's downlink
         // dispatch has somewhere to send `audio.delta` payloads even before
         // the first press has fired.

@@ -175,6 +175,24 @@ final class SessionController: ObservableObject {
     /// 首次引导的 UserDefaults 键。
     static let firstRunGuideShownKey = "ess573_first_run_guide_shown_v1"
 
+    // MARK: - ESS-650 语音打断
+
+    /// 语音打断功能是否启用。由 WatchDebugSettings.voiceBargeInEnabled 驱动；
+    /// 默认 OFF——F2-5 真机零误触通过后才可默认 ON。
+    var voiceBargeInEnabled: Bool = false
+    /// 语音打断 VAD 回调。生产接 PushToTalkController 的 barge-in VAD 采集；
+    /// 测试注入 fake。speaking 期间每帧 PCM16 调用一次。
+    var onBargeInPCMFrame: ((Data) -> Void)?
+    /// 启动/停止 speaking 期间的 VAD-only 采集。生产接 PushToTalkController。
+    var onStartBargeInMonitoring: (() -> Void)?
+    var onStopBargeInMonitoring: (() -> Void)?
+
+    /// ESS-650：speaking 期间的语音打断检测器。在 markAnswerStarted 时
+    /// 创建，markAnswerFinished / interruptSpeaking / exitSession 时释放。
+    private var bargeInDetector: VoiceBargeInDetector?
+    /// 跨轮累计的自回声帧数——F2-5 真机无人声 5 轮回答零误触门禁用。
+    private(set) var bargeInSelfEchoFrames: Int = 0
+
     private let defaults: UserDefaults
     private var enteredAt: Date?
     private var dotsToken: SessionDelayToken?
@@ -355,6 +373,9 @@ final class SessionController: ObservableObject {
 
     /// 回答音频**真实起播**（realtime 首帧已渲染 / SpeechPlayer 起播成功）。
     /// thinking → speaking。收到 delta、入队、落盘都不算起播。
+    ///
+    /// ESS-650：当 voiceBargeInEnabled 为 true 时，起播同时启动 VAD-only
+    /// 采集——数据只进 barge-in 检测器、不上行。F2-5：前 400ms 为静默窗。
     func markAnswerStarted(requestId: String) {
         guard acceptsTurnEvent(requestId, event: "answer_started") else { return }
         guard turnPhase == .thinking else { return }
@@ -364,6 +385,8 @@ final class SessionController: ObservableObject {
             "session", "session_answer_started", requestId: requestId,
             detail: "turn_index=\(turnIndex) phase=speaking"
         )
+        // ESS-650：起播即开始语音打断监听。
+        if voiceBargeInEnabled { startBargeInMonitoring() }
     }
 
     /// 回答**真实播完**。speaking → listening，并自动开下一轮采集。
@@ -375,6 +398,8 @@ final class SessionController: ObservableObject {
         guard acceptsTurnEvent(requestId, event: "answer_finished") else { return }
         guard turnPhase == .speaking || turnPhase == .thinking else { return }
         let fromPhase = turnPhase
+        // ESS-650：回答播完 → 停止打断监听；不产生额外空轮（F2-2）。
+        stopBargeInMonitoring()
         if success {
             WatchLog.info(
                 "session", "session_answer_finished", requestId: requestId,
@@ -409,29 +434,34 @@ final class SessionController: ObservableObject {
         }
     }
 
+    /// ESS-650 语音打断触发源。
+    enum BargeInSource: String {
+        case orbTap = "orb_tap"
+        case voice = "voice"
+    }
+
     /// F4 手动打断：speaking 中点球 → 立刻停播 → 直接开下一轮。
     ///
-    /// ESS-655：打断事件扩字段 `source` / `detect_ms` / `stop_ms`。
-    /// - `source`：点球恒 `.orbTap`；语音打断（ESS-650 / F2）复用这同一个
-    ///   入口传 `.voice`，**不另起第二条打断路径**——两条路径落到不同事件
-    ///   或不同状态机，误触发率就永远算不出来。
-    /// - `detectMs`：点球恒 0（点下去即判定）；语音路径填「起说 → 判定命中」。
-    /// - `stopMs`：本地停播动作的真实耗时，在这里就地量——把「慢在检测」和
-    ///   「慢在停播」分开，才对得上设计稿 ≤200ms 停播的口径。
-    func interruptSpeaking(
-        source: PhoneModeTelemetry.InterruptSource = .orbTap,
-        detectMs: Int = 0
-    ) {
+    /// ESS-650 语音 barge-in：当 `voiceBargeInEnabled` 为 true 时，speaking
+    /// 期间通过 VAD-only 采集检测用户语音。连续说话 ≥300ms 后触发本方法
+    /// （source=voice），≤200ms 内停播回 P2。
+    func interruptSpeaking(source: BargeInSource = .orbTap) {
         guard state == .listening, turnPhase == .speaking else { return }
-        let stopStartedAt = DispatchTime.now().uptimeNanoseconds
-        onInterruptSpeaking?()
-        let stopMs = Int((DispatchTime.now().uptimeNanoseconds &- stopStartedAt) / 1_000_000)
-        WatchLog.record(
-            PhoneModeTelemetry.speakingInterrupted(
-                source: source, detectMs: detectMs, stopMs: stopMs, turnIndex: turnIndex
-            ),
-            requestId: activeTurnRequestId
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        WatchLog.info(
+            "session", "session_speaking_interrupted", requestId: activeTurnRequestId,
+            detail: "turn_index=\(turnIndex) source=\(source.rawValue)"
         )
+        // Stop barge-in monitoring before interrupting playback.
+        stopBargeInMonitoring()
+        onInterruptSpeaking?()
+        let stopMs = Int64(Date().timeIntervalSince1970 * 1000)
+        if source == .voice {
+            WatchLog.info(
+                "session", "voice_barge_in_trigger", requestId: activeTurnRequestId,
+                detail: "detect_ms=\(nowMs) stop_ms=\(stopMs) latency_ms=\(stopMs - nowMs)"
+            )
+        }
         startNextTurn(reason: "user_interrupt")
     }
 
@@ -464,6 +494,76 @@ final class SessionController: ObservableObject {
         armTurnCap()
     }
 
+    // MARK: - ESS-650 语音打断监听（speaking 期间 VAD-only）
+
+    /// 启动 speaking 期间的 VAD-only 采集。由 markAnswerStarted 在进入
+    /// speaking 相位时调用；仅当 voiceBargeInEnabled 为 true 时生效。
+    ///
+    /// F2-2 常开采集：P4 speaking 时 isCapturingLocally == true，
+    /// 数据只进 VAD、不上行。F2-5：detector 内设 400ms 播放守卫 +
+    /// +6dB 能量阈值 + 300ms 连续说话判据。
+    private func startBargeInMonitoring() {
+        guard voiceBargeInEnabled else { return }
+        // 每轮新建 detector——重置 400ms 守卫窗与语音状态。
+        bargeInDetector = VoiceBargeInDetector()
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        bargeInDetector?.playbackStarted(atMs: nowMs)
+        isCapturingLocally = true
+        WatchLog.info(
+            "session", "voice_barge_in_monitoring_started",
+            requestId: activeTurnRequestId,
+            detail: "turn_index=\(turnIndex) guard_ms=400"
+        )
+        onStartBargeInMonitoring?()
+    }
+
+    /// 停止 speaking 期间的 VAD-only 采集。回答正常播完、被打断（点球或
+    /// 语音）、通道失败、退出会话时调用。幂等。
+    private func stopBargeInMonitoring() {
+        guard bargeInDetector != nil else { return }
+        // 累加本轮自回声帧数——F2-5 真机门禁用。
+        if let detector = bargeInDetector {
+            bargeInSelfEchoFrames += detector.selfEchoFrameCount
+            if detector.selfEchoFrameCount > 0 {
+                WatchLog.info(
+                    "session", "session_barge_in_self_echo",
+                    requestId: activeTurnRequestId,
+                    detail: "turn_index=\(turnIndex) self_echo_frames=\(detector.selfEchoFrameCount) cumulative=\(bargeInSelfEchoFrames)"
+                )
+            }
+        }
+        bargeInDetector = nil
+        onStopBargeInMonitoring?()
+        WatchLog.info(
+            "session", "voice_barge_in_monitoring_stopped",
+            requestId: activeTurnRequestId,
+            detail: "turn_index=\(turnIndex)"
+        )
+    }
+
+    /// ESS-650：speaking 期间每帧 PCM16 经此送入 barge-in detector。
+    /// 生产由 PushToTalkController 的 VAD-only 采集路径调用。
+    /// 当检测到连续说话 ≥300ms 后调用 interruptSpeaking(source: .voice)。
+    func handleBargeInPCMFrame(_ pcm: Data) {
+        guard var detector = bargeInDetector, voiceBargeInEnabled else { return }
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let events = detector.processPCM16(pcm, frameStartedAtMs: nowMs)
+        bargeInDetector = detector
+        for event in events {
+            switch event {
+            case .energySpike:
+                break // Logged at trigger time, not per-spike.
+            case .bargeInDetected(let atMs):
+                WatchLog.info(
+                    "session", "voice_barge_in_detected",
+                    requestId: activeTurnRequestId,
+                    detail: "turn_index=\(turnIndex) detect_ms=\(atMs)"
+                )
+                interruptSpeaking(source: .voice)
+            }
+        }
+    }
+
     /// 通道失败（建立期或会话期），全部来自真实事件：
     /// 录音启动失败 / 上行发送失败 / 适配器回退 / 就绪超时。
     /// PRD 异常链 A/B：明确告知 + 退回待机，不静默卡在建立中、
@@ -474,6 +574,7 @@ final class SessionController: ObservableObject {
         let failedFrom = state
         cancelConnectingTimers()
         cancelTurnTimers()
+        stopBargeInMonitoring()
         state = .idle
         turnPhase = .idle
         activeTurnRequestId = nil
@@ -527,6 +628,7 @@ final class SessionController: ObservableObject {
     private func teardownToIdle() {
         cancelConnectingTimers()
         cancelTurnTimers()
+        stopBargeInMonitoring()
         let turns = turnIndex
         state = .disconnecting
         turnPhase = .idle
@@ -601,53 +703,13 @@ final class SessionController: ObservableObject {
         translation.height > 40 && translation.height > abs(translation.width) * 1.5
     }
 
-    /// 「点一下进会话」与「按住说话」的时长分界（PRD F1）：ESS-649 决策 3
-    /// 后长按已无语义，达到该时长即判为误按，走 session_enter_rejected。
-    /// 0.2s：收紧自 0.35s，压缩「想点却被判成按住」的窗口。
-    static let tapToEnterMaxHoldSeconds: TimeInterval = 0.2
+    /// 「点一下进会话」与「按住说话」的时长分界（PRD F1）：松手时
+    /// 按住不足该时长记为「点」——转会话常驻监听；达到则走 PTT 提交。
+    /// 0.35s【待调】：小于典型「按住说一个字」的最短按住，大于快速点按。
+    static let tapToEnterMaxHoldSeconds: TimeInterval = 0.35
 
     static func isTapToEnter(holdSeconds: TimeInterval) -> Bool {
         holdSeconds < tapToEnterMaxHoldSeconds
-    }
-
-    /// 主屏球松手被拒的原因（`session_enter_rejected.reason`）。
-    ///
-    /// ESS-671：本枚举与下面的 `orbReleaseAction` / `noteEnterRejected` 由
-    /// ESS-653（PR #273）落地，被 ESS-651（PR #274，基线过期）整段覆盖，
-    /// 导致 `WatchContentView` 的调用方失去被调方、main 不可构建。此处恢复，
-    /// 同时保留 #274 的意图（阈值 0.2s）——三者取并集，不回滚任何一方。
-    enum EnterRejection: String {
-        /// 按住超过 `tapToEnterMaxHoldSeconds` —— 误触，丢弃这次采集。
-        case holdTooLong = "hold_too_long"
-        /// 点按合法但 touch-down 那次采集没能开起来（上一轮还在收尾、
-        /// 录音启动失败等）。没有在飞的一轮可认领，进会话会当场空转。
-        case captureUnavailable = "capture_unavailable"
-    }
-
-    enum OrbReleaseAction: Equatable {
-        case enter
-        case reject(EnterRejection)
-    }
-
-    /// 主屏球松手的唯一判定点（纯函数，便于 WatchTests 钉死）。
-    ///
-    /// ESS-653：只有「按住 < 阈值 **且** touch-down 那轮确实在采集」才进
-    /// 电话模式；其余一律拒绝——**没有任何分支再回到 PTT 单条提交**。
-    static func orbReleaseAction(holdSeconds: TimeInterval, isCapturing: Bool) -> OrbReleaseAction {
-        guard isTapToEnter(holdSeconds: holdSeconds) else { return .reject(.holdTooLong) }
-        guard isCapturing else { return .reject(.captureUnavailable) }
-        return .enter
-    }
-
-    /// 留证一次被拒的进入。静默拒绝是设计口径（误触不该给反馈），但
-    /// 「用户按了却什么都没发生」必须在日志里可解释，否则真机复盘只剩猜。
-    func noteEnterRejected(reason: EnterRejection, holdSeconds: TimeInterval) {
-        // `holdSeconds` 在 touch-down 时刻缺失时是 .infinity，直接 Int() 会 trap。
-        let holdMs = holdSeconds.isFinite ? Int((holdSeconds * 1000).rounded()) : -1
-        WatchLog.info(
-            "session", "session_enter_rejected",
-            detail: "reason=\(reason.rawValue) hold_ms=\(holdMs)"
-        )
     }
 }
 
@@ -716,6 +778,17 @@ enum SessionTurnWiring {
         }
         pushToTalk.onLocalCaptureChanged = { [weak session] active in
             session?.markLocalCapture(active: active)
+        }
+        // ESS-650：语音打断 VAD-only 采集接线。speaking 期间数据只进
+        // barge-in detector、不上行。
+        session.onStartBargeInMonitoring = { [weak pushToTalk] in
+            pushToTalk?.startBargeInVADCapture()
+        }
+        session.onStopBargeInMonitoring = { [weak pushToTalk] in
+            pushToTalk?.stopBargeInVADCapture()
+        }
+        pushToTalk.onBargeInPCMFrame = { [weak session] pcm in
+            session?.handleBargeInPCMFrame(pcm)
         }
     }
 }

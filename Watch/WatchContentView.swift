@@ -25,8 +25,8 @@ struct WatchContentView: View {
     /// `ConversationTimelineView` 抬升为独立屏）、2 = 设置。冷启动落 tag 0。
     /// 白梦林原话「右滑第 3 屏设置」字面成立即靠这里的 tag 2。
     @State private var selectedTab: Int = 0
-    /// ESS-573 / ESS-653：点球手势的 touch-down 时刻——松手时按时长判定
-    /// 「点一下进电话」 vs 「长按误触（丢弃采集）」（见主屏 orb 手势）。
+    /// ESS-573：点球手势的 touch-down 时刻——松手时按时长分流
+    /// 「点一下进会话」 vs 「按住说话」（见主屏 orb 手势）。
     @State private var orbTouchDownAt: Date?
 
     init(
@@ -130,19 +130,17 @@ struct WatchContentView: View {
                     VoiceOrbView(mode: orbMode, size: 70)
                         .padding(.top, 4)
                         .gesture(
-                            // ESS-653（F1 入口收敛，设计稿 v2.0 §五 D1 方案 B）：
-                            // 主屏球**只有一个语义——点一下打电话给分身**。长按
-                            // 不再提交 PTT，视为误触（袖口压屏等），丢弃这次采集
-                            // 并留证 `session_enter_rejected`。
-                            //
-                            // touch-down 起采保留（不是为 PTT 抢那几百毫秒，而是
-                            // 用户点完立刻开口时首句不丢）：松手判定为「点」时
-                            // enterSession 认领**已经在飞**的那一轮，不重起。
+                            // ESS-573 / PRD F1：点一下进入实时对话，按住
+                            // 仍是 PTT。两者共用一个手势且**零延迟**：
+                            // touch-down 立即 pressBegan（与旧行为一致，
+                            // 早期语音不丢）；松手时按时长分流——短按
+                            // （点）转入会话常驻监听（录音不中断、不提交），
+                            // 长按松手走既有 pressEnded 提交。
                             DragGesture(minimumDistance: 0)
                                 .onChanged { _ in
                                     guard orbTouchDownAt == nil else { return }
                                     orbTouchDownAt = Date()
-                                    // ESS-65 铁律 3：自检绝不锁死 App——用户按下球
+                                    // ESS-65 铁律 3：自检绝不锁死 App——用户按住说话
                                     // 即打断自检让出音频会话，结论记 inconclusive。
                                     selfCheck.interrupt()
                                     pushToTalk.pressBegan()
@@ -151,20 +149,15 @@ struct WatchContentView: View {
                                     let downAt = orbTouchDownAt
                                     orbTouchDownAt = nil
                                     let heldSeconds = downAt.map { Date().timeIntervalSince($0) } ?? .infinity
-                                    switch SessionController.orbReleaseAction(
-                                        holdSeconds: heldSeconds,
-                                        isCapturing: pushToTalk.state == .recording
-                                    ) {
-                                    case .enter:
-                                        // 录音已在 touch-down 开始（pressBegan 幂等，
-                                        // enterSession 内部的 onBeginChannel 不会重复
-                                        // 发起）；就绪由真实 uplink ack 驱动。
+                                    if SessionController.isTapToEnter(holdSeconds: heldSeconds),
+                                       pushToTalk.state == .recording {
+                                        // 点一下 = 进入会话。录音已在 touch-down
+                                        // 开始（pressBegan 幂等，enterSession 内部
+                                        // 的 onBeginChannel 不会重复发起）；就绪
+                                        // 由真实 uplink ack 驱动，见 SessionController。
                                         session.enterSession()
-                                    case .reject(let reason):
-                                        session.noteEnterRejected(reason: reason, holdSeconds: heldSeconds)
-                                        // 丢弃 touch-down 起的这次采集：不提交、停采集、
-                                        // 取消未提交的实时回合、释放音频会话。
-                                        pushToTalk.pressCancelled()
+                                    } else {
+                                        pushToTalk.pressEnded()
                                     }
                                 }
                         )
@@ -425,7 +418,11 @@ struct WatchContentView: View {
             switch session.turnPhase {
             case .listening: return "正在听…"
             case .thinking: return "正在思考…"
-            case .speaking: return "正在回答…（点球打断）"
+            case .speaking:
+                // ESS-650 F2-4：gate OFF → 点球可打断；gate ON → 说话或点球都能打断。
+                return session.voiceBargeInEnabled
+                    ? "正在回答…（说话或点球打断）"
+                    : "正在回答…（点球打断）"
             case .idle: return "稍等…"
             }
         case .disconnecting:
@@ -672,9 +669,7 @@ struct WatchContentView: View {
     /// 语义文本替换阶梯文案。
     private func statusCopy(now: Date) -> MainStatusCopy {
         if isRecording {
-            // ESS-653：待机屏的录音态只存在于 touch-down 到松手这一小段。
-            // 长按已不再提交，「松开发送」会变成一句当场被打脸的承诺。
-            return MainStatusCopy(title: "我在听", subtitle: "松手就和分身通话")
+            return MainStatusCopy(title: "我在听", subtitle: "松开发送（最长 60 秒）")
         }
         if isSpeaking {
             // ESS-259 B-STOP：副标题承诺的「可点字幕打断」在 SubtitlePlaybackView
@@ -682,11 +677,9 @@ struct WatchContentView: View {
             return MainStatusCopy(title: "AI 分身正在说话…", subtitle: "全文同步展示，轻点字幕打断")
         }
         guard let turn = activeTurn, turn.isActive else {
-            // ESS-653 / 设计稿 v2.0 P0 待机屏：主文案「点一下，和分身说话」，
-            // 副文案留空（保持干净）。
             return MainStatusCopy(
-                title: "点一下，和分身说话",
-                subtitle: ""
+                title: "按住说话",
+                subtitle: "松开即发送，结果回来会震动提醒"
             )
         }
         if let progress = currentProgress(for: turn) {

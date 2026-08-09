@@ -24,9 +24,16 @@ final class WatchDebugSettings: ObservableObject {
     static let vadEndpointSilenceMsDefaultsKey = "wristagent.watch.debug.vad-endpoint-silence-ms"
     static let defaultVADEndpointSilenceMs = 700
 
+    /// ESS-650：语音打断功能开关。默认 OFF——F2-5 自身回声零误触发不通过
+    /// 时不得默认 ON。开启后 `.voiceChat` 替代 `.spokenAudio` 以获取 AEC，
+    /// speaking 期间进行 VAD-only 采集检测语音打断。
+    static let voiceBargeInEnabledDefaultsKey = "wristagent.watch.debug.voice-barge-in-enabled"
+
     /// 观察值：SwiftUI Toggle 直接绑定。写入即持久化 + 落日志 + 触发回退回调。
     @Published private(set) var streamingEnabled: Bool
     @Published private(set) var vadEndpointSilenceMs: Int
+    /// ESS-650：语音打断开关（默认 OFF）。
+    @Published private(set) var voiceBargeInEnabled: Bool
 
     /// 单调递增的「流式代」计数：每次从 ON → OFF 加 1。
     /// 未来 wire-up 的流式回合在开始时快照本值，投递前发现不一致即知
@@ -48,6 +55,8 @@ final class WatchDebugSettings: ObservableObject {
         self.vadEndpointSilenceMs = Self.sanitizeVADEndpointSilenceMs(
             storedEndpointMs ?? Self.defaultVADEndpointSilenceMs
         )
+        // ESS-650：语音打断默认 OFF。只有 F2-5 真机零误触通过后才可默认 ON。
+        self.voiceBargeInEnabled = defaults.bool(forKey: Self.voiceBargeInEnabledDefaultsKey)
     }
 
     // MARK: - 门禁
@@ -111,8 +120,45 @@ final class WatchDebugSettings: ObservableObject {
     func logStateAtLaunch() {
         WatchLog.info(
             "settings", "streaming_state_at_launch",
-            detail: "value=\(streamingEnabled) vad_endpoint_ms=\(vadEndpointSilenceMs)"
+            detail: "value=\(streamingEnabled) vad_endpoint_ms=\(vadEndpointSilenceMs) voice_barge_in=\(voiceBargeInEnabled)"
         )
+    }
+
+    // MARK: - ESS-650 语音打断
+
+    /// 设置语音打断开关。副作用：
+    /// 1. 落 UserDefaults
+    /// 2. 发观测事件 `voice_barge_in_gate state=on|off`
+    /// 3. 触发已注册 gate-change 回调
+    func setVoiceBargeInEnabled(_ newValue: Bool, source: String = "user") {
+        let previous = voiceBargeInEnabled
+        guard previous != newValue else { return }
+        voiceBargeInEnabled = newValue
+        defaults.set(newValue, forKey: Self.voiceBargeInEnabledDefaultsKey)
+        WatchLog.info(
+            "settings", "voice_barge_in_gate",
+            detail: "state=\(newValue ? "on" : "off") previous=\(previous) source=\(source)"
+        )
+        if !newValue {
+            // Tear down any in-flight barge-in monitor when gate is turned off.
+            let handlers = Array(bargeInGateHandlers.values)
+            for handler in handlers { handler() }
+        }
+    }
+
+    private var bargeInGateHandlers: [UUID: () -> Void] = [:]
+
+    /// 注册「语音打断开关翻到 OFF 瞬间」触发的回调，用于停止进行中的
+    /// VAD-only 采集。返回 token；调用方负责在生命周期终结前反注册。
+    @discardableResult
+    func onVoiceBargeInDisabled(_ handler: @escaping () -> Void) -> UUID {
+        let token = UUID()
+        bargeInGateHandlers[token] = handler
+        return token
+    }
+
+    func removeVoiceBargeInHandler(_ token: UUID) {
+        bargeInGateHandlers.removeValue(forKey: token)
     }
 
     // MARK: - 回退回调注册（ESS-279 / R4 wire-up 用）

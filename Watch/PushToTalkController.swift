@@ -751,10 +751,17 @@ final class PushToTalkController: ObservableObject {
 
     /// ESS-554：懒建会话级控制器。公开以便 WatchAppServices 预热线缆与
     /// 测试断言。
+    ///
+    /// ESS-650：创建时同步 voiceBargeInEnabled 到控制器——它决定
+    /// configureSession 使用 .voiceChat 还是 .spokenAudio。
     @discardableResult
     func ensureConversationAudioController() -> ConversationAudioController {
-        if let controller = conversationAudioController { return controller }
+        if let controller = conversationAudioController {
+            controller.voiceBargeInEnabled = voiceBargeInEnabled()
+            return controller
+        }
         let controller = makeConversationAudioController()
+        controller.voiceBargeInEnabled = voiceBargeInEnabled()
         conversationAudioController = controller
         return controller
     }
@@ -822,11 +829,6 @@ final class PushToTalkController: ObservableObject {
         streamSequence = 0
     }
 
-    /// ESS-653（F1-3）：**已不再由任何用户手势触发**。入口收敛后主屏长按
-    /// 不提交，全 UI 没有手动单条提交入口；提交只走会话内的
-    /// `endSessionTurn()`（含 `onSalvageTurn` 兜底）。保留本入口是因为
-    /// 「松手即收尾」的语义与 deferred-release 处理仍是底层能力的一部分
-    /// （AudioRecorder 的启动竞态口径引用它），不随 UI 收敛一起删除。
     func pressEnded() {
         guard state == .recording else { return }
         guard recorder.isRecording else {
@@ -1206,29 +1208,6 @@ final class PushToTalkController: ObservableObject {
                 "session", "conversation_reused", requestId: inFlight.requestId,
                 detail: "conversation_id=\(adapter.session.activeConversationId ?? "nil") "
                     + "reason=turn_started_after_boundary turn_id=\(inFlight.turnId)"
-            )
-            return
-        }
-        // ESS-648：短按的真实时序里还有第三种形态——**本次 touch-down 已经起轮、
-        // 但 activeTurn 尚未异步建立**。`pressBegan()` 同步段只置 `state = .recording`
-        // 与 `streamRequestId`；`adapter.beginTurn` 要等 `recorder.start()` 返回后
-        // 才在 Task 里执行（ESS-362 的顺序约束，不能提前）。短按松手往往比这更快，
-        // 于是入口看到的是「gate 为真 + request_id 已铸 + activeTurn 仍为 nil」。
-        // 上面的复用分支要求 activeTurn 已存在，下面的遗留清理分支只看
-        // `state != .idle`——两条都不认这个窗口，结果把**本次合法首轮**当遗留物
-        // `pressCancelled()` 掉，正是 ESS-600 要保护的那一轮。
-        // 判据用 gate + `streamRequestId`（两者都在 `pressBegan` 同步段建立，
-        // `endSessionConversation` 退出时清 gate），因此上一会话遗留的录音状态
-        // gate 为假，仍走下面的清理分支，ESS-642 的边界隔离不受影响。
-        // 这里只开边界、不动录音与 request_id：随后异步落地的 `beginTurn` 会挂到
-        // 刚开的这段 conversation 上，gate 保持为真让它仍是「本次边界之后起的轮」。
-        if let entryTurnRequestId, adapter.session.activeTurn == nil, state != .idle {
-            let handle = adapter.beginConversation()
-            didStartTurnSinceConversationBoundary = true
-            WatchLog.info(
-                "session", "conversation_opened_awaiting_turn", requestId: entryTurnRequestId,
-                detail: "conversation_id=\(handle.conversationId) "
-                    + "ptt_state=\(String(describing: state)) reason=turn_start_pending"
             )
             return
         }
@@ -1710,4 +1689,75 @@ final class PushToTalkController: ObservableObject {
             code: "ERR_PROGRESS_SPOKEN"
         )
     }
+
+    // MARK: - ESS-650 语音打断 VAD-only 采集
+
+    /// ESS-650：speaking 期间只做 VAD 不做上行。启动录音但不接实时上行链——
+    /// 数据只经 `onBargeInPCMFrame` 送入 SessionController 的 barge-in
+    /// detector，不上行到服务器。
+    ///
+    /// 约束：仅在 voiceBargeInEnabled 为 true 且当前不在录音中时调用。
+    /// 录音已在飞时幂等返回（与 pressBegan 同样的守卫语义）。
+    func startBargeInVADCapture() {
+        guard voiceStreamingEnabled() else { return }
+        // 已在录音中（正常 turn 采集）→ 不覆盖。
+        guard state == .idle else {
+            WatchLog.info(
+                "session", "barge_in_vad_skipped",
+                detail: "state=\(String(describing: state)) reason=already_recording"
+            )
+            return
+        }
+        WatchLog.info("session", "barge_in_vad_capture_started")
+        // 启动 recorder，但 streamHandler 只调 barge-in VAD 回调、不调 emitUplinkChunk。
+        Task {
+            if voiceStreamingEnabled() {
+                ensureRealtimeAdapter()
+                ensureConversationAudioAcquired()
+            }
+            do {
+                try await recorder.start(streamHandler: { [weak self] payload, end in
+                    // ESS-650：数据只进 barge-in VAD，不上行。
+                    _ = end
+                    self?.onBargeInPCMFrame?(payload)
+                })
+                guard state == .idle else {
+                    // Late start after cancel.
+                    recorder.cancel()
+                    return
+                }
+                // ESS-362: bring up the realtime PCM tap for VAD consumption.
+                if voiceStreamingEnabled(), let adapter = realtimeAdapter {
+                    // Start the PCM tap but do NOT begin a turn — we only want
+                    // the audio frames for VAD, not for uplink streaming.
+                    adapter.beginTurn(requestId: "barge_in_vad_\(UUID().uuidString.lowercased())")
+                }
+            } catch {
+                WatchLog.error(
+                    "session", "barge_in_vad_start_failed",
+                    detail: "error=\(String(describing: error))",
+                    code: "ERR_BARGEIN_VAD_START", error: error
+                )
+            }
+        }
+    }
+
+    /// ESS-650：停止 speaking 期间的 VAD-only 采集。幂等。
+    func stopBargeInVADCapture() {
+        // Only stop if we started a barge-in VAD session (not a real recording turn).
+        guard let adapter = realtimeAdapter,
+              adapter.currentTurn?.requestId.hasPrefix("barge_in_vad_") == true else {
+            return
+        }
+        WatchLog.info("session", "barge_in_vad_capture_stopped")
+        adapter.cancel(reason: .cancelled)
+        recorder.cancel()
+    }
+
+    /// ESS-650：voiceBargeInEnabled 的运行时读点。默认 OFF。
+    var voiceBargeInEnabled: () -> Bool = { false }
+
+    /// ESS-650：speaking 期间每帧 PCM16 回调。生产由 SessionController
+    /// 的 handleBargeInPCMFrame 接线。
+    var onBargeInPCMFrame: ((Data) -> Void)?
 }
