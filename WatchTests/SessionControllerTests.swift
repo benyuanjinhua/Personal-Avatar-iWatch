@@ -159,14 +159,15 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertEqual(teardownCount, 1)
     }
 
-    /// ESS-652: failureNotice 被 failedReason 替代，不再自动消失。
+    /// ESS-652: failedReason replaces failureNotice; P6 auto-hangup at 15s.
     func testFailedReasonNotAutoDismissed() {
         controller.enterSession()
         controller.markChannelFailed(.channelEvent)
         XCTAssertNotNil(controller.failedReason)
-        fireDelay(SessionController.failureNoticeSeconds)
-        // P6 中 failedReason 不自动消失——用户需点重试或挂断。
-        XCTAssertNotNil(controller.failedReason)
+        // P6 uses 15s auto-hangup timer, not 2s failure notice dismiss.
+        fireDelay(SessionController.failedAutoHangupSeconds)
+        // After auto-hangup, transitions to hungup.
+        XCTAssertEqual(controller.state, .hungup)
     }
 
     /// 失败文案纪律：说清「怎么办」，不出现错误码（PRD 异常链 A）。
