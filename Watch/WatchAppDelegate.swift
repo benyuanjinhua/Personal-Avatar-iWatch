@@ -11,7 +11,6 @@ final class WatchAppServices {
     static let shared = WatchAppServices()
     let settings = WatchSettingsStore()
     let pushToTalk = PushToTalkController()
-    let welcome = WelcomeGreeter()
     let selfCheck = SelfCheckRunner()
     /// ESS-280 Debug 灰度：只在 Watch 本机生效，与 `settings`（会同步给
     /// iPhone 的用户配置）严格分开，避免最终用户被开发者态污染。
@@ -42,9 +41,9 @@ final class WatchAppServices {
         pushToTalk.voiceStreamingEnabled = { [weak debugSettings] in
             debugSettings?.isStreamingActive ?? VoiceStreamingGate.defaultEnabled
         }
-        pushToTalk.onAutoPlayStarted = { [welcome] in welcome.interrupt() }
-        // ESS-535: stop welcome speech immediately when user presses to talk.
-        pushToTalk.onPressBegan = { [welcome] in welcome.interrupt() }
+        // ESS-639: welcome greeting removed; no-op callbacks retained for API stability.
+        pushToTalk.onAutoPlayStarted = {}
+        pushToTalk.onPressBegan = {}
         // ESS-573：会话模式接线。
         // - 进入：与 PTT 共用同一条录音 + 实时上行链（pressBegan），进入
         //   触觉 .start 由该链既有的 .recordingStarted 兑现，不重复播；
