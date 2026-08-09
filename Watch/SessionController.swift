@@ -891,7 +891,7 @@ final class SessionController: ObservableObject {
     /// 「点一下进会话」与「按住说话」的时长分界（PRD F1）：ESS-649 决策 3
     /// 后长按已无语义，达到该时长即判为误按，走 session_enter_rejected。
     /// 0.2s：收紧自 0.35s，压缩「想点却被判成按住」的窗口。
-    static let tapToEnterMaxHoldSeconds: TimeInterval = 0.2
+    static let tapToEnterMaxHoldSeconds: TimeInterval = 0.35
 
     static func isTapToEnter(holdSeconds: TimeInterval) -> Bool {
         holdSeconds < tapToEnterMaxHoldSeconds
