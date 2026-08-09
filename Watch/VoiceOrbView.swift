@@ -49,7 +49,7 @@ struct VoiceOrbView: View {
             if case .listening = mode {
                 WaveformBars(level: listeningLevel)
             } else {
-                Image(systemName: symbol)
+                Image(systemName: Self.symbol(for: mode))
                     .font(.system(size: size * 0.3, weight: .bold))
                     .foregroundStyle(.white)
                     .modifier(BreathingScale(hertz: Self.breathHertz(for: mode),
@@ -124,9 +124,9 @@ struct VoiceOrbView: View {
         }
     }
 
-    private var symbol: String {
+    static func symbol(for mode: Mode) -> String {
         switch mode {
-        case .idle: return "mic.fill"
+        case .idle: return "phone.fill"
         case .establishing: return "antenna.radiowaves.left.and.right"
         case .listening: return "waveform"
         case .thinking: return "ellipsis"

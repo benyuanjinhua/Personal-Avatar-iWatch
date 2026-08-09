@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// 主界面（ESS-40）：首屏即「按住说话」真实链路（ESS-29 PoC 转正，静态 demo 已删除）。
-/// 要素：语音球 + 状态文案 + 按住说话手势 + 结果时间线入口 + 欢迎语（下行音频链验证）。
+/// 主界面（ESS-40）：首屏语音球单击进入电话模式。
+/// 要素：语音球 + 状态文案 + 电话模式入口 + 结果时间线入口 + 欢迎语（下行音频链验证）。
 /// 半双工：录完即传；退出 App 任务继续，重开从 VoiceTurnJournal 恢复。
 struct WatchContentView: View {
     @ObservedObject private var pushToTalk: PushToTalkController
@@ -25,8 +25,8 @@ struct WatchContentView: View {
     /// `ConversationTimelineView` 抬升为独立屏）、2 = 设置。冷启动落 tag 0。
     /// 白梦林原话「右滑第 3 屏设置」字面成立即靠这里的 tag 2。
     @State private var selectedTab: Int = 0
-    /// ESS-573：点球手势的 touch-down 时刻——松手时按时长分流
-    /// 「点一下进会话」 vs 「按住说话」（见主屏 orb 手势）。
+    /// ESS-653：点球手势的 touch-down 时刻——短按进入电话模式，
+    /// 长按只拒绝本次进入，不再作为 PTT 提交入口。
     @State private var orbTouchDownAt: Date?
 
     init(
@@ -130,17 +130,17 @@ struct WatchContentView: View {
                     VoiceOrbView(mode: orbMode, size: 70)
                         .padding(.top, 4)
                         .gesture(
-                            // ESS-573 / PRD F1：点一下进入实时对话，按住
-                            // 仍是 PTT。两者共用一个手势且**零延迟**：
+                            // ESS-653 / PRD F1：点一下进入实时对话。手势保持
+                            // **零延迟**：
                             // touch-down 立即 pressBegan（与旧行为一致，
-                            // 早期语音不丢）；松手时按时长分流——短按
-                            // （点）转入会话常驻监听（录音不中断、不提交），
-                            // 长按松手走既有 pressEnded 提交。
+                            // 早期语音不丢）；短按松手转入会话常驻监听
+                            // （录音不中断、不提交），长按则拒绝进入并取消
+                            // 本次采集，绝不暴露单条 PTT 提交。
                             DragGesture(minimumDistance: 0)
                                 .onChanged { _ in
                                     guard orbTouchDownAt == nil else { return }
                                     orbTouchDownAt = Date()
-                                    // ESS-65 铁律 3：自检绝不锁死 App——用户按住说话
+                                    // ESS-65 铁律 3：自检绝不锁死 App——用户触球
                                     // 即打断自检让出音频会话，结论记 inconclusive。
                                     selfCheck.interrupt()
                                     pushToTalk.pressBegan()
@@ -156,8 +156,9 @@ struct WatchContentView: View {
                                         // 的 onBeginChannel 不会重复发起）；就绪
                                         // 由真实 uplink ack 驱动，见 SessionController。
                                         session.enterSession()
-                                    } else {
-                                        pushToTalk.pressEnded()
+                                    } else if !SessionController.isTapToEnter(holdSeconds: heldSeconds) {
+                                        SessionController.logSessionEntryRejected(holdSeconds: heldSeconds)
+                                        pushToTalk.pressCancelled()
                                     }
                                 }
                         )
@@ -674,8 +675,8 @@ struct WatchContentView: View {
         }
         guard let turn = activeTurn, turn.isActive else {
             return MainStatusCopy(
-                title: "按住说话",
-                subtitle: "松开即发送，结果回来会震动提醒"
+                title: "点一下，和分身说话",
+                subtitle: "按下即开始聆听"
             )
         }
         if let progress = currentProgress(for: turn) {

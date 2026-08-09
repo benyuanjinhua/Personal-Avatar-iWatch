@@ -86,4 +86,8 @@ final class VoiceOrbModeTests: XCTestCase {
     func testThinkingAndSpeakingAreDistinct() {
         XCTAssertNotEqual(VoiceOrbView.Mode.thinking, .speaking)
     }
+
+    func testIdleUsesPhoneEntrySymbol() {
+        XCTAssertEqual(VoiceOrbView.symbol(for: .idle), "phone.fill")
+    }
 }

@@ -588,13 +588,23 @@ final class SessionController: ObservableObject {
         translation.height > 40 && translation.height > abs(translation.width) * 1.5
     }
 
-    /// 「点一下进会话」与「按住说话」的时长分界（PRD F1）：松手时
-    /// 按住不足该时长记为「点」——转会话常驻监听；达到则走 PTT 提交。
+    /// 「点一下进会话」的时长上限（PRD F1）：松手时按住不足该时长
+    /// 记为「点」并转会话常驻监听；达到则拒绝进入且不提交语音。
     /// 0.35s【待调】：小于典型「按住说一个字」的最短按住，大于快速点按。
     static let tapToEnterMaxHoldSeconds: TimeInterval = 0.35
 
     static func isTapToEnter(holdSeconds: TimeInterval) -> Bool {
         holdSeconds < tapToEnterMaxHoldSeconds
+    }
+
+    /// ESS-653 / F6：长按不再表示 PTT。拒绝事件保留实际按压时长，供
+    /// 模拟器/真机验收确认没有进入电话模式或提交单条语音。
+    static func logSessionEntryRejected(holdSeconds: TimeInterval) {
+        let holdMilliseconds = max(0, Int((holdSeconds * 1_000).rounded()))
+        WatchLog.info(
+            "session", "session_enter_rejected",
+            detail: "reason=hold_too_long hold_ms=\(holdMilliseconds)"
+        )
     }
 }
 

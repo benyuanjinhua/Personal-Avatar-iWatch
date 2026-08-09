@@ -316,13 +316,26 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertFalse(SessionController.isVerticalDismiss(translation: CGSize(width: 0, height: -80)))
     }
 
-    /// 点/长按分界：0.35s 以下为「点一下进会话」，及以上为 PTT 提交。
+    /// 点/长按分界：0.35s 以下为「点一下进会话」，及以上拒绝进入。
     func testTapToEnterThreshold() {
         XCTAssertTrue(SessionController.isTapToEnter(holdSeconds: 0.1))
         XCTAssertTrue(SessionController.isTapToEnter(holdSeconds: 0.349))
         XCTAssertFalse(SessionController.isTapToEnter(holdSeconds: 0.35))
         XCTAssertFalse(SessionController.isTapToEnter(holdSeconds: 1.0))
         XCTAssertEqual(SessionController.tapToEnterMaxHoldSeconds, 0.35, accuracy: 1e-9)
+    }
+
+    func testLongHoldLogsSessionEntryRejectionWithDuration() {
+        var captured: (event: String, detail: String?)?
+        WatchLog.setObserver { _, event, _, detail, _ in
+            if event == "session_enter_rejected" { captured = (event, detail) }
+        }
+        defer { WatchLog.setObserver(nil) }
+
+        SessionController.logSessionEntryRejected(holdSeconds: 1.0)
+
+        XCTAssertEqual(captured?.event, "session_enter_rejected")
+        XCTAssertEqual(captured?.detail, "reason=hold_too_long hold_ms=1000")
     }
 
     // MARK: - helpers
