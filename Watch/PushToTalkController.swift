@@ -123,6 +123,11 @@ final class PushToTalkController: ObservableObject {
     /// ESS-321 real-time adapter. Lazily created on first press when the
     /// streaming gate is on. Wiring lives in `ensureRealtimeAdapter()`.
     private(set) var realtimeAdapter: WatchRealtimeMediaAdapter?
+    /// ESS-642：会话边界闸门。`pressBegan` 真正新起一轮时置真，
+    /// `endSessionConversation`（退出会话）与开新 conversation 时置假。
+    /// `beginSessionConversation` 只在它为真时才允许复用在飞回合——
+    /// 上一会话遗留的 activeTurn 因此永远进不了复用分支。
+    private(set) var didStartTurnSinceConversationBoundary = false
 
     /// ESS-509: true when the realtime adapter owns an active turn (from
     /// `beginTurn` through `turnFinished`). Drives WCSession keep-alive by
@@ -655,6 +660,8 @@ final class PushToTalkController: ObservableObject {
         streamSequence = 0
         streamAborted = false
         if !programmatic { WatchHaptics.play(.recordingStarted) }
+        // ESS-642：本轮是在当前 conversation 边界之后新起的，可被会话入口复用。
+        didStartTurnSinceConversationBoundary = true
         onLocalCaptureChanged?(true)
         Task {
             // ESS-554：会话级路径下，首个流式回合在录音启动前完成
@@ -1175,15 +1182,50 @@ final class PushToTalkController: ObservableObject {
         // 为 nil 时自建），它就是这段会话的 conversation——直接复用，不重开。
         // 判据取 `session.activeTurn` 而非 adapter 的镜像：被
         // `beginConversation` 的 `finishTurn` 打死的正是会话侧那一个。
-        if let inFlight = adapter.session.activeTurn {
+        //
+        // ESS-642（本条是上面那个复用的**边界修正**）：「有没有 activeTurn」
+        // 不足以判定可复用——它区分不了「本次 touch-down 新起的首轮」与
+        // 「上一会话遗留的回合」。真机 L1 证据：进入电话模式后
+        // `session_next_listening` 认领了上一会话的 request_id，紧接着
+        // `play_started` 用同一个旧 id 播出上一轮答案，同时刷
+        // `downlink_drop reason=staleSession`。
+        // 闸门收紧为两条同时成立：① 本次 conversation 边界之后确实由
+        // touch-down 起过一轮（`didStartTurnSinceConversationBoundary`，
+        // 上一会话退出时被 `endSessionConversation` 清掉）；② 在飞回合的
+        // request_id 与当前录音的 `streamRequestId` 一致。
+        let entryTurnRequestId = didStartTurnSinceConversationBoundary
+            ? streamRequestId?.uuidString.lowercased() : nil
+        if let inFlight = adapter.session.activeTurn,
+           let entryTurnRequestId, inFlight.requestId == entryTurnRequestId {
             WatchLog.info(
                 "session", "conversation_reused", requestId: inFlight.requestId,
                 detail: "conversation_id=\(adapter.session.activeConversationId ?? "nil") "
-                    + "reason=turn_already_in_flight turn_id=\(inFlight.turnId)"
+                    + "reason=turn_started_after_boundary turn_id=\(inFlight.turnId)"
             )
             return
         }
+        // 走到这里 = 没有可复用的本轮回合。任何遗留物（上一会话的 activeTurn、
+        // 仍在跑的录音、未提交的实时回合）都必须在开新边界**之前**清掉，
+        // 否则新会话会继续认领旧 request_id。
+        if adapter.session.activeTurn != nil || state != .idle {
+            WatchLog.info(
+                "session", "stale_turn_discarded_at_entry",
+                requestId: adapter.session.activeTurn?.requestId,
+                detail: "ptt_state=\(String(describing: state)) "
+                    + "stream_request_id=\(streamRequestId?.uuidString.lowercased() ?? "nil") "
+                    + "started_after_boundary=\(didStartTurnSinceConversationBoundary)"
+            )
+            // 停录 + 清 stream 状态 + abort 未提交实时回合 + 回 .idle，
+            // 让紧随其后的 `pressBegan()` 真正新起一轮、铸新 request_id。
+            pressCancelled()
+            // pressCancelled 只处理 .recording；遗留回合可能停在别的相位，
+            // 这里补一次 adapter 级取消（停播放器 + finishTurn + 停采集）。
+            if adapter.session.activeTurn != nil {
+                adapter.cancel(reason: .cancelled)
+            }
+        }
         let handle = adapter.beginConversation()
+        didStartTurnSinceConversationBoundary = false
         WatchLog.info(
             "session", "conversation_opened",
             detail: "conversation_id=\(handle.conversationId)"
@@ -1193,8 +1235,17 @@ final class PushToTalkController: ObservableObject {
     /// ESS-600：会话结束——关闭 conversation 边界，旧回合的迟到事件因无
     /// conversation 存续而被拒，不会漏进下一次会话。
     func endSessionConversation() {
+        // ESS-642：边界闸门先落。即便下面因为没有 adapter 而早退，也不能把
+        // 「上一会话起过一轮」这个事实留给下一次进入会话去复用。
+        didStartTurnSinceConversationBoundary = false
         guard let adapter = realtimeAdapter else { return }
         let conversationId = adapter.session.activeConversationId
+        // ESS-642：退出时把播放器一并停掉。`closeConversation` 只 finishTurn +
+        // 关边界，不动播放器——旧答案若正在渲染，它会继续播到下一次进入会话，
+        // 真机上表现为「刚进电话模式就听见上一轮的回答」。
+        if adapter.session.activeTurn != nil {
+            adapter.cancel(reason: .cancelled)
+        }
         adapter.closeConversation()
         WatchLog.info(
             "session", "conversation_closed",
