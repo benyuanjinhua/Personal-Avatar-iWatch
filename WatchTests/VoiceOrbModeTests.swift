@@ -20,7 +20,7 @@ final class VoiceOrbModeTests: XCTestCase {
             .establishing,
             .listening(level: 0),
             .thinking,
-            .speaking,
+            .speaking(level: 0),
         ]
         var names: [String] = []
         for m in modes {
@@ -55,7 +55,7 @@ final class VoiceOrbModeTests: XCTestCase {
         XCTAssertEqual(VoiceOrbView.breathHertz(for: .listening(level: 0)), 2.0, accuracy: 1e-9)
         XCTAssertEqual(VoiceOrbView.breathHertz(for: .listening(level: 0.7)), 2.0, accuracy: 1e-9)
         XCTAssertEqual(VoiceOrbView.breathHertz(for: .thinking), 1.3, accuracy: 1e-9)
-        XCTAssertEqual(VoiceOrbView.breathHertz(for: .speaking), 1.3, accuracy: 1e-9)
+        XCTAssertEqual(VoiceOrbView.breathHertz(for: .speaking(level: 0)), 1.3, accuracy: 1e-9)
     }
 
     func testBreathAmplitudePinnedPerMode() {
@@ -63,7 +63,7 @@ final class VoiceOrbModeTests: XCTestCase {
         XCTAssertEqual(VoiceOrbView.breathAmplitude(for: .establishing), 0.04, accuracy: 1e-9)
         XCTAssertEqual(VoiceOrbView.breathAmplitude(for: .listening(level: 0)), 0.08, accuracy: 1e-9)
         XCTAssertEqual(VoiceOrbView.breathAmplitude(for: .thinking), 0.06, accuracy: 1e-9)
-        XCTAssertEqual(VoiceOrbView.breathAmplitude(for: .speaking), 0.06, accuracy: 1e-9)
+        XCTAssertEqual(VoiceOrbView.breathAmplitude(for: .speaking(level: 0)), 0.06, accuracy: 1e-9)
     }
 
     // MARK: - AC-4：listening 电平变化不触发转场动画重建
@@ -84,7 +84,20 @@ final class VoiceOrbModeTests: XCTestCase {
     }
 
     func testThinkingAndSpeakingAreDistinct() {
-        XCTAssertNotEqual(VoiceOrbView.Mode.thinking, .speaking)
+        XCTAssertNotEqual(VoiceOrbView.Mode.thinking, .speaking(level: 0))
+    }
+
+    // MARK: - F4 icon assertions
+
+    /// AC-F4-2：遮住颜色与文字后仍能根据图标判读五个相位。
+    /// idle=phone.fill, establishing=antenna.radiowaves.left.and.right,
+    /// listening=ear.fill, thinking=ellipsis.bubble.fill, speaking=speaker.wave.2.fill。
+    func testSymbolPinnedPerMode() {
+        XCTAssertEqual(VoiceOrbView.symbol(for: .idle), "phone.fill")
+        XCTAssertEqual(VoiceOrbView.symbol(for: .establishing), "antenna.radiowaves.left.and.right")
+        XCTAssertEqual(VoiceOrbView.symbol(for: .listening(level: 0)), "ear.fill")
+        XCTAssertEqual(VoiceOrbView.symbol(for: .thinking), "ellipsis.bubble.fill")
+        XCTAssertEqual(VoiceOrbView.symbol(for: .speaking(level: 0)), "speaker.wave.2.fill")
     }
 
     // MARK: - ESS-653 待机图标
@@ -92,6 +105,6 @@ final class VoiceOrbModeTests: XCTestCase {
     /// 设计稿 v2.0 P0：待机球图标是电话不是麦克风——「这不是按住说话」
     /// 要在第一眼成立。
     func testIdleSymbolIsPhone() {
-        XCTAssertEqual(VoiceOrbView.symbolName(for: .idle), "phone.fill")
+        XCTAssertEqual(VoiceOrbView.symbol(for: .idle), "phone.fill")
     }
 }
