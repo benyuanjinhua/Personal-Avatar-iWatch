@@ -122,6 +122,12 @@ final class PushToTalkController: ObservableObject {
     /// ESS-554：会话级音频控制器。懒创建于首个流式回合（或 adapter 预
     /// 热）；conversation 期间独占 `.playAndRecord` 与两个实时引擎。
     private(set) var conversationAudioController: ConversationAudioController?
+    /// ESS-603 test seam：会话级控制器的构造缝。生产恒为真实控制器；
+    /// 测试注入 fake session/engine 后才能在 CI（无音频硬件）里断言
+    /// 「gate ON 持有期间 breather 不启动」这条契约。
+    var makeConversationAudioController: () -> ConversationAudioController = {
+        ConversationAudioController()
+    }
     private var pendingRealtimeRecording: [String: AudioRecorder.Recording] = [:]
     /// ESS-331: fast-channel failures can arrive while the m4a is still being
     /// recorded (i.e. before `finishRecording()`). When that happens we keep
@@ -337,6 +343,13 @@ final class PushToTalkController: ObservableObject {
 
         // ESS-587：默认接线——提交后启动后台保活；测试可覆盖为计数闭包。
         startBreatherAfterSubmit = { [weak breather] in breather?.start() }
+
+        // ESS-603：会话级 owner 在场时 breather 既不启动也不去激活。
+        // 与上面 recorder.sessionManagedExternally 同一判据（isAcquired），
+        // 保证「谁持有会话」在录音侧与保活侧不会各说各话。
+        breather.isSessionOwnedExternally = { [weak self] in
+            self?.conversationAudioController?.isAcquired == true
+        }
     }
 
     /// 展示纯文本结果全文。录音期间不弹（打断按住说话手势），文字仍在结果卡片里可点开。
@@ -670,7 +683,7 @@ final class PushToTalkController: ObservableObject {
     @discardableResult
     func ensureConversationAudioController() -> ConversationAudioController {
         if let controller = conversationAudioController { return controller }
-        let controller = ConversationAudioController()
+        let controller = makeConversationAudioController()
         conversationAudioController = controller
         return controller
     }

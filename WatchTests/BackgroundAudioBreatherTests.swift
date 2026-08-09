@@ -11,6 +11,14 @@ import XCTest
 /// 2. 安全上限：回合以非播放方式终结（失败 cue / 纯文本结果）或结果永远
 ///    不到达时，breather 不得无限循环静音音频在背景耗电——到点必须自动停，
 ///    并落 `breather.stopped reason=safety_cap` 事件。
+///
+/// ESS-603 追加的**两套契约**（gate 决定哪一套成立，两套都必须被覆盖）：
+/// - **gate OFF / 普通 PTT**（无会话级 owner）：提交后 breather 必须启动，
+///   stop 时必须真的 `setActive(false)`——ESS-519 原契约逐字不变。
+/// - **gate ON（`ConversationAudioController.isAcquired`）**：提交后
+///   breather **不得**启动（落 `start_skipped reason=conversation_session_owned`），
+///   且任何 stop 路径（含 realtime 首帧回调）**不得**去激活会话级 owner
+///   （`stopped ... deactivated=false`，owner 侧 deactivations 恒为 0）。
 @MainActor
 final class BackgroundAudioBreatherTests: XCTestCase {
 
@@ -35,6 +43,71 @@ final class BackgroundAudioBreatherTests: XCTestCase {
             defer { lock.unlock() }
             return entries.last { $0.module == module && $0.event == event }?.detail
         }
+
+        func count(module: String, event: String) -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return entries.filter { $0.module == module && $0.event == event }.count
+        }
+    }
+
+    /// ESS-603：会话级 owner 的确定性替身——CI 无音频硬件，`deactivations`
+    /// 必须可数，不能靠日志 scraping 判定「有没有替 owner 退会话」。
+    private final class FakeSession: ConversationAudioSessionDriving {
+        private(set) var isActive = false
+        private(set) var activations = 0
+        private(set) var deactivations = 0
+
+        func setCategory(
+            _ category: AVAudioSession.Category,
+            mode: AVAudioSession.Mode,
+            policy: AVAudioSession.RouteSharingPolicy,
+            options: AVAudioSession.CategoryOptions
+        ) throws {}
+
+        func setActive(_ active: Bool, options: AVAudioSession.SetActiveOptions) throws {
+            guard active != isActive else { return }
+            isActive = active
+            if active { activations += 1 } else { deactivations += 1 }
+        }
+    }
+
+    private final class FakeEngine: ConversationAudioEngineControlling {
+        private(set) var isRunning = false
+        func prepare() {}
+        func start() throws { isRunning = true }
+        func stop() { isRunning = false }
+    }
+
+    private func makeRecording() -> AudioRecorder.Recording {
+        AudioRecorder.Recording(
+            fileURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("ess603-\(UUID().uuidString).m4a"),
+            data: Data(repeating: 0x33, count: 128),
+            durationMs: 1_500
+        )
+    }
+
+    /// gate ON 的生产接线：注入 fake 会话/引擎的控制器，并真正进入
+    /// conversation（`isAcquired == true`），随后一切按生产路径走。
+    private func makeControllerHoldingConversation() throws
+        -> (PushToTalkController, FakeSession)
+    {
+        let controller = PushToTalkController()
+        let session = FakeSession()
+        let engine = FakeEngine()
+        controller.makeConversationAudioController = {
+            ConversationAudioController(
+                session: session, captureControl: engine, playbackControl: engine
+            )
+        }
+        controller.voiceStreamingEnabled = { true }
+        controller.conversationAudioEnabled = { true }
+        let audio = controller.ensureConversationAudioController()
+        try audio.beginConversation(conversationId: "ess603-\(UUID().uuidString)")
+        XCTAssertTrue(audio.isAcquired, "gate ON 前置：会话级 owner 必须已持有")
+        XCTAssertEqual(session.deactivations, 0)
+        return (controller, session)
     }
 
     override func setUp() {
@@ -104,8 +177,9 @@ final class BackgroundAudioBreatherTests: XCTestCase {
         XCTAssertFalse(breather.isActive, "safety cap must stop the breather after maxDuration")
         XCTAssertEqual(
             sink.detail(module: "breather", event: "stopped"),
-            "reason=safety_cap",
-            "safety-cap runtime evidence must retain the concrete stop reason"
+            "reason=safety_cap deactivated=true",
+            "safety-cap runtime evidence must retain the concrete stop reason；"
+                + "无 owner 时必须真的去激活（ESS-603 gate OFF 契约）"
         )
     }
 
@@ -127,7 +201,7 @@ final class BackgroundAudioBreatherTests: XCTestCase {
         XCTAssertFalse(breather.isActive)
     }
 
-    // MARK: - Controller 接线
+    // MARK: - 契约 A：gate OFF / 普通 PTT（无会话级 owner，ESS-519 原样）
 
     func testSubmitStartsBreatherAfterTransportDispatch() {
         let controller = PushToTalkController()
@@ -136,14 +210,8 @@ final class BackgroundAudioBreatherTests: XCTestCase {
             sink.record(module: module, event: event, detail: detail)
         }
         controller.voiceStreamingEnabled = { false }
-        let recording = AudioRecorder.Recording(
-            fileURL: FileManager.default.temporaryDirectory
-                .appendingPathComponent("ess587-\(UUID().uuidString).m4a"),
-            data: Data(repeating: 0x33, count: 128),
-            durationMs: 1_500
-        )
 
-        controller.simulateSubmitForTests(recording: recording)
+        controller.simulateSubmitForTests(recording: makeRecording())
 
         XCTAssertTrue(controller.breather.isActive, "submit must invoke the production breather wiring")
         XCTAssertEqual(
@@ -151,6 +219,128 @@ final class BackgroundAudioBreatherTests: XCTestCase {
             "sample_rate=8000 duration_s=2 loops=-1",
             "submit must produce runtime evidence from the real breather"
         )
+        XCTAssertEqual(
+            sink.count(module: "breather", event: "start_skipped"), 0,
+            "无 owner 时不得走 ESS-603 的跳过分支"
+        )
         controller.breather.stop(reason: "test_cleanup")
+        XCTAssertEqual(
+            sink.detail(module: "breather", event: "stopped"),
+            "reason=test_cleanup deactivated=true",
+            "gate OFF：会话是 breather 自己激活的，stop 必须真的去激活"
+        )
+    }
+
+    /// gate OFF 的 realtime 首帧路径（ESS-587 接线）：owner 不在场时，
+    /// 首帧 stop 仍必须去激活，`.playback` 会话不能留给真实播放。
+    func testRealtimeFirstFrameStopDeactivatesWhenNoOwner() throws {
+        let sink = LogSink()
+        WatchLog.setObserver { module, event, detail, _ in
+            sink.record(module: module, event: event, detail: detail)
+        }
+        let breather = BackgroundAudioBreather()
+        breather.start()
+        try XCTSkipUnless(breather.isActive, "audio session unavailable on this simulator")
+
+        breather.stop(reason: "realtime_playback")
+
+        XCTAssertFalse(breather.isActive)
+        XCTAssertEqual(
+            sink.detail(module: "breather", event: "stopped"),
+            "reason=realtime_playback deactivated=true"
+        )
+    }
+
+    // MARK: - 契约 B：gate ON（ConversationAudioController 持有会话）
+
+    /// AC1：`isAcquired == true` 时提交不得启动 breather——启动即改写
+    /// owner 的 `.playAndRecord` 类别，回复音频当场失声。
+    func testSubmitDoesNotStartBreatherWhileConversationOwnsSession() throws {
+        let sink = LogSink()
+        let (controller, session) = try makeControllerHoldingConversation()
+        WatchLog.setObserver { module, event, detail, _ in
+            sink.record(module: module, event: event, detail: detail)
+        }
+
+        controller.simulateSubmitForTests(recording: makeRecording())
+
+        XCTAssertFalse(
+            controller.breather.isActive,
+            "会话级持有期间 breather 不得启动（ESS-603 AC1）"
+        )
+        XCTAssertEqual(
+            sink.count(module: "breather", event: "started"), 0,
+            "持有期间不得出现 breather started"
+        )
+        XCTAssertEqual(
+            sink.detail(module: "breather", event: "start_skipped"),
+            "reason=conversation_session_owned",
+            "跳过必须留下可复核的运行时证据"
+        )
+        XCTAssertEqual(session.deactivations, 0, "owner 的会话不得被去激活")
+    }
+
+    /// AC2：realtime 首帧回调（`adapter.onRealtimePlaybackStarted` →
+    /// `breather.stop(reason: "realtime_playback")`）在 owner 在场时
+    /// 必须是彻底的空操作——这正是真机上「首帧到了却没声」的那一步。
+    func testRealtimeFirstFrameStopDoesNotDeactivateConversationOwner() throws {
+        let sink = LogSink()
+        let (controller, session) = try makeControllerHoldingConversation()
+        WatchLog.setObserver { module, event, detail, _ in
+            sink.record(module: module, event: event, detail: detail)
+        }
+
+        controller.simulateSubmitForTests(recording: makeRecording())
+        controller.breather.stop(reason: "realtime_playback")
+        controller.breather.stop(reason: "real_playback")
+
+        XCTAssertEqual(session.deactivations, 0, "首帧/真实播放回调都不得替 owner 退会话")
+        XCTAssertEqual(
+            sink.count(module: "breather", event: "stopped"), 0,
+            "从未启动 → 无 stopped 事件；owner 的会话完全未被触碰"
+        )
+    }
+
+    /// 竞态兜底：breather 先启动、owner 随后接管（先普通 PTT 再进会话）。
+    /// 此时仍要停掉静音循环，但 `setActive(false)` 归 owner 所有，
+    /// 证据落在 `stopped ... deactivated=false`。
+    func testStopDoesNotDeactivateWhenOwnerAppearsAfterStart() throws {
+        let sink = LogSink()
+        WatchLog.setObserver { module, event, detail, _ in
+            sink.record(module: module, event: event, detail: detail)
+        }
+        let breather = BackgroundAudioBreather()
+        breather.start()
+        try XCTSkipUnless(breather.isActive, "audio session unavailable on this simulator")
+
+        // owner 在 breather 活跃之后接管共享会话。
+        breather.isSessionOwnedExternally = { true }
+        breather.stop(reason: "realtime_playback")
+
+        XCTAssertFalse(breather.isActive, "静音循环仍必须停止")
+        XCTAssertEqual(
+            sink.detail(module: "breather", event: "stopped"),
+            "reason=realtime_playback deactivated=false",
+            "owner 在场时只停播放器、不去激活会话"
+        )
+    }
+
+    /// gate 开关是 breather 行为的唯一分水岭：同一个实例，谓词翻转即换契约。
+    func testOwnershipPredicateIsTheOnlyGate() {
+        let sink = LogSink()
+        WatchLog.setObserver { module, event, detail, _ in
+            sink.record(module: module, event: event, detail: detail)
+        }
+        let breather = BackgroundAudioBreather()
+        breather.isSessionOwnedExternally = { true }
+
+        breather.start()
+
+        XCTAssertFalse(breather.isActive)
+        XCTAssertEqual(
+            sink.detail(module: "breather", event: "start_skipped"),
+            "reason=conversation_session_owned"
+        )
+        XCTAssertEqual(sink.count(module: "breather", event: "started"), 0)
     }
 }
