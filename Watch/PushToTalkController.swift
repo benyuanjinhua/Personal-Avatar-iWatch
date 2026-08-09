@@ -989,8 +989,19 @@ final class PushToTalkController: ObservableObject {
             },
             logger: { message in
                 WatchLog.info("realtime", "adapter", detail: message)
-            }
+            },
+            vadConfiguration: LocalVADConfiguration(
+                endpointSilenceMs: Int64(WatchDebugSettings().vadEndpointSilenceMs)
+            ),
+            automaticallyCommitOnSpeechFinal: true
         )
+        // ESS-575: when VAD auto-commits on speech end, finish the AAC
+        // recording so the file fallback and retry cache are set up.
+        adapter.onVADEvent = { [weak self] event in
+            guard let self, case .speechFinal = event,
+                  self.state == .recording, self.recorder.isRecording else { return }
+            self.finishRecording()
+        }
         // ESS-532: clear the pending hold when playback starts, the turn
         // falls back to complete-file, or the turn finishes entirely.
         adapter.onRealtimePendingResolved = { [weak self] in
