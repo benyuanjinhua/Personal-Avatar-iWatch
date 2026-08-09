@@ -96,6 +96,10 @@ final class PushToTalkController: ObservableObject {
     /// 回答音频**真实播完**。`success=false` 表示播放以失败终局收场
     /// （exhausted / playRejected / deferredTimeout…），绝不记成播完。
     var onSessionAnswerFinished: ((_ requestId: String, _ success: Bool, _ reason: String) -> Void)?
+    /// ESS-600 复审阻断 B：完整文件路径的 **interim** 语音播完（回合尚未达终态，
+    /// 最终回答还在路上）。它不是本轮答完，不得开下一轮——会话据此回到等待态
+    /// 并重新武装有界超时。
+    var onSessionAnswerInterim: ((_ requestId: String) -> Void)?
     /// 本轮**零提交**收场（太短 / 收尾抛错）——没有回答可等，会话需重开采集。
     var onSessionTurnAborted: ((_ requestId: String, _ reason: String) -> Void)?
     /// 本地采集起停（与网络 ready 独立呈现）。
@@ -450,7 +454,22 @@ final class PushToTalkController: ObservableObject {
         // 无差别上报「播完」会让一次失败的播放照样开启下一轮。
         if let requestId, !requestId.hasPrefix("error-") {
             if endgame == .success {
-                onSessionAnswerFinished?(requestId, true, "endgame_success")
+                // ESS-600 复审阻断 B：完整文件路径的 interim 与 final **共用同一个
+                // request_id**。interim（回合尚未达终态的 16.8KB fallback）播完不是
+                // 「这一轮答完了」——此时开下一轮，最终回答到达时会落在下一轮里，
+                // 造成跨轮与顺序错乱。终态判定复用 ESS-45×ESS-46 的同一口径
+                // （`turn.currentState.isTerminal`），不另立第二套真相。
+                if journal.turn(withId: requestId)?.currentState.isTerminal == true {
+                    onSessionAnswerFinished?(requestId, true, "endgame_success")
+                } else {
+                    WatchLog.info(
+                        "player", "interim_playback_not_final", requestId: requestId,
+                        detail: "endgame=success bytes=\(bytes) reason=turn_not_terminal"
+                    )
+                    // 回退到「等最终回答」而不是停在回答态：最终结果若永不到达，
+                    // thinking 的有界超时会把会话捞回聆听；停在 speaking 会永久挂死。
+                    onSessionAnswerInterim?(requestId)
+                }
             } else {
                 onSessionAnswerFinished?(requestId, false, "endgame_\(endgame.logToken)")
             }
@@ -1134,7 +1153,27 @@ final class PushToTalkController: ObservableObject {
     /// 本控制器不另铸 id）。
     func beginSessionConversation() {
         guard voiceStreamingEnabled() else { return }
-        let handle = ensureRealtimeAdapter().beginConversation()
+        let adapter = ensureRealtimeAdapter()
+        // ESS-600 复审阻断 A：`RealtimeMediaSession.beginConversation` 开头就是
+        // `finishTurn(reason: .interrupted)`（`Shared/RealtimeMediaSession.swift`）。
+        // 短按进会话时，录音与实时回合在 touch-down 已经起来了——此刻再开一次
+        // conversation 会把**正在飞的首轮打死**，而 `pressBegan()` 因为 state
+        // 已是 .recording 又会把同一个 request_id 交回会话层认领：会话盯着一个
+        // realtime 回合已被 interrupt 的 id，首轮拿不到 play_started/finished。
+        //
+        // 在飞回合本身已经隐式开了 conversation（`beginTurn` 在 conversation
+        // 为 nil 时自建），它就是这段会话的 conversation——直接复用，不重开。
+        // 判据取 `session.activeTurn` 而非 adapter 的镜像：被
+        // `beginConversation` 的 `finishTurn` 打死的正是会话侧那一个。
+        if let inFlight = adapter.session.activeTurn {
+            WatchLog.info(
+                "session", "conversation_reused", requestId: inFlight.requestId,
+                detail: "conversation_id=\(adapter.session.activeConversationId ?? "nil") "
+                    + "reason=turn_already_in_flight turn_id=\(inFlight.turnId)"
+            )
+            return
+        }
+        let handle = adapter.beginConversation()
         WatchLog.info(
             "session", "conversation_opened",
             detail: "conversation_id=\(handle.conversationId)"

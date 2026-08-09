@@ -314,7 +314,13 @@ final class SessionController: ObservableObject {
             "session", "session_turn_committed", requestId: requestId,
             detail: "turn_index=\(turnIndex) phase=thinking"
         )
-        // 有界执行：回答永不到达时不许无限等。
+        armThinkingTimeout()
+    }
+
+    /// 有界执行：回答永不到达时不许无限等。`markTurnCommitted` 与
+    /// `markAnswerInterim` 共用——interim 播完后仍在等最终回答，超时守卫
+    /// 必须重新武装，否则会话会永久挂在一个不会再有事件的相位上。
+    private func armThinkingTimeout() {
         thinkingToken?.cancel()
         thinkingToken = scheduleDelay(Self.thinkingTimeoutSeconds) { [weak self] in
             guard let self, self.state == .listening, self.turnPhase == .thinking else { return }
@@ -326,6 +332,25 @@ final class SessionController: ObservableObject {
             self.presentFailureNotice("没等到回答，再说一次试试")
             self.startNextTurn(reason: "thinking_timeout")
         }
+    }
+
+    /// ESS-600 复审阻断 B：完整文件路径的 **interim** 语音播完。
+    ///
+    /// interim 与最终回答**共用同一个 request_id**（`VoiceTurnJournal` 的回合
+    /// 尚未达终态），所以它播完绝不等于「这一轮答完了」——若在此开下一轮，
+    /// 最终回答到达时会落进下一轮，正是复审指出的跨轮与顺序错乱。
+    /// 相位退回 `.thinking` 并重新武装有界超时：最终回答到了就正常走
+    /// `answer_started → answer_finished`；永不到达则由超时把会话捞回聆听。
+    func markAnswerInterim(requestId: String) {
+        guard acceptsTurnEvent(requestId, event: "answer_interim") else { return }
+        guard turnPhase == .speaking || turnPhase == .thinking else { return }
+        let fromPhase = turnPhase
+        turnPhase = .thinking
+        WatchLog.info(
+            "session", "session_answer_interim", requestId: requestId,
+            detail: "turn_index=\(turnIndex) from=\(fromPhase.logName) phase=thinking"
+        )
+        armThinkingTimeout()
     }
 
     /// 回答音频**真实起播**（realtime 首帧已渲染 / SpeechPlayer 起播成功）。
@@ -629,6 +654,9 @@ enum SessionTurnWiring {
         }
         pushToTalk.onSessionAnswerFinished = { [weak session] requestId, success, reason in
             session?.markAnswerFinished(requestId: requestId, success: success, reason: reason)
+        }
+        pushToTalk.onSessionAnswerInterim = { [weak session] requestId in
+            session?.markAnswerInterim(requestId: requestId)
         }
         pushToTalk.onSessionTurnAborted = { [weak session] requestId, reason in
             session?.markTurnAborted(requestId: requestId, reason: reason)
