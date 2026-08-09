@@ -220,6 +220,14 @@ final class PushToTalkController: ObservableObject {
             self?.conversationAudioController?.isAcquired == true
         }
 
+        // ESS-603：同一口径也约束 ESS-519 breather——会话级持有期间它既不
+        // 改写 category 也不 deactivate。判据用 `isAcquired` 而不是
+        // `conversationAudioEnabled()`：开旗但 acquire 失败时会话并未真正
+        // 被持有，此时必须保留 breather 的后台保活（ESS-554 的降级路径）。
+        breather.isSessionOwnedExternally = { [weak self] in
+            self?.conversationAudioController?.isAcquired == true
+        }
+
         // ESS-41 B3 深修：播放触发下沉到 speech attach 事件本身，按 request_id
         // 定向交付——不依赖该回合仍是 activeTurn、不依赖 UI 挂载、不依赖回合
         // 未被判失败（语音后到时这三个条件都可能已不成立，旧 onChange 触发
@@ -931,6 +939,9 @@ final class PushToTalkController: ObservableObject {
         // WKExtendedRuntimeSession 虽会被 .resignedFrontmost 收回，但
         // 活跃的音频会话保持进程不被挂起，结果到达时可正常播放。
         // ESS-587：经注入缝启动，测试可断言接线存在（本体单测覆盖不到调用方）。
+        // ESS-603：接线保持无条件调用，是否真启动由 breather 自己按
+        // `isSessionOwnedExternally` 判定——会话级持有时落
+        // `start_skipped reason=conversation_audio_owned`，不改写共享会话。
         startBreatherAfterSubmit?()
         streamRequestId = nil
         streamId = nil

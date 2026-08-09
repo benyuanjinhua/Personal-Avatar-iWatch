@@ -16,6 +16,11 @@ import WatchKit
 ///   Activates a `.playback` audio session and plays silent WAV on loop.
 /// - `stop()`: called when real playback starts or the app becomes active
 ///   again. Releases the audio session.
+///
+/// ESS-603 所有权边界：本类改写的是**共享** `AVAudioSession`。当
+/// `ConversationAudioController`（ESS-554）已按会话级持有该 session 时，
+/// breather 必须完全让开——既不 `setCategory(.playback)`，也不
+/// `setActive(false)`。见 `isSessionOwnedExternally`。
 @MainActor
 final class BackgroundAudioBreather {
     /// ESS-519 复审加固：静音保活的绝对上限。回合以非播放方式终结
@@ -26,12 +31,34 @@ final class BackgroundAudioBreather {
 
     private let maxDuration: TimeInterval
     private var player: AVAudioPlayer?
-    private var session: AVAudioSession { AVAudioSession.sharedInstance() }
+    private let session: any ConversationAudioSessionDriving
     private var capTask: Task<Void, Never>?
     private(set) var isActive = false
 
-    init(maxDuration: TimeInterval = BackgroundAudioBreather.defaultMaxDuration) {
+    /// ESS-603：共享 `AVAudioSession` 此刻是否已被会话级 owner
+    /// （`ConversationAudioController`）持有。
+    ///
+    /// 为什么必须让开：ESS-554 的契约是 conversation 期间由 controller 独占
+    /// `.playAndRecord` 激活态，**只有显式退出（点 X）才 deactivate**。而
+    /// App 自己改 category 不触发 interruption 通知，controller 的
+    /// `isAcquired` 仍为 true —— 一旦 breather 把 session 翻成 `.playback`
+    /// 再 `setActive(false)`，会话级播放引擎就挂在一个已失效的 session 上，
+    /// 表现为回答音频无声且无自愈（ESS-598 的 L2 冲突链）。
+    ///
+    /// 会话模式下不启动 breather 不损失后台存活：controller 持有的
+    /// `.playAndRecord` 本身就是活跃音频会话，`audio` 后台模式的保活效果
+    /// 与 ESS-519 静音循环同源，无需第二份。
+    ///
+    /// 默认 `false` = ESS-519 原行为（普通 PTT / 会话开关关闭 / 会话
+    /// acquire 失败降级），本单不改动那条路径。
+    var isSessionOwnedExternally: () -> Bool = { false }
+
+    init(
+        maxDuration: TimeInterval = BackgroundAudioBreather.defaultMaxDuration,
+        session: any ConversationAudioSessionDriving = AVAudioSession.sharedInstance()
+    ) {
         self.maxDuration = maxDuration
+        self.session = session
     }
 
     /// Start silent audio playback. Must be called while the app is still
@@ -40,6 +67,15 @@ final class BackgroundAudioBreather {
     /// long_form and foreground policies).
     func start() {
         guard !isActive else { return }
+        // ESS-603：会话级 owner 持有期间直接让开——放在 app 状态检查之前，
+        // 让「没启动」的原因在日志里唯一可判（R-02.1 对账靠这条事件）。
+        guard !isSessionOwnedExternally() else {
+            WatchLog.info(
+                "breather", "start_skipped",
+                detail: "reason=conversation_audio_owned"
+            )
+            return
+        }
         let appState = WKApplication.shared().applicationState
         guard appState == .active else {
             WatchLog.info(
@@ -53,8 +89,8 @@ final class BackgroundAudioBreather {
             let p = try AVAudioPlayer(data: silentData)
             p.numberOfLoops = -1
             p.volume = 0
-            try session.setCategory(.playback, mode: .default, policy: .default)
-            try session.setActive(true)
+            try session.setCategory(.playback, mode: .default, policy: .default, options: [])
+            try session.setActive(true, options: [])
             guard p.play() else {
                 WatchLog.error(
                     "breather", "play_returned_false",
@@ -83,15 +119,25 @@ final class BackgroundAudioBreather {
     }
 
     /// Stop silent audio playback and release the audio session.
+    ///
+    /// ESS-603：`deactivated=false` 表示会话级 owner 在此期间接管了共享
+    /// session——此时只停静音播放器，**不 deactivate**，把 session 留给
+    /// owner（PD-2：只有显式退出才 deactivate）。
     func stop(reason: String = "explicit") {
         guard isActive else { return }
         capTask?.cancel()
         capTask = nil
         player?.stop()
         player = nil
-        try? session.setActive(false, options: .notifyOthersOnDeactivation)
+        let deactivated = !isSessionOwnedExternally()
+        if deactivated {
+            try? session.setActive(false, options: .notifyOthersOnDeactivation)
+        }
         isActive = false
-        WatchLog.info("breather", "stopped", detail: "reason=\(reason)")
+        WatchLog.info(
+            "breather", "stopped",
+            detail: "reason=\(reason) deactivated=\(deactivated)"
+        )
     }
 
     // MARK: - Silent WAV generation
