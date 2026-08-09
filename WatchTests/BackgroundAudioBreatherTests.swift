@@ -210,6 +210,11 @@ final class BackgroundAudioBreatherTests: XCTestCase {
             sink.record(module: module, event: event, detail: detail)
         }
         controller.voiceStreamingEnabled = { false }
+        // ESS-601: gate-OFF 测试必须显式关闭 conversation audio 路径。
+        // ConversationAudioGate.defaultEnabled = true，不关闭时
+        // PushToTalkController.init 会走 conversation-scoped 适配器，
+        // 干扰 breather 的 gate-OFF 启动路径。
+        controller.conversationAudioEnabled = { false }
 
         controller.simulateSubmitForTests(recording: makeRecording())
 
