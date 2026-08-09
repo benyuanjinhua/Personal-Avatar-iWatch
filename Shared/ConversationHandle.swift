@@ -15,7 +15,7 @@ import Foundation
 /// One conversation contains multiple turns; each turn carries its own
 /// UUIDv7 `turnId`. The handle is the single source of truth for the
 /// conversation identity — no other component may mint conversation IDs.
-struct ConversationHandle: Equatable, Hashable, Sendable, Codable {
+struct ConversationHandle: Sendable, Codable {
 
     /// UUIDv7 that identifies this conversation. Generated at construction
     /// time and immutable thereafter.
@@ -91,6 +91,26 @@ struct ConversationHandle: Equatable, Hashable, Sendable, Codable {
         case createdAt = "created_at"
         case turnCount = "turn_count"
         case isClosed = "is_closed"
+    }
+}
+
+// MARK: - Equatable & Hashable
+
+extension ConversationHandle: Equatable {
+    static func == (lhs: ConversationHandle, rhs: ConversationHandle) -> Bool {
+        lhs.conversationId == rhs.conversationId
+            && lhs.firstTurnId == rhs.firstTurnId
+            && lhs.turnCount == rhs.turnCount
+            && lhs.isClosed == rhs.isClosed
+    }
+}
+
+extension ConversationHandle: Hashable {
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(conversationId)
+        hasher.combine(firstTurnId)
+        hasher.combine(turnCount)
+        hasher.combine(isClosed)
     }
 }
 
