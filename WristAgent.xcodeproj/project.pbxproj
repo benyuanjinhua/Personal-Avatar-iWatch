@@ -138,6 +138,7 @@
 		9C4B6375FC6A420DF38989E9 /* VoiceStreamProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = E86C631B9730FD0A3CB91448 /* VoiceStreamProtocol.swift */; };
 		9CC8DFCBBBA03E71A76FA9BB /* RealtimePlaybackReceiptTracker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 716B2884D666AEE57BA6AB37 /* RealtimePlaybackReceiptTracker.swift */; };
 		9D5E9B2A9E3421DB6ACEC6DD /* BackgroundAudioBreatherTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D9F48A1DBD295B15B067181 /* BackgroundAudioBreatherTests.swift */; };
+		9F9F35D9BF7509E6A0AA6DA3 /* VoiceBargeInWiringTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 230A70234A562482DDEA5AAC /* VoiceBargeInWiringTests.swift */; };
 		9FCAF92E7F4BAF6D75258EC3 /* AvatarErrorCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38CFFC49761BA3D8F3C402C8 /* AvatarErrorCardView.swift */; };
 		9FE3E5082197E2851CD75F30 /* WatchVoiceTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = F16E394DC77EF14BAE142B32 /* WatchVoiceTransport.swift */; };
 		A0B992F64AF3212C3F47CB0E /* BargeInGenerationCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5752A6573A7A674BF8880E4 /* BargeInGenerationCoordinator.swift */; };
@@ -274,6 +275,7 @@
 		1CEDAB5F3CD7B29B993F0FA2 /* RealtimeMediaFormat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeMediaFormat.swift; sourceTree = "<group>"; };
 		1DAF03C2F2C11D4CBC8D9587 /* WatchSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchSettingsView.swift; sourceTree = "<group>"; };
 		1FE6DCDF59808F848A03798D /* DownlinkBacklogHintTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DownlinkBacklogHintTests.swift; sourceTree = "<group>"; };
+		230A70234A562482DDEA5AAC /* VoiceBargeInWiringTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceBargeInWiringTests.swift; sourceTree = "<group>"; };
 		234EBF336FF2F9724F289524 /* ClientLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientLog.swift; sourceTree = "<group>"; };
 		24DF76CA9FD4F1F5347735D9 /* AudioRecorderDurationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRecorderDurationTests.swift; sourceTree = "<group>"; };
 		27F5CF3965DA28F8FC440CB9 /* AudioRealtimeAgentFeatureFlag.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRealtimeAgentFeatureFlag.swift; sourceTree = "<group>"; };
@@ -597,6 +599,7 @@
 				0D83133781FDC42821BB13DF /* SpeechPlayerInterruptionTests.swift */,
 				AAD9BD4DBA7700C65F134EF3 /* SpeechPlayerReleaseTests.swift */,
 				C8BFD3B8E68CD0ED9C78C500 /* SpeechPlayerUserInterruptTests.swift */,
+				230A70234A562482DDEA5AAC /* VoiceBargeInWiringTests.swift */,
 				49650776B8272C45D3CA35CB /* VoiceConfirmTimerTests.swift */,
 				F9C49719F53E734FE041D10B /* VoiceOrbModeTests.swift */,
 				50DEF68818AC545EED28B44F /* WatchDebugSettingsTests.swift */,
@@ -959,6 +962,7 @@
 				7C465E62628112B008899B51 /* SpeechPlayerInterruptionTests.swift in Sources */,
 				68EF687B6F0F17A356355833 /* SpeechPlayerReleaseTests.swift in Sources */,
 				7CD3A14FB1B8F7A79D40B608 /* SpeechPlayerUserInterruptTests.swift in Sources */,
+				9F9F35D9BF7509E6A0AA6DA3 /* VoiceBargeInWiringTests.swift in Sources */,
 				96CAA0EBFA4914CDC450105B /* VoiceConfirmTimerTests.swift in Sources */,
 				BE736ADFC210C176CA197273 /* VoiceOrbModeTests.swift in Sources */,
 				A3BFF832F44C4739239AB662 /* WatchDebugSettingsTests.swift in Sources */,

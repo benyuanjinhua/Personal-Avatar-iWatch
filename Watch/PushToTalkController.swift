@@ -104,6 +104,10 @@ final class PushToTalkController: ObservableObject {
     var onSessionTurnAborted: ((_ requestId: String, _ reason: String) -> Void)?
     /// 本地采集起停（与网络 ready 独立呈现）。
     var onLocalCaptureChanged: ((_ active: Bool) -> Void)?
+    /// ESS-650 F2-3：语音打断命中（携带 `detect_ms`）。会话层据此走与点球
+    /// **同一个** `interruptSpeaking` 入口，只是 `source` 不同——两条路径落到
+    /// 不同状态机，误触发率就永远算不出来（ESS-655 口径 3）。
+    var onSessionVoiceBargeIn: ((_ detectMs: Int) -> Void)?
 
     private static let logger = Logger(subsystem: "com.benyuan.wristagent.watch", category: "PlaybackTrigger")
     private let recorder = AudioRecorder()
@@ -1166,7 +1170,34 @@ final class PushToTalkController: ObservableObject {
         adapter.onAnswerPlaybackFailed = { [weak self] handle, code in
             self?.onSessionAnswerFinished?(handle.requestId, false, "realtime_\(code)")
         }
+        // ESS-650 F2-3：语音打断命中，透传 detect_ms 给会话层。会话层负责
+        // 就地量 stop_ms 并落 source=voice 的 session_speaking_interrupted。
+        adapter.onVoiceBargeInDetected = { [weak self] detectMs in
+            self?.onSessionVoiceBargeIn?(detectMs)
+        }
     }
+
+    // MARK: - ESS-650 语音打断监听（F2-2 / F2-4）
+
+    /// 进入 speaking 时开启「只听不传」的打断监听。
+    /// gate 判定在会话层（`SessionController`）——本函数只在被调用时执行，
+    /// 不自己读 gate，避免两处各判一次导致口径分叉。
+    func beginVoiceBargeInListening() {
+        realtimeAdapter?.beginBargeInListening()
+    }
+
+    /// 结束打断监听。`reason` 进日志：`answer_finished` / `interrupted` /
+    /// `gate_off`（gate 动态关闭的即时停采）/ `session_exit`。
+    func endVoiceBargeInListening(reason: String) {
+        realtimeAdapter?.endBargeInListening(reason: reason)
+    }
+
+    /// 打断监听是否真的在采集——小梁复核「gate 动态切换能即时停止采集」
+    /// 的可断言口径。
+    var isVoiceBargeInListening: Bool { realtimeAdapter?.isBargeInListening ?? false }
+
+    /// F2-5 对账：守卫窗内的高能量帧累计数（疑似自身回声）。
+    var voiceBargeInSelfEchoFrames: Int { realtimeAdapter?.bargeInSelfEchoFrameCount ?? 0 }
 
     // MARK: - ESS-600 会话边界与手动打断
 

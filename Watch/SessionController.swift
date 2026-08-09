@@ -134,6 +134,19 @@ final class SessionController: ObservableObject {
     /// `PushToTalkController.interruptAnswerPlayback()`（realtime 走
     /// barge-in 请求换代，m4a 走 player.stop），停播后本控制器直接开下一轮。
     var onInterruptSpeaking: (() -> Void)?
+    /// ESS-650（F2-2）：进入 speaking 时开启「只听不传」的打断监听。
+    /// 生产接 `PushToTalkController.beginVoiceBargeInListening()`。
+    var onBeginBargeInListening: (() -> Void)?
+    /// ESS-650：结束打断监听。`reason` 区分 `answer_finished` / `interrupted` /
+    /// `gate_off` / `session_exit`，让「gate 动态关闭即时停采」在日志里可判定。
+    var onEndBargeInListening: ((_ reason: String) -> Void)?
+    /// ESS-650（F2-4）：语音打断开关，**默认 OFF**。生产接
+    /// `WatchDebugSettings.voiceBargeInEnabled`；F2-5 未通过不得默认 ON。
+    var voiceBargeInEnabled: () -> Bool = { false }
+    /// ESS-650（F2-5 对账）：读取当前累计的疑似自身回声帧数。生产接
+    /// `PushToTalkController.voiceBargeInSelfEchoFrames`。
+    var bargeInSelfEchoFrames: (() -> Int)?
+
     /// ESS-600：就绪超时的**抢救**出口——把已经录到的语音经可靠通道
     /// （完整文件 / WCSession transferFile）提交，而不是连人带话一起丢。
     /// 生产接 `PushToTalkController.endSessionTurn()`。
@@ -194,15 +207,6 @@ final class SessionController: ObservableObject {
     /// `conversation_id` / `turn_id` 真相在 `RealtimeMediaSession.ConversationHandle`
     /// （唯一铸造点），本序号只是会话层日志的可读游标，不另铸 id。
     private(set) var turnIndex = 0
-
-    // MARK: - ESS-650 语音打断
-
-    var voiceBargeInEnabled: Bool = false
-    var onStartBargeInMonitoring: (() -> Void)?
-    var onStopBargeInMonitoring: (() -> Void)?
-    var onHandleBargeInPCM: ((Data) -> Void)?
-    private var bargeInDetector: VoiceBargeInDetector?
-    private(set) var bargeInSelfEchoFrames: Int = 0
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -355,6 +359,8 @@ final class SessionController: ObservableObject {
         guard turnPhase == .speaking || turnPhase == .thinking else { return }
         let fromPhase = turnPhase
         turnPhase = .thinking
+        // ESS-650：interim 播完退回等待态，已不在 speaking，停采。
+        stopBargeInListening(reason: "answer_interim")
         WatchLog.info(
             "session", "session_answer_interim", requestId: requestId,
             detail: "turn_index=\(turnIndex) from=\(fromPhase.logName) phase=thinking"
@@ -369,12 +375,62 @@ final class SessionController: ObservableObject {
         guard turnPhase == .thinking else { return }
         thinkingToken?.cancel(); thinkingToken = nil
         turnPhase = .speaking
-        // ESS-650: start VAD-only capture during speaking for voice barge-in.
-        if voiceBargeInEnabled { startBargeInMonitoring() }
         WatchLog.info(
             "session", "session_answer_started", requestId: requestId,
             detail: "turn_index=\(turnIndex) phase=speaking"
         )
+        // ESS-650 F2-2：gate ON 时 speaking 期间常开采集（只进 VAD、零上行）。
+        // gate OFF 时**根本不开麦**——「回答时也在听」是要给用户明确承诺的，
+        // 开关关着却在采集属于隐私违背，不是省事。
+        startBargeInListeningIfEnabled()
+    }
+
+    /// ESS-650：进入/离开 speaking 的打断监听闸门。gate 判定只在这一处，
+    /// 采集侧不再自己读一遍开关——两处各判一次必然分叉。
+    private func startBargeInListeningIfEnabled() {
+        guard turnPhase == .speaking, voiceBargeInEnabled() else { return }
+        onBeginBargeInListening?()
+    }
+
+    private func stopBargeInListening(reason: String) {
+        onEndBargeInListening?(reason)
+        // ESS-650 F2-5：把本轮守卫窗内的疑似自身回声帧数落成 ESS-655 定义的
+        // `session_barge_in_self_echo`（保留 b93f3e6 引入的这条事件）。
+        // 只在非零时落——零回声是常态，不该刷屏；而 F2-5 的门槛是「有样本
+        // 且零误触」，样本数由 `voiceBargeInSelfEchoFrames` 累计对账。
+        let echoFrames = bargeInSelfEchoFrames?() ?? 0
+        if echoFrames > 0 {
+            WatchLog.info(
+                "session", "session_barge_in_self_echo", requestId: activeTurnRequestId,
+                detail: "turn_index=\(turnIndex) self_echo_frames=\(echoFrames) reason=\(reason)"
+            )
+        }
+    }
+
+    /// ESS-650 F2-3：语音打断命中。走与点球**同一个** `interruptSpeaking`
+    /// 入口，只是 `source` 与 `detectMs` 不同——两条打断路径落到不同事件或
+    /// 不同状态机，误触发率就永远算不出来（ESS-655 口径 3）。
+    /// gate 在命中瞬间已被关掉时一律丢弃：用户刚关掉开关不该再被打断一次。
+    func handleVoiceBargeIn(detectMs: Int) {
+        guard voiceBargeInEnabled() else {
+            WatchLog.info(
+                "session", "voice_barge_in_ignored", requestId: activeTurnRequestId,
+                detail: "reason=gate_off detect_ms=\(detectMs)"
+            )
+            return
+        }
+        guard state == .listening, turnPhase == .speaking else { return }
+        interruptSpeaking(source: .voice, detectMs: detectMs)
+    }
+
+    /// ESS-650 F2-4：gate 被动态切换。关掉时必须**即时停止采集**——不能等
+    /// 本轮回答播完，否则开关关了麦克风还开着。
+    func noteVoiceBargeInGateChanged(enabled: Bool) {
+        if enabled {
+            startBargeInListeningIfEnabled()
+        } else {
+            stopBargeInListening(reason: "gate_off")
+        }
     }
 
     /// 回答**真实播完**。speaking → listening，并自动开下一轮采集。
@@ -398,8 +454,8 @@ final class SessionController: ObservableObject {
                 code: "ERR_SESSION_ANSWER_FAILED"
             )
         }
-        // ESS-650: stop VAD-only capture before starting next turn.
-        stopBargeInMonitoring()
+        // ESS-650：离开 speaking 即停采（回答播完/失败都算）。
+        stopBargeInListening(reason: success ? "answer_finished" : "answer_failed")
         startNextTurn(reason: success ? "answer_finished" : "answer_failed:\(reason)")
     }
 
@@ -437,10 +493,11 @@ final class SessionController: ObservableObject {
     ) {
         guard state == .listening, turnPhase == .speaking else { return }
         let stopStartedAt = DispatchTime.now().uptimeNanoseconds
+        // ESS-650：打断即离开 speaking，先停采再停播——顺序有意：停采在前，
+        // 停播过程中的扬声器余音才不会再喂进检测器。
+        stopBargeInListening(reason: "interrupted")
         onInterruptSpeaking?()
         let stopMs = Int((DispatchTime.now().uptimeNanoseconds &- stopStartedAt) / 1_000_000)
-        // ESS-650: stop VAD-only capture on any interrupt.
-        stopBargeInMonitoring()
         WatchLog.record(
             PhoneModeTelemetry.speakingInterrupted(
                 source: source, detectMs: detectMs, stopMs: stopMs, turnIndex: turnIndex
@@ -489,6 +546,7 @@ final class SessionController: ObservableObject {
         let failedFrom = state
         cancelConnectingTimers()
         cancelTurnTimers()
+        stopBargeInListeningOnTeardown()
         state = .idle
         turnPhase = .idle
         activeTurnRequestId = nil
@@ -542,6 +600,7 @@ final class SessionController: ObservableObject {
     private func teardownToIdle() {
         cancelConnectingTimers()
         cancelTurnTimers()
+        stopBargeInListeningOnTeardown()
         let turns = turnIndex
         state = .disconnecting
         turnPhase = .idle
@@ -552,6 +611,11 @@ final class SessionController: ObservableObject {
         state = .idle
         enteredAt = nil
         WatchLog.info("session", "session_ended", detail: "mic_released=true turns=\(turns)")
+    }
+
+    /// ESS-650：会话拆链/失败时一并停采，不把麦克风留在会话之外。
+    private func stopBargeInListeningOnTeardown() {
+        stopBargeInListening(reason: "session_exit")
     }
 
     private func cancelTurnTimers() {
@@ -732,6 +796,19 @@ enum SessionTurnWiring {
         pushToTalk.onLocalCaptureChanged = { [weak session] active in
             session?.markLocalCapture(active: active)
         }
+        // ESS-650 F2-2 / F2-3：打断监听的起停与命中回调。
+        session.onBeginBargeInListening = { [weak pushToTalk] in
+            pushToTalk?.beginVoiceBargeInListening()
+        }
+        session.onEndBargeInListening = { [weak pushToTalk] reason in
+            pushToTalk?.endVoiceBargeInListening(reason: reason)
+        }
+        session.bargeInSelfEchoFrames = { [weak pushToTalk] in
+            pushToTalk?.voiceBargeInSelfEchoFrames ?? 0
+        }
+        pushToTalk.onSessionVoiceBargeIn = { [weak session] detectMs in
+            session?.handleVoiceBargeIn(detectMs: detectMs)
+        }
     }
 }
 
@@ -786,65 +863,6 @@ private extension SessionController.State {
         case .connecting: return "connecting"
         case .listening: return "listening"
         case .disconnecting: return "disconnecting"
-        }
-    }
-}
-
-// MARK: - ESS-650 Voice Barge-In
-
-extension SessionController {
-    private func startBargeInMonitoring() {
-        guard voiceBargeInEnabled else { return }
-        bargeInDetector = VoiceBargeInDetector()
-        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
-        bargeInDetector?.playbackStarted(atMs: nowMs)
-        WatchLog.info(
-            "session", "voice_barge_in_monitoring_started",
-            requestId: activeTurnRequestId,
-            detail: "turn_index=\(turnIndex)"
-        )
-        onStartBargeInMonitoring?()
-    }
-
-    private func stopBargeInMonitoring() {
-        guard bargeInDetector != nil else { return }
-        if let detector = bargeInDetector {
-            bargeInSelfEchoFrames += detector.selfEchoFrameCount
-            if detector.selfEchoFrameCount > 0 {
-                WatchLog.info(
-                    "session", "session_barge_in_self_echo",
-                    requestId: activeTurnRequestId,
-                    detail: "turn_index=\(turnIndex) self_echo_frames=\(detector.selfEchoFrameCount) cumulative=\(bargeInSelfEchoFrames)"
-                )
-            }
-        }
-        bargeInDetector = nil
-        onStopBargeInMonitoring?()
-        WatchLog.info(
-            "session", "voice_barge_in_monitoring_stopped",
-            requestId: activeTurnRequestId,
-            detail: "turn_index=\(turnIndex)"
-        )
-    }
-
-    func handleBargeInPCMFrame(_ pcm: Data) {
-        guard var detector = bargeInDetector, voiceBargeInEnabled else { return }
-        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
-        let events = detector.processPCM16(pcm, frameStartedAtMs: nowMs)
-        bargeInDetector = detector
-        for event in events {
-            if case .bargeInDetected(let atMs) = event {
-                let detectMs = Int(atMs)
-                WatchLog.info(
-                    "session", "session_barge_in_detected",
-                    requestId: activeTurnRequestId,
-                    detail: "turn_index=\(turnIndex) source=voice detect_ms=\(detectMs)"
-                )
-                interruptSpeaking(
-                    source: .orbTap,
-                    detectMs: detectMs
-                )
-            }
         }
     }
 }

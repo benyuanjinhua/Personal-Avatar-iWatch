@@ -144,6 +144,19 @@ final class WatchRealtimeMediaAdapter {
     /// 混响会被当成用户开口（Watch 无 AEC）。把守卫带过回合边界，让新一轮
     /// 的头 `playbackGuardMs` 不参与断句判定。
     private var vadGuardUntilMs: Int64 = 0
+
+    // MARK: - ESS-650 语音打断（F2-2 / F2-3）
+
+    /// speaking 期间的打断监听是否开着。为真时麦克风帧**只**喂
+    /// `VoiceBargeInDetector`，绝不进上行（F2-2「零上行」）。
+    private(set) var isBargeInListening = false
+    private var bargeInDetector = VoiceBargeInDetector()
+    private var bargeInFrameStartedAtMs: Int64 = 0
+    /// 本次 speaking 的起播时刻，用于算 `detect_ms`（起说 → 判定命中）。
+    private var bargeInPlaybackStartedAtMs: Int64 = 0
+    /// 语音打断命中。参数是 `detect_ms`——ESS-655 埋点契约要求把「慢在检测」
+    /// 与「慢在停播」分开，停播耗时由 `SessionController` 就地量。
+    var onVoiceBargeInDetected: (@MainActor (_ detectMs: Int) -> Void)?
     private(set) var didTriggerCompleteFileFallback = false
     /// ESS-573: 每回合只向上一层宣告一次「通道就绪」（首个 ack）。
     private var didSignalChannelReady = false
@@ -187,6 +200,13 @@ final class WatchRealtimeMediaAdapter {
     private func wire() {
         recorder.onFrame = { [weak self] frame in
             guard let self else { return }
+            // ESS-650 F2-2：speaking 期间的打断监听是**只进 VAD、零上行**的。
+            // 这条早退是「零上行」的唯一实现点——绝不能改成「先 push 再判断」，
+            // 那样回答播放期间用户的每一帧都会被当成新一轮输入送上去。
+            guard !self.isBargeInListening else {
+                self.consumeBargeIn(frame)
+                return
+            }
             self.session.pushMicrophonePCM(frame)
             self.consumeVAD(frame)
         }
@@ -347,6 +367,78 @@ final class WatchRealtimeMediaAdapter {
         vadGuardUntilMs = effectiveAtMs + (vadEndpointer?.configuration.playbackGuardMs ?? 0)
     }
 
+    // MARK: - ESS-650 打断监听生命周期
+
+    /// F2-2：进入 speaking 时开启「只听不传」的打断监听。
+    ///
+    /// 复用同一个 recorder（不另起第二路采集：两路麦克风在 watchOS 上必然
+    /// 抢会话）；开关只在 `onFrame` 的分流上，因此「零上行」是结构性的，
+    /// 不依赖调用方记得关。gate OFF 时调用方根本不调本函数。
+    func beginBargeInListening(atMs: Int64? = nil) {
+        guard !isBargeInListening else { return }
+        let atMs = atMs ?? Self.uptimeMs()
+        isBargeInListening = true
+        bargeInFrameStartedAtMs = atMs
+        bargeInPlaybackStartedAtMs = atMs
+        bargeInDetector.playbackStarted(atMs: atMs)
+        do {
+            try recorder.start()
+        } catch {
+            // 起采失败不阻断回答播放——打断退化为「只能点球」，如实留证。
+            isBargeInListening = false
+            WatchLog.error(
+                "realtime", "barge_in_listen_start_failed",
+                requestId: currentTurn?.requestId,
+                detail: "error=\(error.localizedDescription)", error: error
+            )
+            return
+        }
+        WatchLog.info(
+            "realtime", "barge_in_listening_started", requestId: currentTurn?.requestId,
+            detail: "uplink=disabled guard_ms=\(bargeInDetector.configuration.playbackGuardMs)"
+        )
+    }
+
+    /// 结束打断监听（回答播完 / 被打断 / gate 关掉 / 退出会话）。
+    /// `reason` 进日志，便于把「gate 动态关闭即时停采」与其它停采区分开。
+    func endBargeInListening(reason: String) {
+        guard isBargeInListening else { return }
+        isBargeInListening = false
+        recorder.stop()
+        bargeInDetector.playbackEnded()
+        WatchLog.info(
+            "realtime", "barge_in_listening_stopped", requestId: currentTurn?.requestId,
+            detail: "reason=\(reason) self_echo_frames=\(bargeInDetector.selfEchoFrameCount)"
+        )
+    }
+
+    /// 累计的疑似自身回声帧数（守卫窗内的高能量帧）。F2-5 的对账口径。
+    var bargeInSelfEchoFrameCount: Int { bargeInDetector.selfEchoFrameCount }
+
+    /// 打断监听的帧消费：**只**喂检测器，不碰上行、不碰会话 VAD。
+    private func consumeBargeIn(_ frame: Data) {
+        let events = bargeInDetector.processPCM16(frame, frameStartedAtMs: bargeInFrameStartedAtMs)
+        bargeInFrameStartedAtMs += Int64(
+            frame.count / MemoryLayout<Int16>.size * 1_000 / vadSampleRate
+        )
+        for event in events {
+            switch event {
+            case .energySpike(let atMs):
+                WatchLog.info(
+                    "realtime", "barge_in_energy_spike", requestId: currentTurn?.requestId,
+                    detail: "at_ms=\(atMs)"
+                )
+            case .bargeInDetected(let atMs):
+                let detectMs = Int(max(0, atMs - bargeInPlaybackStartedAtMs))
+                WatchLog.info(
+                    "realtime", "barge_in_detected", requestId: currentTurn?.requestId,
+                    detail: "at_ms=\(atMs) detect_ms=\(detectMs)"
+                )
+                onVoiceBargeInDetected?(detectMs)
+            }
+        }
+    }
+
     private func consumeVAD(_ frame: Data) {
         guard var endpointer = vadEndpointer else { return }
         let events = endpointer.processPCM16(frame, frameStartedAtMs: vadFrameStartedAtMs)
@@ -375,7 +467,7 @@ final class WatchRealtimeMediaAdapter {
         }
     }
 
-    private static func uptimeMs() -> Int64 {
+    static func uptimeMs() -> Int64 {
         Int64(ProcessInfo.processInfo.systemUptime * 1_000)
     }
 
