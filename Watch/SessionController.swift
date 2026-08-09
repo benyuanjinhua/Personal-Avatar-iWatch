@@ -588,13 +588,30 @@ final class SessionController: ObservableObject {
         translation.height > 40 && translation.height > abs(translation.width) * 1.5
     }
 
-    /// 「点一下进会话」与「按住说话」的时长分界（PRD F1）：松手时
-    /// 按住不足该时长记为「点」——转会话常驻监听；达到则走 PTT 提交。
-    /// 0.35s【待调】：小于典型「按住说一个字」的最短按住，大于快速点按。
+    /// 「点一下进会话」的时长上界（PRD F1 / ESS-653 v2.0）。
+    ///
+    /// ESS-653 之前这条线是「点 vs 按住说话」的分流；v2.0 收敛入口后
+    /// **长按不再有 PTT 语义**，超过该时长的按住是一次被拒绝的进入，
+    /// 而不是另一种提交方式——见 `rejectEnter`。
+    /// 0.35s【待调，F5/ESS-651 将收紧至 0.2s】。
     static let tapToEnterMaxHoldSeconds: TimeInterval = 0.35
 
     static func isTapToEnter(holdSeconds: TimeInterval) -> Bool {
         holdSeconds < tapToEnterMaxHoldSeconds
+    }
+
+    /// ESS-653（F6 证据）：按住超时导致的进入被拒。
+    ///
+    /// 为什么要留证：拒绝对用户是「我按了但什么都没发生」——没有这条事件，
+    /// 真机上分不清「手势被判成长按拒绝」与「点击根本没识别到」。
+    /// `hold_ms` 是收紧阈值（ESS-651）时唯一能用来对账的量。
+    func rejectEnter(reason: String, holdSeconds: TimeInterval) {
+        let holdMs = holdSeconds.isFinite ? Int(holdSeconds * 1_000) : -1
+        WatchLog.info(
+            "session", "session_enter_rejected",
+            detail: "reason=\(reason) hold_ms=\(holdMs) "
+                + "threshold_ms=\(Int(Self.tapToEnterMaxHoldSeconds * 1_000))"
+        )
     }
 }
 

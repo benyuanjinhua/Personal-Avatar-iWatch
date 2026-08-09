@@ -133,12 +133,15 @@ struct WatchContentView: View {
                     VoiceOrbView(mode: orbMode, size: 70)
                         .padding(.top, 4)
                         .gesture(
-                            // ESS-573 / PRD F1：点一下进入实时对话，按住
-                            // 仍是 PTT。两者共用一个手势且**零延迟**：
-                            // touch-down 立即 pressBegan（与旧行为一致，
-                            // 早期语音不丢）；松手时按时长分流——短按
-                            // （点）转入会话常驻监听（录音不中断、不提交），
-                            // 长按松手走既有 pressEnded 提交。
+                            // ESS-653 / PRD F1 v2.0：入口只剩「点一下进入
+                            // 电话模式」，长按**不再有 PTT 提交语义**。
+                            // touch-down 仍立即 pressBegan（零延迟起采，
+                            // 用户点完立刻开口的首句不丢）；松手时：
+                            // - 短按 → enterSession，认领已在录的那一轮；
+                            // - 长按 → 拒绝进入并 pressCancelled 丢弃本次
+                            //   采集（不提交），落 session_enter_rejected。
+                            // 底层 PushToTalkController 能力不删，会话内
+                            // 的自动轮转仍复用它。
                             DragGesture(minimumDistance: 0)
                                 .onChanged { _ in
                                     guard orbTouchDownAt == nil else { return }
@@ -161,7 +164,13 @@ struct WatchContentView: View {
                                         // 由真实 uplink ack 驱动，见 SessionController。
                                         session.enterSession()
                                     } else {
-                                        pushToTalk.pressEnded()
+                                        // ESS-653：长按不再提交。丢弃本次采集并留证——
+                                        // 没有这条事件，真机上分不清「被判成长按拒绝」
+                                        // 与「点击根本没识别到」。
+                                        session.rejectEnter(
+                                            reason: "hold_too_long", holdSeconds: heldSeconds
+                                        )
+                                        pushToTalk.pressCancelled()
                                     }
                                 }
                         )
@@ -696,7 +705,9 @@ struct WatchContentView: View {
     /// 语义文本替换阶梯文案。
     private func statusCopy(now: Date) -> MainStatusCopy {
         if isRecording {
-            return MainStatusCopy(title: "我在听", subtitle: "松开发送（最长 60 秒）")
+            // ESS-653：不再有「松开发送」——松手要么进入电话模式，要么被拒。
+            // 说完停一下由 VAD 断句接管（会话内自动轮转）。
+            return MainStatusCopy(title: "我在听", subtitle: "说完停一下就行")
         }
         if isSpeaking {
             // ESS-259 B-STOP：副标题承诺的「可点字幕打断」在 SubtitlePlaybackView
@@ -704,9 +715,12 @@ struct WatchContentView: View {
             return MainStatusCopy(title: "AI 分身正在说话…", subtitle: "全文同步展示，轻点字幕打断")
         }
         guard let turn = activeTurn, turn.isActive else {
+            // ESS-653：待机文案必须说清「点一下」——旧文案「按住说话/松开即
+            // 发送」描述的是已被移除的语义，照抄会让用户按住，然后什么都
+            // 不发生（只落一条 session_enter_rejected）。
             return MainStatusCopy(
-                title: "按住说话",
-                subtitle: showWelcomeBanner ? "按住语音球开始对话" : "松开即发送，结果回来会震动提醒"
+                title: "点一下，和分身说话",
+                subtitle: showWelcomeBanner ? "点一下语音球接通" : "接通后直接说，说完停一下就行"
             )
         }
         if let progress = currentProgress(for: turn) {

@@ -126,7 +126,9 @@ struct VoiceOrbView: View {
 
     private var symbol: String {
         switch mode {
-        case .idle: return "mic.fill"
+        // ESS-653：入口是「电话模式」而不是「按住说话」。麦克风图标会把
+        // 老用户带回按住说话的肌肉记忆，电话图标才对得上「点一下接通」。
+        case .idle: return "phone.fill"
         case .establishing: return "antenna.radiowaves.left.and.right"
         case .listening: return "waveform"
         case .thinking: return "ellipsis"

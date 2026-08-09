@@ -316,13 +316,50 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertFalse(SessionController.isVerticalDismiss(translation: CGSize(width: 0, height: -80)))
     }
 
-    /// 点/长按分界：0.35s 以下为「点一下进会话」，及以上为 PTT 提交。
+    /// 点/长按分界：0.35s 以下为「点一下进会话」；及以上**不再是 PTT 提交**，
+    /// 而是一次被拒绝的进入（ESS-653 收敛入口后）。
     func testTapToEnterThreshold() {
         XCTAssertTrue(SessionController.isTapToEnter(holdSeconds: 0.1))
         XCTAssertTrue(SessionController.isTapToEnter(holdSeconds: 0.349))
         XCTAssertFalse(SessionController.isTapToEnter(holdSeconds: 0.35))
         XCTAssertFalse(SessionController.isTapToEnter(holdSeconds: 1.0))
         XCTAssertEqual(SessionController.tapToEnterMaxHoldSeconds, 0.35, accuracy: 1e-9)
+    }
+
+    /// ESS-653（F6 证据）：长按被拒必须留证。拒绝对用户是「按了但什么都没
+    /// 发生」——没有这条事件，真机上分不清「判成长按拒绝」与「点击没识别到」。
+    func testRejectEnterEmitsRuntimeEvidenceWithHoldMs() {
+        var events: [(module: String, event: String, detail: String?)] = []
+        WatchLog.setObserver { module, event, _, detail, _ in
+            events.append((module, event, detail))
+        }
+        defer { WatchLog.setObserver(nil) }
+        let controller = self.controller!
+
+        controller.rejectEnter(reason: "hold_too_long", holdSeconds: 1.0)
+
+        let rejected = events.filter { $0.module == "session" && $0.event == "session_enter_rejected" }
+        XCTAssertEqual(rejected.count, 1)
+        let detail = rejected.first?.detail ?? ""
+        XCTAssertTrue(detail.contains("reason=hold_too_long"), "实际=\(detail)")
+        XCTAssertTrue(detail.contains("hold_ms=1000"), "hold_ms 是收紧阈值时唯一能对账的量；实际=\(detail)")
+        XCTAssertTrue(detail.contains("threshold_ms=350"), "实际=\(detail)")
+        // 拒绝不得把会话推进任何状态。
+        XCTAssertEqual(controller.state, .idle)
+    }
+
+    /// 无效时长（手势未记录到 touch-down 时间）不得算出天文数字 hold_ms。
+    func testRejectEnterHandlesNonFiniteHold() {
+        var details: [String] = []
+        WatchLog.setObserver { _, event, _, detail, _ in
+            if event == "session_enter_rejected" { details.append(detail ?? "") }
+        }
+        defer { WatchLog.setObserver(nil) }
+
+        controller.rejectEnter(reason: "hold_too_long", holdSeconds: .infinity)
+
+        XCTAssertEqual(details.count, 1)
+        XCTAssertTrue(details.first?.contains("hold_ms=-1") == true, "实际=\(details.first ?? "")")
     }
 
     // MARK: - helpers
