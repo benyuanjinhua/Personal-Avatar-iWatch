@@ -1204,6 +1204,29 @@ final class PushToTalkController: ObservableObject {
             )
             return
         }
+        // ESS-648：短按的真实时序里还有第三种形态——**本次 touch-down 已经起轮、
+        // 但 activeTurn 尚未异步建立**。`pressBegan()` 同步段只置 `state = .recording`
+        // 与 `streamRequestId`；`adapter.beginTurn` 要等 `recorder.start()` 返回后
+        // 才在 Task 里执行（ESS-362 的顺序约束，不能提前）。短按松手往往比这更快，
+        // 于是入口看到的是「gate 为真 + request_id 已铸 + activeTurn 仍为 nil」。
+        // 上面的复用分支要求 activeTurn 已存在，下面的遗留清理分支只看
+        // `state != .idle`——两条都不认这个窗口，结果把**本次合法首轮**当遗留物
+        // `pressCancelled()` 掉，正是 ESS-600 要保护的那一轮。
+        // 判据用 gate + `streamRequestId`（两者都在 `pressBegan` 同步段建立，
+        // `endSessionConversation` 退出时清 gate），因此上一会话遗留的录音状态
+        // gate 为假，仍走下面的清理分支，ESS-642 的边界隔离不受影响。
+        // 这里只开边界、不动录音与 request_id：随后异步落地的 `beginTurn` 会挂到
+        // 刚开的这段 conversation 上，gate 保持为真让它仍是「本次边界之后起的轮」。
+        if let entryTurnRequestId, adapter.session.activeTurn == nil, state != .idle {
+            let handle = adapter.beginConversation()
+            didStartTurnSinceConversationBoundary = true
+            WatchLog.info(
+                "session", "conversation_opened_awaiting_turn", requestId: entryTurnRequestId,
+                detail: "conversation_id=\(handle.conversationId) "
+                    + "ptt_state=\(String(describing: state)) reason=turn_start_pending"
+            )
+            return
+        }
         // 走到这里 = 没有可复用的本轮回合。任何遗留物（上一会话的 activeTurn、
         // 仍在跑的录音、未提交的实时回合）都必须在开新边界**之前**清掉，
         // 否则新会话会继续认领旧 request_id。

@@ -247,6 +247,83 @@ final class SessionAutoRelistenTests: XCTestCase {
         XCTAssertEqual(Set(conversationIds).count, 5, "5 次进入必须是 5 段不同的 conversation")
     }
 
+    // MARK: - ESS-648：短按的异步 activeTurn 窗口不得取消本次首轮
+
+    /// 生产时序回归。`pressBegan()` 同步段只置 `.recording` 与 `streamRequestId`；
+    /// `adapter.beginTurn` 要等异步 `recorder.start()` 返回后才执行（ESS-362 的
+    /// 顺序约束）。短按松手常常比它快，入口看到的是「闸门为真 + activeTurn 仍为 nil」。
+    /// 上面两个 ESS-642 用例都手工提前 `adapter.beginTurn` 建立前置，**盖不住这个
+    /// 窗口**——所以本用例刻意不建回合，直接进 conversation。
+    func testEntryDuringAsyncTurnStartWindowKeepsRecordingAndRequestId() {
+        let (controller, adapter) = makeControllerWithMockAdapter()
+        guard let requestId = simulateTouchDown(on: controller) else {
+            return XCTFail("pressBegan 未返回 request_id")
+        }
+        XCTAssertEqual(controller.state, .recording)
+        XCTAssertNil(adapter.session.activeTurn, "前置：异步窗口内 activeTurn 尚未建立")
+
+        controller.beginSessionConversation()
+
+        XCTAssertEqual(controller.state, .recording, "本次 touch-down 的合法首轮不得被取消")
+        XCTAssertEqual(
+            controller.pressBegan(), requestId,
+            "紧随其后的 pressBegan 必须交回同一个 request_id，不得更换"
+        )
+        guard let conversationId = adapter.session.activeConversationId else {
+            return XCTFail("窗口内仍必须开出本次会话的 conversation 边界")
+        }
+
+        // 异步 recorder.start() 落地：回合此刻才建立。
+        let turn = adapter.beginTurn(requestId: requestId)
+
+        XCTAssertEqual(turn.conversationId, conversationId, "异步落地的首轮必须归属本次新 conversation")
+        XCTAssertEqual(adapter.session.activeTurn?.requestId, requestId)
+        controller.pressCancelled()
+    }
+
+    /// 同一窗口，走**生产接线**（`SessionTurnWiring` → `onBeginChannel` =
+    /// `beginSessionConversation()` + `pressBegan()`）：会话认领的 request_id
+    /// 必须是本次 touch-down 那一个。ESS-642 真机事故里它是上一会话的旧值。
+    func testSessionEntryDuringAsyncWindowClaimsTouchDownRequestId() {
+        let (controller, adapter) = makeControllerWithMockAdapter()
+        let session = SessionController(defaults: freshDefaults())
+        session.scheduleDelay = { _, _ in NoopDelayToken() }
+        session.playHaptic = { _ in }
+        SessionTurnWiring.connect(session: session, pushToTalk: controller, interruptSelfCheck: {})
+        guard let requestId = simulateTouchDown(on: controller) else {
+            return XCTFail("pressBegan 未返回 request_id")
+        }
+        XCTAssertNil(adapter.session.activeTurn)
+
+        session.enterSession()
+
+        XCTAssertEqual(controller.state, .recording, "点球进会话不得打断已在录的首轮")
+        XCTAssertEqual(
+            session.activeTurnRequestId, requestId,
+            "会话必须认领本次 touch-down 的 request_id"
+        )
+        XCTAssertTrue(session.isCapturingLocally, "录音未中断，本地采集应保持为真")
+        controller.pressCancelled()
+    }
+
+    /// 反向护栏：新开的窗口分支只认「本次边界之后起的」录音。上一会话退出时
+    /// 闸门已落，即便录音状态还残留（异常退出路径），入口仍必须走清理分支，
+    /// 不得因为 activeTurn 为 nil 就把它当成本次的异步窗口放过去。
+    func testEntryStillDiscardsRecordingLeftFromPreviousConversation() {
+        let (controller, adapter) = makeControllerWithMockAdapter()
+        simulateTouchDown(on: controller)
+        XCTAssertEqual(controller.state, .recording)
+        // 上一会话退出：闸门落下，录音状态残留。
+        controller.endSessionConversation()
+        XCTAssertFalse(controller.didStartTurnSinceConversationBoundary)
+
+        controller.beginSessionConversation()
+
+        XCTAssertEqual(controller.state, .idle, "上一会话遗留的录音必须在开新边界前停掉")
+        XCTAssertNil(adapter.session.activeTurn)
+        XCTAssertNotNil(adapter.session.activeConversationId, "清理后仍必须开出新边界")
+    }
+
     // MARK: - 二轮复审阻断 B：interim 播完不是本轮答完
 
     /// 完整文件路径的 interim 与最终回答**共用同一个 request_id**。回合尚未
