@@ -72,6 +72,13 @@ enum ClientLogClock {
     static func timestamp(_ date: Date = Date()) -> String {
         formatter.string(from: date)
     }
+
+    /// ESS-655：`timestamp` 的逆向。事后按 `bridge.log` 算「play_finished →
+    /// session_next_listening ≤ 400ms」这类指标必须把字符串读回 `Date`，
+    /// 用的必须是**写侧同一个 formatter**，否则小数秒会在读侧被静默丢掉。
+    static func date(_ timestamp: String) -> Date? {
+        formatter.date(from: timestamp)
+    }
 }
 
 /// 应用容器内 JSONL 滚动日志：当前文件写满即滚动成待运 chunk。

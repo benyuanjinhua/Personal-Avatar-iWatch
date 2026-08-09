@@ -441,7 +441,7 @@ final class SessionAutoRelistenTests: XCTestCase {
 
     // MARK: - 手动打断（F4）
 
-    func testOrbTapDuringSpeakingStopsPlaybackAndRelistens() {
+    func testOrbTapDuringSpeakingStopsPlaybackAndRelistens() throws {
         let h = makeHarness()
         h.startFirstTurn()
         h.commitCurrentTurn()
@@ -454,6 +454,23 @@ final class SessionAutoRelistenTests: XCTestCase {
         XCTAssertEqual(h.session.turnPhase, .listening)
         XCTAssertEqual(h.startedTurns.count, 2, "打断后直接开下一轮")
         XCTAssertEqual(h.log.count(of: "session_speaking_interrupted"), 1)
+
+        // ESS-655（F6）：打断事件必须带 source / detect_ms / stop_ms，且
+        // 这条**真实运行时事件**要能过 schema 校验——语音打断（F2）接进来后
+        // 误触发率就靠 source 分流，字段漂了当场就该红。
+        let interrupted = h.log.last(of: "session_speaking_interrupted")
+        let fields = try XCTUnwrap(
+            try? PhoneModeTelemetry.validate(
+                event: "session_speaking_interrupted", detail: interrupted?.detail
+            )
+        )
+        XCTAssertEqual(fields["source"], "orb_tap")
+        XCTAssertEqual(fields["detect_ms"], "0", "点球没有检测过程")
+        XCTAssertNotNil(fields["stop_ms"].flatMap(Int.init), "停播耗时必须是可统计的整数毫秒")
+        XCTAssertEqual(
+            interrupted?.requestId, h.startedTurns.first?.requestId,
+            "打断记在**被打断的那一轮**头上，不是打断后新开的那轮"
+        )
     }
 
     /// 非 speaking 相位点球无语义——不许把「正在听」误打断成新一轮，
