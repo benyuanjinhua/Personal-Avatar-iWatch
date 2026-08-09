@@ -60,7 +60,7 @@ final class AudioRecorderHandoverTests: XCTestCase {
         try HostedCITestGate.skipIfHostedCI("recorder.start() hangs in testPlaybackSucceedsAfterRecordingSessionHandover")
         try await waitForHostWelcomeToFinish()
         let events = EventLog()
-        WatchLog.setObserver { _, event, detail, _ in events.record(event: event, detail: detail) }
+        WatchLog.setObserver { _, event, _, detail, _ in events.record(event: event, detail: detail) }
         defer { WatchLog.setObserver(nil) }
 
         let recorder = AudioRecorder()

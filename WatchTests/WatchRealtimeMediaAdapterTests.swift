@@ -418,7 +418,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         ])
         final class LogSink { var events: [(String, String?)] = [] }
         let sink = LogSink()
-        WatchLog.setObserver { _, event, detail, _ in sink.events.append((event, detail)) }
+        WatchLog.setObserver { _, event, _, detail, _ in sink.events.append((event, detail)) }
         defer { WatchLog.setObserver(nil) }
 
         let handle = adapter.beginTurn(requestId: requestId)
@@ -672,7 +672,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         // internal lock, so a plain array captured by a class ref is safe.
         final class LogSink { var events: [LogEvent] = [] }
         let sink = LogSink()
-        WatchLog.setObserver { module, event, detail, _ in
+        WatchLog.setObserver { module, event, _, detail, _ in
             sink.events.append(LogEvent(module: module, event: event, detail: detail))
         }
         defer { WatchLog.setObserver(nil) }
@@ -762,7 +762,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         struct LogEvent { let module: String; let event: String; let detail: String? }
         final class LogSink { var events: [LogEvent] = [] }
         let sink = LogSink()
-        WatchLog.setObserver { module, event, detail, _ in
+        WatchLog.setObserver { module, event, _, detail, _ in
             sink.events.append(LogEvent(module: module, event: event, detail: detail))
         }
         defer { WatchLog.setObserver(nil) }
@@ -829,7 +829,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         struct LogEvent { let module: String; let event: String; let detail: String? }
         final class LogSink { var events: [LogEvent] = [] }
         let sink = LogSink()
-        WatchLog.setObserver { module, event, detail, _ in
+        WatchLog.setObserver { module, event, _, detail, _ in
             sink.events.append(LogEvent(module: module, event: event, detail: detail))
         }
         defer { WatchLog.setObserver(nil) }

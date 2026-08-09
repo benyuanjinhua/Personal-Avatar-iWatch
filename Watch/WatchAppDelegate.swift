@@ -59,23 +59,16 @@ final class WatchAppServices {
             case .failure: WatchHaptics.play(.sessionChannelFailed)
             }
         }
-        sessionController.onBeginChannel = { [pushToTalk, selfCheck] in
+        // ESS-600：会话回合状态机（listening → thinking → speaking → listening
+        // 自动轮转、手动打断、超时抢救）的全部接线。抽成函数是为了让
+        // WatchTests 能对同一段接线断言——「接线没接上」正是本单第一次
+        // 复审被打回的缺陷本身。
+        SessionTurnWiring.connect(
+            session: sessionController,
+            pushToTalk: pushToTalk,
             // 与 PTT 手势同一前置：自检让出音频会话（ESS-65 铁律 3）。
-            selfCheck.interrupt()
-            pushToTalk.pressBegan()
-        }
-        sessionController.onTeardownChannel = { [pushToTalk] in
-            pushToTalk.endSessionChannel()
-        }
-        sessionController.onCommitTurn = { [pushToTalk] in
-            pushToTalk.endSessionTurn()
-        }
-        pushToTalk.onRealtimeChannelReady = { [sessionController] in
-            sessionController.markChannelReady()
-        }
-        pushToTalk.onRealtimeChannelFailed = { [sessionController] failure in
-            sessionController.markChannelFailed(failure)
-        }
+            interruptSelfCheck: { [selfCheck] in selfCheck.interrupt() }
+        )
         // ESS-554：会话级持有期间，所有 SpeechPlayer（结果语音 / 错误语音 /
         // 欢迎语 / 自检）既不重配会话也不 deactivate——会话归
         // ConversationAudioController 独占，点 X 才由它真释放（PD-2）。

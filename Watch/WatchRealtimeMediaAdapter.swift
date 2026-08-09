@@ -99,6 +99,20 @@ final class WatchRealtimeMediaAdapter {
     var onRealtimePlaybackStarted: (@MainActor () -> Void)?
     var onVADEvent: (@MainActor (LocalVADEvent) -> Void)?
 
+    /// ESS-600：**realtime 回答音频真实起播**（`RealtimePlaybackEngine` 的
+    /// 第一个 buffer 已经渲染，不是收到 delta、不是入队成功）。realtime 是
+    /// 默认播放路径，会话回合状态机的 `thinking → speaking` 必须由这里驱动——
+    /// 只接完整文件 `SpeechPlayer` 那条回退路径等于核心闭环没接通
+    /// （ESS-600 复审阻断 1）。
+    var onAnswerPlaybackStarted: (@MainActor (RealtimeMediaSession.TurnHandle) -> Void)?
+    /// ESS-600：**realtime 回答音频真实播完**（最后一个排队 buffer 渲染完毕）。
+    /// 只有本回合（requestId + sessionId 双匹配）的事件才上报；上一轮的迟到
+    /// `.ended` 在这里就被 `currentTurn` 挡掉，并留证 `stale_playback_dropped`。
+    var onAnswerPlaybackFinished: (@MainActor (RealtimeMediaSession.TurnHandle, _ bytesPlayed: Int) -> Void)?
+    /// ESS-600：realtime 播放失败。失败不得伪装成播完——会话层据此走
+    /// `session_answer_failed` 的显式恢复路径。
+    var onAnswerPlaybackFailed: (@MainActor (RealtimeMediaSession.TurnHandle, _ code: String) -> Void)?
+
     /// ESS-573: 真实通道就绪事件——本回合**首个被对端接受的 uplink ack**
     /// 到达时触发一次。该 ack 由 iPhone 在 WSS 实际发出音频后回发
     /// （PhoneConnectivity.acknowledgeRealtimeAppendIfNeeded），因此它证明
@@ -124,6 +138,12 @@ final class WatchRealtimeMediaAdapter {
     private let vadSampleRate: Int
     private let automaticallyCommitOnSpeechFinal: Bool
     private var vadFrameStartedAtMs: Int64 = 0
+    /// ESS-600：回答播完后的 VAD 静默窗，**跨回合保留**。
+    /// `beginTurn` 里的 `reset(atMs:)` 会把守卫清成「此刻」——在自动重新
+    /// 聆听下这正好把守卫清掉了：上一轮回答刚播完就开麦，扬声器余音与
+    /// 混响会被当成用户开口（Watch 无 AEC）。把守卫带过回合边界，让新一轮
+    /// 的头 `playbackGuardMs` 不参与断句判定。
+    private var vadGuardUntilMs: Int64 = 0
     private(set) var didTriggerCompleteFileFallback = false
     /// ESS-573: 每回合只向上一层宣告一次「通道就绪」（首个 ack）。
     private var didSignalChannelReady = false
@@ -184,14 +204,27 @@ final class WatchRealtimeMediaAdapter {
                 // No session_id substitution — Bixuan's acceptance criteria
                 // explicitly forbids that.
                 guard let handle = self.currentTurn,
-                      handle.requestId == requestId, handle.sessionId == sessionId,
-                      let responseId else { break }
+                      handle.requestId == requestId, handle.sessionId == sessionId else {
+                    self.logStalePlayback(event: "started", requestId: requestId, sessionId: sessionId)
+                    break
+                }
+                // ESS-600：首帧已渲染 = 回答真实开口。会话回合状态机
+                // thinking → speaking 的唯一驱动源（realtime 侧）。
+                WatchLog.info(
+                    "realtime", "play_started", requestId: requestId,
+                    detail: "path=realtime response_id=\(responseId ?? "nil") turn_id=\(handle.turnId)"
+                )
+                self.onAnswerPlaybackStarted?(handle)
+                guard let responseId else { break }
                 self.transport.sendPlaybackStarted(handle: handle, responseId: responseId)
             case .ended(let requestId, let sessionId, let responseId, let bytesPlayed):
                 self.playbackEndedForVADGuard()
-                if let handle = self.currentTurn,
-                   handle.requestId == requestId, handle.sessionId == sessionId,
-                   let responseId {
+                guard let handle = self.currentTurn,
+                      handle.requestId == requestId, handle.sessionId == sessionId else {
+                    self.logStalePlayback(event: "ended", requestId: requestId, sessionId: sessionId)
+                    break
+                }
+                if let responseId {
                     self.transport.sendPlaybackEnded(
                         handle: handle,
                         responseId: responseId,
@@ -203,21 +236,46 @@ final class WatchRealtimeMediaAdapter {
                         detail: "response_id=\(responseId) bytes_played=\(bytesPlayed)"
                     )
                 }
+                // ESS-600：最后一个排队 buffer 已渲染 = 回答真实说完，
+                // 会话据此自动开下一轮采集（speaking → listening）。
+                WatchLog.info(
+                    "realtime", "play_finished", requestId: requestId,
+                    detail: "path=realtime response_id=\(responseId ?? "nil") bytes_played=\(bytesPlayed) turn_id=\(handle.turnId)"
+                )
+                // 一个回合可能携带多个 response（`RealtimePlaybackReceiptTracker`
+                // 的 `superseded` 分支：被更新的 response 顶掉的旧 response 也会
+                // 发 `.ended`）。只有**当前** response 播完才算这一轮答完——
+                // 拿被顶掉的旧 response 去开下一轮，用户还没听到新回答就被重新
+                // 开麦了。responseId 任一侧为 nil 时不做此判定（旧链路无 id）。
+                if let responseId, let current = self.currentResponseId, responseId != current {
+                    WatchLog.info(
+                        "realtime", "superseded_response_ended", requestId: requestId,
+                        detail: "response_id=\(responseId) current_response_id=\(current)"
+                    )
+                    break
+                }
+                self.onAnswerPlaybackFinished?(handle, bytesPlayed)
                 // A playback `.ended` event closes only this response. One
                 // realtime session may carry multiple responses, so ending
                 // the downlink here would reject the next response's chunks
                 // as `.sessionEnded`. Explicit cancel, interruption, or the
                 // next turn remains responsible for closing/replacing it.
-            case .bargedIn, .failed:
-                if case .failed(let rid, _, _, let code) = event {
-                    WatchLog.error(
-                        "realtime", "playback_engine_failed",
-                        requestId: rid,
-                        detail: "playback_event=failed",
-                        code: code
-                    )
-                }
+            case .bargedIn:
                 break
+            case .failed(let requestId, let sessionId, _, let code):
+                WatchLog.error(
+                    "realtime", "playback_engine_failed",
+                    requestId: requestId,
+                    detail: "playback_event=failed",
+                    code: code
+                )
+                // ESS-600：播放失败绝不记成播完。会话层走显式失败恢复。
+                guard let handle = self.currentTurn,
+                      handle.requestId == requestId, handle.sessionId == sessionId else {
+                    self.logStalePlayback(event: "failed", requestId: requestId, sessionId: sessionId)
+                    break
+                }
+                self.onAnswerPlaybackFailed?(handle, code)
             }
             self.logger("playback_event=\(event)")
         }
@@ -233,7 +291,8 @@ final class WatchRealtimeMediaAdapter {
         didSignalChannelReady = false
         currentResponseId = nil
         vadFrameStartedAtMs = Self.uptimeMs()
-        vadEndpointer?.reset(atMs: vadFrameStartedAtMs)
+        // ESS-600：守卫带过回合边界（见 `vadGuardUntilMs`）。
+        vadEndpointer?.reset(atMs: max(vadFrameStartedAtMs, vadGuardUntilMs))
         // `session.beginTurn(...)` fires a `.turnFinished(...)` for any
         // existing turn which already cancels; the explicit cancel here is a
         // defence for the first-ever call (no prior turn to fire finished).
@@ -257,10 +316,35 @@ final class WatchRealtimeMediaAdapter {
         session.commitUplink()
     }
 
+    /// ESS-600：不属于当前回合的播放事件被丢弃时留证。上一轮的迟到
+    /// `.started/.ended` 若被当成本轮事件上报，会话会在用户还没说话时
+    /// 就跳到下一轮——「旧音频零补播」这条验收正是钉这里。
+    private func logStalePlayback(event: String, requestId: String, sessionId: String) {
+        WatchLog.info(
+            "realtime", "stale_playback_dropped", requestId: requestId,
+            detail: "event=\(event) session_id=\(sessionId) current_request_id=\(currentTurn?.requestId ?? "nil")"
+        )
+    }
+
+    /// ESS-600：会话边界。进入实时对话时开一个 conversation，退出时关闭——
+    /// `conversation_id` 由 `ConversationHandle` 唯一铸造并在整段会话内保持
+    /// 不变，`turn_id` 每轮 `beginTurn` 递增（见 `RealtimeMediaSession.beginTurn`）。
+    @discardableResult
+    func beginConversation() -> ConversationHandle {
+        session.beginConversation()
+    }
+
+    /// ESS-600：关闭会话边界。关闭后旧回合的迟到事件因无 conversation 存续
+    /// 而被拒，不会漏进下一次会话。
+    func closeConversation() {
+        session.closeConversation()
+    }
+
     func playbackEndedForVADGuard(atMs: Int64? = nil) {
         let effectiveAtMs = atMs ?? Self.uptimeMs()
         vadEndpointer?.playbackEnded(atMs: effectiveAtMs)
         vadFrameStartedAtMs = effectiveAtMs
+        vadGuardUntilMs = effectiveAtMs + (vadEndpointer?.configuration.playbackGuardMs ?? 0)
     }
 
     private func consumeVAD(_ frame: Data) {

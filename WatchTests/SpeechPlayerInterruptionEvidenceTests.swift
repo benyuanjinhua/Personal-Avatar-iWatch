@@ -34,7 +34,7 @@ final class SpeechPlayerInterruptionEvidenceTests: XCTestCase {
 
     func testInterruptionLogCarriesInstanceTagAndUserInfoFields() async throws {
         let sink = Sink()
-        WatchLog.setObserver { module, event, detail, code in sink.record(module: module, event: event, detail: detail, code: code) }
+        WatchLog.setObserver { module, event, _, detail, code in sink.record(module: module, event: event, detail: detail, code: code) }
 
         let a = SpeechPlayer(instanceTag: "evidence-a")
         let b = SpeechPlayer(instanceTag: "evidence-b")
@@ -86,7 +86,7 @@ final class SpeechPlayerInterruptionEvidenceTests: XCTestCase {
 
     func testObserverLifecycleEventsFire() async throws {
         let sink = Sink()
-        WatchLog.setObserver { module, event, detail, code in sink.record(module: module, event: event, detail: detail, code: code) }
+        WatchLog.setObserver { module, event, _, detail, code in sink.record(module: module, event: event, detail: detail, code: code) }
 
         do {
             _ = SpeechPlayer(instanceTag: "lifecycle-x")

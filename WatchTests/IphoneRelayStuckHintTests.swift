@@ -71,7 +71,7 @@ final class IphoneRelayStuckHintTests: XCTestCase {
             }
         }
         let sink = Sink()
-        WatchLog.setObserver { module, event, detail, _ in
+        WatchLog.setObserver { module, event, _, detail, _ in
             sink.record(module: module, event: event, detail: detail)
         }
         defer { WatchLog.setObserver(nil) }

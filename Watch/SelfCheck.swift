@@ -107,7 +107,7 @@ final class SelfCheckRunner: ObservableObject {
         running = true
         interrupted = false
         WatchLog.info("selfcheck", "selfcheck_started", detail: SelfCheckPolicy.startedDetail(fingerprint: fingerprint))
-        WatchLog.setObserver { [signals] module, event, detail, code in
+        WatchLog.setObserver { [signals] module, event, _, detail, code in
             // 只关心真实链路组件的会话/播放信号；自检自身的日志不计入。
             guard module != "selfcheck" else { return }
             signals.record(event: event, detail: detail, code: code)

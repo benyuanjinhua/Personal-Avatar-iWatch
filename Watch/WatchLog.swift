@@ -22,11 +22,17 @@ enum WatchLog {
     /// 出现 0 次」，而这些事件由 AudioRecorder/SpeechPlayer 在真实链路内部落日志，
     /// 不能靠返回值判断（失败可能被回落尝试吞掉）。观察者只读元数据（module/
     /// event/错误码），不改变日志行为；仅自检期间安装，平时为 nil 零开销。
-    nonisolated(unsafe) private static var observer: (@Sendable (String, String, String?, String?) -> Void)?
+    /// ESS-600：观察者补上 `requestId`。R-02 要求的证据是**按 request_id
+    /// 关联**的事件链（「同一 conversation 下逐轮 record_started → … →
+    /// next_listening」），少了这个字段就只能按事件名计数，证不了归属。
+    nonisolated(unsafe) private static var observer: (@Sendable (String, String, String?, String?, String?) -> Void)?
     private static let observerLock = NSLock()
 
     static func setObserver(
-        _ newValue: (@Sendable (_ module: String, _ event: String, _ detail: String?, _ errorCode: String?) -> Void)?
+        _ newValue: (@Sendable (
+            _ module: String, _ event: String, _ requestId: String?,
+            _ detail: String?, _ errorCode: String?
+        ) -> Void)?
     ) {
         observerLock.lock()
         defer { observerLock.unlock() }
@@ -81,6 +87,6 @@ enum WatchLog {
         observerLock.lock()
         let currentObserver = observer
         observerLock.unlock()
-        currentObserver?(module, event, detail, error?.code)
+        currentObserver?(module, event, requestId, detail, error?.code)
     }
 }

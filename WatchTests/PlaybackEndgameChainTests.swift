@@ -42,7 +42,7 @@ final class PlaybackEndgameChainTests: XCTestCase {
         super.setUp()
         collector = EventCollector()
         let sink = collector!
-        WatchLog.setObserver { module, event, detail, errorCode in
+        WatchLog.setObserver { module, event, _, detail, errorCode in
             sink.append(CapturedEvent(module: module, event: event, detail: detail, errorCode: errorCode))
         }
     }

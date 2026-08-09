@@ -41,7 +41,12 @@ final class SessionControllerTests: XCTestCase {
             self?.scheduled.append((delay, fire))
             return FakeDelayToken { self?.cancelCount += 1 }
         }
-        controller.onBeginChannel = { [weak self] in self?.beginCount += 1 }
+        // ESS-600：`onBeginChannel` 现在返回**已在飞那一轮**的 request_id
+        // （点球进会话时录音在 touch-down 就开始了），会话据此认领第 1 轮。
+        controller.onBeginChannel = { [weak self] in
+            self?.beginCount += 1
+            return "req-\(self?.beginCount ?? 0)"
+        }
         controller.onTeardownChannel = { [weak self] in self?.teardownCount += 1 }
         controller.onCommitTurn = { [weak self] in self?.commitCount += 1 }
     }
