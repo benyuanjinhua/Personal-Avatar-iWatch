@@ -397,6 +397,10 @@ final class SessionController: ObservableObject {
         guard acceptsTurnEvent(requestId, event: "answer_started") else { return }
         guard turnPhase == .thinking else { return }
         thinkingToken?.cancel(); thinkingToken = nil
+        thinkingSlowToken?.cancel(); thinkingSlowToken = nil
+        thinkingHardToken?.cancel(); thinkingHardToken = nil
+        thinkingSlowToken?.cancel(); thinkingSlowToken = nil
+        thinkingHardToken?.cancel(); thinkingHardToken = nil
         turnPhase = .speaking
         WatchLog.info(
             "session", "session_answer_started", requestId: requestId,
@@ -435,6 +439,8 @@ final class SessionController: ObservableObject {
         guard acceptsTurnEvent(requestId, event: "turn_aborted") else { return }
         turnCapToken?.cancel(); turnCapToken = nil
         thinkingToken?.cancel(); thinkingToken = nil
+        thinkingSlowToken?.cancel(); thinkingSlowToken = nil
+        thinkingHardToken?.cancel(); thinkingHardToken = nil
         turnPhase = .idle
         WatchLog.info(
             "session", "session_turn_aborted", requestId: requestId,
@@ -479,6 +485,8 @@ final class SessionController: ObservableObject {
         guard state == .listening else { return }
         relistenToken?.cancel(); relistenToken = nil
         thinkingToken?.cancel(); thinkingToken = nil
+        thinkingSlowToken?.cancel(); thinkingSlowToken = nil
+        thinkingHardToken?.cancel(); thinkingHardToken = nil
         // ESS-652: the previous round just completed.
         markRoundCompleted()
         guard let requestId = onStartTurn?() else {
@@ -681,6 +689,8 @@ final class SessionController: ObservableObject {
     private func cancelTurnTimers() {
         turnCapToken?.cancel(); turnCapToken = nil
         thinkingToken?.cancel(); thinkingToken = nil
+        thinkingSlowToken?.cancel(); thinkingSlowToken = nil
+        thinkingHardToken?.cancel(); thinkingHardToken = nil
         relistenToken?.cancel(); relistenToken = nil
         // ESS-652: cancel thinking slow/hard timers on turn reset.
         thinkingSlowToken?.cancel(); thinkingSlowToken = nil
