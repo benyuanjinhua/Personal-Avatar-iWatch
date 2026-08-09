@@ -130,10 +130,9 @@ struct WatchContentView: View {
                     VoiceOrbView(mode: orbMode, size: 70)
                         .padding(.top, 4)
                         .gesture(
-                            // ESS-653（F1 入口收敛，设计稿 v2.0 §五 D1 方案 B）：
-                            // 主屏球**只有一个语义——点一下打电话给分身**。长按
-                            // 不再提交 PTT，视为误触（袖口压屏等），丢弃这次采集
-                            // 并留证 `session_enter_rejected`。
+                            // ESS-686：主屏球只有持续对话入口语义。触摸时长不再
+                            // 复用旧 PTT 的「短按/长按」守卫；松手只确认入口，
+                            // 已启动的采集与 realtime 回合由会话认领并继续运行。
                             //
                             // touch-down 起采保留（不是为 PTT 抢那几百毫秒，而是
                             // 用户点完立刻开口时首句不丢）：松手判定为「点」时
@@ -148,11 +147,8 @@ struct WatchContentView: View {
                                     pushToTalk.pressBegan()
                                 }
                                 .onEnded { _ in
-                                    let downAt = orbTouchDownAt
                                     orbTouchDownAt = nil
-                                    let heldSeconds = downAt.map { Date().timeIntervalSince($0) } ?? .infinity
                                     switch SessionController.orbReleaseAction(
-                                        holdSeconds: heldSeconds,
                                         isCapturing: pushToTalk.state == .recording
                                     ) {
                                     case .enter:
@@ -161,7 +157,7 @@ struct WatchContentView: View {
                                         // 发起）；就绪由真实 uplink ack 驱动。
                                         session.enterSession()
                                     case .reject(let reason):
-                                        session.noteEnterRejected(reason: reason, holdSeconds: heldSeconds)
+                                        session.noteEnterRejected(reason: reason)
                                         // 丢弃 touch-down 起的这次采集：不提交、停采集、
                                         // 取消未提交的实时回合、释放音频会话。
                                         pushToTalk.pressCancelled()

@@ -888,24 +888,11 @@ final class SessionController: ObservableObject {
         translation.height > 40 && translation.height > abs(translation.width) * 1.5
     }
 
-    /// 「点一下进会话」与「按住说话」的时长分界（PRD F1）：ESS-649 决策 3
-    /// 后长按已无语义，达到该时长即判为误按，走 session_enter_rejected。
-    /// 0.2s：收紧自 0.35s，压缩「想点却被判成按住」的窗口。
-    static let tapToEnterMaxHoldSeconds: TimeInterval = 0.2
-
-    static func isTapToEnter(holdSeconds: TimeInterval) -> Bool {
-        holdSeconds < tapToEnterMaxHoldSeconds
-    }
-
     /// 主屏球松手被拒的原因（`session_enter_rejected.reason`）。
     ///
-    /// ESS-671：本枚举与下面的 `orbReleaseAction` / `noteEnterRejected` 由
-    /// ESS-653（PR #273）落地，被 ESS-651（PR #274，基线过期）整段覆盖，
-    /// 导致 `WatchContentView` 的调用方失去被调方、main 不可构建。此处恢复，
-    /// 同时保留 #274 的意图（阈值 0.2s）——三者取并集，不回滚任何一方。
+    /// ESS-686：持续会话入口不再有按压时长拒绝；这里只保留无法认领
+    /// touch-down 采集这一种真实入口失败。
     enum EnterRejection: String {
-        /// 按住超过 `tapToEnterMaxHoldSeconds` —— 误触，丢弃这次采集。
-        case holdTooLong = "hold_too_long"
         /// 点按合法但 touch-down 那次采集没能开起来（上一轮还在收尾、
         /// 录音启动失败等）。没有在飞的一轮可认领，进会话会当场空转。
         case captureUnavailable = "capture_unavailable"
@@ -918,22 +905,19 @@ final class SessionController: ObservableObject {
 
     /// 主屏球松手的唯一判定点（纯函数，便于 WatchTests 钉死）。
     ///
-    /// ESS-653：只有「按住 < 阈值 **且** touch-down 那轮确实在采集」才进
-    /// 电话模式；其余一律拒绝——**没有任何分支再回到 PTT 单条提交**。
-    static func orbReleaseAction(holdSeconds: TimeInterval, isCapturing: Bool) -> OrbReleaseAction {
-        guard isTapToEnter(holdSeconds: holdSeconds) else { return .reject(.holdTooLong) }
+    /// ESS-686：持续会话入口不接收手势时长，因此旧 PTT 的按压守卫无法
+    /// 影响它。touch-down 那轮已采集就进入，否则拒绝；没有 PTT 提交分支。
+    static func orbReleaseAction(isCapturing: Bool) -> OrbReleaseAction {
         guard isCapturing else { return .reject(.captureUnavailable) }
         return .enter
     }
 
     /// 留证一次被拒的进入。静默拒绝是设计口径（误触不该给反馈），但
     /// 「用户按了却什么都没发生」必须在日志里可解释，否则真机复盘只剩猜。
-    func noteEnterRejected(reason: EnterRejection, holdSeconds: TimeInterval) {
-        // `holdSeconds` 在 touch-down 时刻缺失时是 .infinity，直接 Int() 会 trap。
-        let holdMs = holdSeconds.isFinite ? Int((holdSeconds * 1000).rounded()) : -1
+    func noteEnterRejected(reason: EnterRejection) {
         WatchLog.info(
             "session", "session_enter_rejected",
-            detail: "reason=\(reason.rawValue) hold_ms=\(holdMs)"
+            detail: "reason=\(reason.rawValue)"
         )
     }
 }

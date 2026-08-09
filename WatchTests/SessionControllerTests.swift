@@ -318,40 +318,19 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertFalse(SessionController.isVerticalDismiss(translation: CGSize(width: 0, height: -80)))
     }
 
-    /// 点/长按分界：0.2s 以下为「点一下进会话」，及以上判误按拒绝（ESS-651）。
-    func testTapToEnterThreshold() {
-        XCTAssertTrue(SessionController.isTapToEnter(holdSeconds: 0.1))
-        XCTAssertTrue(SessionController.isTapToEnter(holdSeconds: 0.15))   // 验收 1
-        XCTAssertTrue(SessionController.isTapToEnter(holdSeconds: 0.199))  // 边界下
-        XCTAssertFalse(SessionController.isTapToEnter(holdSeconds: 0.2))   // 边界上（闭区间归拒绝）
-        XCTAssertFalse(SessionController.isTapToEnter(holdSeconds: 0.3))   // 验收 2
-        XCTAssertFalse(SessionController.isTapToEnter(holdSeconds: 1.0))
-        XCTAssertEqual(SessionController.tapToEnterMaxHoldSeconds, 0.2, accuracy: 1e-9)
-    }
+    // MARK: - ESS-686 持续会话入口与旧 PTT 时长守卫分流
 
-    // MARK: - ESS-653 入口收敛（F1）—— ESS-671 恢复被 PR #274 覆盖的用例
-
-    /// AC-9 第 1 条：按住超过阈值再松手 —— 不进电话、不提交，判定为
-    /// `hold_too_long`。**本用例同时是「长按不再走 PTT 提交」的钉子**：
-    /// 判定结果只有 enter / reject 两种，没有第三条通向单条提交的分支。
-    /// 边界值随 ESS-651 收紧到 0.2s。
-    func testLongHoldIsRejectedAndNeverSubmits() {
-        XCTAssertEqual(
-            SessionController.orbReleaseAction(holdSeconds: 1.0, isCapturing: true),
-            .reject(.holdTooLong)
-        )
-        XCTAssertEqual(
-            SessionController.orbReleaseAction(holdSeconds: 0.2, isCapturing: true),
-            .reject(.holdTooLong)
-        )
-        XCTAssertEqual(SessionController.EnterRejection.holdTooLong.rawValue, "hold_too_long")
+    /// 持续会话入口只看 touch-down 采集是否已建立；短按与长按松手都认领
+    /// 同一在飞回合，不存在通向 hold_too_long 或 PTT submit 的分支。
+    func testReleaseEntersRegardlessOfPressDurationSemantics() {
+        XCTAssertEqual(SessionController.orbReleaseAction(isCapturing: true), .enter)
     }
 
     /// AC-9 第 2 条：点一下（且 touch-down 那轮确实在采集）→ 进电话，
     /// 认领在飞的那一轮（`enterSession` 的 onBeginChannel 不重起）。
     func testShortTapEntersAndClaimsInFlightTurn() {
         XCTAssertEqual(
-            SessionController.orbReleaseAction(holdSeconds: 0.05, isCapturing: true),
+            SessionController.orbReleaseAction(isCapturing: true),
             .enter
         )
         controller.enterSession()
@@ -364,45 +343,26 @@ final class SessionControllerTests: XCTestCase {
     /// 没有在飞的一轮可认领，进去就是空转。
     func testTapWithoutCaptureIsRejected() {
         XCTAssertEqual(
-            SessionController.orbReleaseAction(holdSeconds: 0.05, isCapturing: false),
+            SessionController.orbReleaseAction(isCapturing: false),
             .reject(.captureUnavailable)
         )
     }
 
-    /// AC-1 的证据面：拒绝必须真的落一条 `session_enter_rejected`，且
-    /// detail 同时带 `reason` 与 `hold_ms`——按 R-02.1，「逻辑上应该会记」
+    /// 采集不可用的拒绝必须真的落一条 `session_enter_rejected`——按 R-02.1，「逻辑上应该会记」
     /// 不算数，这里用 `WatchLog` 观察者钉住实际写出去的那一行。
-    func testRejectEmitsRuntimeEvidenceWithReasonAndHoldMs() {
+    func testCaptureUnavailableRejectEmitsRuntimeEvidence() {
         var captured: [(event: String, detail: String?)] = []
         WatchLog.setObserver { _, event, _, detail, _ in
             if event == "session_enter_rejected" { captured.append((event, detail)) }
         }
         defer { WatchLog.setObserver(nil) }
 
-        controller.noteEnterRejected(reason: .holdTooLong, holdSeconds: 1.0)
+        controller.noteEnterRejected(reason: .captureUnavailable)
 
         XCTAssertEqual(captured.count, 1)
-        XCTAssertEqual(captured.first?.detail, "reason=hold_too_long hold_ms=1000")
+        XCTAssertEqual(captured.first?.detail, "reason=capture_unavailable")
         XCTAssertEqual(controller.state, .idle)
         XCTAssertFalse(controller.isInSession)
-    }
-
-    /// touch-down 时刻缺失时 holdSeconds 是 .infinity：判为误触，且留证
-    /// **不得因 `Int(.infinity)` 而 trap**（直接 `Int()` 会当场崩）。
-    func testMissingTouchDownIsRejectedWithoutTrapping() {
-        var captured: String?
-        WatchLog.setObserver { _, event, _, detail, _ in
-            if event == "session_enter_rejected" { captured = detail }
-        }
-        defer { WatchLog.setObserver(nil) }
-
-        XCTAssertEqual(
-            SessionController.orbReleaseAction(holdSeconds: .infinity, isCapturing: true),
-            .reject(.holdTooLong)
-        )
-        controller.noteEnterRejected(reason: .holdTooLong, holdSeconds: .infinity)
-
-        XCTAssertEqual(captured, "reason=hold_too_long hold_ms=-1")
     }
 
     // MARK: - helpers
