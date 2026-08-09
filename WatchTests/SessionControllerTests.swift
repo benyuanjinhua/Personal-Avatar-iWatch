@@ -268,17 +268,18 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertFalse(controller.showFirstRunGuide)
     }
 
-    // MARK: - 后台（PRD 异常链 C 的 Wave 1 临时口径）
+    // MARK: - 后台
 
-    /// 会话中进后台 → 显式收口 + 告知，不留「以为还在听」的假会话。
-    func testBackgroundDuringSessionEndsIt() {
+    /// ESS-598：会话级音频仍持有时，scenePhase 变化不得被误当用户退出。
+    func testBackgroundDuringSessionPreservesChannel() {
         controller.enterSession()
         controller.markChannelReady()
         controller.noteEnteredBackground()
-        XCTAssertEqual(controller.state, .idle)
-        XCTAssertNotNil(controller.failureNotice)
-        XCTAssertEqual(haptics, [.ready, .failure])
-        XCTAssertEqual(teardownCount, 1)
+        XCTAssertEqual(controller.state, .listening)
+        XCTAssertNil(controller.failureNotice)
+        XCTAssertEqual(haptics, [.ready])
+        XCTAssertEqual(teardownCount, 0)
+        XCTAssertTrue(controller.isInSession)
     }
 
     /// 待机时进后台 → 无操作。

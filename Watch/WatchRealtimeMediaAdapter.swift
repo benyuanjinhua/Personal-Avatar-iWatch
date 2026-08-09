@@ -273,9 +273,15 @@ final class WatchRealtimeMediaAdapter {
         for event in events {
             switch event {
             case .speechStarted(let atMs):
-                WatchLog.info("vad", "speech_started", detail: "at_ms=\(atMs)")
+                WatchLog.info(
+                    "vad", "speech_started", requestId: currentTurn?.requestId,
+                    detail: "at_ms=\(atMs)"
+                )
             case .speechFinal(let atMs, let reason):
-                WatchLog.info("vad", "speech_final", detail: "at_ms=\(atMs) reason=\(reason.rawValue)")
+                WatchLog.info(
+                    "vad", "speech_final", requestId: currentTurn?.requestId,
+                    detail: "at_ms=\(atMs) reason=\(reason.rawValue)"
+                )
                 if automaticallyCommitOnSpeechFinal {
                     recorder.stop()
                     session.commitUplink()

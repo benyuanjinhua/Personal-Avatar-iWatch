@@ -214,17 +214,15 @@ final class SessionController: ObservableObject {
         onTeardownChannel?()
     }
 
-    /// 会话中系统进入后台（PRD 异常链 C 的 Wave 1 临时口径：
-    /// A/B 形态待 ESS-529 取证，当前基线放腕 2.2s 后 App 即被收走——
-    /// 与其让用户「以为还在听、实际已断」，不如显式收口并告知）。
-    /// 只在 `.background` 触发；`.inactive`（横幅等瞬态）不触发，
-    /// 与 ESS-538 的打断标记口径一致。
+    /// 会话中系统进入后台。会话级 `.playAndRecord` 与前台延长已建立时，
+    /// scenePhase 变化只代表 UI 不再 frontmost，不能据此主动取消仍在采集的
+    /// turn；否则放腕会把一次正常说话误判成用户退出。
     func noteEnteredBackground() {
         guard isInSession else { return }
-        WatchLog.info("session", "session_ended_by_background")
-        playHaptic(.failure)
-        presentFailureNotice("手表熄屏，本轮对话已结束")
-        teardownToIdle()
+        WatchLog.info(
+            "session", "session_continues_in_background",
+            detail: "state=\(state.logName) channel_preserved=true"
+        )
     }
 
     // MARK: - 退出

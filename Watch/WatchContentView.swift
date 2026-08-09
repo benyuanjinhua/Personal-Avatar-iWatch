@@ -285,6 +285,14 @@ struct WatchContentView: View {
                     .position(x: proxy.size.width / 2, y: proxy.size.height * 0.62)
                     .accessibilityLabel("实时对话中")
 
+                // ESS-598：球体动画不能成为唯一反馈。真机强光、抬腕与连接
+                // 建立期都可能让动画差异不可辨，明确显示当前主链路阶段。
+                Text(sessionStatusText)
+                    .font(.caption2.bold())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .position(x: proxy.size.width / 2, y: 18)
+
                 // 建立中 >800ms 未就绪 → 三点渐显（PRD §3.5.1 第 3 步）。
                 if session.showConnectingDots {
                     connectingDots
@@ -399,6 +407,25 @@ struct WatchContentView: View {
             return .idle
         case .disconnecting, .idle:
             return .idle
+        }
+    }
+
+    private var sessionStatusText: String {
+        switch session.state {
+        case .connecting:
+            return "正在连接…"
+        case .listening:
+            if isSpeaking || pushToTalk.realtimePlaybackPending {
+                return "正在回答…"
+            }
+            if pushToTalk.state == .finishing || activeTurn?.isActive == true {
+                return "正在思考…"
+            }
+            return pushToTalk.state == .recording ? "正在听…" : "可以说话"
+        case .disconnecting:
+            return "正在结束…"
+        case .idle:
+            return ""
         }
     }
 
