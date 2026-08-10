@@ -25,6 +25,10 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         session.onDownlink = { [weak self] envelope in
             self?.forwardRealtimeDownlink(envelope)
         }
+        session.onStateChange = { [weak self] state in
+            guard case .active(let requestId, let sessionId) = state else { return }
+            self?.sendRealtimeChannelReady(requestId: requestId, sessionId: sessionId)
+        }
         return session
     }()
     /// ESS-391: feature flag controlling the Agent direct path.
@@ -327,6 +331,36 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         )
     }
 
+    private func sendRealtimeChannelReady(requestId: String, sessionId: String) {
+        guard let data = try? JSONEncoder().encode(RealtimeChannelReady(
+            requestId: requestId, sessionId: sessionId
+        )) else { return }
+        let session = WCSession.default
+        guard session.activationState == .activated, session.isReachable else {
+            PhoneAgentClientLog.info(
+                module: "agent_transport", event: "channel_ready_deferred",
+                requestId: requestId, sessionId: sessionId,
+                detail: "reason=watch_unreachable"
+            )
+            return
+        }
+        session.sendMessage(
+            [RealtimeMediaMessage.channelReadyEnvelopeKey: data],
+            replyHandler: nil,
+            errorHandler: { error in
+                PhoneAgentClientLog.error(
+                    module: "agent_transport", event: "channel_ready_send_failed",
+                    requestId: requestId, sessionId: sessionId,
+                    detail: error.localizedDescription, code: "ERR_CHANNEL_READY_SEND"
+                )
+            }
+        )
+        PhoneAgentClientLog.info(
+            module: "agent_transport", event: "channel_ready_sent",
+            requestId: requestId, sessionId: sessionId
+        )
+    }
+
     private static func turnIdentity(for envelope: RealtimeUplinkEnvelope) -> (requestId: String, sessionId: String)? {
         switch envelope.kind {
         case .streamStart:
@@ -464,8 +498,10 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
                 guard let self, let transport else { return }
                 self.realtimeSession.receiveAgentDownlink(envelope, from: transport)
             }
-            transport.onStateChange = { [weak self] state in
+            transport.onStateChange = { [weak self, weak transport] state in
+                guard let self, let transport else { return }
                 Self.logger.info("agent transport state → \(String(describing: state), privacy: .public)")
+                self.realtimeSession.agentTransportDidChangeState(state, from: transport)
             }
             realtimeSession.isAgentTransport = true
             Self.logger.info(

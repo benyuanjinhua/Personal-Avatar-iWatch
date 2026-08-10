@@ -500,5 +500,15 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
 enum RealtimeMediaMessage {
     static let uplinkEnvelopeKey = "wristagent_realtime_uplink"
     static let uplinkAckEnvelopeKey = "wristagent_realtime_uplink_ack"
+    static let channelReadyEnvelopeKey = "wristagent_realtime_channel_ready"
     static let downlinkEnvelopeKey = "wristagent_realtime_downlink"
+}
+
+/// Explicit transport-level readiness signal. Unlike an audio append ACK this
+/// is emitted as soon as the iPhone has established the selected realtime
+/// transport, so entering a conversation never depends on the user speaking
+/// or finishing the first recording.
+struct RealtimeChannelReady: Codable, Equatable, Sendable {
+    let requestId: String
+    let sessionId: String
 }
