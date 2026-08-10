@@ -228,7 +228,7 @@ struct WatchSettingsView: View {
             Button {
                 selfCheck.rerun()
             } label: {
-                Label(selfCheck.isRunning ? "自检运行中…" : "重新自检", systemImage: "arrow.clockwise")
+                Label(selfCheck.isRunning ? "自检运行中…" : "开始自检", systemImage: "play.circle")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
@@ -247,9 +247,8 @@ struct WatchSettingsView: View {
     }
 
     private var selfCheckStatusText: String {
-        // ESS-163 复审补丁：`.idle` 覆盖两个场景——本进程从未跑过、
-        // 或冷启动同 build 已跑过（autoRunIfNeeded → selfcheck_skipped）。
-        // 后者的结果在磁盘 RunRecord 里，走 latestOutcome 还原；仍读不出
+        // ESS-163 复审补丁：`.idle` 时从磁盘 RunRecord 还原上次手动自检
+        // 的结果；仍读不出
         // （首启前 / 旧记录字段不全）才落到「尚未运行」。运行中直接
         // 展示实时步骤——本页对开发者不算噪音。
         if case .running(let step) = selfCheck.stage {

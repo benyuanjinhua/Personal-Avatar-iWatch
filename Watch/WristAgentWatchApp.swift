@@ -31,10 +31,9 @@ struct WristAgentWatchApp: App {
                     WKExtension.shared().isFrontmostTimeoutExtended = true
                     WatchLog.info("lifecycle", "frontmost_timeout_extended")
                     services.bootstrap(reason: "scene_task")
-                    // ESS-65 / G9：新 build 首启先跑装机音频自检（同 build 只跑一次），
-                    // 结束前不放欢迎语/未读播放——两者会与自检抢同一个音频会话。
-                    // 用户按住说话可随时打断自检（SelfCheckRunner.interrupt）。
-                    await services.selfCheck.autoRunIfNeeded()
+                    // ESS-688：正常冷启动不得自动占用麦克风或播放自检音频。
+                    // 自检只允许从设置页由用户显式触发。
+                    services.selfCheck.handleColdStart()
                     // ESS-55 未读优先：有未读结果直接呈现（触觉 + 全文）。
                     // ESS-639：冷启动欢迎语已移除。
                     services.pushToTalk.presentUnreadIfAny()
