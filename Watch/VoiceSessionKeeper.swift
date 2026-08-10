@@ -27,7 +27,7 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
     /// 主球 touch-down 起录后，touch-up 会进入持续会话但不会结束录音。
     /// 该状态等价于“手势已经松开”，允许消费 recording start defer；它只
     /// 影响 runtime 启动门，不改变录音、实时链路或 request_id 生命周期。
-    private var continuousConversationActive = false
+    private var recordingGate = RuntimeSessionRecordingGate()
     /// ESS-363：app 非 active 时触发的 session 请求——不能 start()，挂起到
     /// 下次 appDidBecomeActive 再起；存下 reason 是为了挂起恢复后能落正确的事件。
     private var startDeferredUntilActive = false
@@ -124,8 +124,7 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
     /// 持续会话生命周期输入。进入会话发生在主球 touch-up，因此 true 时
     /// recording defer 必须立即消费；退出后恢复普通 PTT 的手势保护语义。
     func setContinuousConversationActive(_ active: Bool) {
-        guard continuousConversationActive != active else { return }
-        continuousConversationActive = active
+        guard recordingGate.setContinuousConversationActive(active) else { return }
         WatchLog.info(
             "runtime", "conversation_hold_changed",
             detail: "active=\(active) recording=\(isRecording) deferred=\(recordingStartDeferred)"
@@ -148,7 +147,7 @@ final class VoiceSessionKeeper: NSObject, ObservableObject {
             holdReason = reason
             if RuntimeSessionPolicy.shouldStartExtendedSession(
                 for: verdict.decision,
-                recordingGestureReleased: continuousConversationActive
+                recordingGestureReleased: recordingGate.recordingGestureReleased
             ) {
                 recordingStartDeferred = false
                 startSessionIfNeeded(reason: reason)

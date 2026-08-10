@@ -107,3 +107,17 @@ enum RuntimeSessionPolicy {
         return Verdict(decision: .release, reviewAt: nil)
     }
 }
+
+/// ESS-689：录音态 runtime 启动门的最小状态机。
+/// false = 普通 PTT 手势仍按住；true = touch-up 后持续会话仍在。
+/// 返回值表示状态是否真的变化，调用方据此保证重复 enter/exit 通知幂等。
+struct RuntimeSessionRecordingGate {
+    private(set) var recordingGestureReleased = false
+
+    @discardableResult
+    mutating func setContinuousConversationActive(_ active: Bool) -> Bool {
+        guard recordingGestureReleased != active else { return false }
+        recordingGestureReleased = active
+        return true
+    }
+}
