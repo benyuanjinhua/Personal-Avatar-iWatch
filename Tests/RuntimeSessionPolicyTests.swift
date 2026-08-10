@@ -60,6 +60,29 @@ final class RuntimeSessionPolicyTests: XCTestCase {
         XCTAssertFalse(RuntimeSessionPolicy.shouldStartExtendedSession(for: decision))
     }
 
+    /// ESS-689：主球 touch-down 起录时先 defer；touch-up 进入持续会话后，
+    /// 即使仍在录音等待用户开口，也必须消费 defer 并启动 runtime。
+    func testContinuousRecordingConsumesDeferredStartAfterGestureReleased() {
+        let recording = decide(isRecording: true).decision
+
+        XCTAssertFalse(
+            RuntimeSessionPolicy.shouldStartExtendedSession(
+                for: recording,
+                recordingGestureReleased: false
+            ),
+            "手势仍按住时不得启动 runtime，以免系统取消手势"
+        )
+        XCTAssertTrue(
+            RuntimeSessionPolicy.shouldStartExtendedSession(
+                for: recording,
+                recordingGestureReleased: true
+            ),
+            "松手进入持续会话后必须在持续录音态消费 defer"
+        )
+        XCTAssertEqual(recording, .hold(reason: "recording"),
+                       "消费 runtime defer 不得结束录音或改变持有原因")
+    }
+
     func testExtendedSessionStartsAfterGestureForActiveTurn() {
         let turn = makeTurn(states: [.recorded, .waitingForMac])
         let decision = decide(turns: [turn]).decision

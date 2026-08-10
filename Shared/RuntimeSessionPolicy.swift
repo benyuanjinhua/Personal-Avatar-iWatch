@@ -31,9 +31,12 @@ enum RuntimeSessionPolicy {
     /// that gesture on device, producing a 10-60 ms AAC header-only recording.
     /// Defer the system session until release; the newly recorded active turn then
     /// immediately supplies the hold reason for the background wait.
-    static func shouldStartExtendedSession(for decision: Decision) -> Bool {
+    static func shouldStartExtendedSession(
+        for decision: Decision,
+        recordingGestureReleased: Bool = false
+    ) -> Bool {
         guard case .hold(let reason) = decision else { return false }
-        return reason != "recording"
+        return reason != "recording" || recordingGestureReleased
     }
 
     /// ESS-58：会话被系统收回后，回到前台时是否允许自动重持。

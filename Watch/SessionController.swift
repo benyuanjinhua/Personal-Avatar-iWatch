@@ -720,6 +720,10 @@ final class SessionController: ObservableObject {
             self.state = .idle
             self.hungupSummary = nil
             self.completedRounds = 0
+            WatchLog.info(
+                "session", "session_page_exited",
+                detail: "reason=\(reason) rounds=\(rounds) destination=idle"
+            )
         }
     }
 

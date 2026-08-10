@@ -39,7 +39,10 @@ struct WristAgentWatchApp: App {
                     services.pushToTalk.presentUnreadIfAny()
                 }
                 .onChange(of: scenePhase) { _, newPhase in
-                    WatchLog.info("lifecycle", "scene_phase", detail: String(describing: newPhase))
+                    WatchLog.info(
+                        "lifecycle", "scene_phase",
+                        detail: "phase=\(String(describing: newPhase)) session_state=\(String(describing: services.sessionController.state))"
+                    )
                     switch newPhase {
                     case .active:
                         // ESS-58：解锁/切回后，被锁屏截断的播放原位续播，
