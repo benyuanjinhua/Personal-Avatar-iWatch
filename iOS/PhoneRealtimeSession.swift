@@ -224,7 +224,19 @@ final class PhoneRealtimeSession {
         currentTransport = transport
         transition(to: .connecting(requestId: requestId, sessionId: sessionId))
         scheduleReceive(transport)
-        transition(to: .active(requestId: requestId, sessionId: sessionId))
+        // Agent WSS connect is asynchronous. Its adapter reports the real
+        // `.active` transition; announcing readiness here races token mint /
+        // socket upgrade and recreates the false-ready failure mode.
+        if !isAgentTransport {
+            transition(to: .active(requestId: requestId, sessionId: sessionId))
+        }
+    }
+
+    /// Accept state changes only from the transport serving the current turn.
+    /// A superseded socket may still deliver a queued callback after close.
+    func agentTransportDidChangeState(_ newState: State, from transport: Transport) {
+        guard currentTransport === transport else { return }
+        transition(to: newState)
     }
 
     private func scheduleReceive(_ transport: Transport) {

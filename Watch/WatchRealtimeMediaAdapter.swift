@@ -522,6 +522,25 @@ final class WatchRealtimeMediaAdapter {
         }
     }
 
+    func receiveChannelReady(_ ready: RealtimeChannelReady) {
+        guard let turn = currentTurn,
+              turn.requestId == ready.requestId,
+              turn.sessionId == ready.sessionId else {
+            WatchLog.info(
+                "realtime", "stale_channel_ready_dropped", requestId: ready.requestId,
+                detail: "session_id=\(ready.sessionId)"
+            )
+            return
+        }
+        guard !didSignalChannelReady else { return }
+        didSignalChannelReady = true
+        WatchLog.info(
+            "realtime", "channel_ready_received", requestId: ready.requestId,
+            detail: "session_id=\(ready.sessionId) source=transport_connected"
+        )
+        onChannelReady?(ready.requestId)
+    }
+
     /// Called when the user starts speaking again mid-response.
     func bargeIn() {
         session.bargeInDownlink()

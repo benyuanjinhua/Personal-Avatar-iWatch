@@ -374,6 +374,31 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         XCTAssertEqual(readyEvents, [requestId])
     }
 
+    func testTransportReadySignalsBeforeUserSpeaksAndRejectsStaleTurn() {
+        let requestId = "44444444-4444-4444-4444-444444440695"
+        let sessionId = "55555555-5555-5555-5555-555555550695"
+        let (adapter, _, _, _, _) = makeAdapter(sessionIds: [sessionId])
+        var readyEvents: [String] = []
+        adapter.onChannelReady = { readyEvents.append($0) }
+
+        let handle = adapter.beginTurn(requestId: requestId)
+        adapter.receiveChannelReady(RealtimeChannelReady(
+            requestId: "99999999-9999-9999-9999-999999999999",
+            sessionId: handle.sessionId
+        ))
+        XCTAssertTrue(readyEvents.isEmpty)
+
+        adapter.receiveChannelReady(RealtimeChannelReady(
+            requestId: handle.requestId,
+            sessionId: handle.sessionId
+        ))
+        adapter.receiveChannelReady(RealtimeChannelReady(
+            requestId: handle.requestId,
+            sessionId: handle.sessionId
+        ))
+        XCTAssertEqual(readyEvents, [requestId])
+    }
+
     /// ESS-573：新回合重置 ready 信号——下一回合的首个 ack 必须再次触发
     /// （多轮会话里每轮的就绪都要能独立确认）。
     func testChannelReadyRearoundsForNextTurn() {

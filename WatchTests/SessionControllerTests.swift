@@ -125,6 +125,35 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertEqual(haptics, [.ready])
     }
 
+    /// ESS-695：30 秒是持续会话稳定性验收窗口，不是设备等待动作。
+    /// 即使触发首段静默提示，只要会话仍有输入能力，页面必须继续停留。
+    func testConversationRemainsVisibleAfterThirtySeconds() {
+        controller.enterSession()
+        controller.markChannelReady()
+
+        fireDelay(SessionController.silenceHint1Seconds)
+
+        XCTAssertEqual(controller.state, .listening)
+        XCTAssertTrue(controller.isInSession)
+        XCTAssertEqual(teardownCount, 0)
+    }
+
+    /// 流式回答进行中超过 30 秒也不得被静默治理误判并退回表盘。
+    func testStreamingAnswerRemainsVisibleAfterThirtySeconds() {
+        controller.enterSession()
+        controller.markChannelReady()
+        let requestId = controller.activeTurnRequestId!
+        controller.markTurnCommitted(requestId: requestId)
+        controller.markAnswerStarted(requestId: requestId)
+
+        fireDelay(SessionController.silenceHint1Seconds)
+
+        XCTAssertEqual(controller.state, .listening)
+        XCTAssertEqual(controller.turnPhase, .speaking)
+        XCTAssertTrue(controller.isInSession)
+        XCTAssertEqual(teardownCount, 0)
+    }
+
     // MARK: - 失败路径
 
     /// 就绪超时：5s 无真实 ack → 进入 P6 failed 态（不退回 idle）。
