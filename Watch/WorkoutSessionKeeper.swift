@@ -39,7 +39,7 @@ final class WorkoutSessionKeeper: NSObject {
         config.locationType = .unknown
 
         do {
-            let session = HKWorkoutSession(
+            let session = try HKWorkoutSession(
                 healthStore: healthStore,
                 configuration: config
             )

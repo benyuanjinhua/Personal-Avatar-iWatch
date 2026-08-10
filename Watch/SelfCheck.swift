@@ -3,7 +3,7 @@ import Combine
 import Foundation
 import WatchKit
 
-/// 装机音频自检（ESS-65 / G9）：新 build 首启自动跑一遍「录音 → 播放 →
+/// 装机音频自检（ESS-65 / G9）：用户从设置页显式触发「录音 → 播放 →
 /// 播放后立刻录音 → 录音后立刻播放 → 会话状态复位 → 中断残留 → 双激活
 /// 失败」（S1/S2/S3/S3R/S4/S5/S6），结论经 WatchLog → Bridge 回传，
 /// Bridge 侧 `Scripts/watch-smoke-gate.mjs` 一条命令判定 PASS/FAIL，
@@ -60,8 +60,7 @@ final class SelfCheckRunner: ObservableObject {
         return outcome
     }
 
-    /// ESS-163 复审补丁：Debug 面板要在 `.idle`（本进程冷启动同 build 已跑过、
-    /// autoRunIfNeeded 走了 selfcheck_skipped 分支）时也能展示最近一次结论。
+    /// ESS-163 复审补丁：Debug 面板要在 `.idle` 时也能展示最近一次结论。
     /// 本进程刚跑完 → 取活体 `stage`；否则退到磁盘 RunRecord。旧记录缺
     /// failedStep/reason 字段无法还原时返回 nil，UI 走空态而不是硬编默认。
     var latestOutcome: SelfCheckPolicy.Outcome? {
@@ -71,16 +70,13 @@ final class SelfCheckRunner: ObservableObject {
 
     // MARK: - 入口
 
-    /// 冷启动入口：同一 build 只跑一次（inconclusive 例外，见 SelfCheckPolicy）。
-    /// 返回时自检已结束（或被打断/无需跑），调用方再放行欢迎语/未读结果，
-    /// 避免自检与欢迎语抢同一个音频会话。
-    func autoRunIfNeeded() async {
-        let fingerprint = BuildFingerprint.current().detail
-        guard SelfCheckPolicy.shouldAutoRun(currentFingerprint: fingerprint, lastRun: loadLastRun()) else {
-            WatchLog.info("selfcheck", "selfcheck_skipped", detail: "reason=same_build \(fingerprint)")
-            return
-        }
-        await run(fingerprint: fingerprint)
+    /// ESS-688：冷启动只留下可审计的禁用事件，不运行任何录音或播放步骤。
+    /// 真正的自检入口只有设置页按钮调用的 `rerun()`。
+    func handleColdStart() {
+        WatchLog.info(
+            "selfcheck", "selfcheck_skipped",
+            detail: "reason=manual_only \(BuildFingerprint.current().detail)"
+        )
     }
 
     /// 手动重跑（结果卡片按钮）：不受「同 build 只跑一次」限制。
