@@ -62,17 +62,17 @@ final class VoiceBargeInEvidenceTests: XCTestCase {
 
     // MARK: - F2-4：gate 的默认值、持久化与契约事件
 
-    func testGateDefaultsOff() {
-        XCTAssertFalse(
+    func testGateDefaultsOnForFreshInstall() {
+        XCTAssertTrue(
             WatchDebugSettings(defaults: isolatedDefaults("default")).voiceBargeInEnabled,
-            "F2-5 真机零误触通过前，语音打断默认必须 OFF"
+            "ESS-711：新安装必须默认支持语音打断"
         )
     }
 
     func testGatePersistsAcrossRelaunch() {
         let defaults = isolatedDefaults("persist")
-        WatchDebugSettings(defaults: defaults).setVoiceBargeInEnabled(true)
-        XCTAssertTrue(WatchDebugSettings(defaults: defaults).voiceBargeInEnabled)
+        WatchDebugSettings(defaults: defaults).setVoiceBargeInEnabled(false)
+        XCTAssertFalse(WatchDebugSettings(defaults: defaults).voiceBargeInEnabled)
     }
 
     /// `voice_barge_in_gate` 必须过得了 ESS-655 契约校验。
@@ -84,11 +84,11 @@ final class VoiceBargeInEvidenceTests: XCTestCase {
         let log = LogSpy(); log.install(); defer { log.uninstall() }
         let settings = WatchDebugSettings(defaults: isolatedDefaults("contract"))
 
-        settings.setVoiceBargeInEnabled(true)
         settings.setVoiceBargeInEnabled(false)
+        settings.setVoiceBargeInEnabled(true)
 
         let details = log.details(of: "voice_barge_in_gate")
-        XCTAssertEqual(details, ["state=on reason=user_toggle", "state=off reason=user_toggle"])
+        XCTAssertEqual(details, ["state=off reason=user_toggle", "state=on reason=user_toggle"])
         for detail in details {
             XCTAssertNoThrow(
                 try PhoneModeTelemetry.validate(
@@ -104,7 +104,7 @@ final class VoiceBargeInEvidenceTests: XCTestCase {
     func testLaunchSnapshotReportsGateState() {
         let log = LogSpy(); log.install(); defer { log.uninstall() }
         WatchDebugSettings(defaults: isolatedDefaults("launch")).logStateAtLaunch()
-        XCTAssertEqual(log.details(of: "voice_barge_in_gate"), ["state=off reason=launch_snapshot"])
+        XCTAssertEqual(log.details(of: "voice_barge_in_gate"), ["state=on reason=launch_snapshot"])
     }
 
     /// **ON 也要通知订阅者。** 只在 OFF 时回调等于「运行中打开」永远不闭环：
@@ -114,11 +114,11 @@ final class VoiceBargeInEvidenceTests: XCTestCase {
         var observed: [Bool] = []
         settings.onVoiceBargeInChanged { observed.append($0) }
 
-        settings.setVoiceBargeInEnabled(true)
-        settings.setVoiceBargeInEnabled(true)     // 幂等：同值不重复通知
         settings.setVoiceBargeInEnabled(false)
+        settings.setVoiceBargeInEnabled(false)    // 幂等：同值不重复通知
+        settings.setVoiceBargeInEnabled(true)
 
-        XCTAssertEqual(observed, [true, false])
+        XCTAssertEqual(observed, [false, true])
     }
 
     /// gate 必须有**真实调用点**。整改前 `setVoiceBargeInEnabled` 一个调用点

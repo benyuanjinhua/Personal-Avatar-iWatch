@@ -160,11 +160,11 @@ struct WatchSettingsView: View {
     /// 只能靠改代码打开——F2-4「运行时切换」与全部真机验收都无从谈起
     /// （ESS-667 复审阻断 2）。
     ///
-    /// 默认 OFF，此处不改默认值：F2-5 真机零误触通过后要动的是
-    /// `WatchDebugSettings` 的默认值，不是这个 Toggle。
+    /// ESS-711 后新安装默认 ON；此处保留可见退出开关，回声异常时用户可
+    /// 显式关闭，且该选择在重启后继续生效。
     private var voiceBargeInSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            sectionHeader("语音打断（Debug）")
+            sectionHeader("语音打断")
 
             Toggle(isOn: Binding(
                 get: { debugSettings.voiceBargeInEnabled },
