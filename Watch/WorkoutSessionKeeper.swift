@@ -1,6 +1,4 @@
 import HealthKit
-import WatchKit
-import os
 
 /// ESS-540 F6: HKWorkoutSession-based foreground keep-alive.
 ///
@@ -20,25 +18,48 @@ import os
 /// need a privacy policy covering HealthKit usage.
 @MainActor
 final class WorkoutSessionKeeper: NSObject {
-    private static let logger = Logger(
-        subsystem: "com.benyuan.wristagent.watch",
-        category: "WorkoutSession"
-    )
+    typealias EnabledProvider = () -> Bool
+    typealias StartProbe = () throws -> Void
 
-    private let healthStore = HKHealthStore()
+    private let enabledProvider: EnabledProvider
+    private let startProbe: StartProbe?
+    private lazy var healthStore = HKHealthStore()
     private var session: HKWorkoutSession?
     private var builder: HKLiveWorkoutBuilder?
     private var isActive = false
+
+    init(
+        enabledProvider: @escaping EnabledProvider = {
+            Bundle.main.object(forInfoDictionaryKey: "HealthKitWorkoutKeepAliveEnabled") as? Bool == true
+        },
+        startProbe: StartProbe? = nil
+    ) {
+        self.enabledProvider = enabledProvider
+        self.startProbe = startProbe
+        super.init()
+    }
 
     /// Start a workout session to keep the app foregrounded.
     /// Call when the user enters a real-time conversation.
     func start() {
         guard !isActive else { return }
+        // HKWorkoutSession is an entitlement-backed API. Calling it from a
+        // build whose capability/provisioning is incomplete can terminate the
+        // process before Swift receives an Error. It must therefore be an
+        // explicit, fail-closed capability, not an optimistic runtime probe.
+        guard enabledProvider() else {
+            WatchLog.info(
+                "workout", "workout_session_skipped",
+                detail: "reason=capability_disabled session_preserved=true"
+            )
+            return
+        }
         let config = HKWorkoutConfiguration()
         config.activityType = .other
         config.locationType = .unknown
 
         do {
+            try startProbe?()
             let session = try HKWorkoutSession(
                 healthStore: healthStore,
                 configuration: config
@@ -54,10 +75,14 @@ final class WorkoutSessionKeeper: NSObject {
             try session.startActivity(with: Date())
             try builder.beginCollection(withStart: Date()) { _, _ in }
             isActive = true
-            Self.logger.info("workout_session_started")
+            WatchLog.info("workout", "workout_session_started")
         } catch {
-            Self.logger.error(
-                "workout_session_start_failed error=\(error.localizedDescription)"
+            self.session = nil
+            self.builder = nil
+            isActive = false
+            WatchLog.error(
+                "workout", "workout_session_start_failed",
+                detail: "session_preserved=true", error: error
             )
         }
     }
@@ -71,11 +96,11 @@ final class WorkoutSessionKeeper: NSObject {
             try session.end()
             try builder?.endCollection(withEnd: Date()) { _, _ in }
         } catch {
-            Self.logger.error("workout_session_stop_failed error=\(error.localizedDescription)")
+            WatchLog.error("workout", "workout_session_stop_failed", error: error)
         }
         self.session = nil
         self.builder = nil
-        Self.logger.info("workout_session_stopped")
+        WatchLog.info("workout", "workout_session_stopped")
     }
 }
 
@@ -87,8 +112,9 @@ extension WorkoutSessionKeeper: HKWorkoutSessionDelegate {
         date: Date
     ) {
         Task { @MainActor in
-            Self.logger.info(
-                "workout_session_state_changed from=\(fromState.rawValue) to=\(toState.rawValue)"
+            WatchLog.info(
+                "workout", "workout_session_state_changed",
+                detail: "from=\(fromState.rawValue) to=\(toState.rawValue)"
             )
         }
     }
@@ -98,8 +124,9 @@ extension WorkoutSessionKeeper: HKWorkoutSessionDelegate {
         didFailWithError error: Error
     ) {
         Task { @MainActor in
-            Self.logger.error(
-                "workout_session_failed error=\(error.localizedDescription)"
+            WatchLog.error(
+                "workout", "workout_session_failed",
+                detail: "session_preserved=true", error: error
             )
             self.isActive = false
             self.session = nil
