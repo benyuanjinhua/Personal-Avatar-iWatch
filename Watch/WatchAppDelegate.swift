@@ -106,6 +106,11 @@ final class WatchAppServices {
         SpeechPlayer.sessionExternallyOwned = { [pushToTalk] in
             pushToTalk.conversationAudioController?.isAcquired == true
         }
+        // ESS-755：StreamingAudioPlayer 同理——会话级持有期间不得重配/释放
+        // AVAudioSession，引擎与 playerNode 正常起停但 avtouch 零触碰。
+        StreamingAudioPlayer.sessionExternallyOwned = { [pushToTalk] in
+            pushToTalk.conversationAudioController?.isAcquired == true
+        }
         // ESS-321: pre-warm the adapter so the settings store's downlink
         // dispatch has somewhere to send `audio.delta` payloads even before
         // the first press has fired.

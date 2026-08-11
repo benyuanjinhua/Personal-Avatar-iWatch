@@ -18,6 +18,40 @@ import XCTest
 @MainActor
 final class WatchStreamReceiverTests: XCTestCase {
 
+    // MARK: - WatchLog 旁路收集器（ESS-755 gate 契约测试）
+
+    private struct CapturedLogEvent {
+        let event: String
+        let detail: String?
+    }
+
+    private final class LogCollector: @unchecked Sendable {
+        private let lock = NSLock()
+        private var events: [CapturedLogEvent] = []
+        func append(_ e: CapturedLogEvent) { lock.lock(); events.append(e); lock.unlock() }
+        func matches(event: String) -> [CapturedLogEvent] {
+            lock.lock(); defer { lock.unlock() }
+            return events.filter { $0.event == event }
+        }
+    }
+
+    private var logCollector: LogCollector!
+
+    override func setUp() {
+        super.setUp()
+        logCollector = LogCollector()
+        let sink = logCollector!
+        WatchLog.setObserver { _, event, _, detail, _ in
+            sink.append(CapturedLogEvent(event: event, detail: detail))
+        }
+    }
+
+    override func tearDown() {
+        WatchLog.setObserver(nil)
+        logCollector = nil
+        super.tearDown()
+    }
+
     private let requestId = UUID().uuidString
     private let streamId = UUID().uuidString
 
@@ -287,5 +321,116 @@ final class WatchStreamReceiverTests: XCTestCase {
         )
         receiver.receive(chunk: uplinkChunk)
         XCTAssertTrue(fallbackCalls.isEmpty, "uplink chunk 不应触发 fallback")
+    }
+
+    // MARK: - StreamingAudioPlayer 会话所有权 gate ON/OFF 契约（ESS-755）
+
+    /// Spy：记录 setPlaybackCategory / activate / deactivate 调用次数。
+    /// 纯逻辑、无音频硬件依赖——在 hosted CI 稳定运行。
+    private final class StreamingAudioSessionSpy: StreamingAudioPlayerSessionControlling {
+        var setPlaybackCategoryCalls = 0
+        var activateCalls = 0
+        var deactivateCalls = 0
+
+        func setPlaybackCategory() throws { setPlaybackCategoryCalls += 1 }
+        func activate() throws { activateCalls += 1 }
+        func deactivate() { deactivateCalls += 1 }
+    }
+
+    /// Spy：桩化 AVAudioEngine，记录 start / stop 调用次数。
+    /// 不创建真实音频 IO——在 hosted CI 稳定运行。
+    private final class StreamingAudioEngineSpy: StreamingAudioEngineControlling {
+        let mainMixerNode = AVAudioMixerNode()
+        var starts = 0
+        var stops = 0
+
+        func attach(_ node: AVAudioPlayerNode) {}
+        func connect(_ node: AVAudioPlayerNode, to engineNode: AVAudioNode, format: AVAudioFormat?) {}
+        func start() throws { starts += 1 }
+        func stop() { stops += 1 }
+    }
+
+    /// Gate OFF（默认=回合级旧行为）：StreamingAudioPlayer 必须调用
+    /// session.setPlaybackCategory + activate + deactivate。
+    /// 纯逻辑 spy 断言，无需音频硬件、hosted CI 稳定执行。
+    func testSessionExternallyOwnedGateOffPlayerTouchesSession() {
+        StreamingAudioPlayer.sessionExternallyOwned = { false }
+        defer { StreamingAudioPlayer.sessionExternallyOwned = { false } }
+
+        let sessionSpy = StreamingAudioSessionSpy()
+        let engineSpy = StreamingAudioEngineSpy()
+        let player = StreamingAudioPlayer(
+            sampleRate: 24_000, context: "gate-off",
+            session: sessionSpy, engine: engineSpy
+        )
+        player.start()
+        player.stop()
+
+        XCTAssertEqual(sessionSpy.setPlaybackCategoryCalls, 1,
+                       "gate OFF：start() 必须调 setPlaybackCategory 恰好一次")
+        XCTAssertEqual(sessionSpy.activateCalls, 1,
+                       "gate OFF：start() 必须调 activate 恰好一次")
+        XCTAssertEqual(sessionSpy.deactivateCalls, 1,
+                       "gate OFF：stop() 必须调 deactivate 恰好一次")
+        XCTAssertEqual(engineSpy.starts, 1, "gate OFF：引擎必须启动")
+        XCTAssertEqual(engineSpy.stops, 1, "gate OFF：引擎必须停止")
+    }
+
+    /// Gate ON（会话级持有）：StreamingAudioPlayer 零触碰 session
+    /// spy 上的任何方法；引擎正常起停。纯逻辑、hosted CI 安全。
+    func testSessionExternallyOwnedGateOnPlayerSkipsSession() {
+        StreamingAudioPlayer.sessionExternallyOwned = { true }
+        defer { StreamingAudioPlayer.sessionExternallyOwned = { false } }
+
+        let sessionSpy = StreamingAudioSessionSpy()
+        let engineSpy = StreamingAudioEngineSpy()
+        let player = StreamingAudioPlayer(
+            sampleRate: 24_000, context: "gate-on",
+            session: sessionSpy, engine: engineSpy
+        )
+        player.start()
+        player.stop()
+
+        XCTAssertEqual(sessionSpy.setPlaybackCategoryCalls, 0,
+                       "gate ON：不得调 setPlaybackCategory")
+        XCTAssertEqual(sessionSpy.activateCalls, 0,
+                       "gate ON：不得调 activate")
+        XCTAssertEqual(sessionSpy.deactivateCalls, 0,
+                       "gate ON：不得调 deactivate")
+        XCTAssertEqual(engineSpy.starts, 1, "gate ON：引擎仍须启动")
+        XCTAssertEqual(engineSpy.stops, 1, "gate ON：引擎仍须停止")
+    }
+
+    /// Gate ON 后切回 OFF：session 调用计数恢复为旧行为。
+    /// 纯逻辑、hosted CI 安全。
+    func testSessionExternallyOwnedGateToggleOnThenOffRestoresOldBehavior() {
+        // Gate ON
+        StreamingAudioPlayer.sessionExternallyOwned = { true }
+        let sessionA = StreamingAudioSessionSpy()
+        let playerA = StreamingAudioPlayer(
+            sampleRate: 24_000, context: "gate-on",
+            session: sessionA, engine: StreamingAudioEngineSpy()
+        )
+        playerA.start()
+        playerA.stop()
+        XCTAssertEqual(sessionA.setPlaybackCategoryCalls, 0)
+        XCTAssertEqual(sessionA.activateCalls, 0)
+        XCTAssertEqual(sessionA.deactivateCalls, 0)
+
+        // Gate OFF
+        StreamingAudioPlayer.sessionExternallyOwned = { false }
+        let sessionB = StreamingAudioSessionSpy()
+        let playerB = StreamingAudioPlayer(
+            sampleRate: 24_000, context: "gate-off",
+            session: sessionB, engine: StreamingAudioEngineSpy()
+        )
+        playerB.start()
+        playerB.stop()
+        XCTAssertEqual(sessionB.setPlaybackCategoryCalls, 1,
+                       "gate ON→OFF 切回后 setPlaybackCategory 必须恢复")
+        XCTAssertEqual(sessionB.activateCalls, 1,
+                       "gate ON→OFF 切回后 activate 必须恢复")
+        XCTAssertEqual(sessionB.deactivateCalls, 1,
+                       "gate ON→OFF 切回后 deactivate 必须恢复")
     }
 }
