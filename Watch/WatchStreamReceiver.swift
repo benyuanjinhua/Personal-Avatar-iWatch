@@ -10,12 +10,20 @@ import os
 /// - 以 `WatchDebugSettings.isStreamingActive` 为总门禁
 /// - 降级：buffer 超时/越窗/背压时走 `voice.stream.fallback` 回退整段 m4a
 ///
-/// 顺序契约（ESS-747）：**当前流只能前进，不能倒退。**
+/// 顺序契约（ESS-747 / ESS-777）：**当前流只能前进，不能倒退。**
 /// - 一条分片必须带合法的 `request_id` + `stream_id`；两者一起才是流身份。
-/// - 只有「新 `request_id`」能取代在飞流；同 `request_id` 换 `stream_id` 的
-///   分片一律丢弃，不得顶掉正在播的流。
-/// - 流一旦终结（被取代 / 取消 / 回退），其 `request_id` 进有界墓碑，
-///   此后任何迟到分片只会被丢弃——旧回答不能抢占新回答，也不会补播。
+/// - 同 `request_id` 换 `stream_id` 的分片一律丢弃，不得顶掉正在播的流。
+/// - 只有「不比水位线旧的新 `request_id`」能取代在飞流。水位线
+///   `admittedTurnFloorMs` 取自回合 `request_id` 的 UUIDv7 时间戳——
+///   一条**由协议携带、单调递增**的回合序号（RFC 9562 前 48 位）。
+/// - 流一旦终结（被取代 / 取消 / 回退），其 `request_id` 进有界墓碑。
+///
+/// 两层各自负责什么，别混：
+/// - **水位线**是顺序正确性的下限：比它旧的回合永远开不了流，与墓碑
+///   是否淘汰无关。这正是 ESS-777 判定「有界墓碑淘汰后旧流可再抢占」
+///   的补法——不能靠一个会被 FIFO 淘汰的集合来保证顺序。
+/// - **墓碑**只是最近 32 条的精确拒绝缓存（日志更好读），并兜住不带
+///   时序的 `request_id`（非 UUIDv7）。它不是正确性边界。
 ///
 /// 线程：全部 `@MainActor`；`didReceiveMessageData` 通过 `Task { @MainActor in }` 进入。
 @MainActor
@@ -77,17 +85,31 @@ final class WatchStreamReceiver: ObservableObject {
 
     private var activeStream: StreamState?
     private var disableObserverToken: UUID?
-    /// ESS-747：已终结流的墓碑（tombstone）。任何进过这里的 `request_id`
-    /// 都不能再被复活——迟到的旧分片只能被丢弃，不能重开一条流。
-    /// 有界 FIFO：只保留最近 `maxRetiredRequests` 个，避免长会话无限增长。
+    /// ESS-747：已终结流的墓碑（tombstone）。有界 FIFO，只保留最近
+    /// `maxRetiredRequests` 个——它负责**精确**拒绝最近若干条旧流（含
+    /// 不带时序的 id），但**不是**顺序正确性的下限，见 `admittedTurnFloorMs`。
     private var retiredRequestIds: Set<String> = []
     private var retiredOrder: [String] = []
+    /// ESS-777 复审阻断项：墓碑一旦 FIFO 淘汰，被淘汰的旧流又能重新抢占
+    /// 当前流（窗口只是从下一轮推迟到第 33 轮以后）。所以顺序正确性不能
+    /// 靠这个有界集合，必须靠一个**不会被淘汰**的单调水位线。
+    ///
+    /// 取值：迄今**准入过**的最新一轮的 UUIDv7 时间戳。回合 `request_id`
+    /// 由 Watch 自己在 `PushToTalkController.pressBegan` 用
+    /// `UUIDv7.generate()` 生成（RFC 9562 前 48 位为 Unix 毫秒），下行流的
+    /// `request_id` 是同一个 id 原样回来的——因此这是一条**由协议携带、
+    /// 接收端可校验、单调递增**的回合序号，不是到达顺序拍出来的本地 serial。
+    ///
+    /// 契约：比水位线更旧的回合**永远**开不了新流，与墓碑是否淘汰无关。
+    private var admittedTurnFloorMs: UInt64?
     /// ESS-747：本接收器内单调递增的流序号，见 `StreamState.serial`。
+    /// 只用于日志归因，**不参与**任何顺序判定。
     private var streamSerial = 0
     /// ESS-509: WCSession health monitor, started when streaming begins.
     private let keepAlive = RealtimeSessionKeepAlive()
 
-    /// 墓碑上限。一次会话内的回合数远小于此；超出即淘汰最旧的一条。
+    /// 墓碑上限：只是「精确拒绝」的缓存深度，超出即淘汰最旧的一条。
+    /// 淘汰**不会**打开顺序漏洞——被淘汰的旧回合由 `admittedTurnFloorMs` 兜底。
     static let maxRetiredRequests = 32
 
     /// 门禁：编译期 OFF + debug 开关。
@@ -100,6 +122,7 @@ final class WatchStreamReceiver: ObservableObject {
     var activeStreamSerial: Int? { activeStream?.serial }
     var activeBufferedBytes: Int? { activeStream?.buffer.bufferedBytes }
     var retiredRequestCount: Int { retiredRequestIds.count }
+    var admittedTurnFloor: UInt64? { admittedTurnFloorMs }
 
     // MARK: - Init
 
@@ -174,12 +197,13 @@ final class WatchStreamReceiver: ObservableObject {
                 )
                 return
             } else {
-                // 新 request_id：这是新一轮回答，旧流让位并进墓碑（单向，
-                // 之后旧流的迟到分片只会被丢弃）。
+                // 新 request_id：只有**不比水位线旧**的回合才配取代在飞流。
+                guard admitAsNewTurn(key: key, seq: chunk.sequence) else { return }
                 retire(active, reason: "new_stream_supersedes")
                 startStream(key: key, generation: currentGen)
             }
         } else {
+            guard admitAsNewTurn(key: key, seq: chunk.sequence) else { return }
             startStream(key: key, generation: currentGen)
         }
 
@@ -191,7 +215,35 @@ final class WatchStreamReceiver: ObservableObject {
 
     // MARK: - Stream lifecycle (ESS-747)
 
-    /// 开一条新流。调用方必须已确认：身份合法、未进墓碑、旧流已 `retire`。
+    /// 能否把这条分片当作**新一轮**来开流。
+    ///
+    /// 判据是回合时序水位线，不是墓碑：`request_id` 是 UUIDv7 时，比水位线
+    /// 更旧的回合永远开不了流——墓碑淘汰与否都一样（ESS-777 阻断项）。
+    ///
+    /// 不带时序的 `request_id`（非 UUIDv7）无法比较，退回「墓碑精确拒绝」
+    /// 这一层，保持既有行为，不拿随机位当时间戳用；此时也不动水位线，
+    /// 免得一个随机高位把之后所有合法回合全挡在门外。
+    ///
+    /// 被拒的回合不会因此丢答案：整段 m4a 走 `transferSpeech` 可靠通道，
+    /// 与 chunk 流并行（见 `WatchAppDelegate` 接线注释），这里只丢流式快路径。
+    private func admitAsNewTurn(key: StreamKey, seq: Int) -> Bool {
+        guard let incomingTurnMs = UUIDv7.turnTimestampMs(ofString: key.requestId) else {
+            return true  // 无时序：只由墓碑把关
+        }
+        if let floor = admittedTurnFloorMs, incomingTurnMs < floor {
+            WatchLog.info(
+                "stream", "chunk_rejected_stale_turn",
+                requestId: key.requestId,
+                detail: "stream_id=\(key.streamId) seq=\(seq) turn_ms=\(incomingTurnMs) floor_ms=\(floor)"
+            )
+            return false
+        }
+        admittedTurnFloorMs = max(admittedTurnFloorMs ?? incomingTurnMs, incomingTurnMs)
+        return true
+    }
+
+    /// 开一条新流。调用方必须已确认：身份合法、未进墓碑、时序不旧于水位线、
+    /// 旧流已 `retire`。
     private func startStream(key: StreamKey, generation: Int) {
         streamSerial += 1
         activeStream = StreamState(
@@ -251,9 +303,7 @@ final class WatchStreamReceiver: ObservableObject {
             // ESS-748：播放器起不来就**立刻降级一次**，不再推进序列。
             // 推进了等于宣称「这段已经放过了」，整段回答会静默消失。
             guard ensurePlayer(stream: &stream) else {
-                triggerFallback(
-                    requestId: stream.requestId, reason: .playerStartFailed, stream: &stream
-                )
+                triggerFallback(reason: .playerStartFailed, stream: &stream)
                 return
             }
             stream.player?.append(pcmData: pcmData)

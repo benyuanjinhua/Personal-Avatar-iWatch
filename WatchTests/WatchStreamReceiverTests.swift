@@ -409,6 +409,84 @@ final class WatchStreamReceiverTests: XCTestCase {
                        "墓碑应按 FIFO 淘汰，不得无限增长")
     }
 
+    // MARK: - ESS-777 复审阻断项：墓碑淘汰后旧流仍不得抢占
+
+    /// 生产路径的回合 id 是 UUIDv7（`PushToTalkController.pressBegan`），
+    /// 这里按毫秒递增构造，保证「第 N 轮比第 N-1 轮新」是确定性的，不靠时钟。
+    private func turnId(msOffset: UInt64) -> String {
+        let random = (0..<10).map { _ in UInt8.random(in: .min ... .max) }
+        return UUIDv7.make(timestampMs: 1_785_810_000_000 + msOffset, random: random)
+            .uuidString.lowercased()
+    }
+
+    /// ESS-777 阻断项 1 的确定性回归：替换次数超过墓碑上限后，**最旧那一轮**
+    /// 已被 FIFO 淘汰出墓碑；此时重放它的迟到分片，当前流必须纹丝不动。
+    /// 修复前这条会红——旧流不再命中墓碑，会 `retire` 当前流并自立为 active。
+    func testEvictedOldTurnStillCannotPreemptCurrentStream() {
+        let settings = makeSettings()
+        var fallbackCalls: [(String, VoiceStreamFallbackReason)] = []
+        let receiver = WatchStreamReceiver(debugSettings: settings) { id, reason in
+            fallbackCalls.append((id, reason))
+        }
+
+        // 第 0 轮：之后要被淘汰出墓碑的那一轮。
+        let oldestRid = turnId(msOffset: 0)
+        let oldestSid = UUID().uuidString
+        receiver.receive(chunk: chunk(1, requestId: oldestRid, streamId: oldestSid))
+        XCTAssertEqual(receiver.activeRequestId, oldestRid)
+
+        // 再跑 maxRetiredRequests + 1 轮，把第 0 轮挤出墓碑。
+        for index in 1...(WatchStreamReceiver.maxRetiredRequests + 1) {
+            receiver.receive(chunk: chunk(1, requestId: turnId(msOffset: UInt64(index)),
+                                          streamId: UUID().uuidString))
+        }
+        XCTAssertFalse(receiver.retiredRequestCount > WatchStreamReceiver.maxRetiredRequests)
+
+        let currentRid = receiver.activeRequestId
+        let currentSid = receiver.activeStreamId
+        let currentSerial = receiver.activeStreamSerial
+        let currentBuffered = receiver.activeBufferedBytes
+
+        // 重放已被淘汰的第 0 轮的迟到分片。
+        receiver.receive(chunk: chunk(2, bytes: 64, requestId: oldestRid, streamId: oldestSid))
+
+        XCTAssertEqual(receiver.activeRequestId, currentRid, "被淘汰的旧回合不得成为当前流")
+        XCTAssertEqual(receiver.activeStreamId, currentSid)
+        XCTAssertEqual(receiver.activeStreamSerial, currentSerial, "当前流不得被重建")
+        XCTAssertEqual(receiver.activeBufferedBytes, currentBuffered, "旧分片不得混入当前流缓冲")
+        XCTAssertTrue(fallbackCalls.isEmpty)
+    }
+
+    /// 水位线只挡更旧的回合，不能把合法的新回合也挡掉。
+    func testNewerTurnStillSupersedesCurrentStream() {
+        let settings = makeSettings()
+        let receiver = WatchStreamReceiver(debugSettings: settings) { _, _ in }
+
+        let older = turnId(msOffset: 0)
+        let newer = turnId(msOffset: 5_000)
+        receiver.receive(chunk: chunk(1, requestId: older, streamId: UUID().uuidString))
+        receiver.receive(chunk: chunk(1, requestId: newer, streamId: UUID().uuidString))
+
+        XCTAssertEqual(receiver.activeRequestId, newer, "更新的回合必须能取代在飞流")
+        XCTAssertEqual(receiver.admittedTurnFloor, UUIDv7.turnTimestampMs(ofString: newer))
+    }
+
+    /// 不带时序的 request_id（非 UUIDv7）不得抬高水位线——否则一个随机高位
+    /// 会把之后所有合法回合永久挡在门外。
+    func testNonV7RequestIdDoesNotMoveTheFloor() {
+        let settings = makeSettings()
+        let receiver = WatchStreamReceiver(debugSettings: settings) { _, _ in }
+
+        let v4 = UUID().uuidString  // 随机版本，非 v7
+        receiver.receive(chunk: chunk(1, requestId: v4, streamId: UUID().uuidString))
+        XCTAssertNil(receiver.admittedTurnFloor, "非 v7 不参与时序判定")
+
+        // 之后的合法 v7 回合仍能正常开流。
+        let v7 = turnId(msOffset: 0)
+        receiver.receive(chunk: chunk(1, requestId: v7, streamId: UUID().uuidString))
+        XCTAssertEqual(receiver.activeRequestId, v7)
+    }
+
     // MARK: - 非 downlink chunk 拒绝
 
     func testNonDownlinkChunkIgnored() {
