@@ -179,11 +179,16 @@ export function createDownlinkGuard({
   const send = text => {
     if (tripped) return
     const buffered = ws.bufferedAmount ?? 0
-    if (buffered > maxBufferedBytes) {
+    // Charge the frame we are about to queue, not just the backlog already
+    // there (ESS-792 review): checking `bufferedAmount` alone would let one
+    // more frame cross the cap and only trip on the *next* send, making the
+    // ceiling soft by up to one frame. Projecting keeps it a hard cap.
+    const projected = buffered + Buffer.byteLength(text)
+    if (projected > maxBufferedBytes) {
       tripped = true
       log('downlink_backpressure_disconnect', {
         ...base(), code: 'ERR_SLOW_CONSUMER',
-        buffered_bytes: buffered, cap: maxBufferedBytes,
+        buffered_bytes: buffered, projected_bytes: projected, cap: maxBufferedBytes,
       })
       try { ws.close(1013, 'ERR_SLOW_CONSUMER') } catch { /* already dead */ }
       if (closeGraceMs > 0) {
@@ -195,10 +200,10 @@ export function createDownlinkGuard({
       }
       return
     }
-    if (!warned && buffered > warnBufferedBytes) {
+    if (!warned && projected > warnBufferedBytes) {
       warned = true
       log('downlink_backpressure_warning', {
-        ...base(), buffered_bytes: buffered,
+        ...base(), buffered_bytes: buffered, projected_bytes: projected,
         warn_at: warnBufferedBytes, cap: maxBufferedBytes,
       })
     }

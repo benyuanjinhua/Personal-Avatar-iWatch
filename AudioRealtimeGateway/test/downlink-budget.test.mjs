@@ -274,6 +274,29 @@ describe('createDownlinkGuard — slow consumer (ESS-746)', () => {
     assert.equal(guard.tripped(), false)
   })
 
+  it('is a hard cap: the frame that would cross it is never queued (ESS-792)', () => {
+    // 900 already buffered + a 200 B frame = 1100 > cap 1000. Checking only
+    // the existing backlog would queue this frame and trip on the next one,
+    // leaving the buffer above the cap in between.
+    const ws = fakeWs(900)
+    const { guard, logs } = guardFor(ws)
+    guard.send('x'.repeat(200))
+    assert.deepEqual(ws.sent, [])
+    assert.equal(ws.closed.code, 1013)
+    const log = logs.find(item => item.evt === 'downlink_backpressure_disconnect')
+    assert.equal(log.buffered_bytes, 900)
+    assert.equal(log.projected_bytes, 1_100)
+  })
+
+  it('leaves a frame that still fits alone', () => {
+    const ws = fakeWs(900)
+    const { guard } = guardFor(ws)
+    guard.send('x'.repeat(50))
+    assert.equal(ws.sent.length, 1)
+    assert.equal(ws.closed, null)
+    assert.equal(guard.tripped(), false)
+  })
+
   it('disconnects a stalled consumer and drops every later frame', () => {
     const ws = fakeWs(5_000)
     const { guard, logs, timers } = guardFor(ws)

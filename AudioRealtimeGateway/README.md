@@ -195,8 +195,9 @@ upstream nor a Watch that stopped draining can grow the process without limit.
   of after the 30 s barrier gap. This window is what bounds the per-session
   dedup set of seen sequences.
 - **Slow consumer.** Before each downlink frame the socket's `bufferedAmount`
-  is checked: crossing `downlink_backpressure_warn_bytes` logs one
-  `downlink_backpressure_warning`; crossing `max_downlink_buffered_bytes`
+  **plus the frame about to be queued** is checked, so the cap is hard rather
+  than exceeded by one frame: crossing `downlink_backpressure_warn_bytes` logs
+  one `downlink_backpressure_warning`; crossing `max_downlink_buffered_bytes`
   logs `downlink_backpressure_disconnect` and closes with WS code `1013`
   (reason `ERR_SLOW_CONSUMER`), dropping every later frame. Because `close()`
   queues behind the same backlog, `terminate()` follows after
