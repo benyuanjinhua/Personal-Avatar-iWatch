@@ -434,12 +434,53 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         )
     }
 
-    /// Bridge → iPhone → Watch: enqueue a decoded downlink envelope onto the
-    /// existing WatchDownlinkOutbox so it flows through the same durable
-    /// queue that carries status envelopes.
+    /// Agent/Bridge → iPhone → Watch realtime downlink.
+    ///
+    /// Realtime envelopes MUST have a single delivery path while the Watch is
+    /// reachable. The generic outbox deliberately sends every item twice
+    /// (`transferUserInfo` for durability plus `sendMessage` for latency).
+    /// That is correct for idempotent status messages, but it is not correct
+    /// for an ordered media stream: the durable copy can arrive later and
+    /// replay seq 0...N after `audio.done`, which made the Watch observe a
+    /// second, out-of-order stream and drop it as `sessionEnded` (ESS-773).
+    ///
+    /// Use the interactive channel exactly once when reachable. Only enqueue
+    /// a durable copy when the interactive channel is unavailable or reports
+    /// a delivery error.
     @MainActor
     private func forwardRealtimeDownlink(_ envelope: RealtimeDownlinkEnvelope) {
         guard let data = try? JSONEncoder().encode(envelope) else { return }
+        let session = WCSession.default
+        guard RealtimeDownlinkDeliveryPolicy.route(
+            isActivated: session.activationState == .activated,
+            isReachable: session.isReachable
+        ) == .interactiveOnly else {
+            enqueueRealtimeDownlinkFallback(envelope: envelope, data: data, reason: "unreachable")
+            return
+        }
+        session.sendMessage(
+            [RealtimeMediaMessage.downlinkEnvelopeKey: data],
+            replyHandler: nil
+        ) { [weak self] error in
+            Task { @MainActor in
+                self?.enqueueRealtimeDownlinkFallback(
+                    envelope: envelope,
+                    data: data,
+                    reason: "interactive_failed:\(error.localizedDescription)"
+                )
+            }
+        }
+    }
+
+    @MainActor
+    private func enqueueRealtimeDownlinkFallback(
+        envelope: RealtimeDownlinkEnvelope,
+        data: Data,
+        reason: String
+    ) {
+        Self.downlinkLogger.notice(
+            "realtime downlink durable fallback request_id=\(envelope.requestId, privacy: .public) kind=\(envelope.kind.rawValue, privacy: .public) reason=\(reason, privacy: .public)"
+        )
         enqueueDownlink(
             requestId: envelope.requestId,
             kind: .relayStatus,
@@ -857,8 +898,15 @@ extension PhoneConnectivity: WatchFeedbackChannel {
                     item.messageKey: payload,
                     Self.downlinkItemIdKey: item.id
                 ])
-                // 可达时额外走一次即时通道降低延迟；失败无所谓，可靠性由上面那条兜底。
-                if session.isReachable {
+                // Realtime fallback is already here because the interactive
+                // send was unavailable/failed. Sending it on BOTH channels
+                // would reintroduce the duplicate/out-of-order stream that
+                // ESS-773 removes. Other idempotent status payloads retain
+                // the latency optimization.
+                if session.isReachable,
+                   RealtimeDownlinkDeliveryPolicy.shouldAddInteractiveCopyToDurable(
+                       messageKey: item.messageKey
+                   ) {
                     session.sendMessage([item.messageKey: payload], replyHandler: nil, errorHandler: { _ in })
                 }
             }

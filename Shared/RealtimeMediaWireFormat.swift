@@ -1,5 +1,23 @@
 import Foundation
 
+/// ESS-773: realtime media must use one WCSession delivery path at a time.
+/// Status/result messages are idempotent and may use durable + interactive
+/// delivery together; ordered `audio.delta` / `audio.done` envelopes may not.
+enum RealtimeDownlinkDeliveryPolicy {
+    enum Route: Equatable {
+        case interactiveOnly
+        case durableOnly
+    }
+
+    static func route(isActivated: Bool, isReachable: Bool) -> Route {
+        isActivated && isReachable ? .interactiveOnly : .durableOnly
+    }
+
+    static func shouldAddInteractiveCopyToDurable(messageKey: String) -> Bool {
+        messageKey != RealtimeMediaMessage.downlinkEnvelopeKey
+    }
+}
+
 /// ESS-321 wire envelope for the Watch → iPhone hop.
 ///
 /// The Watch fast channel is `WCSession.sendMessageData`, which carries an
