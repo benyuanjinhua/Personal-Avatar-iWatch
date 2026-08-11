@@ -60,4 +60,25 @@ final class EncryptedAudioVaultTests: XCTestCase {
         XCTAssertFalse(vault.contains(name: "turn-5.m4a"))
         XCTAssertThrowsError(try vault.load(name: "turn-5.m4a"))
     }
+
+    /// 模拟重启：使用相同密钥创建新的 vault 实例后应能解密历史数据。
+    func testRestartDecryptability() throws {
+        let vault = try EncryptedAudioVault(directory: directory, key: key)
+        let audio = Data("重启前写入的音频数据".utf8)
+        try vault.store(audio, name: "persisted.m4a")
+
+        // 模拟重启：用相同密钥创建新的 vault 实例
+        let vaultAfterRestart = try EncryptedAudioVault(directory: directory, key: key)
+        let loaded = try vaultAfterRestart.load(name: "persisted.m4a")
+        XCTAssertEqual(loaded, audio, "重启后应能用同一密钥解密历史音频")
+        XCTAssertTrue(vaultAfterRestart.contains(name: "persisted.m4a"))
+    }
+
+    /// 验证 keychainSaveFailed 错误类型构造正确且 Equatable。
+    func testKeychainSaveFailedError() {
+        let status: OSStatus = errSecNotAvailable
+        let error = EncryptedAudioVault.VaultError.keychainSaveFailed(status)
+        XCTAssertEqual(error, .keychainSaveFailed(errSecNotAvailable))
+        XCTAssertNotEqual(error, .keychainSaveFailed(errSecDuplicateItem))
+    }
 }
