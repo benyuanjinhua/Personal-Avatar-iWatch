@@ -21,17 +21,33 @@ const conversationKey = ({ deviceId, sessionId }) =>
 // qwen-audio-agent realtime WSS. The qwen service owns the provider credential;
 // this process only talks to its loopback endpoint, so provider secrets never
 // cross this adapter or enter its logs.
+
+const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/
+
 export class QwenAgentTransport {
   constructor({
     gatewayUrl = 'ws://127.0.0.1:3101/api/realtime',
     connectTimeoutMs = 10_000,
     maxPendingBytes = 2 * 1024 * 1024,
+    // Downlink budget (ESS-746). The upstream is a separate process whose
+    // output this adapter cannot trust: an oversized, malformed or endless
+    // `audio.delta` stream would otherwise be forwarded verbatim and grow
+    // the session's dedup set and the Watch socket's send buffer without
+    // bound. Caps are per turn and fail the turn explicitly (retriable) so
+    // the client degrades in seconds instead of waiting for the 30 s done
+    // barrier to time out.
+    maxDownlinkFrameBytes = 128 * 1024,
+    maxDownlinkFrames = 4096,
+    maxDownlinkBytes = 32 * 1024 * 1024,
     takeover = true,
     log = () => {},
   } = {}) {
     this.gatewayUrl = gatewayUrl
     this.connectTimeoutMs = connectTimeoutMs
     this.maxPendingBytes = maxPendingBytes
+    this.maxDownlinkFrameBytes = maxDownlinkFrameBytes
+    this.maxDownlinkFrames = maxDownlinkFrames
+    this.maxDownlinkBytes = maxDownlinkBytes
     this.takeover = takeover
     this.log = log
     this.turns = new Map()
@@ -78,6 +94,7 @@ export class QwenAgentTransport {
       requestId, sessionId, deviceId, generation, responseId, onEvent,
       ws: null, ready: false, terminal: false, committed: false,
       pending: [], pendingBytes: 0, nextOutputSequence: 0,
+      downlinkFrames: 0, downlinkBytes: 0,
       connectTimer: null,
     }
     const scopeLog = { request_id: requestId, session_id: sessionId, device_id: deviceId, generation }
@@ -105,6 +122,18 @@ export class QwenAgentTransport {
       onEvent({ type: 'agent.error', response_id: responseId, code, detail, retriable: true })
       try { turn.ws?.close() } catch { /* best effort */ }
       this.#release(turn)
+    }
+
+    // A frame the upstream should never have sent. Log the rejection with the
+    // measured size so the cap can be re-tuned from evidence, then fail the
+    // turn — dropping it silently would leave a hole the downstream done
+    // barrier can only resolve by timing out.
+    const rejectFrame = (code, detail, extra) => {
+      if (turn.terminal) return
+      this.log('upstream_frame_rejected', {
+        request_id: requestId, session_id: sessionId, generation, code, ...extra,
+      })
+      fail(code, detail)
     }
 
     const sendOrQueue = (event, bytes = 0) => {
@@ -166,7 +195,31 @@ export class QwenAgentTransport {
           return
         }
         if (event.type === 'audio.delta' && event.audio) {
-          const sequence = Number.isInteger(event.sequence)
+          const audio = event.audio
+          if (typeof audio !== 'string' || audio.length % 4 !== 0 || !BASE64.test(audio)) {
+            rejectFrame('ERR_UPSTREAM_FRAME_INVALID', 'audio payload is not base64', {
+              audio_type: typeof audio,
+              audio_length: typeof audio === 'string' ? audio.length : null,
+            })
+            return
+          }
+          if (audio.length > this.maxDownlinkFrameBytes) {
+            rejectFrame('ERR_UPSTREAM_FRAME_SIZE', 'upstream audio frame exceeds the downlink frame cap', {
+              audio_length: audio.length, cap: this.maxDownlinkFrameBytes,
+            })
+            return
+          }
+          turn.downlinkFrames += 1
+          turn.downlinkBytes += audio.length
+          if (turn.downlinkFrames > this.maxDownlinkFrames
+            || turn.downlinkBytes > this.maxDownlinkBytes) {
+            rejectFrame('ERR_UPSTREAM_BUDGET_EXCEEDED', 'upstream exceeded the per-turn downlink budget', {
+              frames: turn.downlinkFrames, frames_cap: this.maxDownlinkFrames,
+              bytes: turn.downlinkBytes, bytes_cap: this.maxDownlinkBytes,
+            })
+            return
+          }
+          const sequence = Number.isInteger(event.sequence) && event.sequence >= 0
             ? event.sequence : turn.nextOutputSequence
           turn.nextOutputSequence = Math.max(turn.nextOutputSequence, sequence + 1)
           this.log('upstream_event_received', {

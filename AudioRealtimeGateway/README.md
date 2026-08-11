@@ -176,6 +176,33 @@ late frames arriving on the previous connection are dropped (`stale_generation`)
   and max bytes per frame (`max_frame_bytes`, default 64 KiB). Excess → close
   with `ERR_RATE_LIMIT`.
 
+#### Downlink budget and backpressure (ESS-746)
+
+The server→client path is bounded at every hop, so neither a misbehaving
+upstream nor a Watch that stopped draining can grow the process without limit.
+
+- **Upstream frame validation.** An `audio.delta` whose payload is not base64,
+  or is larger than `max_downlink_frame_bytes`, fails the turn immediately
+  (`ERR_UPSTREAM_FRAME_INVALID` / `ERR_UPSTREAM_FRAME_SIZE`, both retriable)
+  rather than being forwarded or dropped into a hole the done barrier could
+  only resolve by timing out.
+- **Per-turn / per-session budget.** More than `max_downlink_frames` frames or
+  `max_downlink_bytes` bytes in one response ends it
+  (`ERR_UPSTREAM_BUDGET_EXCEEDED` upstream-side, `ERR_DOWNLINK_BUDGET`
+  session-side, non-retriable). `max_downlink_frames` doubles as the sequence
+  window — a `sequence` or an upstream-claimed `final_sequence` at or beyond it
+  can never complete a legal dense prefix, so it is refused on arrival instead
+  of after the 30 s barrier gap. This window is what bounds the per-session
+  dedup set of seen sequences.
+- **Slow consumer.** Before each downlink frame the socket's `bufferedAmount`
+  is checked: crossing `downlink_backpressure_warn_bytes` logs one
+  `downlink_backpressure_warning`; crossing `max_downlink_buffered_bytes`
+  logs `downlink_backpressure_disconnect` and closes with WS code `1013`
+  (reason `ERR_SLOW_CONSUMER`), dropping every later frame. Because `close()`
+  queues behind the same backlog, `terminate()` follows after
+  `downlink_close_grace_ms`. Clients reconnect per turn, so a cut socket costs
+  one turn.
+
 #### Error codes (stable)
 
 | code | HTTP / WS close | Meaning |
@@ -194,6 +221,11 @@ late frames arriving on the previous connection are dropped (`stale_generation`)
 | `ERR_UNKNOWN_FIELD` | — / 1008 | Strict schema rejection. |
 | `ERR_UNSUPPORTED_BINARY` | — / 1008 | Binary WS frame received. |
 | `ERR_UPSTREAM_UNAVAILABLE` | — / 1011 | Agent transport failed. |
+| `ERR_UPSTREAM_FRAME_SIZE` | — / 1008 | Upstream `audio.delta` exceeds `max_downlink_frame_bytes` (retriable). |
+| `ERR_UPSTREAM_FRAME_INVALID` | — / 1008 | Upstream `audio.delta` payload is not base64 (retriable). |
+| `ERR_UPSTREAM_BUDGET_EXCEEDED` | — / 1008 | Upstream exceeded the per-turn downlink frame/byte budget. |
+| `ERR_DOWNLINK_BUDGET` | — / 1008 | Session downlink budget or sequence window exhausted (not retriable). |
+| `ERR_SLOW_CONSUMER` | — / 1013 | Client stopped draining; `bufferedAmount` passed `max_downlink_buffered_bytes`. Close reason only — no `error` frame, the socket is already backlogged. |
 
 ## Auth
 
@@ -254,6 +286,12 @@ Grepping a single `request_id` yields the whole turn:
 | `max_frame_bytes` | `65536` | Per-frame hard cap |
 | `max_events_per_second` | `200` | Per-connection rate limit |
 | `max_uplink_bytes_per_second` | `524288` | 512 KiB/s uplink cap |
+| `max_downlink_frame_bytes` | `131072` | Largest single upstream `audio.delta` payload accepted (base64 chars) |
+| `max_downlink_frames` | `4096` | Downlink sequence window + per-turn / per-session frame budget |
+| `max_downlink_bytes` | `33554432` | Per-turn / per-session downlink byte budget (base64 chars) |
+| `max_downlink_buffered_bytes` | `4194304` | Socket `bufferedAmount` at which a slow consumer is disconnected |
+| `downlink_backpressure_warn_bytes` | `1048576` | `bufferedAmount` that logs one `downlink_backpressure_warning` |
+| `downlink_close_grace_ms` | `5000` | Grace before `terminate()` when `close()` cannot drain |
 | `agent_transport` | `agent` | `agent` connects the production qwen-audio-agent loopback WSS; `mock` is test-only. |
 | `agent_gateway_url` | `ws://127.0.0.1:3101/api/realtime` | Existing qwen-audio-agent endpoint. Keep loopback-only. |
 | `agent_connect_timeout_ms` | `10000` | Fail the northbound turn with a structured upstream timeout. |

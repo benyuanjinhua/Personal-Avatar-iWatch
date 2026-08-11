@@ -47,6 +47,14 @@ export class RealtimeSession {
     maxFrameBytes = 64 * 1024,
     maxEventsPerSecond = 200,
     maxUplinkBytesPerSecond = 512 * 1024,
+    // Downlink budget (ESS-746). `seenDownlinkSequences` and the socket send
+    // buffer both grow with the number of forwarded deltas, so an upstream
+    // that never stops producing (or that claims an absurd `final_sequence`)
+    // must hit a ceiling instead of the process heap. The sequence window is
+    // what bounds the Set: a sequence at or beyond `maxDownlinkFrames` can
+    // never be part of a legal dense prefix within the budget.
+    maxDownlinkFrames = 4096,
+    maxDownlinkBytes = 32 * 1024 * 1024,
     now = () => Date.now(),
     setTimer = (fn, ms) => setTimeout(fn, ms),
     clearTimer = t => clearTimeout(t),
@@ -69,6 +77,8 @@ export class RealtimeSession {
     this.maxFrameBytes = maxFrameBytes
     this.maxEventsPerSecond = maxEventsPerSecond
     this.maxUplinkBytesPerSecond = maxUplinkBytesPerSecond
+    this.maxDownlinkFrames = maxDownlinkFrames
+    this.maxDownlinkBytes = maxDownlinkBytes
     this.now = now
     this.setTimer = setTimer
     this.clearTimer = clearTimer
@@ -88,6 +98,7 @@ export class RealtimeSession {
     this.responseId = scope.request_id + ':gen' + scope.generation
     this.seenDownlinkSequences = new Set()
     this.downlinkHighWatermark = -1
+    this.downlinkBytes = 0
     this.doneEmitted = false
     this.cancelled = false
     // `pendingFinalSequence` is the raw `final_sequence` the upstream sent on
@@ -372,6 +383,13 @@ export class RealtimeSession {
       return
     }
     if (!Number.isInteger(event.sequence) || event.sequence < 0) return
+    // Sequence window: beyond it a delta can never complete a dense prefix
+    // inside the frame budget, so accepting it would only grow the dedup set.
+    if (event.sequence >= this.maxDownlinkFrames) {
+      return this._failDownlinkBudget('sequence_out_of_window', {
+        sequence: event.sequence, frames_cap: this.maxDownlinkFrames,
+      })
+    }
     // A first delta inside the bounded empty-response window disproves the
     // provisional done(-1).  Withdraw only that ambiguous marker.  A later
     // done(N) is still held and released verbatim under the ESS-388 barrier.
@@ -405,6 +423,19 @@ export class RealtimeSession {
       })
       return
     }
+    // Total budget for this session, charged only for frames actually
+    // retained and forwarded (duplicates above cost neither memory nor
+    // socket buffer, so they must not burn the budget either).
+    const frameBytes = typeof event.audio === 'string' ? event.audio.length : 0
+    if (this.seenDownlinkSequences.size >= this.maxDownlinkFrames
+      || this.downlinkBytes + frameBytes > this.maxDownlinkBytes) {
+      return this._failDownlinkBudget('session_budget_exhausted', {
+        sequence: event.sequence,
+        frames: this.seenDownlinkSequences.size, frames_cap: this.maxDownlinkFrames,
+        bytes: this.downlinkBytes + frameBytes, bytes_cap: this.maxDownlinkBytes,
+      })
+    }
+    this.downlinkBytes += frameBytes
     this.seenDownlinkSequences.add(event.sequence)
     if (event.sequence > this.downlinkHighWatermark) {
       this.downlinkHighWatermark = event.sequence
@@ -440,6 +471,13 @@ export class RealtimeSession {
     const claimed = Number.isInteger(event.final_sequence)
       ? event.final_sequence
       : this.downlinkHighWatermark
+    // A barrier outside the sequence window can never be satisfied — waiting
+    // for it would only burn the full gap timeout before failing anyway.
+    if (claimed >= this.maxDownlinkFrames) {
+      return this._failDownlinkBudget('final_sequence_out_of_window', {
+        claimed_final_sequence: claimed, frames_cap: this.maxDownlinkFrames,
+      })
+    }
     if (this.pendingFinalSequence === null) {
       this.pendingFinalSequence = claimed
       this.log('done_barrier_pending', {
@@ -492,6 +530,16 @@ export class RealtimeSession {
     }
     // Still waiting for holes to be backfilled — arm the gap timer once.
     this._armBarrierTimer()
+  }
+
+  // Terminal, non-retriable: the upstream has already produced more than one
+  // turn can legally contain, so retrying the same turn would reproduce it.
+  _failDownlinkBudget(reason, extra) {
+    this.log('downlink_budget_exceeded', {
+      request_id: this.scope.request_id, session_id: this.scope.session_id,
+      response_id: this.responseId, reason, ...extra,
+    })
+    this.fail('ERR_DOWNLINK_BUDGET', { detail: reason, retriable: false, ...extra })
   }
 
   _armBarrierTimer() {
