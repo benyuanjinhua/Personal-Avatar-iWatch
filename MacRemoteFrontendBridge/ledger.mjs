@@ -9,8 +9,9 @@
 //   accepted | processing | permission_required | completed | failed | cancelled
 
 import { EventEmitter } from 'node:events'
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { createHash } from 'node:crypto'
+import { mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 export const NORTH_STATES = new Set([
   'accepted', 'processing', 'permission_required', 'completed', 'failed', 'cancelled',
@@ -42,41 +43,109 @@ export function clientFailureDetail(errorCode) {
 }
 
 export class TurnLedger extends EventEmitter {
-  constructor({ stateDir, maxResultChars = 4000, maxResultAudioBytes = 2 * 1024 * 1024, log = () => {} }) {
+  constructor({
+    stateDir,
+    maxResultChars = 4000,
+    maxResultAudioBytes = 2 * 1024 * 1024,
+    maxTurns = 5000,
+    terminalRetentionMs = 7 * 24 * 60 * 60 * 1000,
+    log = () => {},
+  }) {
     super()
+    // `path` is the pre-ESS-742 monolithic file. New writes are sharded into
+    // one atomic file per request so update latency does not grow with history.
     this.path = join(stateDir, 'turn-ledger.json')
+    this.recordsDir = join(stateDir, 'turn-ledger.d')
     this.maxResultChars = maxResultChars
     this.maxResultAudioBytes = maxResultAudioBytes
+    this.maxTurns = Number.isSafeInteger(maxTurns) && maxTurns > 0 ? maxTurns : 5000
+    this.terminalRetentionMs = (Number.isFinite(terminalRetentionMs) || terminalRetentionMs === Infinity)
+      && terminalRetentionMs >= 0
+      ? terminalRetentionMs : 7 * 24 * 60 * 60 * 1000
     this.log = log
     this.turns = new Map()
     this.load()
   }
 
   load() {
+    let legacy = null
     try {
-      const raw = JSON.parse(readFileSync(this.path, 'utf8'))
-      for (const [id, turn] of Object.entries(raw.turns || {})) {
-        // Pre-ESS-235 ledgers have no timing object. Backfill only timestamps
-        // from the Bridge clock domain; Watch timestamps cannot be reconstructed.
-        turn.timing = {
-          watch_created_at: null,
-          bridge_accepted_at: turn.created_at ?? null,
-          processing_started_at: null,
-          first_audio_ready_at: null,
-          first_audio_source: null,
-          completed_at: null,
-          ...turn.timing,
-        }
-        this.turns.set(id, turn)
-      }
+      legacy = JSON.parse(readFileSync(this.path, 'utf8')).turns || {}
     } catch { /* first boot */ }
+
+    for (const [id, turn] of Object.entries(legacy || {})) this.loadTurn(id, turn)
+    try {
+      for (const name of readdirSync(this.recordsDir)) {
+        if (!name.endsWith('.json')) continue
+        try {
+          const turn = JSON.parse(readFileSync(join(this.recordsDir, name), 'utf8'))
+          if (typeof turn?.request_id === 'string') this.loadTurn(turn.request_id, turn)
+        } catch (error) {
+          this.log({ evt: 'turn_ledger_record_skipped', file: name, error: error.message })
+        }
+      }
+    } catch { /* no sharded ledger yet */ }
+
+    this.prune({ persist: false })
+    if (legacy) {
+      // Complete migration before retiring the old snapshot. A crash midway is
+      // harmless: the next boot repeats idempotent per-record replacements.
+      for (const turn of this.turns.values()) this.save(turn)
+      renameSync(this.path, `${this.path}.migrated`)
+      this.log({ evt: 'turn_ledger_migrated', turns: this.turns.size })
+    }
   }
 
-  save() {
-    mkdirSync(dirname(this.path), { recursive: true })
-    const tmp = this.path + '.tmp'
-    writeFileSync(tmp, JSON.stringify({ turns: Object.fromEntries(this.turns) }), { mode: 0o600 })
-    renameSync(tmp, this.path)
+  loadTurn(id, turn) {
+    // Pre-ESS-235 ledgers have no timing object. Backfill only timestamps from
+    // the Bridge clock domain; Watch timestamps cannot be reconstructed.
+    turn.timing = {
+      watch_created_at: null,
+      bridge_accepted_at: turn.created_at ?? null,
+      processing_started_at: null,
+      first_audio_ready_at: null,
+      first_audio_source: null,
+      completed_at: null,
+      ...turn.timing,
+    }
+    this.turns.set(id, turn)
+  }
+
+  recordPath(requestId) {
+    const name = createHash('sha256').update(requestId).digest('hex')
+    return join(this.recordsDir, `${name}.json`)
+  }
+
+  save(turn = null) {
+    if (!turn) {
+      for (const item of this.turns.values()) this.save(item)
+      return
+    }
+    mkdirSync(this.recordsDir, { recursive: true })
+    const path = this.recordPath(turn.request_id)
+    const tmp = `${path}.${process.pid}.tmp`
+    writeFileSync(tmp, JSON.stringify(turn), { mode: 0o600 })
+    renameSync(tmp, path)
+  }
+
+  prune({ now = Date.now(), persist = true } = {}) {
+    const terminal = [...this.turns.values()]
+      .filter(turn => TERMINAL.has(turn.state))
+      .sort((a, b) => Date.parse(a.updated_at) - Date.parse(b.updated_at))
+    const expired = terminal.filter(turn => {
+      const updatedAt = Date.parse(turn.updated_at)
+      return Number.isFinite(updatedAt) && now - updatedAt > this.terminalRetentionMs
+    })
+    const overLimit = Math.max(0, this.turns.size - expired.length - this.maxTurns)
+    const victims = new Set([...expired, ...terminal.filter(t => !expired.includes(t)).slice(0, overLimit)])
+    for (const turn of victims) {
+      this.turns.delete(turn.request_id)
+      if (persist) {
+        try { unlinkSync(this.recordPath(turn.request_id)) } catch { /* already absent */ }
+      }
+    }
+    if (victims.size) this.log({ evt: 'turn_ledger_pruned', turns: victims.size, retained: this.turns.size })
+    return victims.size
   }
 
   get(requestId) { return this.turns.get(requestId) }
@@ -134,7 +203,8 @@ export class TurnLedger extends EventEmitter {
       },
     }
     this.turns.set(requestId, turn)
-    this.save()
+    this.save(turn)
+    this.prune()
     this.emitState(turn)
     return { turn, replay: false }
   }
@@ -151,7 +221,7 @@ export class TurnLedger extends EventEmitter {
     if (patch.state === 'processing' && !timing.processing_started_at) timing.processing_started_at = updatedAt
     if (patch.state && TERMINAL.has(patch.state) && !timing.completed_at) timing.completed_at = updatedAt
     Object.assign(turn, patch, { updated_at: updatedAt, timing })
-    if (persist) this.save()
+    if (persist) this.save(turn)
     this.emitState(turn)
     return turn
   }
@@ -269,7 +339,7 @@ export class TurnLedger extends EventEmitter {
     if (turn.delivered_ack) return turn
     turn.delivered_ack = { at: new Date().toISOString(), source }
     turn.updated_at = new Date().toISOString()
-    this.save()
+    this.save(turn)
     return turn
   }
 
@@ -285,7 +355,7 @@ export class TurnLedger extends EventEmitter {
       turn.playback_receipts[responseId] = {
         at: new Date().toISOString(), bytes_played: bytesPlayed, source,
       }
-      this.save()
+      this.save(turn)
     }
     return this.reconcilePlaybackDelivery(requestId)
   }
@@ -333,7 +403,7 @@ export class TurnLedger extends EventEmitter {
     turn.delivery_attempts = (turn.delivery_attempts || 0) + 1
     const delay = Math.min(maxDelayMs, baseDelayMs * 2 ** Math.max(0, turn.delivery_attempts - 1))
     turn.next_delivery_at = new Date(now + delay).toISOString()
-    this.save()
+    this.save(turn)
     return { attempt: turn.delivery_attempts, delay_ms: delay }
   }
 
