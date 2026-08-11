@@ -24,7 +24,7 @@ final class WatchStreamReceiver: ObservableObject {
         let streamId: String
         let startedAt: Date
         let streamingGeneration: Int
-        var player: StreamingAudioPlayer?
+        var player: StreamAudioPlaying?
         var gapTimer: Task<Void, Never>?
         var playedSequence: Int = 0
         var didFallback: Bool = false
@@ -34,6 +34,14 @@ final class WatchStreamReceiver: ObservableObject {
 
     private let debugSettings: WatchDebugSettings
     let fallbackHandler: (String, VoiceStreamFallbackReason) -> Void
+    /// ESS-748 test seam：播放器构造缝。生产恒为 `StreamingAudioPlayer`；
+    /// 单测注入「起播必失败」的替身——`AVAudioSession`/`AVAudioEngine` 的启动
+    /// 失败在模拟器里无法稳定构造，没有这条缝，「起播失败必须降级」这条契约
+    /// 就只能靠人眼复核（它当初正是这样漏掉的）。
+    var makeStreamPlayer: (_ sampleRate: Int, _ context: String) -> StreamAudioPlaying =
+        { sampleRate, context in
+            StreamingAudioPlayer(sampleRate: sampleRate, context: context)
+        }
 
     // MARK: - State
 
@@ -126,7 +134,14 @@ final class WatchStreamReceiver: ObservableObject {
 
         case .ready(let chunks):
             let pcmData = assemblePCM(from: chunks)
-            ensurePlayer(stream: &stream)
+            // ESS-748：播放器起不来就**立刻降级一次**，不再推进序列。
+            // 推进了等于宣称「这段已经放过了」，整段回答会静默消失。
+            guard ensurePlayer(stream: &stream) else {
+                triggerFallback(
+                    requestId: stream.requestId, reason: .playerStartFailed, stream: &stream
+                )
+                return
+            }
             stream.player?.append(pcmData: pcmData)
             stream.playedSequence = stream.buffer.nextSequence
 
@@ -167,14 +182,19 @@ final class WatchStreamReceiver: ObservableObject {
 
     // MARK: - Player
 
-    private func ensurePlayer(stream: inout StreamState) {
-        guard stream.player == nil else { return }
-        let player = StreamingAudioPlayer(
-            sampleRate: 24_000,
-            context: stream.requestId
-        )
+    /// ESS-748：起播失败时**不保存 player**（保存一个永远不出声的实例，
+    /// 后续 append 全部静默丢弃），并把失败如实交回调用方。
+    /// - Returns: 播放器是否可用。
+    private func ensurePlayer(stream: inout StreamState) -> Bool {
+        if stream.player != nil { return true }
+        let player = makeStreamPlayer(24_000, stream.requestId)
+        do {
+            try player.start()
+        } catch {
+            return false
+        }
         stream.player = player
-        player.start()
+        return true
     }
 
     // MARK: - Helpers
@@ -225,10 +245,22 @@ final class WatchStreamReceiver: ObservableObject {
 
 // MARK: - StreamingAudioPlayer (PCM via AVAudioEngine)
 
+/// ESS-748：流播放器的可注入接缝。抽成协议只为一件事——让「起播失败必须
+/// 立即降级、不得推进序列」这条契约可以在 CI 上被断言；模拟器里无法稳定
+/// 制造 `AVAudioEngine` 启动失败。
+@MainActor
+protocol StreamAudioPlaying: AnyObject {
+    /// 起播。**失败必须抛出**，调用方据此降级（返回 Void 会让失败静默）。
+    func start() throws
+    func append(pcmData: Data)
+    func markEndOfStream()
+    func stop()
+}
+
 /// 逐片 PCM 播放器：用 `AVAudioEngine` + `AVAudioPlayerNode` 实现无缝续播。
 /// 首片入队即自动起播；之后 `append(pcmData:)` 直接把 buffer 排进 player node 队列。
 @MainActor
-final class StreamingAudioPlayer {
+final class StreamingAudioPlayer: StreamAudioPlaying {
     private let sampleRate: Double
     private let context: String
     private let pcmFormat: AVAudioFormat
@@ -263,7 +295,15 @@ final class StreamingAudioPlayer {
         engine.connect(playerNode, to: engine.mainMixerNode, format: fmt)
     }
 
-    func start() {
+    /// ESS-748：起播失败必须**可判定**。
+    ///
+    /// 修这条之前本函数捕获错误后返回 Void，调用方无从得知起播失败：
+    /// receiver 照旧保存 player、照旧推进 `playedSequence`、照旧在 EOS 时
+    /// 标记结束，而 `append` 因 `isStarted == false` 静默丢弃每一帧——
+    /// 结果是音频整段消失、用户没有任何提示、也不会降级到完整文件。
+    ///
+    /// - Throws: 底层 `AVAudioSession` / `AVAudioEngine` 的启动错误。
+    func start() throws {
         guard !isStarted else { return }
         do {
             let session = AVAudioSession.sharedInstance()
@@ -285,6 +325,7 @@ final class StreamingAudioPlayer {
                 detail: "error=\(error.localizedDescription)",
                 code: "ERR_STREAM_PLAYER_START"
             )
+            throw error
         }
     }
 
