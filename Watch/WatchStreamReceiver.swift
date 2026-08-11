@@ -10,6 +10,13 @@ import os
 /// - 以 `WatchDebugSettings.isStreamingActive` 为总门禁
 /// - 降级：buffer 超时/越窗/背压时走 `voice.stream.fallback` 回退整段 m4a
 ///
+/// 顺序契约（ESS-747）：**当前流只能前进，不能倒退。**
+/// - 一条分片必须带合法的 `request_id` + `stream_id`；两者一起才是流身份。
+/// - 只有「新 `request_id`」能取代在飞流；同 `request_id` 换 `stream_id` 的
+///   分片一律丢弃，不得顶掉正在播的流。
+/// - 流一旦终结（被取代 / 取消 / 回退），其 `request_id` 进有界墓碑，
+///   此后任何迟到分片只会被丢弃——旧回答不能抢占新回答，也不会补播。
+///
 /// 线程：全部 `@MainActor`；`didReceiveMessageData` 通过 `Task { @MainActor in }` 进入。
 @MainActor
 final class WatchStreamReceiver: ObservableObject {
@@ -17,17 +24,40 @@ final class WatchStreamReceiver: ObservableObject {
         subsystem: "beer.workspace.wristagent", category: "StreamReceiver"
     )
 
+    /// 流身份：`request_id` + `stream_id` 一起才唯一标识一条下行流。
+    /// 与 `RealtimeDownlinkPlayback.SessionKey` 同一语义，命名保持一致。
+    struct StreamKey: Hashable {
+        let requestId: String
+        let streamId: String
+
+        init(requestId: String, streamId: String) {
+            self.requestId = requestId
+            self.streamId = streamId
+        }
+
+        init(chunk: VoiceStreamChunk) {
+            self.init(requestId: chunk.requestId, streamId: chunk.streamId)
+        }
+    }
+
     /// 单 stream 状态：每个 request_id 最多一个活跃下行流。
     private struct StreamState {
         var buffer: VoiceStreamReorderBuffer
-        let requestId: String
-        let streamId: String
+        let key: StreamKey
         let startedAt: Date
         let streamingGeneration: Int
+        /// 本接收器内单调递增的流序号（generation）。只用于日志归因：
+        /// 一条日志里能直接看出「第几条流被第几条流取代」。
+        let serial: Int
+        /// ESS-748：类型是协议而不是具体类——起播失败必须可判定并降级，
+        /// 测试需要注入「起播必失败」的替身（模拟器造不出 AVAudioEngine 启动失败）。
         var player: StreamAudioPlaying?
         var gapTimer: Task<Void, Never>?
         var playedSequence: Int = 0
         var didFallback: Bool = false
+
+        var requestId: String { key.requestId }
+        var streamId: String { key.streamId }
     }
 
     // MARK: - Dependencies (injected for testability)
@@ -47,11 +77,29 @@ final class WatchStreamReceiver: ObservableObject {
 
     private var activeStream: StreamState?
     private var disableObserverToken: UUID?
+    /// ESS-747：已终结流的墓碑（tombstone）。任何进过这里的 `request_id`
+    /// 都不能再被复活——迟到的旧分片只能被丢弃，不能重开一条流。
+    /// 有界 FIFO：只保留最近 `maxRetiredRequests` 个，避免长会话无限增长。
+    private var retiredRequestIds: Set<String> = []
+    private var retiredOrder: [String] = []
+    /// ESS-747：本接收器内单调递增的流序号，见 `StreamState.serial`。
+    private var streamSerial = 0
     /// ESS-509: WCSession health monitor, started when streaming begins.
     private let keepAlive = RealtimeSessionKeepAlive()
 
+    /// 墓碑上限。一次会话内的回合数远小于此；超出即淘汰最旧的一条。
+    static let maxRetiredRequests = 32
+
     /// 门禁：编译期 OFF + debug 开关。
     var gateOpen: Bool { debugSettings.isStreamingActive }
+
+    // MARK: - Observability (tests + logs)
+
+    var activeRequestId: String? { activeStream?.requestId }
+    var activeStreamId: String? { activeStream?.streamId }
+    var activeStreamSerial: Int? { activeStream?.serial }
+    var activeBufferedBytes: Int? { activeStream?.buffer.bufferedBytes }
+    var retiredRequestCount: Int { retiredRequestIds.count }
 
     // MARK: - Init
 
@@ -91,35 +139,101 @@ final class WatchStreamReceiver: ObservableObject {
             cancelAll(reason: "generation_mismatch")
             return
         }
+        // ESS-747：身份不合法的分片不得参与「谁是当前流」的判定。放行的话，
+        // 一条 request_id 为垃圾值的分片会先顶掉在飞的流、再因 invalidChunk
+        // 回退——用一条无法归因的分片打死一个正在播的回答。
+        guard UUID(uuidString: chunk.requestId) != nil,
+              UUID(uuidString: chunk.streamId) != nil else {
+            Self.logger.warning("chunk_rejected_invalid_identity seq=\(chunk.sequence)")
+            return
+        }
 
-        // 新 stream 或同一 stream 的后续 chunk
-        if let active = activeStream, active.requestId == chunk.requestId {
-            // 同一 stream：追加 chunk
-        } else {
-            // 新 stream：终止旧流
-            if activeStream != nil {
-                cancelAll(reason: "new_stream_supersedes")
-            }
-            activeStream = StreamState(
-                buffer: VoiceStreamReorderBuffer(),
-                requestId: chunk.requestId,
-                streamId: chunk.streamId,
-                startedAt: Date(),
-                streamingGeneration: currentGen
-            )
-            // ESS-509: start WCSession keep-alive when streaming begins
-            keepAlive.start()
+        let key = StreamKey(chunk: chunk)
+        // ESS-747：墓碑优先于一切。已终结的 request_id 无论换不换 stream_id
+        // 都不能重开——这正是「旧回答迟到抢占新回答」的入口。
+        guard !retiredRequestIds.contains(key.requestId) else {
             WatchLog.info(
-                "stream", "stream_started",
+                "stream", "chunk_rejected_retired_stream",
                 requestId: chunk.requestId,
-                detail: "stream_id=\(chunk.streamId) gen=\(currentGen)"
+                detail: "stream_id=\(chunk.streamId) seq=\(chunk.sequence)"
             )
+            return
+        }
+
+        if let active = activeStream {
+            if active.key == key {
+                // 同一 stream：追加 chunk
+            } else if active.requestId == key.requestId {
+                // ESS-747：同 request_id 异 stream_id。一个回合只有一条下行流，
+                // 第二条 stream_id 只可能是重传或残留——直接丢弃，**不得**顶掉
+                // 在飞的流（顶掉即把已播到一半的回答从头再来）。
+                WatchLog.info(
+                    "stream", "chunk_rejected_stream_id_mismatch",
+                    requestId: chunk.requestId,
+                    detail: "incoming_stream_id=\(chunk.streamId) active_stream_id=\(active.streamId) seq=\(chunk.sequence)"
+                )
+                return
+            } else {
+                // 新 request_id：这是新一轮回答，旧流让位并进墓碑（单向，
+                // 之后旧流的迟到分片只会被丢弃）。
+                retire(active, reason: "new_stream_supersedes")
+                startStream(key: key, generation: currentGen)
+            }
+        } else {
+            startStream(key: key, generation: currentGen)
         }
 
         guard var stream = activeStream, !stream.didFallback else { return }
         let result = stream.buffer.append(chunk)
         apply(result: result, stream: &stream)
         activeStream = stream
+    }
+
+    // MARK: - Stream lifecycle (ESS-747)
+
+    /// 开一条新流。调用方必须已确认：身份合法、未进墓碑、旧流已 `retire`。
+    private func startStream(key: StreamKey, generation: Int) {
+        streamSerial += 1
+        activeStream = StreamState(
+            buffer: VoiceStreamReorderBuffer(),
+            key: key,
+            startedAt: Date(),
+            streamingGeneration: generation,
+            serial: streamSerial
+        )
+        // ESS-509: start WCSession keep-alive when streaming begins
+        keepAlive.start()
+        WatchLog.info(
+            "stream", "stream_started",
+            requestId: key.requestId,
+            detail: "stream_id=\(key.streamId) gen=\(generation) serial=\(streamSerial)"
+        )
+    }
+
+    /// 终结一条流并立墓碑：停计时器与播放器、清活跃态、记 `request_id`。
+    /// 单向操作——同一 `request_id` 此后不会再被接受。
+    private func retire(_ stream: StreamState, reason: String) {
+        stream.gapTimer?.cancel()
+        stream.player?.stop()
+        if activeStream?.key == stream.key { activeStream = nil }
+        keepAlive.stop()  // ESS-509
+        tombstone(stream.key.requestId)
+        WatchLog.info(
+            "stream", "stream_retired",
+            requestId: stream.requestId,
+            detail: "stream_id=\(stream.streamId) serial=\(stream.serial) reason=\(reason)"
+        )
+    }
+
+    /// 有界 FIFO 墓碑。超出上限即淘汰最旧的一条——上限远大于一次会话的
+    /// 回合数，被淘汰的 `request_id` 早已不可能还有分片在路上。
+    private func tombstone(_ requestId: String) {
+        guard retiredRequestIds.insert(requestId).inserted else { return }
+        retiredOrder.append(requestId)
+        while retiredOrder.count > Self.maxRetiredRequests {
+            let evicted = retiredOrder.removeFirst()
+            retiredRequestIds.remove(evicted)
+        }
     }
 
     // MARK: - Buffer result handling
@@ -153,7 +267,7 @@ final class WatchStreamReceiver: ObservableObject {
             }
 
         case .fallback(let reason):
-            triggerFallback(requestId: stream.requestId, reason: reason, stream: &stream)
+            triggerFallback(reason: reason, stream: &stream)
 
         case .alreadyFellBack:
             break
@@ -164,7 +278,9 @@ final class WatchStreamReceiver: ObservableObject {
 
     private func scheduleGapTimer(stream: inout StreamState) {
         stream.gapTimer?.cancel()
-        let capturedRequestId = stream.requestId
+        // ESS-747：计时器认的是完整流身份，不是只认 request_id——否则同
+        // request_id 的另一条流会被上一条流的超时误伤。
+        let capturedKey = stream.key
         stream.gapTimer = Task { [weak self] in
             let timeout = VoiceStreamConstants.gapTimeoutSeconds
             let nanos = UInt64(timeout * 1_000_000_000)
@@ -172,7 +288,7 @@ final class WatchStreamReceiver: ObservableObject {
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 guard let self, var active = self.activeStream,
-                      active.requestId == capturedRequestId, !active.didFallback else { return }
+                      active.key == capturedKey, !active.didFallback else { return }
                 let result = active.buffer.gapTimedOut()
                 self.apply(result: result, stream: &active)
                 self.activeStream = active
@@ -203,13 +319,17 @@ final class WatchStreamReceiver: ObservableObject {
         chunks.reduce(into: Data()) { $0.append($1.payload) }
     }
 
-    private func triggerFallback(requestId: String, reason: VoiceStreamFallbackReason, stream: inout StreamState) {
+    private func triggerFallback(reason: VoiceStreamFallbackReason, stream: inout StreamState) {
+        let requestId = stream.requestId
         stream.didFallback = true
         stream.gapTimer?.cancel()
         stream.gapTimer = nil
         stream.player?.stop()
         stream.player = nil
         keepAlive.stop()  // ESS-509
+        // ESS-747：回退是终局——整段 m4a 由可靠通道接管，这条流的任何后续
+        // 分片（含换了 stream_id 的重传）都必须被丢弃，不能再起播放。
+        tombstone(requestId)
         WatchLog.error(
             "stream", "fallback",
             requestId: requestId,
@@ -221,25 +341,20 @@ final class WatchStreamReceiver: ObservableObject {
 
     // MARK: - Lifecycle
 
-    /// 外部取消（用户主动关闭、回合终止等）。
+    /// 外部取消（用户主动关闭、回合终止等）。取消即立墓碑：被取消的回合
+    /// 不会因为一条迟到分片又活过来。
     func cancelStream(requestId: String) {
         guard let active = activeStream, active.requestId == requestId else { return }
-        active.gapTimer?.cancel()
-        active.player?.stop()
-        activeStream = nil
-        keepAlive.stop()  // ESS-509
+        retire(active, reason: "cancelled")
         WatchLog.info("stream", "stream_cancelled", requestId: requestId)
     }
 
     func cancelAll(reason: String) {
         guard let active = activeStream else { return }
-        active.gapTimer?.cancel()
-        active.player?.stop()
-        keepAlive.stop()  // ESS-509
+        retire(active, reason: reason)
         WatchLog.info("stream", "stream_cancelled_all",
                        requestId: active.requestId,
                        detail: "reason=\(reason)")
-        activeStream = nil
     }
 }
 

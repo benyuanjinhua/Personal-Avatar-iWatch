@@ -11,6 +11,8 @@ import XCTest
 /// - 重复去重：同一 sequence 二次到达不占预算
 /// - 开关翻转：`onStreamingDisabled` 回调触发在途流终止
 /// - 流替换：新 request_id 到达时终止旧流
+/// - 顺序正确性（ESS-747）：旧流迟到分片被墓碑丢弃、同 request_id 异
+///   stream_id 不得抢占、取消/回退后不得复活、墓碑有界
 ///
 /// 不覆盖（需要真机/AVAudioSession）：
 /// - `StreamingAudioPlayer` 实际出声路径（`AVAudioEngine.start()`）
@@ -261,12 +263,150 @@ final class WatchStreamReceiverTests: XCTestCase {
 
         // 启动流 1
         receiver.receive(chunk: chunk(0, requestId: rid1))
+        XCTAssertEqual(receiver.activeRequestId, rid1)
         // 启动流 2（替代流 1）
         receiver.receive(chunk: chunk(0, requestId: rid2))
+        XCTAssertEqual(receiver.activeRequestId, rid2, "新 request_id 应取代旧流")
 
-        // 流 1 的旧 chunk 应被拒绝
-        // Note: after newStreamSupersedes, old chunks go through the receiver again
-        // which creates a new StreamState for old rid — this is fine, it's a new stream
+        // ESS-747：流 1 的迟到分片必须被丢弃，不得把当前流换回去。
+        receiver.receive(chunk: chunk(1, requestId: rid1))
+        XCTAssertEqual(receiver.activeRequestId, rid2, "旧流迟到分片不得抢占当前流")
+        XCTAssertTrue(fallbackCalls.isEmpty)
+    }
+
+    // MARK: - ESS-747 顺序正确性：旧流不得抢占当前流
+
+    /// 旧流迟到：rid1 被 rid2 取代后，rid1 的后续分片只能被丢弃。
+    /// 用 seq 1（pending，不释放）避免构造 `StreamingAudioPlayer`，
+    /// 因此本例在 hosted CI 上也能跑，不需要 `HostedCITestGate`。
+    func testLateChunkFromSupersededStreamIsRejected() {
+        let settings = makeSettings()
+        var fallbackCalls: [(String, VoiceStreamFallbackReason)] = []
+        let receiver = WatchStreamReceiver(debugSettings: settings) { id, reason in
+            fallbackCalls.append((id, reason))
+        }
+
+        let rid1 = UUID().uuidString
+        let sid1 = UUID().uuidString
+        let rid2 = UUID().uuidString
+        let sid2 = UUID().uuidString
+
+        receiver.receive(chunk: chunk(1, requestId: rid1, streamId: sid1))
+        XCTAssertEqual(receiver.activeRequestId, rid1)
+
+        receiver.receive(chunk: chunk(1, requestId: rid2, streamId: sid2))
+        XCTAssertEqual(receiver.activeRequestId, rid2)
+        XCTAssertEqual(receiver.activeStreamId, sid2)
+        let bufferedAfterSwap = receiver.activeBufferedBytes
+
+        // 旧流迟到分片：既不能换流，也不能进新流的 buffer。
+        receiver.receive(chunk: chunk(2, bytes: 64, requestId: rid1, streamId: sid1))
+        XCTAssertEqual(receiver.activeRequestId, rid2, "旧流不得复活")
+        XCTAssertEqual(receiver.activeStreamId, sid2)
+        XCTAssertEqual(receiver.activeBufferedBytes, bufferedAfterSwap,
+                       "旧流分片不得混入当前流缓冲")
+        XCTAssertTrue(fallbackCalls.isEmpty, "丢弃旧分片不应触发回退")
+    }
+
+    /// 同 request_id、异 stream_id：一个回合只有一条下行流，第二条只可能是
+    /// 重传/残留 —— 丢弃，且**不得**顶掉在飞的流。
+    func testSameRequestIdDifferentStreamIdRejected() {
+        let settings = makeSettings()
+        var fallbackCalls: [(String, VoiceStreamFallbackReason)] = []
+        let receiver = WatchStreamReceiver(debugSettings: settings) { id, reason in
+            fallbackCalls.append((id, reason))
+        }
+
+        let rid = UUID().uuidString
+        let sidA = UUID().uuidString
+        let sidB = UUID().uuidString
+
+        receiver.receive(chunk: chunk(1, bytes: 8, requestId: rid, streamId: sidA))
+        XCTAssertEqual(receiver.activeStreamId, sidA)
+        XCTAssertEqual(receiver.activeBufferedBytes, 8)
+        let serialA = receiver.activeStreamSerial
+
+        receiver.receive(chunk: chunk(2, bytes: 16, requestId: rid, streamId: sidB))
+        XCTAssertEqual(receiver.activeStreamId, sidA, "异 stream_id 不得取代当前流")
+        XCTAssertEqual(receiver.activeStreamSerial, serialA, "当前流不应被重建")
+        XCTAssertEqual(receiver.activeBufferedBytes, 8, "异 stream_id 分片不得进缓冲")
+        XCTAssertTrue(fallbackCalls.isEmpty)
+    }
+
+    /// 回退是终局：同一 request_id 换个 stream_id 重来也不能复活这条流。
+    func testFallenBackStreamCannotBeResurrectedWithNewStreamId() {
+        let settings = makeSettings()
+        var fallbackCalls: [(String, VoiceStreamFallbackReason)] = []
+        let receiver = WatchStreamReceiver(debugSettings: settings) { id, reason in
+            fallbackCalls.append((id, reason))
+        }
+
+        let rid = UUID().uuidString
+        let sidA = UUID().uuidString
+        let sidB = UUID().uuidString
+
+        // 越窗 → 回退（该 request_id 进墓碑）
+        receiver.receive(chunk: chunk(33, requestId: rid, streamId: sidA))
+        XCTAssertEqual(fallbackCalls.count, 1)
+        let serialAfterFallback = receiver.activeStreamSerial
+
+        // 换 stream_id 重发 seq 0：既不许重开流，也不许二次回退。
+        receiver.receive(chunk: chunk(0, requestId: rid, streamId: sidB))
+        XCTAssertEqual(fallbackCalls.count, 1, "已回退的 request_id 不应二次回退")
+        XCTAssertEqual(receiver.activeStreamId, sidA, "已回退的流不得被新 stream_id 重开")
+        XCTAssertEqual(receiver.activeStreamSerial, serialAfterFallback, "不得重建流状态")
+    }
+
+    /// 取消是显式终结：被取消的回合不因迟到分片重开。
+    func testCancelledStreamCannotRestart() {
+        let settings = makeSettings()
+        var fallbackCalls: [(String, VoiceStreamFallbackReason)] = []
+        let receiver = WatchStreamReceiver(debugSettings: settings) { id, reason in
+            fallbackCalls.append((id, reason))
+        }
+
+        let rid = UUID().uuidString
+        receiver.receive(chunk: chunk(1, requestId: rid))
+        XCTAssertEqual(receiver.activeRequestId, rid)
+
+        receiver.cancelStream(requestId: rid)
+        XCTAssertNil(receiver.activeRequestId)
+
+        receiver.receive(chunk: chunk(2, requestId: rid))
+        XCTAssertNil(receiver.activeRequestId, "已取消的 request_id 不得重开流")
+        XCTAssertTrue(fallbackCalls.isEmpty)
+    }
+
+    /// 身份非法（非 UUID）的分片不得参与「谁是当前流」的判定 —— 否则一条
+    /// 无法归因的垃圾分片能顶掉正在播的回答。
+    func testInvalidIdentityChunkCannotSupersedeActiveStream() {
+        let settings = makeSettings()
+        var fallbackCalls: [(String, VoiceStreamFallbackReason)] = []
+        let receiver = WatchStreamReceiver(debugSettings: settings) { id, reason in
+            fallbackCalls.append((id, reason))
+        }
+
+        let rid = UUID().uuidString
+        receiver.receive(chunk: chunk(1, requestId: rid))
+        XCTAssertEqual(receiver.activeRequestId, rid)
+
+        receiver.receive(chunk: chunk(1, requestId: "not-a-uuid", streamId: "also-not"))
+        XCTAssertEqual(receiver.activeRequestId, rid, "非法身份分片不得取代当前流")
+        XCTAssertTrue(fallbackCalls.isEmpty)
+    }
+
+    /// 墓碑必须有界：长会话不能靠无限增长的 Set 维持顺序正确性。
+    func testRetiredLedgerIsBounded() {
+        let settings = makeSettings()
+        let receiver = WatchStreamReceiver(debugSettings: settings) { _, _ in }
+
+        let total = WatchStreamReceiver.maxRetiredRequests + 8
+        for _ in 0..<total {
+            receiver.receive(chunk: chunk(1, requestId: UUID().uuidString,
+                                          streamId: UUID().uuidString))
+        }
+        XCTAssertEqual(receiver.retiredRequestCount, WatchStreamReceiver.maxRetiredRequests,
+                       "墓碑应按 FIFO 淘汰，不得无限增长")
     }
 
     // MARK: - 非 downlink chunk 拒绝
