@@ -26,6 +26,8 @@ export const ISSUER_ERR = {
   TOKEN_INVALID: ['ERR_TOKEN_INVALID', 401],
   TOKEN_EXPIRED: ['ERR_TOKEN_EXPIRED', 401],
   TOKEN_CONSUMED: ['ERR_TOKEN_CONSUMED', 401],
+  SESSION_CAPACITY: ['ERR_SESSION_CAPACITY', 429],
+  DEVICE_CAPACITY: ['ERR_DEVICE_CAPACITY', 429],
 }
 
 export class IssuerError extends Error {
@@ -124,53 +126,70 @@ export class TokenIssuer {
     }
   }
 
-  // Least-recently-used device bucket for the generation guard, created on
-  // demand. Touching re-inserts so eviction always takes the coldest device.
-  #deviceSessions(deviceId) {
-    const existing = this.generations.get(deviceId)
-    if (existing) {
-      this.generations.delete(deviceId)
-      this.generations.set(deviceId, existing)
-      return existing
+  // Drop this device's generation entries that are idle past the TTL.
+  // Returns the bucket, or undefined if the device is not tracked yet.
+  #releaseIdleSessions(deviceId) {
+    const sessions = this.generations.get(deviceId)
+    if (!sessions) return undefined
+    const cutoff = this.now() - this.generationTtlMs
+    for (const [sessionId, entry] of sessions) {
+      if (entry.seenAt <= cutoff) sessions.delete(sessionId)
     }
-    const created = new Map()
-    this.generations.set(deviceId, created)
-    while (this.generations.size > this.maxDevices) {
-      const coldest = this.generations.keys().next().value
-      this.generations.delete(coldest)
-      this.log('generation_evicted', { device_id: coldest, reason: 'device_capacity' })
-    }
-    return created
+    return sessions
   }
 
   // Enforce and record the monotone-generation guard.
   //
-  // Bounding this map is safe because it is NOT the replay defence: a token
-  // can only be minted with a fresh HMAC signature (nonce + ±skew timestamp,
-  // device-auth.mjs) and can only be spent once within its <=90 s TTL. The
-  // guard exists so a *legitimate but stale* client cannot re-open an already
-  // superseded generation of a live session. Entries are therefore only
-  // released once the session has been idle for `generationTtlMs` (default
-  // 1 h ≫ any session's token lifetime), or when a single device has pushed
-  // past `maxSessionsPerDevice` distinct sessions — which only ever costs
-  // that device its own coldest sessions.
+  // The guard is a lower bound that must never move backwards while a token
+  // minted under it can still be presented, so BOTH ceilings here fail closed:
+  // once a device fills its session slots (or the device table is full) we
+  // reject the mint instead of dropping a guard entry. Dropping the coldest
+  // entry would bound memory just as well but would silently reset that
+  // session's highest generation to 0, letting a superseded generation be
+  // re-opened inside the TTL window (ESS-794 finding — the LRU version of this
+  // function accepted generation 1 again right after a 2-session flood).
+  //
+  // The rejection is self-limiting rather than a lockout: entries idle past
+  // `generationTtlMs` are released first, and only a device that holds
+  // `maxSessionsPerDevice` genuinely *fresh* sessions is refused — and only
+  // for its own device_id, since the map is partitioned per device.
   #recordGeneration(deviceId, sessionId, generation) {
-    const sessions = this.#deviceSessions(deviceId)
+    let sessions = this.generations.get(deviceId)
+    // Only a *new* session_id can push a device over its ceiling; re-minting
+    // for a session already tracked is always allowed.
+    if (sessions && !sessions.has(sessionId) && sessions.size >= this.maxSessionsPerDevice) {
+      sessions = this.#releaseIdleSessions(deviceId)
+      if (sessions.size >= this.maxSessionsPerDevice) {
+        this.log('issuer_capacity_rejected', {
+          device_id: deviceId, session_id: sessionId, reason: 'session_capacity',
+          live: sessions.size,
+        })
+        throw new IssuerError(ISSUER_ERR.SESSION_CAPACITY,
+          `device holds ${sessions.size} live sessions`)
+      }
+    }
+    if (!sessions) {
+      if (this.generations.size >= this.maxDevices) {
+        this.prune()
+        if (this.generations.size >= this.maxDevices) {
+          this.log('issuer_capacity_rejected', {
+            device_id: deviceId, reason: 'device_capacity', live: this.generations.size,
+          })
+          throw new IssuerError(ISSUER_ERR.DEVICE_CAPACITY,
+            `issuer tracks ${this.generations.size} live devices`)
+        }
+      }
+      sessions = new Map()
+      this.generations.set(deviceId, sessions)
+    }
+
     const previous = sessions.get(sessionId)
     const highest = previous?.generation ?? 0
     if (generation < highest) {
       throw new IssuerError(ISSUER_ERR.GENERATION_BACKWARD,
         `generation ${generation} < highest ${highest}`)
     }
-    if (previous) sessions.delete(sessionId)
     sessions.set(sessionId, { generation: Math.max(highest, generation), seenAt: this.now() })
-    while (sessions.size > this.maxSessionsPerDevice) {
-      const coldest = sessions.keys().next().value
-      sessions.delete(coldest)
-      this.log('generation_evicted', {
-        device_id: deviceId, session_id: coldest, reason: 'session_capacity',
-      })
-    }
   }
 
   #storeToken(sha, entry) {
@@ -182,8 +201,11 @@ export class TokenIssuer {
     }
     this.tokens.set(sha, entry)
     owned.add(sha)
-    // Per-device first so one noisy device evicts only its own tokens; the
-    // global cap is a backstop for many-device fan-out.
+    // Tokens evict rather than fail closed, unlike the generation guard: a
+    // dropped token entry can only ever cause a *rejection* (consume() answers
+    // ERR_TOKEN_INVALID for an unknown sha), so eviction cannot resurrect a
+    // spent token or weaken single-use. Per-device first so one noisy device
+    // evicts only its own tokens; the global cap backstops many-device fan-out.
     while (owned.size > this.maxTokensPerDevice) {
       this.#deleteToken(owned.values().next().value, 'device_capacity')
     }

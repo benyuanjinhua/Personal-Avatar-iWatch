@@ -286,8 +286,16 @@ Grepping a single `request_id` yields the whole turn:
 | `generation_ttl_ms` | `3600000` | Idle retention of the per-session monotone-generation guard |
 | `max_tokens` | `4096` | Global live-token ceiling; oldest evicted past it |
 | `max_tokens_per_device` | `64` | Per-device live-token ceiling — hits before the global one, so one device evicts only its own |
-| `max_generation_devices` | `64` | Devices tracked by the generation guard (LRU) |
-| `max_generation_sessions_per_device` | `256` | Sessions tracked per device (LRU) |
+| `max_generation_devices` | `64` | Devices tracked by the generation guard. Fail-closed: a new device past it gets `ERR_DEVICE_CAPACITY` (429) |
+| `max_generation_sessions_per_device` | `256` | Sessions tracked per device. Fail-closed: a new `session_id` past it gets `ERR_SESSION_CAPACITY` (429) |
+
+The two generation ceilings refuse rather than evict. Evicting the coldest
+entry would bound memory equally well but would reset that session's highest
+generation to `0`, letting a superseded generation be re-opened inside the TTL
+window (ESS-794). Refusals only ever apply to a *new* `session_id` — a device
+sitting at its ceiling keeps minting for the sessions it already owns — and
+clear as soon as the held entries go idle past `generation_ttl_ms`. The token
+ceilings do evict, because a dropped token entry can only cause a rejection.
 | `heartbeat_interval_ms` | `15000` | WS-level ping cadence |
 | `idle_disconnect_ms` | `60000` | Kill idle sockets |
 | `max_frame_bytes` | `65536` | Per-frame hard cap |
