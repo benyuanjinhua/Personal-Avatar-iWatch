@@ -223,5 +223,3 @@ final class WCSessionAdapterTests: XCTestCase {
         try! WatchDownlinkOutbox(directory: directory, log: { _ in })
     }
 }
-
-

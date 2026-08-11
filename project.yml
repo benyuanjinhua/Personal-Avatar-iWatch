@@ -78,7 +78,6 @@ targets:
     scheme:
       testTargets:
         - WristAgent Watch Tests
-        - WristAgent iOSTests
 
   # ESS-753：iOS 单测 target。PhoneRealtimeSession / PhoneConnectivity /
   # WristAgentPhoneRelay 等 iPhone 实时链路行为目前只能编译验证，补齐到 CI
