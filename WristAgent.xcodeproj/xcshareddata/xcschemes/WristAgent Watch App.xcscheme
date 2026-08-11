@@ -50,6 +50,17 @@
                ReferencedContainer = "container:WristAgent.xcodeproj">
             </BuildableReference>
          </TestableReference>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "7E749452923A53A9D8408282"
+               BuildableName = "WristAgent iOSTests.xctest"
+               BlueprintName = "WristAgent iOSTests"
+               ReferencedContainer = "container:WristAgent.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
       <CommandLineArguments>
       </CommandLineArguments>

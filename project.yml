@@ -78,6 +78,22 @@ targets:
     scheme:
       testTargets:
         - WristAgent Watch Tests
+        - WristAgent iOSTests
+
+  # ESS-753：iOS 单测 target。PhoneRealtimeSession / PhoneConnectivity /
+  # WristAgentPhoneRelay 等 iPhone 实时链路行为目前只能编译验证，补齐到 CI
+  # 以拦截直连路由、token mint、WSS 生命周期、文件路径与持久化的回归。
+  WristAgent iOSTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: iOSTests
+    dependencies:
+      - target: WristAgent
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(WRISTAGENT_BUNDLE_ID).iostests
+        GENERATE_INFOPLIST_FILE: YES
 
   # ESS-73：watch 模拟器宿主单测——swift test 编不到 Watch target，
   # 中断残留等运行时行为只能在 watchOS 进程里复现（R-02 运行时证据）。
@@ -103,6 +119,10 @@ schemes:
       targets:
         WristAgent: all
         WristAgent Watch App: all
+    test:
+      targets:
+        - WristAgent iOSTests
+        - WristAgent Watch Tests
     run:
       config: Debug
     archive:

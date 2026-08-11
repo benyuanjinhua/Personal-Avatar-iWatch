@@ -13,6 +13,7 @@
 		06514EB08E697AAAEEA6F10A /* ResultNotificationPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13475F099EA8ADC39FB4651D /* ResultNotificationPolicy.swift */; };
 		06E2F65AB24A39F35B1CB39D /* RuntimeSessionPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B644F4BEAE260E21C555E9E /* RuntimeSessionPolicy.swift */; };
 		070E69DBE697BF3DE0503A23 /* ResultNotifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = 797588258D8FFBB69B05BB71 /* ResultNotifier.swift */; };
+		079BBEE6BCAB7B72E1E4FA6E /* WCSessionAdapterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B41B8022F47E043EE6359503 /* WCSessionAdapterTests.swift */; };
 		0B0B586F84AB14F3F9C91F32 /* SessionController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B8DEBE07738843EED2FE5C7 /* SessionController.swift */; };
 		0B14BB8E0DE371AE0274D4F9 /* PhoneConnectivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08AB0CED9CE83E1BB446A82C /* PhoneConnectivity.swift */; };
 		0B21A7424638FD9297A195A5 /* AudioRealtimeAgentTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = F5EC070D0A3D70F7AFB66387 /* AudioRealtimeAgentTransport.swift */; };
@@ -104,6 +105,7 @@
 		7045B87E2347FCA6BB2FFE4F /* ErrorCue_VoiceBusy.m4a in Resources */ = {isa = PBXBuildFile; fileRef = 69D850E7D15B7525D07D9DBF /* ErrorCue_VoiceBusy.m4a */; };
 		707A59AAF2C9619F3909A162 /* RecorderErrorCopyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD573B88FBB9CCE341ED1513 /* RecorderErrorCopyTests.swift */; };
 		70FD953CB2F4AAEE8EC1B04A /* RealtimeDownlinkRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE23EED29A03F535392EF09F /* RealtimeDownlinkRelay.swift */; };
+		7182F51BC2221DBB5E5FF29E /* PhonePersistenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 96175853200EA215B11264B9 /* PhonePersistenceTests.swift */; };
 		7249351A21B20AAC649807D9 /* RealtimeMediaFormat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CEDAB5F3CD7B29B993F0FA2 /* RealtimeMediaFormat.swift */; };
 		72AEE3274DC1730DAB22022E /* VoiceTurnJournal.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6F558DCDF4B9CA8F0BA2E2D /* VoiceTurnJournal.swift */; };
 		72E757EA3A1C9DBEF705D3A5 /* VoiceStatusEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0EAD7935F2F128D8408C210F /* VoiceStatusEnvelope.swift */; };
@@ -181,7 +183,9 @@
 		C2DD31347EF19DFDA9187ABB /* PhoneRealtimeSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = F824A2078CC9EF4E32AEA011 /* PhoneRealtimeSession.swift */; };
 		C3D8984AB14E3ECEB93542E0 /* OpenWristAgentIntent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F9C01710FDC8C90D754460F /* OpenWristAgentIntent.swift */; };
 		C46BB1D490E314A5F2FD6696 /* AgentTokenFallbackReason.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3E3EF41FD4D1B3D4ACB250F /* AgentTokenFallbackReason.swift */; };
+		C6B6DA291FCFFCDA0100F6D8 /* PhoneRealtimeRoutingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 97DBD0F3A68E253D2E62D1BE /* PhoneRealtimeRoutingTests.swift */; };
 		C8D3D2E8D0626D66145B3C31 /* RealtimeDownlinkPlayback.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C41457A27FD24A41133AFFE /* RealtimeDownlinkPlayback.swift */; };
+		CBB348CC8B7A615B6AB1830C /* PhoneRealtimeSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CDC8A19B42F6C6D72D17A25D /* PhoneRealtimeSessionTests.swift */; };
 		CCB3BBBEF6EAB9DDD84249E5 /* AvatarErrorPresenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 448AA6286D0C4ACA51DC8ADD /* AvatarErrorPresenter.swift */; };
 		CD555D87536F29C54A475DFB /* BridgeTurnProjection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A61F7EAFB8A0CCF3D03F1D2 /* BridgeTurnProjection.swift */; };
 		CEA31973C29CBFC9511A3BAB /* PlaybackEndgamePolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F3363DB5FB9EF9FF44F0744 /* PlaybackEndgamePolicy.swift */; };
@@ -243,6 +247,13 @@
 			proxyType = 1;
 			remoteGlobalIDString = 3B9F782E44A10D91CA405688;
 			remoteInfo = "WristAgent Watch App";
+		};
+		60A12F6BFB50F4D740D5F40A /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 85B21323A96B25B07A518363 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = CF25B19D6DB2959DBE22B263;
+			remoteInfo = WristAgent;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -329,6 +340,7 @@
 		63B4FAFE429B15682CA5E9F8 /* RealtimeMediaWireFormat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeMediaWireFormat.swift; sourceTree = "<group>"; };
 		660A4DC8375BF7F24E66C40F /* RecordingInterruptionPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingInterruptionPolicy.swift; sourceTree = "<group>"; };
 		670B3104058BFB1235409EF2 /* PhoneRealtimeWebSocketTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneRealtimeWebSocketTransport.swift; sourceTree = "<group>"; };
+		672B9028EEEC37BEEFBE0ADB /* WristAgent iOSTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = "WristAgent iOSTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		67C6A03628F073DFB7BD92CF /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		684996623F2E6BDB2845CDBB /* ResultAudioPathTraversalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResultAudioPathTraversalTests.swift; sourceTree = "<group>"; };
 		6983995D53E90803381BB8E0 /* VoiceBargeInDetector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceBargeInDetector.swift; sourceTree = "<group>"; };
@@ -360,6 +372,8 @@
 		905294A59B10050708A50FBF /* PlaybackRecoveryPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackRecoveryPolicy.swift; sourceTree = "<group>"; };
 		937C17EC6A16413E34C276A2 /* WatchContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchContentView.swift; sourceTree = "<group>"; };
 		96150E5C8428B98CF5C6765B /* ErrorCue_Retryable.m4a */ = {isa = PBXFileReference; path = ErrorCue_Retryable.m4a; sourceTree = "<group>"; };
+		96175853200EA215B11264B9 /* PhonePersistenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhonePersistenceTests.swift; sourceTree = "<group>"; };
+		97DBD0F3A68E253D2E62D1BE /* PhoneRealtimeRoutingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneRealtimeRoutingTests.swift; sourceTree = "<group>"; };
 		98840DEEAC5DA7B6F8FCC628 /* AudioRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRecorder.swift; sourceTree = "<group>"; };
 		9A2CDFE23539DF4DB5ADDAF7 /* CompanionContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionContentView.swift; sourceTree = "<group>"; };
 		9F3363DB5FB9EF9FF44F0744 /* PlaybackEndgamePolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackEndgamePolicy.swift; sourceTree = "<group>"; };
@@ -368,6 +382,7 @@
 		A5752A6573A7A674BF8880E4 /* BargeInGenerationCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BargeInGenerationCoordinator.swift; sourceTree = "<group>"; };
 		AAD9BD4DBA7700C65F134EF3 /* SpeechPlayerReleaseTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechPlayerReleaseTests.swift; sourceTree = "<group>"; };
 		B1CE1503A0D6F97C52A835D5 /* WatchAppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchAppDelegate.swift; sourceTree = "<group>"; };
+		B41B8022F47E043EE6359503 /* WCSessionAdapterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WCSessionAdapterTests.swift; sourceTree = "<group>"; };
 		B4ABFE757D618285BCA3C777 /* ErrorCue_TranscriptDiscarded.m4a */ = {isa = PBXFileReference; path = ErrorCue_TranscriptDiscarded.m4a; sourceTree = "<group>"; };
 		B9D95B86CF79B5796D5EA9DC /* SelfCheck.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfCheck.swift; sourceTree = "<group>"; };
 		BF28D500590D9DF5BF4D748A /* ClientLogUplink.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientLogUplink.swift; sourceTree = "<group>"; };
@@ -385,6 +400,7 @@
 		CB7ABFE8DE51D05121E27317 /* VoiceOutbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceOutbox.swift; sourceTree = "<group>"; };
 		CC28E8D4A89C399924568EEB /* SecureTokenStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureTokenStore.swift; sourceTree = "<group>"; };
 		CC3ECBAA9A62DE9AED7C9C34 /* AudioSessionPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioSessionPolicy.swift; sourceTree = "<group>"; };
+		CDC8A19B42F6C6D72D17A25D /* PhoneRealtimeSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneRealtimeSessionTests.swift; sourceTree = "<group>"; };
 		CE83A54EC29559337BA73D64 /* SelfCheckYieldBarrierTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfCheckYieldBarrierTests.swift; sourceTree = "<group>"; };
 		CFCE4F8E6894C97A571F6634 /* AudioRealtimeAgentCodec.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRealtimeAgentCodec.swift; sourceTree = "<group>"; };
 		D0A1CA98E116775B1257DB33 /* PhoneHistoryViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneHistoryViews.swift; sourceTree = "<group>"; };
@@ -539,6 +555,17 @@
 			path = iOS;
 			sourceTree = "<group>";
 		};
+		92F0A58099CCA131E46C3E73 /* iOSTests */ = {
+			isa = PBXGroup;
+			children = (
+				96175853200EA215B11264B9 /* PhonePersistenceTests.swift */,
+				97DBD0F3A68E253D2E62D1BE /* PhoneRealtimeRoutingTests.swift */,
+				CDC8A19B42F6C6D72D17A25D /* PhoneRealtimeSessionTests.swift */,
+				B41B8022F47E043EE6359503 /* WCSessionAdapterTests.swift */,
+			);
+			path = iOSTests;
+			sourceTree = "<group>";
+		};
 		BE04671AC7E90D1581E6AC05 /* Watch */ = {
 			isa = PBXGroup;
 			children = (
@@ -586,6 +613,7 @@
 		C2ED56EF033338F62BCCC439 /* Products */ = {
 			isa = PBXGroup;
 			children = (
+				672B9028EEEC37BEEFBE0ADB /* WristAgent iOSTests.xctest */,
 				2E88D71F4696224E69D652E8 /* WristAgent Watch App.app */,
 				53B51BD6D2B825F5E3E2A727 /* WristAgent Watch Tests.xctest */,
 				6AE6645A23368CC50DBD7CCE /* WristAgent.app */,
@@ -637,6 +665,7 @@
 			isa = PBXGroup;
 			children = (
 				54A036CF449463DCBB1BE0B1 /* iOS */,
+				92F0A58099CCA131E46C3E73 /* iOSTests */,
 				1496EF7B8FA3D1016A22CDC1 /* Shared */,
 				BE04671AC7E90D1581E6AC05 /* Watch */,
 				E0960019F13FD9B843014358 /* WatchTests */,
@@ -683,6 +712,24 @@
 			productReference = 53B51BD6D2B825F5E3E2A727 /* WristAgent Watch Tests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
+		7E749452923A53A9D8408282 /* WristAgent iOSTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 3CD94A6EA98CC936291CDA47 /* Build configuration list for PBXNativeTarget "WristAgent iOSTests" */;
+			buildPhases = (
+				18B9EF76A29AE42218B8540A /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				7A23CBE2B39B791615A4E146 /* PBXTargetDependency */,
+			);
+			name = "WristAgent iOSTests";
+			packageProductDependencies = (
+			);
+			productName = "WristAgent iOSTests";
+			productReference = 672B9028EEEC37BEEFBE0ADB /* WristAgent iOSTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 		CF25B19D6DB2959DBE22B263 /* WristAgent */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 5A8246362B99773025EFC65D /* Build configuration list for PBXNativeTarget "WristAgent" */;
@@ -720,6 +767,10 @@
 						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
+					7E749452923A53A9D8408282 = {
+						DevelopmentTeam = "";
+						ProvisioningStyle = Automatic;
+					};
 					CF25B19D6DB2959DBE22B263 = {
 						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
@@ -742,6 +793,7 @@
 			targets = (
 				CF25B19D6DB2959DBE22B263 /* WristAgent */,
 				3B9F782E44A10D91CA405688 /* WristAgent Watch App */,
+				7E749452923A53A9D8408282 /* WristAgent iOSTests */,
 				4DEDBCFFC6FBD241C13DA076 /* WristAgent Watch Tests */,
 			);
 		};
@@ -781,6 +833,17 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		18B9EF76A29AE42218B8540A /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				7182F51BC2221DBB5E5FF29E /* PhonePersistenceTests.swift in Sources */,
+				C6B6DA291FCFFCDA0100F6D8 /* PhoneRealtimeRoutingTests.swift in Sources */,
+				CBB348CC8B7A615B6AB1830C /* PhoneRealtimeSessionTests.swift in Sources */,
+				079BBEE6BCAB7B72E1E4FA6E /* WCSessionAdapterTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		85E2CB81B75454076D009B1F /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -1013,6 +1076,11 @@
 			target = 3B9F782E44A10D91CA405688 /* WristAgent Watch App */;
 			targetProxy = 3ABDD484832A2B8AC012AB10 /* PBXContainerItemProxy */;
 		};
+		7A23CBE2B39B791615A4E146 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = CF25B19D6DB2959DBE22B263 /* WristAgent */;
+			targetProxy = 60A12F6BFB50F4D740D5F40A /* PBXContainerItemProxy */;
+		};
 		CD9B13C4307B406F5162154C /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			target = 3B9F782E44A10D91CA405688 /* WristAgent Watch App */;
@@ -1188,6 +1256,23 @@
 			};
 			name = Debug;
 		};
+		7708AA22EB884A911B7B3DE5 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(WRISTAGENT_BUNDLE_ID).iostests";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/WristAgent.app/WristAgent";
+			};
+			name = Debug;
+		};
 		7B175453FF778828AB5528C0 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -1201,6 +1286,23 @@
 				WATCHOS_DEPLOYMENT_TARGET = 10.0;
 			};
 			name = Debug;
+		};
+		81BDDBBD6EF361A324005BB8 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(WRISTAGENT_BUNDLE_ID).iostests";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/WristAgent.app/WristAgent";
+			};
+			name = Release;
 		};
 		C08D2741ADF0A3EC2927B854 /* Release */ = {
 			isa = XCBuildConfiguration;
@@ -1262,6 +1364,15 @@
 			buildConfigurations = (
 				7B175453FF778828AB5528C0 /* Debug */,
 				C1018E014A7C2D7D7F9549DC /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		3CD94A6EA98CC936291CDA47 /* Build configuration list for PBXNativeTarget "WristAgent iOSTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				7708AA22EB884A911B7B3DE5 /* Debug */,
+				81BDDBBD6EF361A324005BB8 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
