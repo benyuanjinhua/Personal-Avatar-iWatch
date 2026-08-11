@@ -79,7 +79,12 @@ export function createBridge(overrides = {}) {
     maxResultAudioBytes: CONFIG.max_result_audio_bytes,
     log,
   })
-  const gateway = new GatewayClient({ baseUrl: CONFIG.gateway_url, log })
+  const gateway = new GatewayClient({
+    baseUrl: CONFIG.gateway_url,
+    sseMaxEventBytes: CONFIG.sse_max_event_bytes ?? 256 * 1024,
+    sseMaxBufferBytes: CONFIG.sse_max_buffer_bytes ?? 1024 * 1024,
+    log,
+  })
   const watcher = new TaskWatcher({ gateway, ledger, config: CONFIG, log })
   watcher.startDenySweeper()   // D1：写开关关闭时全局清扫 pending 权限（no-op otherwise）
   const audio = new AudioPipeline({
@@ -1232,7 +1237,16 @@ export function createBridge(overrides = {}) {
 
   // ---- WSS /v1/voice/events ----------------------------------------------
 
-  const wss = new WebSocketServer({ noServer: true })
+  // ESS-744：帧级硬上限。没有 maxPayload 时，ws 会把任意大小的帧完整收进内存
+  // 后才交给业务层校验——一条声明 500MB 的帧足以在校验发生前打爆堆。
+  // 下限由合法音频帧反推：解码后 maxFrameBytes → base64 膨胀 4/3 + JSON 信封余量，
+  // 配置值低于它会误杀正常上行，因此取两者较大值。
+  const realtimeMaxFrameBytes = CONFIG.realtime_media_max_frame_bytes ?? 64 * 1024
+  const wsMaxPayloadBytes = Math.max(
+    CONFIG.ws_max_payload_bytes ?? 256 * 1024,
+    Math.ceil(realtimeMaxFrameBytes * 4 / 3) + 4 * 1024,
+  )
+  const wss = new WebSocketServer({ noServer: true, maxPayload: wsMaxPayloadBytes })
   const eventClients = new Set() // { ws, deviceId }
   const mediaClients = new Set()
   const eventsHeartbeatMs = CONFIG.events_heartbeat_ms ?? 20_000
@@ -1445,7 +1459,37 @@ export function createBridge(overrides = {}) {
             client.accepted = true
             if (client.pendingResult) completeRealtimeTurn(client.pendingResult)
           }
+          // ESS-744：串行 chain 本身是无界的——帧一到就挂上 Promise 链，raw buffer
+          // 被闭包持有到轮到它处理为止；突发上行会在 chain 追平前全部堆在内存里。
+          // 双上限（条数 + 字节）+ 半满暂停读取形成真实背压；仍然超限说明对端
+          // 无视背压，按结构化失败断链，绝不静默丢帧。
+          const maxQueuedMessages = CONFIG.realtime_media_max_queued_messages ?? 64
+          const maxQueuedBytes = CONFIG.realtime_media_max_queued_bytes ?? 4 * 1024 * 1024
+          const pauseAt = Math.max(1, Math.ceil(maxQueuedMessages / 2))
+          const resumeAt = Math.max(0, Math.floor(pauseAt / 2))
+          let queuedMessages = 0
+          let queuedBytes = 0
+          let readPaused = false
+          let overloaded = false
           ws.on('message', raw => {
+            if (overloaded) return // 已断链，迟到的帧不再入队
+            const size = Buffer.isBuffer(raw) ? raw.length : Buffer.byteLength(String(raw))
+            if (queuedMessages >= maxQueuedMessages || queuedBytes + size > maxQueuedBytes) {
+              overloaded = true
+              log({
+                evt: 'realtime_media_inbound_overload', request_id: requestId, device_id: deviceId,
+                queued_messages: queuedMessages, queued_bytes: queuedBytes, frame_bytes: size,
+                max_messages: maxQueuedMessages, max_bytes: maxQueuedBytes,
+              })
+              fail(Object.assign(new Error('inbound queue limit exceeded'), { code: 'ERR_STREAM_OVERLOAD' }))
+              return
+            }
+            queuedMessages += 1
+            queuedBytes += size
+            if (!readPaused && queuedMessages >= pauseAt) {
+              readPaused = true
+              ws.pause()   // 背压：停止从 socket 读取，直到积压回落
+            }
             chain = chain.then(async () => {
               let message
               try { message = JSON.parse(raw.toString()) } catch { throw Object.assign(new Error('invalid JSON'), { code: 'ERR_BAD_JSON' }) }
@@ -1494,7 +1538,14 @@ export function createBridge(overrides = {}) {
               else if (message.type === 'barge_in') client.media.bargeIn()
               else if (message.type === 'close') ws.close(1000, 'completed')
               else throw Object.assign(new Error('unknown media event'), { code: 'ERR_STREAM_PROTOCOL' })
-            }).catch(fail)
+            }).catch(fail).finally(() => {
+              queuedMessages -= 1
+              queuedBytes -= size
+              if (readPaused && queuedMessages <= resumeAt) {
+                readPaused = false
+                ws.resume()
+              }
+            })
           })
           const cleanup = (reason, code = null) => {
             if (client.disconnected) return
