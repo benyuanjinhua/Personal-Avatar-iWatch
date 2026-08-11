@@ -24,15 +24,15 @@ final class WatchDebugSettings: ObservableObject {
     static let vadEndpointSilenceMsDefaultsKey = "wristagent.watch.debug.vad-endpoint-silence-ms"
     static let defaultVADEndpointSilenceMs = 700
 
-    /// ESS-711：语音打断功能开关。未设置时默认 ON；用户显式关闭后仍持久化
-    /// 为 OFF。开启后 `.voiceChat` 替代 `.spokenAudio` 以获取 AEC，
-    /// speaking 期间进行 VAD-only 采集检测语音打断。
+    /// ESS-650 / ESS-711：语音打断功能开关。新安装默认 ON；用户显式关闭
+    /// 后继续尊重本机持久化选择。开启后 `.voiceChat` 替代 `.spokenAudio`
+    /// 以获取 AEC，speaking 期间进行 VAD-only 采集检测语音打断。
     static let voiceBargeInEnabledDefaultsKey = "wristagent.watch.debug.voice-barge-in-enabled"
 
     /// 观察值：SwiftUI Toggle 直接绑定。写入即持久化 + 落日志 + 触发回退回调。
     @Published private(set) var streamingEnabled: Bool
     @Published private(set) var vadEndpointSilenceMs: Int
-    /// ESS-711：语音打断开关（未设置时默认 ON）。
+    /// ESS-650 / ESS-711：语音打断开关（新安装默认 ON）。
     @Published private(set) var voiceBargeInEnabled: Bool
 
     /// 单调递增的「流式代」计数：每次从 ON → OFF 加 1。
@@ -55,9 +55,9 @@ final class WatchDebugSettings: ObservableObject {
         self.vadEndpointSilenceMs = Self.sanitizeVADEndpointSilenceMs(
             storedEndpointMs ?? Self.defaultVADEndpointSilenceMs
         )
-        // ESS-711：正常对话默认支持语音打断。必须区分「缺 key」与用户显式
-        // 写入 false；直接调用 bool(forKey:) 会把两者都折叠成 false，导致新装
-        // 和历史从未操作过开关的设备继续默认关闭。
+        // ESS-711：完整能力已存在但旧代码把缺省 key 读成 false，导致生产包
+        // 永远表现为“不支持语音打断”。缺 key 的新安装默认 ON；显式选择仍
+        // 按 UserDefaults 保留，给回声异常设备留有可见的退出开关。
         if defaults.object(forKey: Self.voiceBargeInEnabledDefaultsKey) != nil {
             self.voiceBargeInEnabled = defaults.bool(forKey: Self.voiceBargeInEnabledDefaultsKey)
         } else {

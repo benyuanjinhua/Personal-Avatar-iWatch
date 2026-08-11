@@ -47,7 +47,10 @@ final class PhoneRealtimeSession {
     private let transportFactory: (_ requestId: String, _ sessionId: String) -> Transport?
     private var currentTransport: Transport?
     private(set) var state: State = .idle
-    private var pendingDownlink: [RealtimeDownlinkEnvelope] = []
+    /// ESS-751：下行断连缓冲。策略（何时缓冲、上限、淘汰）收在
+    /// `Shared/PendingDownlinkBuffer.swift`，因为 `iOS/` 没有单测 target——
+    /// 留在这里这条策略就只能靠人眼复核，正是它当初写错还合入的原因。
+    private var pendingDownlink = PendingDownlinkBuffer<RealtimeDownlinkEnvelope>()
     /// ESS-391: Agent transports deliver events via callbacks rather than
     /// the Bridge-style `receive(handler:)` loop. When `true`, `scheduleReceive`
     /// is a no-op — the transport itself wires downlink delivery.
@@ -80,7 +83,7 @@ final class PhoneRealtimeSession {
                 Self.logger.info(
                     "realtime discarding \(self.pendingDownlink.count) stale downlink envelopes from previous session"
                 )
-                pendingDownlink.removeAll(keepingCapacity: true)
+                pendingDownlink.discardAll()
             }
             openIfNeeded(requestId: start.requestId, sessionId: start.sessionId)
         case .audioAppend:
@@ -159,7 +162,7 @@ final class PhoneRealtimeSession {
         transition(to: .cancelled)
         currentTransport?.close(reason: reason)
         currentTransport = nil
-        pendingDownlink.removeAll(keepingCapacity: false)
+        pendingDownlink.discardAll()
     }
 
     /// System reported the phone entered background / lost network / the
@@ -172,12 +175,38 @@ final class PhoneRealtimeSession {
         endTurn(reason: "lifecycle_\(reason)")
     }
 
-    /// Recent downlink envelopes buffered while the watch reconnected — the
-    /// caller can drain and forward them.
+    /// ESS-751：唯一的下行出口。有消费者就直接转发**且不留副本**；没有
+    /// 消费者时才进断连缓冲，并受三条上限约束。
+    private func deliverDownlink(_ envelope: RealtimeDownlinkEnvelope) {
+        guard let onDownlink else {
+            enqueuePendingDownlink(envelope)
+            return
+        }
+        onDownlink(envelope)
+    }
+
+    private func enqueuePendingDownlink(_ envelope: RealtimeDownlinkEnvelope) {
+        let dropped = pendingDownlink.enqueue(
+            envelope,
+            bytes: envelope.audio?.payload.count ?? 0,
+            nowSeconds: Date().timeIntervalSince1970
+        )
+        if dropped > 0 {
+            Self.logger.notice(
+                "realtime pending downlink trimmed dropped=\(dropped, privacy: .public) remaining=\(self.pendingDownlink.count, privacy: .public) bytes=\(self.pendingDownlink.byteCount, privacy: .public)"
+            )
+        }
+    }
+
+    /// 断连重放：重连后把缓冲里的 envelope 交出去。取走即清空——
+    /// 缓冲的语义是「还没送到的」，送出去就不再是待送。
     func drainPendingDownlink() -> [RealtimeDownlinkEnvelope] {
-        let snapshot = pendingDownlink
-        pendingDownlink.removeAll(keepingCapacity: false)
-        return snapshot
+        pendingDownlink.drain()
+    }
+
+    /// 当前缓冲深度（条数 / 字节），供测试与排查对账。
+    var pendingDownlinkStats: (count: Int, bytes: Int) {
+        (pendingDownlink.count, pendingDownlink.byteCount)
     }
 
     /// Agent transports push events through callbacks instead of the Bridge
@@ -201,8 +230,7 @@ final class PhoneRealtimeSession {
             logDroppedDownlink(envelope, reason: "request_session_mismatch")
             return
         }
-        pendingDownlink.append(envelope)
-        onDownlink?(envelope)
+        deliverDownlink(envelope)
     }
 
     private func openIfNeeded(requestId: String, sessionId: String) {
@@ -247,8 +275,7 @@ final class PhoneRealtimeSession {
             guard let self, let transport, self.currentTransport === transport else { return }
             switch result {
             case .success(let envelope):
-                self.pendingDownlink.append(envelope)
-                self.onDownlink?(envelope)
+                self.deliverDownlink(envelope)
                 self.scheduleReceive(transport)
             case .failure(let error):
                 Self.logger.error(

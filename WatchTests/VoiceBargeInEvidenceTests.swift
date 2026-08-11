@@ -62,20 +62,17 @@ final class VoiceBargeInEvidenceTests: XCTestCase {
 
     // MARK: - F2-4：gate 的默认值、持久化与契约事件
 
-    func testGateDefaultsOnWhenNoPreferenceExists() {
+    func testGateDefaultsOnForFreshInstall() {
         XCTAssertTrue(
             WatchDebugSettings(defaults: isolatedDefaults("default")).voiceBargeInEnabled,
-            "正常对话必须无需用户进入调试设置就支持语音打断"
+            "ESS-711：新安装必须默认支持语音打断"
         )
     }
 
-    func testExplicitGateOptOutPersistsAcrossRelaunch() {
+    func testGatePersistsAcrossRelaunch() {
         let defaults = isolatedDefaults("persist")
         WatchDebugSettings(defaults: defaults).setVoiceBargeInEnabled(false)
-        XCTAssertFalse(
-            WatchDebugSettings(defaults: defaults).voiceBargeInEnabled,
-            "默认 ON 不得覆盖用户显式关闭"
-        )
+        XCTAssertFalse(WatchDebugSettings(defaults: defaults).voiceBargeInEnabled)
     }
 
     /// `voice_barge_in_gate` 必须过得了 ESS-655 契约校验。
