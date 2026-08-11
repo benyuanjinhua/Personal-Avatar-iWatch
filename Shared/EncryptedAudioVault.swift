@@ -2,6 +2,71 @@ import CryptoKit
 import Foundation
 import Security
 
+// MARK: - Keychain 抽象
+
+/// 加密密钥存取边界：生产走 Keychain，测试可注入内存实现验证失败与持久化路径。
+protocol AudioVaultKeyProviding {
+    /// 读取已有密钥，不存在时返回 nil。
+    func readExistingKey() -> SymmetricKey?
+    /// 持久化新密钥；失败抛出对应 OSStatus。
+    func persistNewKey(_ data: Data) throws
+    /// 清理旧密钥。
+    func deleteKey()
+}
+
+/// 生产 Keychain 实现。
+struct KeychainAudioVaultKeyProvider: AudioVaultKeyProviding {
+    private let service: String
+    private let account: String
+
+    init(service: String, account: String) {
+        self.service = service
+        self.account = account
+    }
+
+    func readExistingKey() -> SymmetricKey? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: CFTypeRef?
+        guard
+            SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+            let data = result as? Data,
+            data.count == 32
+        else { return nil }
+        return SymmetricKey(data: data)
+    }
+
+    func persistNewKey(_ data: Data) throws {
+        let baseQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        SecItemDelete(baseQuery as CFDictionary)
+        var item = baseQuery
+        item[kSecValueData as String] = data
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let status = SecItemAdd(item as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw EncryptedAudioVault.VaultError.keychainSaveFailed(status)
+        }
+    }
+
+    func deleteKey() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+}
+
 /// 临时语音的加密存储（ESS-29）：结果语音落盘前用 AES-GCM 加密，
 /// 播放时解密到内存、交付后删除文件。密钥保存在本机钥匙串
 /// （ThisDeviceOnly，本地生成的对称密钥，不是任何云端凭据）。
@@ -17,9 +82,14 @@ final class EncryptedAudioVault {
     private let fileManager = FileManager.default
 
     /// 测试可传入固定密钥；生产用钥匙串托管密钥。
-    init(directory: URL, key: SymmetricKey? = nil) throws {
+    /// `keyProvider` 仅在没有显式 `key` 时使用，用于 Keychain 失败与持久化测试。
+    init(directory: URL, key: SymmetricKey? = nil, keyProvider: AudioVaultKeyProviding? = nil) throws {
         self.directory = directory
-        self.key = try key ?? Self.keychainKey()
+        if let key {
+            self.key = key
+        } else {
+            self.key = try Self.keychainKey(provider: keyProvider)
+        }
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
     }
 
@@ -65,41 +135,17 @@ final class EncryptedAudioVault {
 
     // MARK: - 钥匙串托管密钥
 
-    private static let keychainService = "com.benyuan.wristagent.audio-vault-key"
-    private static let keychainAccount = "default"
+    private static let defaultKeychainProvider = KeychainAudioVaultKeyProvider(
+        service: "com.benyuan.wristagent.audio-vault-key",
+        account: "default"
+    )
 
-    private static func keychainKey() throws -> SymmetricKey {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var result: CFTypeRef?
-        if
-            SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-            let data = result as? Data,
-            data.count == 32
-        {
-            return SymmetricKey(data: data)
-        }
-
+    private static func keychainKey(provider: AudioVaultKeyProviding? = nil) throws -> SymmetricKey {
+        let provider = provider ?? defaultKeychainProvider
+        if let existing = provider.readExistingKey() { return existing }
         let key = SymmetricKey(size: .bits256)
         let keyData = key.withUnsafeBytes { Data($0) }
-        let baseQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount
-        ]
-        SecItemDelete(baseQuery as CFDictionary)
-        var item = baseQuery
-        item[kSecValueData as String] = keyData
-        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        let status = SecItemAdd(item as CFDictionary, nil)
-        guard status == errSecSuccess else {
-            throw VaultError.keychainSaveFailed(status)
-        }
+        try provider.persistNewKey(keyData)
         return key
     }
 }

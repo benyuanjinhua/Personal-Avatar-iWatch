@@ -212,7 +212,17 @@ final class PushToTalkController: ObservableObject {
                 detail: "count=\(staleIds.count) holds=[\(holdReasons)] scene_phase=\(phase)"
             )
         }
-        speechVault = try? EncryptedAudioVault(directory: base.appendingPathComponent("SpeechVault", isDirectory: true))
+        do {
+            speechVault = try EncryptedAudioVault(directory: base.appendingPathComponent("SpeechVault", isDirectory: true))
+        } catch let error as EncryptedAudioVault.VaultError {
+            WatchLog.error("speech_vault", "keychain_save_failed",
+                          detail: "vault_init_failed", code: "\(error)", error: error)
+            speechVault = nil
+        } catch {
+            WatchLog.error("speech_vault", "init_failed",
+                          detail: "vault_init_unexpected", code: "ERR_VAULT_INIT", error: error)
+            speechVault = nil
+        }
         transport = WatchVoiceTransport(journal: journal)
         retryStore = RetryRecordingStore(
             directory: base.appendingPathComponent("RetryCache", isDirectory: true),
