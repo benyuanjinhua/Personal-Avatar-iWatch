@@ -197,6 +197,7 @@
 		D482537406EC7EC94069E3AF /* WristAgentPhoneRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79F87E24A5046DA1229304B2 /* WristAgentPhoneRelay.swift */; };
 		D51204118681270691727D4C /* SpeechPlayerInterruptionEvidenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FDE52A8C1B2854E4646A286 /* SpeechPlayerInterruptionEvidenceTests.swift */; };
 		D646FBAAC6F5F67130E21FB0 /* PhoneRealtimeWebSocketTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 670B3104058BFB1235409EF2 /* PhoneRealtimeWebSocketTransport.swift */; };
+		D6826091D5DA6899BFA803D4 /* PhoneRelayAdapterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 91CBB92D1BD7BDC115771C2E /* PhoneRelayAdapterTests.swift */; };
 		D73937DBAF6A7155D9CDC698 /* VoiceStreamChunkMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = ECD1DB988318EDCB4DD695B6 /* VoiceStreamChunkMessage.swift */; };
 		D9B1A7DECC44E46204E0FFF3 /* UUIDv7.swift in Sources */ = {isa = PBXBuildFile; fileRef = E36424AC38F0A8BB28751248 /* UUIDv7.swift */; };
 		DA2251EBFC87EADF4EFBC247 /* PhoneModeTelemetry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08B98A3AF040EA6874482194 /* PhoneModeTelemetry.swift */; };
@@ -370,6 +371,7 @@
 		8D4D9B7BAB821EF5BEF00394 /* ConversationTimelineView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationTimelineView.swift; sourceTree = "<group>"; };
 		8F9C01710FDC8C90D754460F /* OpenWristAgentIntent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenWristAgentIntent.swift; sourceTree = "<group>"; };
 		905294A59B10050708A50FBF /* PlaybackRecoveryPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackRecoveryPolicy.swift; sourceTree = "<group>"; };
+		91CBB92D1BD7BDC115771C2E /* PhoneRelayAdapterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneRelayAdapterTests.swift; sourceTree = "<group>"; };
 		937C17EC6A16413E34C276A2 /* WatchContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchContentView.swift; sourceTree = "<group>"; };
 		96150E5C8428B98CF5C6765B /* ErrorCue_Retryable.m4a */ = {isa = PBXFileReference; path = ErrorCue_Retryable.m4a; sourceTree = "<group>"; };
 		96175853200EA215B11264B9 /* PhonePersistenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhonePersistenceTests.swift; sourceTree = "<group>"; };
@@ -561,6 +563,7 @@
 				96175853200EA215B11264B9 /* PhonePersistenceTests.swift */,
 				97DBD0F3A68E253D2E62D1BE /* PhoneRealtimeRoutingTests.swift */,
 				CDC8A19B42F6C6D72D17A25D /* PhoneRealtimeSessionTests.swift */,
+				91CBB92D1BD7BDC115771C2E /* PhoneRelayAdapterTests.swift */,
 				B41B8022F47E043EE6359503 /* WCSessionAdapterTests.swift */,
 			);
 			path = iOSTests;
@@ -840,6 +843,7 @@
 				7182F51BC2221DBB5E5FF29E /* PhonePersistenceTests.swift in Sources */,
 				C6B6DA291FCFFCDA0100F6D8 /* PhoneRealtimeRoutingTests.swift in Sources */,
 				CBB348CC8B7A615B6AB1830C /* PhoneRealtimeSessionTests.swift in Sources */,
+				D6826091D5DA6899BFA803D4 /* PhoneRelayAdapterTests.swift in Sources */,
 				079BBEE6BCAB7B72E1E4FA6E /* WCSessionAdapterTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
