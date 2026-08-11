@@ -244,10 +244,22 @@ final class WristAgentPhoneRelay: ObservableObject {
         )
     }
 
+    /// ESS-749：结果/探针语音的暂存文件名。`request_id` 只以 sha256 摘要形式
+    /// 出现（不可逆、定长 hex），再经 `RelayIdentifier.fileURL` 确认标准化后
+    /// 仍是 `resultAudioDirectory` 的直接子项——服务端 ID 无法参与路径构造。
+    private func stagingURL(requestId: String, suffix: String) -> URL? {
+        RelayIdentifier.fileURL(
+            in: resultAudioDirectory, name: "\(RelayIdentifier.fileToken(for: requestId))\(suffix)"
+        )
+    }
+
     /// 结果音频 transferFile 完成后删除本地临时文件（成功交付即删，§8）。
     func handleResultAudioTransferFinished(fileName: String, error: Error?) {
         guard error == nil else { return }
-        try? FileManager.default.removeItem(at: resultAudioDirectory.appendingPathComponent(fileName))
+        // ESS-749：文件名来自 WCSession 回执，删除前同样过目录内校验，
+        // 绝不让一条回执删到暂存目录以外的东西。
+        guard let url = RelayIdentifier.fileURL(in: resultAudioDirectory, name: fileName) else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 
     // MARK: - Outbox 上送
@@ -451,12 +463,15 @@ final class WristAgentPhoneRelay: ObservableObject {
         guard let message = BridgeEventMessage.decode(from: data) else { return }
         switch message.type {
         case "turn.state":
-            if let turn = message.turn { process(projection: turn) }
+            if let turn = message.turn, accepts(requestId: turn.requestId, event: "turn.state") {
+                process(projection: turn)
+            }
         case "snapshot":
             // ESS-171：completed turn 出现在 snapshot 里 = Bridge 还没收到我们的 /ack。
             // 先清掉这些 request_id 的乐观缓存（否则 stageAndTransferSpeech 会短路），
             // 再走一次正常投影处理，最后踢一下下行队列。
-            let pendingCompleted = (message.turns ?? []).filter { $0.status == "completed" }
+            let turns = (message.turns ?? []).filter { accepts(requestId: $0.requestId, event: "snapshot") }
+            let pendingCompleted = turns.filter { $0.status == "completed" }
             for turn in pendingCompleted {
                 if let sha = turn.result?.audio?.sha256.lowercased() {
                     deliveredResultAudio.remove(audioDeliveryKey(turn.requestId, sha))
@@ -465,17 +480,35 @@ final class WristAgentPhoneRelay: ObservableObject {
             watchChannel?.retryPendingDownlinks(
                 requestIds: pendingCompleted.map(\.requestId), trigger: "wss-snapshot"
             )
-            message.turns?.forEach { process(projection: $0) }
+            turns.forEach { process(projection: $0) }
         case "turn.interim":
-            if let interim = message.interim { process(interim: interim) }
+            if let interim = message.interim, accepts(requestId: interim.requestId, event: "turn.interim") {
+                process(interim: interim)
+            }
         case "turn.progress":
             if let progress = message.progress, progress.isValid { process(progress: progress) }
         case "voice.stream.chunk":
             // ESS-324 B2：Bridge 下行流式分片 → 校验 sha256 → 转发 Watch
-            if let chunk = message.chunk { process(streamChunk: chunk) }
+            if let chunk = message.chunk, accepts(requestId: chunk.requestId, event: "voice.stream.chunk") {
+                process(streamChunk: chunk)
+            }
         default:
             break // 未知事件类型：忽略，不中断事件流。
         }
+    }
+
+    /// ESS-749：Bridge 下行的 `request_id` 是不可信输入，它会一路流进落盘文件名、
+    /// 去重键与下行队列。在事件入口一次性收敛：不合法即整条事件丢弃，
+    /// 不做「清洗后继续用」——被清洗过的 ID 与账本对不上，比丢事件更危险。
+    /// 原始 ID 不进日志（可能是攻击载荷），只记长度。
+    private func accepts(requestId: String, event: String) -> Bool {
+        guard RelayIdentifier.isValid(requestId) else {
+            Self.downlinkLogger.error(
+                "bridge event dropped: malformed request_id event=\(event, privacy: .public) id_len=\(requestId.count)"
+            )
+            return false
+        }
+        return true
     }
 
     private func process(progress: BridgeProgressProjection) {
@@ -506,7 +539,9 @@ final class WristAgentPhoneRelay: ObservableObject {
             deliveredInterims.insert(key) // 文字已经可靠入队；音频缺失时不伪造
             return
         }
-        let url = resultAudioDirectory.appendingPathComponent("\(interim.requestId)-interim-\(interim.deliverySequence).m4a")
+        guard let url = stagingURL(
+            requestId: interim.requestId, suffix: "-interim-\(interim.deliverySequence).m4a"
+        ) else { return }
         guard (try? data.write(to: url, options: .atomic)) != nil,
               watchChannel?.transferSpeech(fileURL: url, envelope: envelope) == true
         else { return }
@@ -618,7 +653,10 @@ final class WristAgentPhoneRelay: ObservableObject {
     private func stageAndTransferSpeech(projection: BridgeTurnProjection, data: Data, sha: String) {
         let key = audioDeliveryKey(projection.requestId, sha)
         guard !deliveredResultAudio.contains(key) else { return }
-        let url = resultAudioDirectory.appendingPathComponent("\(projection.requestId).m4a")
+        guard let url = stagingURL(requestId: projection.requestId, suffix: ".m4a") else {
+            notifyAudioDegradation(requestId: projection.requestId, sourceCode: "ERR_VAULT_STORE")
+            return
+        }
         guard (try? data.write(to: url, options: .atomic)) != nil else {
             notifyAudioDegradation(requestId: projection.requestId, sourceCode: "ERR_VAULT_STORE")
             return
@@ -671,7 +709,10 @@ final class WristAgentPhoneRelay: ObservableObject {
             relayLog("探针语音内联校验失败 \(projection.requestId.prefix(8))…")
             return
         }
-        let url = resultAudioDirectory.appendingPathComponent("\(projection.requestId)-probe.m4a")
+        guard let url = stagingURL(requestId: projection.requestId, suffix: "-probe.m4a") else {
+            relayLog("探针语音路径非法 \(projection.requestId.prefix(8))…")
+            return
+        }
         guard (try? data.write(to: url, options: .atomic)) != nil else {
             relayLog("探针语音落盘失败 \(projection.requestId.prefix(8))…")
             return
@@ -737,8 +778,10 @@ final class WristAgentPhoneRelay: ObservableObject {
             notifyAudioDegradation(requestId: projection.requestId, sourceCode: "ERR_NO_SPEECH_FILE")
             return
         }
-        let partialURL = resultAudioDirectory
-            .appendingPathComponent("\(projection.requestId).m4a.partial")
+        guard let partialURL = stagingURL(requestId: projection.requestId, suffix: ".m4a.partial") else {
+            notifyAudioDegradation(requestId: projection.requestId, sourceCode: "ERR_AUDIO_FETCH")
+            return
+        }
         var assembled = (try? Data(contentsOf: partialURL)) ?? Data()
         Self.downlinkLogger.info(
             "result audio fetch started request_id=\(projection.requestId, privacy: .public) state=queued bytes_staged=\(assembled.count) expected_bytes=\(meta.sizeBytes ?? -1)"
