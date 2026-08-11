@@ -408,6 +408,40 @@ final class WatchStreamReceiver: ObservableObject {
     }
 }
 
+// MARK: - StreamingAudioPlayer 注入缝（ESS-755 阻断 2/3）
+
+/// AVAudioSession 窄缝：将 setCategory / activate / deactivate 封装为
+/// 可注入协议，使 gate 契约测试无需音频硬件、在 hosted CI 稳定运行。
+protocol StreamingAudioPlayerSessionControlling: AnyObject {
+    func setPlaybackCategory() throws
+    func activate() throws
+    func deactivate()
+}
+
+extension AVAudioSession: StreamingAudioPlayerSessionControlling {
+    func setPlaybackCategory() throws {
+        try setCategory(.playback, mode: .default)
+    }
+    func activate() throws {
+        try setActive(true)
+    }
+    func deactivate() {
+        try? setActive(false, options: .notifyOthersOnDeactivation)
+    }
+}
+
+/// AVAudioEngine 窄缝：将引擎的 attach / connect / start / stop 封装为
+/// 可注入协议。Spy 实现提供 mainMixerNode 桩，使测试完全脱离音频硬件。
+protocol StreamingAudioEngineControlling: AnyObject {
+    var mainMixerNode: AVAudioMixerNode { get }
+    func attach(_ node: AVAudioPlayerNode)
+    func connect(_ node: AVAudioPlayerNode, to engineNode: AVAudioNode, format: AVAudioFormat?)
+    func start() throws
+    func stop()
+}
+
+extension AVAudioEngine: StreamingAudioEngineControlling {}
+
 // MARK: - StreamingAudioPlayer (PCM via AVAudioEngine)
 
 /// ESS-748：流播放器的可注入接缝。抽成协议只为一件事——让「起播失败必须
@@ -429,8 +463,9 @@ final class StreamingAudioPlayer: StreamAudioPlaying {
     private let sampleRate: Double
     private let context: String
     private let pcmFormat: AVAudioFormat
-    private let engine: AVAudioEngine
+    private let engine: any StreamingAudioEngineControlling
     private let playerNode: AVAudioPlayerNode
+    private let session: any StreamingAudioPlayerSessionControlling
 
     private var isStarted = false
     private var isEndOfStream = false
@@ -441,9 +476,21 @@ final class StreamingAudioPlayer: StreamAudioPlaying {
         subsystem: "beer.workspace.wristagent", category: "StreamPlayer"
     )
 
-    init(sampleRate: Int, context: String) {
+    /// ESS-554：ConversationAudioController 持有会话期间返回 true。
+    /// 此时 StreamingAudioPlayer 跳过 AVAudioSession setCategory/setActive，
+    /// 仅起停自身引擎与 playerNode——会话级 `.playAndRecord` 已激活，
+    /// 重配为 `.playback` 会踩塌录音/路由。默认 false = 回合级旧行为。
+    static var sessionExternallyOwned: () -> Bool = { false }
+
+    init(
+        sampleRate: Int,
+        context: String,
+        session: any StreamingAudioPlayerSessionControlling = AVAudioSession.sharedInstance(),
+        engine: any StreamingAudioEngineControlling = AVAudioEngine()
+    ) {
         self.sampleRate = Double(sampleRate)
         self.context = context
+        self.session = session
 
         guard let fmt = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
@@ -454,7 +501,7 @@ final class StreamingAudioPlayer: StreamAudioPlaying {
             fatalError("StreamingAudioPlayer: unsupported PCM format")
         }
         self.pcmFormat = fmt
-        self.engine = AVAudioEngine()
+        self.engine = engine
         self.playerNode = AVAudioPlayerNode()
         engine.attach(playerNode)
         engine.connect(playerNode, to: engine.mainMixerNode, format: fmt)
@@ -471,9 +518,16 @@ final class StreamingAudioPlayer: StreamAudioPlaying {
     func start() throws {
         guard !isStarted else { return }
         do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default)
-            try session.setActive(true)
+            if Self.sessionExternallyOwned() {
+                WatchLog.info(
+                    "stream", "session_activation_skipped",
+                    requestId: context,
+                    detail: "reason=conversation_owned"
+                )
+            } else {
+                try session.setPlaybackCategory()
+                try session.activate()
+            }
 
             try engine.start()
             playerNode.play()
@@ -551,7 +605,15 @@ final class StreamingAudioPlayer: StreamAudioPlaying {
             requestId: context,
             detail: "total_bytes=\(totalBytes) buffers=\(totalBuffers)"
         )
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        if Self.sessionExternallyOwned() {
+            WatchLog.info(
+                "stream", "session_release_skipped",
+                requestId: context,
+                detail: "reason=conversation_owned"
+            )
+        } else {
+            session.deactivate()
+        }
     }
 }
 
