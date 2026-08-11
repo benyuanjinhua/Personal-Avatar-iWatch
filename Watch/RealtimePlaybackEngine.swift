@@ -207,12 +207,17 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
             // `.dataPlayedBack` fires once the buffer has actually been played
             // through the output. This is the "real" completion Bixuan
             // required in ESS-335, not the "we queued it" pseudo-event.
+            //
+            // ESS-756: capture the turn handle at schedule time; late
+            // callbacks from a prior turn are guarded in didCompleteBuffer
+            // so they cannot count against a new turn's tracker.
+            let scheduledTurn = turn
             playerNode.scheduleBuffer(
                 pcmBuffer, at: nil,
                 completionCallbackType: .dataPlayedBack
             ) { [weak self] _ in
                 Task { @MainActor in
-                    self?.didCompleteBuffer(responseId: responseId, bytes: payloadBytes)
+                    self?.didCompleteBuffer(responseId: responseId, bytes: payloadBytes, for: scheduledTurn)
                 }
             }
         }
@@ -271,8 +276,12 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         isRunning = false
     }
 
-    private func didCompleteBuffer(responseId: String?, bytes: Int) {
-        guard let turn = currentTurn else { return }
+    /// ESS-756: `turn` is the handle captured at schedule time. Late
+    /// completions from a prior turn are silently dropped when the captured
+    /// handle no longer matches `currentTurn`, preventing old playback
+    /// callbacks from leaking into a new turn's receipt tracker.
+    func didCompleteBuffer(responseId: String?, bytes: Int, for turn: RealtimeMediaSession.TurnHandle) {
+        guard let current = currentTurn, current == turn else { return }
         let receipts = tracker.bufferCompleted(responseId: responseId, bytes: bytes)
         if let started = receipts.started {
             onPlaybackEvent?(.started(

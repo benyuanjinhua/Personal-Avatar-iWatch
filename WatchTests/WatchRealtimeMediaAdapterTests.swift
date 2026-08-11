@@ -982,4 +982,78 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         )
         XCTAssertEqual(timer.armCount, 0)
     }
+
+    // MARK: - ESS-756 turn-guard against late completion callbacks
+
+    /// ESS-756 acceptance: a `.dataPlayedBack` completion from a prior turn
+    /// must be silently dropped when `currentTurn` has moved on, preventing
+    /// old playback receipts from leaking into a new turn's tracker.
+    func testEss756_LateCallbackFromPriorTurnIsDropped() {
+        let engine = RealtimePlaybackEngine(lifecycleOwner: { .conversation })
+        var events: [RealtimePlaybackEngine.PlaybackEvent] = []
+        engine.onPlaybackEvent = { events.append($0) }
+
+        let turnA = RealtimeMediaSession.TurnHandle(
+            requestId: "756a756a-756a-756a-756a-756a756a756a",
+            sessionId: "756b756b-756b-756b-756b-756b756b756b"
+        )
+        let turnB = RealtimeMediaSession.TurnHandle(
+            requestId: "756c756c-756c-756c-756c-756c756c756c",
+            sessionId: "756d756d-756d-756d-756d-756d756d756d"
+        )
+
+        // Prepare turn A with a real enqueue so the tracker holds state.
+        try! engine.prepare(for: turnA)
+        let payloadA = Data(repeating: 0x01, count: 480)
+        let chunkA = VoiceStreamChunk(
+            requestId: turnA.requestId, streamId: turnA.sessionId,
+            direction: .downlink, sequence: 0, capturedAtMs: 1,
+            codec: "pcm_s16le", sampleRate: 24_000, payload: payloadA
+        )
+        engine.enqueue(playables: [
+            RealtimeDownlinkPlayback.PlayableChunk(chunk: chunkA, responseId: "resp-756")
+        ])
+
+        // Prepare turn B — this calls stop() which resets the tracker and
+        // switches currentTurn. Any late callback from turn A must be
+        // dropped because its captured TurnHandle differs from currentTurn.
+        try! engine.prepare(for: turnB)
+
+        // Simulate a late completion from turn A.
+        engine.didCompleteBuffer(responseId: "resp-756", bytes: 480, for: turnA)
+        XCTAssertTrue(
+            events.isEmpty,
+            "late buffer completion from a prior turn must be dropped — no started/ended event"
+        )
+
+        // Now enqueue and complete a buffer for turn B — events must fire.
+        let payloadB = Data(repeating: 0x02, count: 480)
+        let chunkB = VoiceStreamChunk(
+            requestId: turnB.requestId, streamId: turnB.sessionId,
+            direction: .downlink, sequence: 0, capturedAtMs: 2,
+            codec: "pcm_s16le", sampleRate: 24_000, payload: payloadB
+        )
+        engine.enqueue(playables: [
+            RealtimeDownlinkPlayback.PlayableChunk(chunk: chunkB, responseId: "resp-756")
+        ])
+        engine.didCompleteBuffer(responseId: "resp-756", bytes: 480, for: turnB)
+        XCTAssertFalse(
+            events.isEmpty,
+            "buffer completion for current turn must emit started event"
+        )
+        guard case .started(let requestId, let sessionId, let responseId) = events[0] else {
+            return XCTFail("expected .started event for current turn")
+        }
+        XCTAssertEqual(requestId, turnB.requestId)
+        XCTAssertEqual(sessionId, turnB.sessionId)
+        XCTAssertEqual(responseId, "resp-756")
+
+        // Verify no cross-contamination: turnA events never surfaced.
+        let turnAEvents = events.filter {
+            if case .started(let rid, _, _) = $0 { return rid == turnA.requestId }
+            if case .ended(let rid, _, _, _) = $0 { return rid == turnA.requestId }
+            return false
+        }
+        XCTAssertTrue(turnAEvents.isEmpty, "no events must reference turn A's requestId")
+    }
 }
