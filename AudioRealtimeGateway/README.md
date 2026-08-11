@@ -282,6 +282,12 @@ Grepping a single `request_id` yields the whole turn:
 | `dev_allow_plain_ws` | `false` | Only for local integration |
 | `max_token_ttl_ms` | `90000` | ESS-388 A1 ceiling |
 | `default_token_ttl_ms` | `30000` | Applied when client omits `ttl_ms` |
+| `token_sweep_interval_ms` | `30000` | Issuer sweep cadence; started on listen, stopped on close. `0` disables (tests only). |
+| `generation_ttl_ms` | `3600000` | Idle retention of the per-session monotone-generation guard |
+| `max_tokens` | `4096` | Global live-token ceiling; oldest evicted past it |
+| `max_tokens_per_device` | `64` | Per-device live-token ceiling — hits before the global one, so one device evicts only its own |
+| `max_generation_devices` | `64` | Devices tracked by the generation guard (LRU) |
+| `max_generation_sessions_per_device` | `256` | Sessions tracked per device (LRU) |
 | `heartbeat_interval_ms` | `15000` | WS-level ping cadence |
 | `idle_disconnect_ms` | `60000` | Kill idle sockets |
 | `max_frame_bytes` | `65536` | Per-frame hard cap |
