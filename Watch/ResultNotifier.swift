@@ -16,12 +16,16 @@ final class ResultNotifier: NSObject, ObservableObject {
     var onOpenResult: ((String) -> Void)?
 
     private let center = UNUserNotificationCenter.current()
+    /// 可注入的通知提交器（默认直连 UNUserNotificationCenter）。WatchTests 注入 mock
+    /// 以驱动 retry/exhausted 链路并捕获日志证据（ESS-788 复审 R-02.1）。
+    let submitter: NotificationSubmitter
     private let defaults = UserDefaults.standard
     /// 用户在引导卡上点过「暂不」：不再展示引导卡（不得反复弹窗骚扰，细则 #2）。
     private let promptDeclinedKey = "wristagent.watch.notification-prompt-declined"
 
-    init(policy: ResultNotificationPolicy) {
+    init(policy: ResultNotificationPolicy, submitter: NotificationSubmitter? = nil) {
         self.policy = policy
+        self.submitter = submitter ?? UNUserNotificationCenter.current()
         super.init()
         center.delegate = self
         refreshAuthorizationStatus()
@@ -117,60 +121,57 @@ final class ResultNotifier: NSObject, ObservableObject {
     // MARK: - 通知投递（含提交失败重试）
 
     /// 向 UNUserNotificationCenter 提交通知请求。成功才 markNotified；提交失败按退避重试，
-    /// 上限 3 次。重试调度依赖 `DispatchQueue.main.asyncAfter`，仅存活进程内有效；
-    /// 进程退出后重试不会自动恢复（决策见 ESS-788 架构复审）。
+    /// 上限 3 次提交（首发 + 2 次重试）。重试调度依赖 `DispatchQueue.main.asyncAfter`，
+    /// 仅存活进程内有效；进程退出后重试不会自动恢复（决策见 ESS-788 架构复审）。
     /// 注意：本方法异步提交后立即返回，此时尚不知道最终投递结果。`notifyResultIfEligible`
     /// 的返回值语义是"已发起投递尝试"而非"已送达"——调用方兜底触觉的重检已列为跟进项。
-    private func deliverNotification(
+    /// - Parameter logDetail: 业务上下文，如 `"playback_reason=xxx"`，贯穿所有日志不变。
+    func deliverNotification(
         requestId: String,
         content: UNMutableNotificationContent,
         sourceLabel: String,
-        retryLogDetail: String = ""
+        logDetail: String = ""
     ) {
-        center.add(UNNotificationRequest(
+        submitter.submit(UNNotificationRequest(
             identifier: "result-\(requestId)", content: content, trigger: nil
         )) { [weak self] error in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let action = self.policy.evaluateDelivery(requestId: requestId, error: error)
+                let detail = self.logDetailString(sourceLabel: sourceLabel, logDetail: logDetail)
                 switch action {
                 case .markNotified:
-                    WatchLog.info(
-                        "notify", "result_notified", requestId: requestId,
-                        detail: "source=\(sourceLabel)\(retryLogDetail.isEmpty ? "" : " retry_attempt=\(self.policy.retryAttemptCount(requestId: requestId))")"
-                    )
+                    WatchLog.info("notify", "result_notified", requestId: requestId, detail: detail)
                     self.policy.markNotified(requestId: requestId)
                 case .retry(let delay):
-                    WatchLog.error(
-                        "notify", "result_notify_failed", requestId: requestId,
-                        detail: "source=\(sourceLabel)\(retryLogDetail.isEmpty ? "" : " \(retryLogDetail)")",
-                        error: error
-                    )
-                    WatchLog.info(
-                        "notify", "result_notify_retry_scheduled", requestId: requestId,
-                        detail: "delay=\(Int(delay))s attempt=\(self.policy.retryAttemptCount(requestId: requestId)) source=\(sourceLabel)"
-                    )
+                    let attempt = self.policy.retryAttemptCount(requestId: requestId)
+                    let retryDetail = "\(detail) retry_attempt=\(attempt)"
+                    WatchLog.error("notify", "result_notify_failed", requestId: requestId,
+                        detail: retryDetail, error: error)
+                    WatchLog.info("notify", "result_notify_retry_scheduled", requestId: requestId,
+                        detail: "delay=\(Int(delay))s attempt=\(attempt) source=\(sourceLabel)")
                     DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                         guard let self else { return }
                         self.deliverNotification(
                             requestId: requestId, content: content,
-                            sourceLabel: sourceLabel,
-                            retryLogDetail: "retry_attempt=\(self.policy.retryAttemptCount(requestId: requestId))"
+                            sourceLabel: sourceLabel, logDetail: logDetail
                         )
                     }
                 case .exhausted:
-                    WatchLog.error(
-                        "notify", "result_notify_failed", requestId: requestId,
-                        detail: "source=\(sourceLabel)\(retryLogDetail.isEmpty ? "" : " \(retryLogDetail)")",
-                        error: error
-                    )
-                    WatchLog.info(
-                        "notify", "result_notify_retry_exhausted", requestId: requestId,
-                        detail: "source=\(sourceLabel)"
-                    )
+                    WatchLog.error("notify", "result_notify_failed", requestId: requestId,
+                        detail: detail, error: error)
+                    WatchLog.info("notify", "result_notify_retry_exhausted", requestId: requestId,
+                        detail: "source=\(sourceLabel)")
                 }
             }
         }
+    }
+
+    /// 构建 source + 业务上下文的日志 detail 字符串。
+    private func logDetailString(sourceLabel: String, logDetail: String) -> String {
+        var parts = ["source=\(sourceLabel)"]
+        if !logDetail.isEmpty { parts.append(logDetail) }
+        return parts.joined(separator: " ")
     }
 
     /// ESS-154 T2：播放终局失败的横幅告知。**不再看 T1 的 `short_task` /
@@ -208,7 +209,7 @@ final class ResultNotifier: NSObject, ObservableObject {
         deliverNotification(
             requestId: requestId, content: content,
             sourceLabel: "playback_failure",
-            retryLogDetail: "playback_reason=\(reasonLabel)"
+            logDetail: "playback_reason=\(reasonLabel)"
         )
         return true
     }

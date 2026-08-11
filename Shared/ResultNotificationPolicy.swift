@@ -35,9 +35,10 @@ final class ResultNotificationPolicy {
         var attemptCount: Int
     }
 
-    /// 最大重试次数（含首次失败）。超过上限不再重试，避免无限循环消耗资源。
+    /// 最大重试次数（含首次失败）。即最多提交 maxRetryAttempts=3 次：首发 + 2 次重试，
+    /// 第 3 次失败直接 exhausted，不再退避。
     static let maxRetryAttempts = 3
-    /// 退避基数：2s → 4s → 8s。
+    /// 退避基数：首次重试 2s，二次重试 4s（第 3 次失败不重试，无 8s 分支）。
     static let baseRetryDelaySeconds: TimeInterval = 2.0
 
     private let ledgerURL: URL
@@ -99,6 +100,14 @@ final class ResultNotificationPolicy {
     /// 评估 `center.add` 完成结果，返回应执行的投递动作（纯函数，可单测覆盖全链路）。
     /// - Parameter error: `center.add` completion 传入的 error（nil = 成功）
     /// - Returns: `.markNotified` 成功 / `.retry(after:)` 应退避重试 / `.exhausted` 已达上限
+    ///
+    /// 已知取舍（见 ESS-788 非阻断观察）：
+    /// - 幂等窗口：markNotified 后移到 async completion，退避 2–4s 内 `skipReason` 的
+    ///   `alreadyNotified` 门尚未闭合，同 request_id 补投会起第二条投递链；用户侧因
+    ///   identifier 相同不会见两条，但两条链共用 retryStates 计数，可能提前 exhausted。
+    /// - exhausted 后不清理 retryStates：同 request_id 后续通知（如 result 耗尽后再来
+    ///   playback_failure）失败时会立即 exhausted，不再重试。这是有意设计——request_id
+    ///   维度的投递前景明确悲观，不浪费时间。
     func evaluateDelivery(requestId: String, error: Error?) -> DeliveryAction {
         if error == nil {
             retryStates.removeValue(forKey: requestId)
