@@ -280,7 +280,7 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
     /// completions from a prior turn are silently dropped when the captured
     /// handle no longer matches `currentTurn`, preventing old playback
     /// callbacks from leaking into a new turn's receipt tracker.
-    func didCompleteBuffer(responseId: String?, bytes: Int, for turn: RealtimeMediaSession.TurnHandle) {
+    private func didCompleteBuffer(responseId: String?, bytes: Int, for turn: RealtimeMediaSession.TurnHandle) {
         guard let current = currentTurn, current == turn else { return }
         let receipts = tracker.bufferCompleted(responseId: responseId, bytes: bytes)
         if let started = receipts.started {

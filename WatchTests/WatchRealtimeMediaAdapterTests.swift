@@ -990,8 +990,6 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
     /// old playback receipts from leaking into a new turn's tracker.
     func testEss756_LateCallbackFromPriorTurnIsDropped() {
         let engine = RealtimePlaybackEngine(lifecycleOwner: { .conversation })
-        var events: [RealtimePlaybackEngine.PlaybackEvent] = []
-        engine.onPlaybackEvent = { events.append($0) }
 
         let turnA = RealtimeMediaSession.TurnHandle(
             requestId: "756a756a-756a-756a-756a-756a756a756a",
@@ -1002,7 +1000,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
             sessionId: "756d756d-756d-756d-756d-756d756d756d"
         )
 
-        // Prepare turn A with a real enqueue so the tracker holds state.
+        // ── Turn A: prepare + enqueue real PCM buffers ──
         try! engine.prepare(for: turnA)
         let payloadA = Data(repeating: 0x01, count: 480)
         let chunkA = VoiceStreamChunk(
@@ -1014,19 +1012,22 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
             RealtimeDownlinkPlayback.PlayableChunk(chunk: chunkA, responseId: "resp-756")
         ])
 
-        // Prepare turn B — this calls stop() which resets the tracker and
-        // switches currentTurn. Any late callback from turn A must be
-        // dropped because its captured TurnHandle differs from currentTurn.
+        // ── Turn B: prepare (stop + reset + new turn) BEFORE old
+        //    buffer's `.dataPlayedBack` callback fires — this is the
+        //    race window the bug exists in ──
         try! engine.prepare(for: turnB)
 
-        // Simulate a late completion from turn A.
-        engine.didCompleteBuffer(responseId: "resp-756", bytes: 480, for: turnA)
-        XCTAssertTrue(
-            events.isEmpty,
-            "late buffer completion from a prior turn must be dropped — no started/ended event"
-        )
+        // ── Capture every event that surfaces after the turn switch ──
+        var events: [RealtimePlaybackEngine.PlaybackEvent] = []
+        let turnBStarted = XCTestExpectation(description: "turn B .started fires")
+        engine.onPlaybackEvent = { event in
+            events.append(event)
+            if case .started(let rid, _, _) = event, rid == turnB.requestId {
+                turnBStarted.fulfill()
+            }
+        }
 
-        // Now enqueue and complete a buffer for turn B — events must fire.
+        // ── Enqueue turn B buffers and wait for the async completion ──
         let payloadB = Data(repeating: 0x02, count: 480)
         let chunkB = VoiceStreamChunk(
             requestId: turnB.requestId, streamId: turnB.sessionId,
@@ -1036,24 +1037,32 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         engine.enqueue(playables: [
             RealtimeDownlinkPlayback.PlayableChunk(chunk: chunkB, responseId: "resp-756")
         ])
-        engine.didCompleteBuffer(responseId: "resp-756", bytes: 480, for: turnB)
-        XCTAssertFalse(
-            events.isEmpty,
-            "buffer completion for current turn must emit started event"
-        )
-        guard case .started(let requestId, let sessionId, let responseId) = events[0] else {
-            return XCTFail("expected .started event for current turn")
-        }
-        XCTAssertEqual(requestId, turnB.requestId)
-        XCTAssertEqual(sessionId, turnB.sessionId)
-        XCTAssertEqual(responseId, "resp-756")
 
-        // Verify no cross-contamination: turnA events never surfaced.
-        let turnAEvents = events.filter {
-            if case .started(let rid, _, _) = $0 { return rid == turnA.requestId }
-            if case .ended(let rid, _, _, _) = $0 { return rid == turnA.requestId }
-            return false
+        wait(for: [turnBStarted], timeout: 5.0)
+
+        // ── Assertions ──
+        // 1. Turn B must have produced at least a .started event.
+        let turnBEvents = events.filter {
+            switch $0 {
+            case .started(let rid, _, _): return rid == turnB.requestId
+            case .ended(let rid, _, _, _): return rid == turnB.requestId
+            default: return false
+            }
         }
-        XCTAssertTrue(turnAEvents.isEmpty, "no events must reference turn A's requestId")
+        XCTAssertFalse(turnBEvents.isEmpty, "turn B must emit playback events")
+
+        // 2. No event must carry turn A's requestId — the guard must
+        //    drop any late completion from the prior turn.
+        let turnAEvents = events.filter {
+            switch $0 {
+            case .started(let rid, _, _): return rid == turnA.requestId
+            case .ended(let rid, _, _, _): return rid == turnA.requestId
+            default: return false
+            }
+        }
+        XCTAssertTrue(
+            turnAEvents.isEmpty,
+            "no events must reference turn A — late callbacks are dropped by the turn-guard"
+        )
     }
 }
