@@ -1405,7 +1405,13 @@ export function createBridge(overrides = {}) {
             if (ws.bufferedAmount > maxBuffered) throw Object.assign(new Error('client backpressure limit exceeded'), { code: 'ERR_STREAM_BACKPRESSURE' })
             ws.send(JSON.stringify(event))
           }
+          // ESS-797：终止是单一、幂等的状态。第一个失败定调，之后既不再报错也不再
+          // 执行任何已排队的消息——否则过载判定之后仍会有帧继续打到上游，
+          // 而它们撞上已关闭的 socket 又会刷出二次 ERR_STREAM_CLOSED 噪声。
+          let terminated = false
           const fail = error => {
+            if (terminated) return
+            terminated = true
             const code = error?.code ?? 'ERR_STREAM_PROTOCOL'
             log({ evt: 'realtime_media_error', request_id: requestId, device_id: deviceId, code })
             if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'error', code, request_id: requestId, session_id: sessionId }))
@@ -1470,12 +1476,10 @@ export function createBridge(overrides = {}) {
           let queuedMessages = 0
           let queuedBytes = 0
           let readPaused = false
-          let overloaded = false
           ws.on('message', raw => {
-            if (overloaded) return // 已断链，迟到的帧不再入队
+            if (terminated) return // 已进入终止态，迟到的帧不再入队
             const size = Buffer.isBuffer(raw) ? raw.length : Buffer.byteLength(String(raw))
             if (queuedMessages >= maxQueuedMessages || queuedBytes + size > maxQueuedBytes) {
-              overloaded = true
               log({
                 evt: 'realtime_media_inbound_overload', request_id: requestId, device_id: deviceId,
                 queued_messages: queuedMessages, queued_bytes: queuedBytes, frame_bytes: size,
@@ -1491,6 +1495,9 @@ export function createBridge(overrides = {}) {
               ws.pause()   // 背压：停止从 socket 读取，直到积压回落
             }
             chain = chain.then(async () => {
+              // 终止态在这里兑现：排队中的消息轮到自己时若已终止，连解析都不做，
+              // 更不会调用 client.media / supervisor 产生上游副作用（fail-close）。
+              if (terminated) return
               let message
               try { message = JSON.parse(raw.toString()) } catch { throw Object.assign(new Error('invalid JSON'), { code: 'ERR_BAD_JSON' }) }
               if (!client.opened) {
@@ -1536,7 +1543,10 @@ export function createBridge(overrides = {}) {
                 })
               }
               else if (message.type === 'barge_in') client.media.bargeIn()
-              else if (message.type === 'close') ws.close(1000, 'completed')
+              else if (message.type === 'close') {
+                terminated = true // 客户端主动收口，同样是终止态：后面的排队消息不再执行
+                ws.close(1000, 'completed')
+              }
               else throw Object.assign(new Error('unknown media event'), { code: 'ERR_STREAM_PROTOCOL' })
             }).catch(fail).finally(() => {
               queuedMessages -= 1
@@ -1550,6 +1560,7 @@ export function createBridge(overrides = {}) {
           const cleanup = (reason, code = null) => {
             if (client.disconnected) return
             client.disconnected = true
+            terminated = true // 连接已断，媒体会话即将关闭，排队消息不得再打上游
             mediaClients.delete(client)
             client.media?.close('cancelled')
             supervisor.closeMediaSession(requestId, { cancel: client.opened })
