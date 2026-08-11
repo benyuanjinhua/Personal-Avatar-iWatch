@@ -19,11 +19,34 @@ final class ResultNotificationPolicy {
         case notAuthorized = "not_authorized"
     }
 
+    /// `center.add` 完成后的投递动作（由 `evaluateDelivery` 返回）。
+    enum DeliveryAction: Equatable {
+        /// 通知已送达，应调用 `markNotified`。
+        case markNotified
+        /// 提交失败但未达上限，应在 `after` 秒后重试。
+        case retry(after: TimeInterval)
+        /// 已达重试上限，不再重试。
+        case exhausted
+    }
+
+    /// 单次通知提交失败后的重试状态（仅存活进程内有效；进程退出后 `DispatchQueue.asyncAfter`
+    /// 重试调度丢失，重试不会自动恢复 —— 约束见 ESS-788 架构复审结论）。
+    private struct RetryState {
+        var attemptCount: Int
+    }
+
+    /// 最大重试次数（含首次失败）。超过上限不再重试，避免无限循环消耗资源。
+    static let maxRetryAttempts = 3
+    /// 退避基数：2s → 4s → 8s。
+    static let baseRetryDelaySeconds: TimeInterval = 2.0
+
     private let ledgerURL: URL
     private let maximumLedgerCount = 50
     /// 已通知的 request_id（幂等口径与 ESS-54 交付 ACK 一致：按 request_id 去重，
     /// 补投/重连多次到达只通知一次）。持久化，杀掉重开不重复通知。
     private var notified: [String]
+    /// 通知提交失败的重试状态，按 request_id 索引（仅内存，不持久化）。
+    private var retryStates: [String: RetryState]
 
     init(directory: URL) {
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -36,6 +59,7 @@ final class ResultNotificationPolicy {
         } else {
             notified = []
         }
+        retryStates = [:]
     }
 
     /// 结果到达时是否发通知；nil = 发，否则给出跳过原因。
@@ -68,6 +92,35 @@ final class ResultNotificationPolicy {
 
     func hasNotified(requestId: String) -> Bool {
         notified.contains(requestId)
+    }
+
+    // MARK: - 提交失败重试（进程内上限 + 退避）
+
+    /// 评估 `center.add` 完成结果，返回应执行的投递动作（纯函数，可单测覆盖全链路）。
+    /// - Parameter error: `center.add` completion 传入的 error（nil = 成功）
+    /// - Returns: `.markNotified` 成功 / `.retry(after:)` 应退避重试 / `.exhausted` 已达上限
+    func evaluateDelivery(requestId: String, error: Error?) -> DeliveryAction {
+        if error == nil {
+            retryStates.removeValue(forKey: requestId)
+            return .markNotified
+        }
+        let attempt: Int
+        if let existing = retryStates[requestId] {
+            attempt = existing.attemptCount + 1
+        } else {
+            attempt = 1
+        }
+        retryStates[requestId] = RetryState(attemptCount: attempt)
+        if attempt < Self.maxRetryAttempts {
+            let delay = Self.baseRetryDelaySeconds * pow(2.0, Double(attempt - 1))
+            return .retry(after: delay)
+        }
+        return .exhausted
+    }
+
+    /// 当前已尝试次数（含最新一次），用于日志。无记录时返回 0。
+    func retryAttemptCount(requestId: String) -> Int {
+        retryStates[requestId]?.attemptCount ?? 0
     }
 
     /// 通知内容（纯函数，可测）。协议限制：结果载荷里没有原始提问的转写摘要

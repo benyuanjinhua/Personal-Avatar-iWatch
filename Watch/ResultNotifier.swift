@@ -110,20 +110,67 @@ final class ResultNotifier: NSObject, ObservableObject {
         content.body = text.body
         content.sound = .default
         content.userInfo = ["request_id": turn.requestId]
-        // identifier = request_id：系统层第三重幂等（同 id 替换不叠加）。
+        deliverNotification(requestId: turn.requestId, content: content, sourceLabel: "result")
+        return true
+    }
+
+    // MARK: - 通知投递（含提交失败重试）
+
+    /// 向 UNUserNotificationCenter 提交通知请求。成功才 markNotified；提交失败按退避重试，
+    /// 上限 3 次。重试调度依赖 `DispatchQueue.main.asyncAfter`，仅存活进程内有效；
+    /// 进程退出后重试不会自动恢复（决策见 ESS-788 架构复审）。
+    /// 注意：本方法异步提交后立即返回，此时尚不知道最终投递结果。`notifyResultIfEligible`
+    /// 的返回值语义是"已发起投递尝试"而非"已送达"——调用方兜底触觉的重检已列为跟进项。
+    private func deliverNotification(
+        requestId: String,
+        content: UNMutableNotificationContent,
+        sourceLabel: String,
+        retryLogDetail: String = ""
+    ) {
         center.add(UNNotificationRequest(
-            identifier: "result-\(turn.requestId)", content: content, trigger: nil
-        )) { error in
-            Task { @MainActor in
-                if let error {
-                    WatchLog.error("notify", "result_notify_failed", requestId: turn.requestId, error: error)
-                } else {
-                    WatchLog.info("notify", "result_notified", requestId: turn.requestId)
+            identifier: "result-\(requestId)", content: content, trigger: nil
+        )) { [weak self] error in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let action = self.policy.evaluateDelivery(requestId: requestId, error: error)
+                switch action {
+                case .markNotified:
+                    WatchLog.info(
+                        "notify", "result_notified", requestId: requestId,
+                        detail: "source=\(sourceLabel)\(retryLogDetail.isEmpty ? "" : " retry_attempt=\(self.policy.retryAttemptCount(requestId: requestId))")"
+                    )
+                    self.policy.markNotified(requestId: requestId)
+                case .retry(let delay):
+                    WatchLog.error(
+                        "notify", "result_notify_failed", requestId: requestId,
+                        detail: "source=\(sourceLabel)\(retryLogDetail.isEmpty ? "" : " \(retryLogDetail)")",
+                        error: error
+                    )
+                    WatchLog.info(
+                        "notify", "result_notify_retry_scheduled", requestId: requestId,
+                        detail: "delay=\(Int(delay))s attempt=\(self.policy.retryAttemptCount(requestId: requestId)) source=\(sourceLabel)"
+                    )
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                        guard let self else { return }
+                        self.deliverNotification(
+                            requestId: requestId, content: content,
+                            sourceLabel: sourceLabel,
+                            retryLogDetail: "retry_attempt=\(self.policy.retryAttemptCount(requestId: requestId))"
+                        )
+                    }
+                case .exhausted:
+                    WatchLog.error(
+                        "notify", "result_notify_failed", requestId: requestId,
+                        detail: "source=\(sourceLabel)\(retryLogDetail.isEmpty ? "" : " \(retryLogDetail)")",
+                        error: error
+                    )
+                    WatchLog.info(
+                        "notify", "result_notify_retry_exhausted", requestId: requestId,
+                        detail: "source=\(sourceLabel)"
+                    )
                 }
             }
         }
-        policy.markNotified(requestId: turn.requestId)
-        return true
     }
 
     /// ESS-154 T2：播放终局失败的横幅告知。**不再看 T1 的 `short_task` /
@@ -158,25 +205,11 @@ final class ResultNotifier: NSObject, ObservableObject {
         content.body = text.body
         content.sound = .default
         content.userInfo = ["request_id": requestId]
-        center.add(UNNotificationRequest(
-            identifier: "result-\(requestId)", content: content, trigger: nil
-        )) { error in
-            Task { @MainActor in
-                if let error {
-                    WatchLog.error(
-                        "notify", "result_notify_failed", requestId: requestId,
-                        detail: "source=playback_failure playback_reason=\(reasonLabel)",
-                        error: error
-                    )
-                } else {
-                    WatchLog.info(
-                        "notify", "result_notified", requestId: requestId,
-                        detail: "source=playback_failure playback_reason=\(reasonLabel)"
-                    )
-                }
-            }
-        }
-        policy.markNotified(requestId: requestId)
+        deliverNotification(
+            requestId: requestId, content: content,
+            sourceLabel: "playback_failure",
+            retryLogDetail: "playback_reason=\(reasonLabel)"
+        )
         return true
     }
 

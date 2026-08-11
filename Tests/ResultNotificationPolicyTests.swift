@@ -92,4 +92,99 @@ final class ResultNotificationPolicyTests: XCTestCase {
         let provisional = ResultNotificationPolicy.provisionalContent()
         XCTAssertFalse(provisional.title.contains("结果来了"), "兜底文案不得谎称已有结果")
     }
+
+    // MARK: - 提交失败重试（上限 + 退避，evaluateDelivery 纯函数可测全链路）
+
+    private struct FakeError: Error {}
+
+    func testEvaluateDeliverySuccessReturnsMarkNotified() {
+        let policy = ResultNotificationPolicy(directory: directory)
+        let requestId = newRequestId()
+        XCTAssertEqual(policy.evaluateDelivery(requestId: requestId, error: nil), .markNotified)
+        XCTAssertEqual(policy.retryAttemptCount(requestId: requestId), 0)
+    }
+
+    func testEvaluateDeliveryFailureThenSuccessPipeline() {
+        // 模拟 completion error 链路：首次失败 → retry，二次成功 → markNotified。
+        let policy = ResultNotificationPolicy(directory: directory)
+        let requestId = newRequestId()
+
+        // 第 1 次 add 失败：返回 retry(2s)
+        let r1 = policy.evaluateDelivery(requestId: requestId, error: FakeError())
+        XCTAssertEqual(r1, .retry(after: 2.0))
+        XCTAssertEqual(policy.retryAttemptCount(requestId: requestId), 1)
+        // 失败不记账
+        XCTAssertFalse(policy.hasNotified(requestId: requestId))
+
+        // 第 2 次 add 成功：返回 markNotified
+        let r2 = policy.evaluateDelivery(requestId: requestId, error: nil)
+        XCTAssertEqual(r2, .markNotified)
+        // 此时调用方应执行 markNotified
+        policy.markNotified(requestId: requestId)
+        XCTAssertTrue(policy.hasNotified(requestId: requestId))
+    }
+
+    func testEvaluateDeliveryExhaustsAfterMaxRetries() {
+        let policy = ResultNotificationPolicy(directory: directory)
+        let requestId = newRequestId()
+
+        // 第 1 次失败：retry(2s)
+        XCTAssertEqual(policy.evaluateDelivery(requestId: requestId, error: FakeError()), .retry(after: 2.0))
+        XCTAssertEqual(policy.retryAttemptCount(requestId: requestId), 1)
+
+        // 第 2 次失败：retry(4s)
+        XCTAssertEqual(policy.evaluateDelivery(requestId: requestId, error: FakeError()), .retry(after: 4.0))
+        XCTAssertEqual(policy.retryAttemptCount(requestId: requestId), 2)
+
+        // 第 3 次失败（即第 4 次 add 调用，attemptCount=3=maxRetryAttempts）：exhausted
+        XCTAssertEqual(policy.evaluateDelivery(requestId: requestId, error: FakeError()), .exhausted)
+        XCTAssertEqual(policy.retryAttemptCount(requestId: requestId), 3)
+
+        // exhausted 后不再记录为已通知
+        XCTAssertFalse(policy.hasNotified(requestId: requestId))
+    }
+
+    func testEvaluateDeliverySuccessClearsRetryState() {
+        let policy = ResultNotificationPolicy(directory: directory)
+        let requestId = newRequestId()
+
+        _ = policy.evaluateDelivery(requestId: requestId, error: FakeError())
+        XCTAssertEqual(policy.retryAttemptCount(requestId: requestId), 1)
+
+        // 成功后状态清除
+        _ = policy.evaluateDelivery(requestId: requestId, error: nil)
+        XCTAssertEqual(policy.retryAttemptCount(requestId: requestId), 0)
+    }
+
+    func testRetryStateIsNotPersistedAcrossRelaunch() {
+        // ESS-788 决策：重试依赖 DispatchQueue.asyncAfter，进程退出后调度丢失，
+        // 持久化重试状态无恢复路径；改为仅存活进程内有效。
+        let requestId = newRequestId()
+        let policy1 = ResultNotificationPolicy(directory: directory)
+        _ = policy1.evaluateDelivery(requestId: requestId, error: FakeError())
+        XCTAssertEqual(policy1.retryAttemptCount(requestId: requestId), 1)
+
+        // 模拟杀进程重开：重试状态不持久化，新实例从零开始
+        let policy2 = ResultNotificationPolicy(directory: directory)
+        XCTAssertEqual(policy2.retryAttemptCount(requestId: requestId), 0)
+    }
+
+    func testEvaluateDeliveryDoesNotAffectNotifiedLedger() {
+        // 重试状态与已通知账本是独立的：失败不应将 requestId 标记为已通知。
+        let policy = ResultNotificationPolicy(directory: directory)
+        let requestId = newRequestId()
+
+        _ = policy.evaluateDelivery(requestId: requestId, error: FakeError())
+        XCTAssertFalse(policy.hasNotified(requestId: requestId))
+
+        // 确认 skipReason 不会因失败而跳过
+        let created = Date(timeIntervalSince1970: 1_753_920_000)
+        XCTAssertNil(policy.skipReason(
+            requestId: requestId,
+            turnCreatedAt: created,
+            completedAt: created.addingTimeInterval(120),
+            isAppActive: false,
+            isAuthorized: true
+        ))
+    }
 }
