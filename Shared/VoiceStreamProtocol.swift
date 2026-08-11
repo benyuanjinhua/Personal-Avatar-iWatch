@@ -142,6 +142,10 @@ enum VoiceStreamFallbackReason: Equatable {
     case backpressure
     case gapTimedOut
     case streamEndedWithGap
+    /// ESS-748: the PCM player could not start (AVAudioSession / AVAudioEngine)
+    /// or could not accept a buffer. Nothing was ever scheduled, so the stream
+    /// must degrade to the complete-file path instead of dropping audio.
+    case playerUnavailable
 }
 
 enum VoiceStreamBufferResult: Equatable {
