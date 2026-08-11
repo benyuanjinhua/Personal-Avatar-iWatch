@@ -76,6 +76,7 @@
 		4ED9C5BD14C4BFD599B5E4BF /* AudioRealtimeAgentFeatureFlag.swift in Sources */ = {isa = PBXBuildFile; fileRef = 27F5CF3965DA28F8FC440CB9 /* AudioRealtimeAgentFeatureFlag.swift */; };
 		4F4DFA1EE5AE597B638B5502 /* AudioRealtimeAgentTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = F5EC070D0A3D70F7AFB66387 /* AudioRealtimeAgentTransport.swift */; };
 		4FBE2499075E0DDE72FFA982 /* PushToTalkStreamingStartupTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F6E45BED5CAC55818D04A8EB /* PushToTalkStreamingStartupTests.swift */; };
+		523F4AC61DFE68C7F232A3EF /* PendingDownlinkBuffer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B4F63CDFB83979811AE2689 /* PendingDownlinkBuffer.swift */; };
 		54817C157F20C92848363962 /* ConversationHistory.swift in Sources */ = {isa = PBXBuildFile; fileRef = E92A4F28175D63C6FBD62D7E /* ConversationHistory.swift */; };
 		58811851CF1DC7312D174853 /* SelfCheckColdStartTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 69C65661F50854E5DA6A5407 /* SelfCheckColdStartTests.swift */; };
 		59EF7588E503BBA5DF84681B /* UUIDv7.swift in Sources */ = {isa = PBXBuildFile; fileRef = E36424AC38F0A8BB28751248 /* UUIDv7.swift */; };
@@ -182,6 +183,7 @@
 		CEA31973C29CBFC9511A3BAB /* PlaybackEndgamePolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F3363DB5FB9EF9FF44F0744 /* PlaybackEndgamePolicy.swift */; };
 		CFE0EF1FB0CD60D2CA12A03B /* SelfCheckPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5781515B605FE09873311309 /* SelfCheckPolicy.swift */; };
 		D23E8DF58407ADEEE6F36F3A /* SubtitleScript.swift in Sources */ = {isa = PBXBuildFile; fileRef = C426A9FB7C2456FD57F1BA1E /* SubtitleScript.swift */; };
+		D3AF454484C6920CDFE52A19 /* PendingDownlinkBuffer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B4F63CDFB83979811AE2689 /* PendingDownlinkBuffer.swift */; };
 		D3C4178F9DE0CC5B10EE75A9 /* RecordingInterruptionPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 660A4DC8375BF7F24E66C40F /* RecordingInterruptionPolicy.swift */; };
 		D3EFA8AA982DB431C5827917 /* ErrorCue_Retryable.m4a in Resources */ = {isa = PBXBuildFile; fileRef = 96150E5C8428B98CF5C6765B /* ErrorCue_Retryable.m4a */; };
 		D482537406EC7EC94069E3AF /* WristAgentPhoneRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79F87E24A5046DA1229304B2 /* WristAgentPhoneRelay.swift */; };
@@ -328,6 +330,7 @@
 		69C65661F50854E5DA6A5407 /* SelfCheckColdStartTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfCheckColdStartTests.swift; sourceTree = "<group>"; };
 		69D850E7D15B7525D07D9DBF /* ErrorCue_VoiceBusy.m4a */ = {isa = PBXFileReference; path = ErrorCue_VoiceBusy.m4a; sourceTree = "<group>"; };
 		6AE6645A23368CC50DBD7CCE /* WristAgent.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = WristAgent.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		6B4F63CDFB83979811AE2689 /* PendingDownlinkBuffer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PendingDownlinkBuffer.swift; sourceTree = "<group>"; };
 		705AF1DB2B569E089BCFD919 /* PhoneAgentClientLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneAgentClientLog.swift; sourceTree = "<group>"; };
 		716B2884D666AEE57BA6AB37 /* RealtimePlaybackReceiptTracker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimePlaybackReceiptTracker.swift; sourceTree = "<group>"; };
 		73DA7FDE513C75183DABE590 /* RealtimeSessionReducer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeSessionReducer.swift; sourceTree = "<group>"; };
@@ -442,6 +445,7 @@
 				3A74603EEEBF6327940BB0BE /* ErrorCueCatalog.swift */,
 				EEE83E69A84D0788F31329E4 /* LocalVADEndpointer.swift */,
 				C608A2AC1FA2B2981F7EB790 /* MainStatusCopy.swift */,
+				6B4F63CDFB83979811AE2689 /* PendingDownlinkBuffer.swift */,
 				827B4FDF631BEBEFA13118A9 /* PersistHelper.swift */,
 				705AF1DB2B569E089BCFD919 /* PhoneAgentClientLog.swift */,
 				F1D625735940BC43AB433FDB /* PhoneModeCallMetrics.swift */,
@@ -797,6 +801,7 @@
 				FFC6B09DA5B4296BAC67C690 /* ErrorCueCatalog.swift in Sources */,
 				6F68B5E709EADBD0A814A163 /* LocalVADEndpointer.swift in Sources */,
 				B8341DE12C11F07793D54054 /* MainStatusCopy.swift in Sources */,
+				D3AF454484C6920CDFE52A19 /* PendingDownlinkBuffer.swift in Sources */,
 				5FC7E0538B77B76B1A1E55BE /* PersistHelper.swift in Sources */,
 				0C62CECE71F4B7D31A5F702B /* PhoneAgentClientLog.swift in Sources */,
 				68781D48489578E0762AA9F7 /* PhoneClientLog.swift in Sources */,
@@ -880,6 +885,7 @@
 				82B50E90942BDC1117375BB7 /* MainStatusCopy.swift in Sources */,
 				C3D8984AB14E3ECEB93542E0 /* OpenWristAgentIntent.swift in Sources */,
 				A7E57A17426B0BB822699784 /* PCMFrameRecorder.swift in Sources */,
+				523F4AC61DFE68C7F232A3EF /* PendingDownlinkBuffer.swift in Sources */,
 				34523D43C35817094DA2E618 /* PermissionRequestView.swift in Sources */,
 				97AFD9059AF401EBE72670D9 /* PersistHelper.swift in Sources */,
 				E862ECE1B4C8426413ABA90B /* PhoneAgentClientLog.swift in Sources */,
