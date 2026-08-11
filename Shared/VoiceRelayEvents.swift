@@ -165,8 +165,13 @@ struct VoiceRelayResultPayload: Codable, Equatable {
         try RelayEventCoding.encoder.encode(self)
     }
 
+    /// ESS-749：`request_id` 会参与 Watch 侧结果音频落盘路径，解码即校验，
+    /// 不合法（越长、含 `/` `.` 等）一律当作坏载荷丢弃。
     static func decode(from data: Data) -> VoiceRelayResultPayload? {
-        try? RelayEventCoding.decoder.decode(VoiceRelayResultPayload.self, from: data)
+        guard let payload = try? RelayEventCoding.decoder.decode(
+            VoiceRelayResultPayload.self, from: data
+        ), RelayIdentifier.isValid(payload.requestId) else { return nil }
+        return payload
     }
 }
 

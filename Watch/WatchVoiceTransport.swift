@@ -32,7 +32,7 @@ final class WatchVoiceTransport: ObservableObject {
     @Published private(set) var remoteStatus: RelayStatusUpdate?
     /// 最新服务端真实步骤；独立于通用状态，后者不可覆盖它。
     @Published private(set) var progressStatus: RelayStatusUpdate?
-    /// Mac 返回的最新结果；音频落在 resultsDirectory/<request_id>.m4a。
+    /// Mac 返回的最新结果；音频落在 resultsDirectory/<sha256(request_id)>.m4a（ESS-749）。
     @Published private(set) var lastResult: VoiceRelayResultPayload?
     /// ESS-231 兜底告警：send_begin 后 15s 未收到 iPhone Relay 的 `.accepted`
     /// 状态时，request_id 加入本集合并触发触觉；UI 层订阅并显示"iPhone
@@ -152,7 +152,17 @@ final class WatchVoiceTransport: ObservableObject {
             )
             return
         }
-        let destination = resultsDirectory.appendingPathComponent("\(payload.requestId).m4a")
+        // ESS-749：文件名只用 request_id 的不可逆摘要，并在标准化后确认仍在
+        // resultsDirectory 内——服务端 ID 绝不裸进路径。
+        guard let destination = RelayIdentifier.fileURL(
+            in: resultsDirectory, name: "\(RelayIdentifier.fileToken(for: payload.requestId)).m4a"
+        ) else {
+            WatchLog.error(
+                "transport", "result_audio_path_rejected", requestId: payload.requestId,
+                detail: "id_len=\(payload.requestId.count)", code: "ERR_FILE_PATH"
+            )
+            return
+        }
         try? fileManager.removeItem(at: destination)
         guard (try? audioData.write(to: destination, options: .atomic)) != nil else {
             WatchLog.error(
