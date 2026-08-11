@@ -432,15 +432,22 @@ extension AVAudioSession: StreamingAudioPlayerSessionControlling {
 
 /// AVAudioEngine 窄缝：将引擎的 attach / connect / start / stop 封装为
 /// 可注入协议。Spy 实现提供 mainMixerNode 桩，使测试完全脱离音频硬件。
+/// 形参使用 `AVAudioNode` 匹配 `AVAudioEngine` 的 ObjC 桥接签名；
+/// extension 提供显式转发，避免 `AVAudioPlayerNode` 逆变不满足。
 protocol StreamingAudioEngineControlling: AnyObject {
     var mainMixerNode: AVAudioMixerNode { get }
-    func attach(_ node: AVAudioPlayerNode)
-    func connect(_ node: AVAudioPlayerNode, to engineNode: AVAudioNode, format: AVAudioFormat?)
+    func attachNode(_ node: AVAudioNode)
+    func connectNode(_ node1: AVAudioNode, to node2: AVAudioNode, format: AVAudioFormat?)
     func start() throws
     func stop()
 }
 
-extension AVAudioEngine: StreamingAudioEngineControlling {}
+extension AVAudioEngine: StreamingAudioEngineControlling {
+    func attachNode(_ node: AVAudioNode) { self.attach(node) }
+    func connectNode(_ node1: AVAudioNode, to node2: AVAudioNode, format: AVAudioFormat?) {
+        self.connect(node1, to: node2, format: format)
+    }
+}
 
 // MARK: - StreamingAudioPlayer (PCM via AVAudioEngine)
 
@@ -471,6 +478,10 @@ final class StreamingAudioPlayer: StreamAudioPlaying {
     private var isEndOfStream = false
     private var totalBytes = 0
     private var totalBuffers = 0
+    /// ESS-755 非阻断意见 1：锁存 start() 时的 gate 决定，stop() 按锁存值走——
+    /// 防止 conversation 在 start↔stop 之间 release 导致「没激活却 deactivate」
+    /// 的契约缺口（与 SpeechPlayer.releaseAudioSession 的 sharedSessionOwner 同源）。
+    private var didSkipSessionActivation = false
 
     private static let logger = Logger(
         subsystem: "beer.workspace.wristagent", category: "StreamPlayer"
@@ -503,8 +514,8 @@ final class StreamingAudioPlayer: StreamAudioPlaying {
         self.pcmFormat = fmt
         self.engine = engine
         self.playerNode = AVAudioPlayerNode()
-        engine.attach(playerNode)
-        engine.connect(playerNode, to: engine.mainMixerNode, format: fmt)
+        engine.attachNode(playerNode)
+        engine.connectNode(playerNode, to: engine.mainMixerNode, format: fmt)
     }
 
     /// ESS-748：起播失败必须**可判定**。
@@ -518,7 +529,8 @@ final class StreamingAudioPlayer: StreamAudioPlaying {
     func start() throws {
         guard !isStarted else { return }
         do {
-            if Self.sessionExternallyOwned() {
+            didSkipSessionActivation = Self.sessionExternallyOwned()
+            if didSkipSessionActivation {
                 WatchLog.info(
                     "stream", "session_activation_skipped",
                     requestId: context,
@@ -605,7 +617,7 @@ final class StreamingAudioPlayer: StreamAudioPlaying {
             requestId: context,
             detail: "total_bytes=\(totalBytes) buffers=\(totalBuffers)"
         )
-        if Self.sessionExternallyOwned() {
+        if didSkipSessionActivation {
             WatchLog.info(
                 "stream", "session_release_skipped",
                 requestId: context,
@@ -614,6 +626,7 @@ final class StreamingAudioPlayer: StreamAudioPlaying {
         } else {
             session.deactivate()
         }
+        didSkipSessionActivation = false
     }
 }
 

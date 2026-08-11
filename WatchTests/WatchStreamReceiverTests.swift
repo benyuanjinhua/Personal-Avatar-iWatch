@@ -20,40 +20,6 @@ import XCTest
 @MainActor
 final class WatchStreamReceiverTests: XCTestCase {
 
-    // MARK: - WatchLog 旁路收集器（ESS-755 gate 契约测试）
-
-    private struct CapturedLogEvent {
-        let event: String
-        let detail: String?
-    }
-
-    private final class LogCollector: @unchecked Sendable {
-        private let lock = NSLock()
-        private var events: [CapturedLogEvent] = []
-        func append(_ e: CapturedLogEvent) { lock.lock(); events.append(e); lock.unlock() }
-        func matches(event: String) -> [CapturedLogEvent] {
-            lock.lock(); defer { lock.unlock() }
-            return events.filter { $0.event == event }
-        }
-    }
-
-    private var logCollector: LogCollector!
-
-    override func setUp() {
-        super.setUp()
-        logCollector = LogCollector()
-        let sink = logCollector!
-        WatchLog.setObserver { _, event, _, detail, _ in
-            sink.append(CapturedLogEvent(event: event, detail: detail))
-        }
-    }
-
-    override func tearDown() {
-        WatchLog.setObserver(nil)
-        logCollector = nil
-        super.tearDown()
-    }
-
     private let requestId = UUID().uuidString
     private let streamId = UUID().uuidString
 
@@ -556,14 +522,19 @@ final class WatchStreamReceiverTests: XCTestCase {
     }
 
     /// Spy：桩化 AVAudioEngine，记录 start / stop 调用次数。
-    /// 不创建真实音频 IO——在 hosted CI 稳定运行。
+    /// 内部持有真实 AVAudioEngine 做 graph 搭建（playerNode 必须 attach
+    /// 到真实引擎才能 play()，否则 ObjC 异常杀进程），但 start/stop 走 spy
+    /// 计数——不启动音频 IO，hosted CI 安全。
     private final class StreamingAudioEngineSpy: StreamingAudioEngineControlling {
-        let mainMixerNode = AVAudioMixerNode()
+        private let realEngine = AVAudioEngine()
+        var mainMixerNode: AVAudioMixerNode { realEngine.mainMixerNode }
         var starts = 0
         var stops = 0
 
-        func attach(_ node: AVAudioPlayerNode) {}
-        func connect(_ node: AVAudioPlayerNode, to engineNode: AVAudioNode, format: AVAudioFormat?) {}
+        func attachNode(_ node: AVAudioNode) { realEngine.attachNode(node) }
+        func connectNode(_ node1: AVAudioNode, to node2: AVAudioNode, format: AVAudioFormat?) {
+            realEngine.connectNode(node1, to: node2, format: format)
+        }
         func start() throws { starts += 1 }
         func stop() { stops += 1 }
     }
@@ -624,6 +595,7 @@ final class WatchStreamReceiverTests: XCTestCase {
     func testSessionExternallyOwnedGateToggleOnThenOffRestoresOldBehavior() {
         // Gate ON
         StreamingAudioPlayer.sessionExternallyOwned = { true }
+        defer { StreamingAudioPlayer.sessionExternallyOwned = { false } }
         let sessionA = StreamingAudioSessionSpy()
         let playerA = StreamingAudioPlayer(
             sampleRate: 24_000, context: "gate-on",
