@@ -9,6 +9,7 @@ final class EncryptedAudioVault {
     enum VaultError: Error, Equatable {
         case fileMissing(String)
         case corrupted(String)
+        case keychainSaveFailed(OSStatus)
     }
 
     private let directory: URL
@@ -18,7 +19,7 @@ final class EncryptedAudioVault {
     /// 测试可传入固定密钥；生产用钥匙串托管密钥。
     init(directory: URL, key: SymmetricKey? = nil) throws {
         self.directory = directory
-        self.key = key ?? Self.keychainKey()
+        self.key = try key ?? Self.keychainKey()
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
     }
 
@@ -67,7 +68,7 @@ final class EncryptedAudioVault {
     private static let keychainService = "com.benyuan.wristagent.audio-vault-key"
     private static let keychainAccount = "default"
 
-    private static func keychainKey() -> SymmetricKey {
+    private static func keychainKey() throws -> SymmetricKey {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
@@ -95,7 +96,10 @@ final class EncryptedAudioVault {
         var item = baseQuery
         item[kSecValueData as String] = keyData
         item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        SecItemAdd(item as CFDictionary, nil)
+        let status = SecItemAdd(item as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw VaultError.keychainSaveFailed(status)
+        }
         return key
     }
 }
