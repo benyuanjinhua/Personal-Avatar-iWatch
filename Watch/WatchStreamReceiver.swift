@@ -24,7 +24,7 @@ final class WatchStreamReceiver: ObservableObject {
         let streamId: String
         let startedAt: Date
         let streamingGeneration: Int
-        var player: StreamingAudioPlayer?
+        var player: StreamingAudioPlaying?
         var gapTimer: Task<Void, Never>?
         var playedSequence: Int = 0
         var didFallback: Bool = false
@@ -34,6 +34,10 @@ final class WatchStreamReceiver: ObservableObject {
 
     private let debugSettings: WatchDebugSettings
     let fallbackHandler: (String, VoiceStreamFallbackReason) -> Void
+    /// ESS-748 seam: tests inject a fake so the start-failure path can be
+    /// exercised without audio hardware (hosted CI has none — see
+    /// `HostedCITestGate`). Production uses the real `StreamingAudioPlayer`.
+    private let makePlayer: @MainActor (String) -> StreamingAudioPlaying
 
     // MARK: - State
 
@@ -45,13 +49,23 @@ final class WatchStreamReceiver: ObservableObject {
     /// 门禁：编译期 OFF + debug 开关。
     var gateOpen: Bool { debugSettings.isStreamingActive }
 
+    /// Snapshot for tests (ESS-748): sequence actually handed to the player for
+    /// the active stream, or nil when there is none. Production paths do not
+    /// read this. Asserting it stays at 0 is how "a dead player must not
+    /// advance the stream" is proven.
+    var activePlayedSequence: Int? { activeStream?.playedSequence }
+
     // MARK: - Init
 
     init(
         debugSettings: WatchDebugSettings,
+        makePlayer: @escaping @MainActor (String) -> StreamingAudioPlaying = { context in
+            StreamingAudioPlayer(sampleRate: 24_000, context: context)
+        },
         fallbackHandler: @escaping (String, VoiceStreamFallbackReason) -> Void
     ) {
         self.debugSettings = debugSettings
+        self.makePlayer = makePlayer
         self.fallbackHandler = fallbackHandler
         disableObserverToken = debugSettings.onStreamingDisabled { [weak self] in
             Task { @MainActor in self?.cancelAll(reason: "streaming_disabled") }
@@ -125,9 +139,17 @@ final class WatchStreamReceiver: ObservableObject {
             break
 
         case .ready(let chunks):
+            // ESS-748: the player must be proven live before the sequence
+            // advances. A failed start / failed enqueue means nothing was ever
+            // scheduled — degrade the whole turn instead of dropping audio.
+            guard let player = ensurePlayer(stream: &stream) else { return }
             let pcmData = assemblePCM(from: chunks)
-            ensurePlayer(stream: &stream)
-            stream.player?.append(pcmData: pcmData)
+            do {
+                try player.append(pcmData: pcmData)
+            } catch {
+                playerFailed(error, stage: "append", stream: &stream)
+                return
+            }
             stream.playedSequence = stream.buffer.nextSequence
 
             let endOfStream = chunks.contains(where: \.endOfStream)
@@ -167,14 +189,32 @@ final class WatchStreamReceiver: ObservableObject {
 
     // MARK: - Player
 
-    private func ensurePlayer(stream: inout StreamState) {
-        guard stream.player == nil else { return }
-        let player = StreamingAudioPlayer(
-            sampleRate: 24_000,
-            context: stream.requestId
-        )
+    /// Returns a started player, or `nil` after having triggered exactly one
+    /// fallback for this stream (ESS-748).
+    private func ensurePlayer(stream: inout StreamState) -> StreamingAudioPlaying? {
+        if let existing = stream.player { return existing }
+        let player = makePlayer(stream.requestId)
+        do {
+            try player.start()
+        } catch {
+            playerFailed(error, stage: "start", stream: &stream)
+            return nil
+        }
         stream.player = player
-        player.start()
+        return player
+    }
+
+    /// Single funnel for "the PCM path is dead": log the runtime evidence, then
+    /// degrade the turn to the complete-file channel. `triggerFallback` is
+    /// absorbing, so at most one fallback fires per stream.
+    private func playerFailed(_ error: Error, stage: String, stream: inout StreamState) {
+        WatchLog.error(
+            "stream", "player_unavailable",
+            requestId: stream.requestId,
+            detail: "stage=\(stage) error=\(error.localizedDescription)",
+            code: "ERR_STREAM_PLAYER_UNAVAILABLE"
+        )
+        triggerFallback(requestId: stream.requestId, reason: .playerUnavailable, stream: &stream)
     }
 
     // MARK: - Helpers
@@ -223,12 +263,42 @@ final class WatchStreamReceiver: ObservableObject {
     }
 }
 
+// MARK: - StreamingAudioPlaying
+
+/// ESS-748: the receiver's view of the PCM player. `start` / `append` are
+/// throwing because a failure there means *no audio was scheduled* — the
+/// receiver has to hear about it to degrade the turn.
+@MainActor
+protocol StreamingAudioPlaying: AnyObject {
+    func start() throws
+    func append(pcmData: Data) throws
+    func markEndOfStream()
+    func stop()
+}
+
+/// Failures that make the streaming PCM path unusable for the rest of the turn.
+enum StreamingAudioPlayerError: Error, LocalizedError, Equatable {
+    /// `append` was called on a player whose `start()` never succeeded.
+    case notStarted
+    /// `AVAudioPCMBuffer` allocation failed for the given payload size.
+    case bufferAllocationFailed(bytes: Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .notStarted:
+            return "streaming player not started"
+        case .bufferAllocationFailed(let bytes):
+            return "PCM buffer allocation failed for \(bytes) bytes"
+        }
+    }
+}
+
 // MARK: - StreamingAudioPlayer (PCM via AVAudioEngine)
 
 /// 逐片 PCM 播放器：用 `AVAudioEngine` + `AVAudioPlayerNode` 实现无缝续播。
 /// 首片入队即自动起播；之后 `append(pcmData:)` 直接把 buffer 排进 player node 队列。
 @MainActor
-final class StreamingAudioPlayer {
+final class StreamingAudioPlayer: StreamingAudioPlaying {
     private let sampleRate: Double
     private let context: String
     private let pcmFormat: AVAudioFormat
@@ -263,7 +333,10 @@ final class StreamingAudioPlayer {
         engine.connect(playerNode, to: engine.mainMixerNode, format: fmt)
     }
 
-    func start() {
+    /// ESS-748: throws instead of swallowing. A silent start failure left the
+    /// receiver advancing sequences into a dead player — audio vanished with
+    /// no error surface and no complete-file degradation.
+    func start() throws {
         guard !isStarted else { return }
         do {
             let session = AVAudioSession.sharedInstance()
@@ -285,18 +358,20 @@ final class StreamingAudioPlayer {
                 detail: "error=\(error.localizedDescription)",
                 code: "ERR_STREAM_PLAYER_START"
             )
+            throw error
         }
     }
 
-    func append(pcmData: Data) {
-        guard isStarted, !pcmData.isEmpty else { return }
+    func append(pcmData: Data) throws {
+        guard isStarted else { throw StreamingAudioPlayerError.notStarted }
+        guard !pcmData.isEmpty else { return }
         let frameCount = AVAudioFrameCount(pcmData.count / MemoryLayout<Int16>.size)
         guard let buffer = AVAudioPCMBuffer(
             pcmFormat: pcmFormat,
             frameCapacity: frameCount
         ) else {
             Self.logger.error("buffer_alloc_failed bytes=\(pcmData.count)")
-            return
+            throw StreamingAudioPlayerError.bufferAllocationFailed(bytes: pcmData.count)
         }
         buffer.frameLength = frameCount
         pcmData.withUnsafeBytes { ptr in

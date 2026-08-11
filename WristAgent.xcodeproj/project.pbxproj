@@ -160,6 +160,7 @@
 		AFAD025D181738E8D93753BB /* SelfCheckLatestOutcomeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 10796288EEC2915673662B9E /* SelfCheckLatestOutcomeTests.swift */; };
 		AFE89128B354D801AA7BF512 /* RealtimePlaybackReceiptTracker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 716B2884D666AEE57BA6AB37 /* RealtimePlaybackReceiptTracker.swift */; };
 		B16D51DE77210C44933FBD3B /* ErrorCue_README.md in Resources */ = {isa = PBXBuildFile; fileRef = 44E84C0EE7746687AFA3A75F /* ErrorCue_README.md */; };
+		B2F709E4F3DEC8B4C5C7813F /* StreamPlayerStartFailureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3EEA2EE367D8835C57BF7FF5 /* StreamPlayerStartFailureTests.swift */; };
 		B338F411DD25A0ACA401E4DD /* WatchRealtimeMediaAdapterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DADB09FEF300D41C2F68E5BA /* WatchRealtimeMediaAdapterTests.swift */; };
 		B61FF83E4DCF49ED91557083 /* EncryptedAudioVault.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7C56A17FC91DC667B51B7D6 /* EncryptedAudioVault.swift */; };
 		B6585933C8D51C2E81B72056 /* RealtimeUplinkStream.swift in Sources */ = {isa = PBXBuildFile; fileRef = D57D9FD3BB121F4AAB879ACF /* RealtimeUplinkStream.swift */; };
@@ -293,6 +294,7 @@
 		385A7BF623716F8B230FD7E7 /* SubtitlePlaybackView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubtitlePlaybackView.swift; sourceTree = "<group>"; };
 		38CFFC49761BA3D8F3C402C8 /* AvatarErrorCardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AvatarErrorCardView.swift; sourceTree = "<group>"; };
 		3A74603EEEBF6327940BB0BE /* ErrorCueCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ErrorCueCatalog.swift; sourceTree = "<group>"; };
+		3EEA2EE367D8835C57BF7FF5 /* StreamPlayerStartFailureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamPlayerStartFailureTests.swift; sourceTree = "<group>"; };
 		448AA6286D0C4ACA51DC8ADD /* AvatarErrorPresenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AvatarErrorPresenter.swift; sourceTree = "<group>"; };
 		44E84C0EE7746687AFA3A75F /* ErrorCue_README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = ErrorCue_README.md; sourceTree = "<group>"; };
 		47E5A851D917B87AF55B3340 /* PhoneRealtimeAgentTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneRealtimeAgentTransport.swift; sourceTree = "<group>"; };
@@ -607,6 +609,7 @@
 				0D83133781FDC42821BB13DF /* SpeechPlayerInterruptionTests.swift */,
 				AAD9BD4DBA7700C65F134EF3 /* SpeechPlayerReleaseTests.swift */,
 				C8BFD3B8E68CD0ED9C78C500 /* SpeechPlayerUserInterruptTests.swift */,
+				3EEA2EE367D8835C57BF7FF5 /* StreamPlayerStartFailureTests.swift */,
 				15949530B1F5E7788C4B586D /* VoiceBargeInEvidenceTests.swift */,
 				230A70234A562482DDEA5AAC /* VoiceBargeInWiringTests.swift */,
 				49650776B8272C45D3CA35CB /* VoiceConfirmTimerTests.swift */,
@@ -973,6 +976,7 @@
 				7C465E62628112B008899B51 /* SpeechPlayerInterruptionTests.swift in Sources */,
 				68EF687B6F0F17A356355833 /* SpeechPlayerReleaseTests.swift in Sources */,
 				7CD3A14FB1B8F7A79D40B608 /* SpeechPlayerUserInterruptTests.swift in Sources */,
+				B2F709E4F3DEC8B4C5C7813F /* StreamPlayerStartFailureTests.swift in Sources */,
 				98D13B05E184C18CE1EDD2A2 /* VoiceBargeInEvidenceTests.swift in Sources */,
 				9F9F35D9BF7509E6A0AA6DA3 /* VoiceBargeInWiringTests.swift in Sources */,
 				96CAA0EBFA4914CDC450105B /* VoiceConfirmTimerTests.swift in Sources */,
