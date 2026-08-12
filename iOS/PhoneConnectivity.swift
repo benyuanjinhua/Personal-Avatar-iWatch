@@ -18,19 +18,24 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     /// ESS-321 real-time media session (Watch ↔ iPhone ↔ Bridge/Agent). Lazily
     /// constructed on the first uplink envelope so households that never
     /// enable streaming do not pay for the WSS setup.
-    private lazy var realtimeSession: PhoneRealtimeSession = {
+    /// ESS-751：显式 storage 而不是 `lazy var`——连通性回调要能判断「会话是否
+    /// 已经存在」再决定要不要重放，用 `lazy var` 光是查询就会触发 WSS 构造。
+    private var realtimeSessionStorage: PhoneRealtimeSession?
+    private var realtimeSession: PhoneRealtimeSession {
+        if let existing = realtimeSessionStorage { return existing }
         let session = PhoneRealtimeSession(transportFactory: { [weak self] requestId, sessionId in
             self?.makeRealtimeTransport(requestId: requestId, sessionId: sessionId)
         })
         session.onDownlink = { [weak self] envelope in
-            self?.forwardRealtimeDownlink(envelope)
+            self?.forwardRealtimeDownlink(envelope) ?? .deferred
         }
         session.onStateChange = { [weak self] state in
             guard case .active(let requestId, let sessionId) = state else { return }
             self?.sendRealtimeChannelReady(requestId: requestId, sessionId: sessionId)
         }
+        realtimeSessionStorage = session
         return session
-    }()
+    }
     /// ESS-391: feature flag controlling the Agent direct path.
     private let agentFlag = AudioRealtimeAgentFeatureFlag()
     /// ESS-391: cached Agent session — created once, reused across turns.
@@ -167,6 +172,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
                 }
             }
             // 会话刚激活正是此前静默丢弃的时刻，这里必须补投。
+            self.replayRealtimeDownlink(trigger: "activation")
             self.flushDownlink(trigger: "activation")
             self.relay.resumeEvents(trigger: "wc-activation")
         }
@@ -180,6 +186,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
 
     nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
         Task { @MainActor in
+            self.replayRealtimeDownlink(trigger: "reachability")
             self.flushDownlink(trigger: "reachability")
             self.relay.resumeEvents(trigger: "wc-reachability")
         }
@@ -187,6 +194,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
 
     nonisolated func sessionWatchStateDidChange(_ session: WCSession) {
         Task { @MainActor in
+            self.replayRealtimeDownlink(trigger: "watch-state")
             self.flushDownlink(trigger: "watch-state")
             self.relay.resumeEvents(trigger: "wc-watch-state")
         }
@@ -436,57 +444,79 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
 
     /// Agent/Bridge → iPhone → Watch realtime downlink.
     ///
-    /// Realtime envelopes MUST have a single delivery path while the Watch is
-    /// reachable. The generic outbox deliberately sends every item twice
-    /// (`transferUserInfo` for durability plus `sendMessage` for latency).
-    /// That is correct for idempotent status messages, but it is not correct
-    /// for an ordered media stream: the durable copy can arrive later and
-    /// replay seq 0...N after `audio.done`, which made the Watch observe a
-    /// second, out-of-order stream and drop it as `sessionEnded` (ESS-773).
+    /// ESS-773：realtime envelope 在 Watch 可达时必须**只走一条投递路径**。
+    /// 通用 outbox 故意双发（`transferUserInfo` 保底 + `sendMessage` 低延迟），
+    /// 这对幂等状态消息是对的，对有序媒体流是错的：持久副本可能在
+    /// `audio.done` 之后才到并重放 seq 0…N，Watch 会把它当成第二条乱序流
+    /// 直接按 `sessionEnded` 丢弃。
     ///
-    /// Use the interactive channel exactly once when reachable. Only enqueue
-    /// a durable copy when the interactive channel is unavailable or reports
-    /// a delivery error.
+    /// ESS-751：返回值告诉 `PhoneRealtimeSession` 这条能不能忘掉——只有**持久
+    /// 队列真正接手**（或永久不可投递且已留痕）才是 `.handled`；只走了尽力而为
+    /// 通道时必须 `.deferred`，留给断连重放。
+    ///
+    /// 两者合起来的口径：可达 → 交互通道单发，投递结果未知，故 `.deferred`
+    /// （由 Watch 侧回执/重连重放收口）；不可达或交互通道报错 → 进持久队列，
+    /// 由 `enqueueDownlink` 的返回值决定。
     @MainActor
-    private func forwardRealtimeDownlink(_ envelope: RealtimeDownlinkEnvelope) {
-        guard let data = try? JSONEncoder().encode(envelope) else { return }
+    private func forwardRealtimeDownlink(
+        _ envelope: RealtimeDownlinkEnvelope
+    ) -> RealtimeDownlinkDisposition {
+        guard let data = try? JSONEncoder().encode(envelope) else {
+            // 编码是确定性的，重放只会再失败一次；缓存它只会漏内存，但要留痕。
+            Self.downlinkLogger.error(
+                "realtime downlink encode failed request_id=\(envelope.requestId, privacy: .public) kind=\(envelope.kind.rawValue, privacy: .public)"
+            )
+            return .handled
+        }
         let session = WCSession.default
         guard RealtimeDownlinkDeliveryPolicy.route(
             isActivated: session.activationState == .activated,
             isReachable: session.isReachable
         ) == .interactiveOnly else {
-            enqueueRealtimeDownlinkFallback(envelope: envelope, data: data, reason: "unreachable")
-            return
+            return enqueueRealtimeDownlinkFallback(
+                envelope: envelope, data: data, reason: "unreachable"
+            )
         }
         session.sendMessage(
             [RealtimeMediaMessage.downlinkEnvelopeKey: data],
             replyHandler: nil
         ) { [weak self] error in
             Task { @MainActor in
-                self?.enqueueRealtimeDownlinkFallback(
+                _ = self?.enqueueRealtimeDownlinkFallback(
                     envelope: envelope,
                     data: data,
                     reason: "interactive_failed:\(error.localizedDescription)"
                 )
             }
         }
+        // 交互通道是尽力而为：`sendMessage` 无回执即成功未知。保守记 `.deferred`，
+        // 让断连缓冲留一份，由重连重放兜底——ESS-751 的整条链路正是为此存在。
+        return .deferred
     }
 
     @MainActor
+    @discardableResult
     private func enqueueRealtimeDownlinkFallback(
         envelope: RealtimeDownlinkEnvelope,
         data: Data,
         reason: String
-    ) {
+    ) -> RealtimeDownlinkDisposition {
         Self.downlinkLogger.notice(
             "realtime downlink durable fallback request_id=\(envelope.requestId, privacy: .public) kind=\(envelope.kind.rawValue, privacy: .public) reason=\(reason, privacy: .public)"
         )
-        enqueueDownlink(
+        return enqueueDownlink(
             requestId: envelope.requestId,
             kind: .relayStatus,
             key: RealtimeMediaMessage.downlinkEnvelopeKey,
             data: data
         )
+    }
+
+    /// ESS-751：断连重放的真实触发点。WCSession activation / reachability /
+    /// watch-state 恢复时调用；会话还没构造或缓冲为空时是空操作。
+    private func replayRealtimeDownlink(trigger: String) {
+        guard let session = realtimeSessionStorage, session.pendingDownlinkStats.count > 0 else { return }
+        session.replayPendingDownlink(trigger: trigger)
     }
 
     /// Transport factory that selects Bridge or Agent path based on the
@@ -827,16 +857,19 @@ extension PhoneConnectivity: WatchFeedbackChannel {
         return true
     }
 
+    /// 返回值表示持久队列是否接手：`.handled` 才允许调用方忘掉这条下行；
+    /// `.deferred` 说明只走了尽力而为通道，调用方需自行保留重投（ESS-751）。
+    @discardableResult
     private func enqueueDownlink(
         requestId: String, kind: WatchDownlinkKind, key: String, data: Data
-    ) {
+    ) -> RealtimeDownlinkDisposition {
         guard let downlink else {
             // 队列不可用时退回旧的尽力而为通道，但明确留痕，不假装成功。
             Self.downlinkLogger.error(
                 "下行队列不可用，退回尽力而为通道 request_id=\(requestId, privacy: .public)"
             )
             bestEffortSend(key: key, data: data)
-            return
+            return .deferred
         }
         do {
             _ = try downlink.enqueue(
@@ -847,10 +880,11 @@ extension PhoneConnectivity: WatchFeedbackChannel {
                 "下行入队失败 request_id=\(requestId, privacy: .public) error=\(String(describing: error), privacy: .public)"
             )
             bestEffortSend(key: key, data: data)
-            return
+            return .deferred
         }
         refreshDownlinkCount()
         flushDownlink(trigger: "enqueue")
+        return .handled
     }
 
     /// 排空下行队列。会话未激活/未安装 Watch App 时**不投递也不丢弃**，

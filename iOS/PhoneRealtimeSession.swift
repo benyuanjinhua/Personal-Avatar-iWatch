@@ -47,18 +47,19 @@ final class PhoneRealtimeSession {
     private let transportFactory: (_ requestId: String, _ sessionId: String) -> Transport?
     private var currentTransport: Transport?
     private(set) var state: State = .idle
-    /// ESS-751：下行断连缓冲。策略（何时缓冲、上限、淘汰）收在
-    /// `Shared/PendingDownlinkBuffer.swift`，因为 `iOS/` 没有单测 target——
-    /// 留在这里这条策略就只能靠人眼复核，正是它当初写错还合入的原因。
-    private var pendingDownlink = PendingDownlinkBuffer<RealtimeDownlinkEnvelope>()
+    /// ESS-751：下行主链路（转发 / 断连缓冲 / 重连重放）收在
+    /// `Shared/RealtimeDownlinkRelay.swift`，因为 `iOS/` 没有单测 target——
+    /// 留在这里这条链路就只能靠人眼复核，正是它两次写错还合入的原因。
+    private var pendingDownlink = RealtimeDownlinkRelay()
     /// ESS-391: Agent transports deliver events via callbacks rather than
     /// the Bridge-style `receive(handler:)` loop. When `true`, `scheduleReceive`
     /// is a no-op — the transport itself wires downlink delivery.
     var isAgentTransport: Bool = false
 
     /// Emits every decoded downlink envelope. `PhoneConnectivity` bridges this
-    /// back to the watch via `WatchDownlinkOutbox`.
-    var onDownlink: ((RealtimeDownlinkEnvelope) -> Void)?
+    /// back to the watch via `WatchDownlinkOutbox` and reports whether that
+    /// durable queue actually took ownership —— ESS-751：只有它没接住的才留副本。
+    var onDownlink: ((RealtimeDownlinkEnvelope) -> RealtimeDownlinkDisposition)?
     /// Emits state transitions so callers can flip UI or log evidence.
     var onStateChange: ((State) -> Void)?
 
@@ -80,10 +81,10 @@ final class PhoneRealtimeSession {
             // downlink envelopes queued from a previous incomplete session
             // so they don't pollute the new turn's playback.
             if !pendingDownlink.isEmpty {
+                let discarded = pendingDownlink.discardAll()
                 Self.logger.info(
-                    "realtime discarding \(self.pendingDownlink.count) stale downlink envelopes from previous session"
+                    "realtime discarding \(discarded) stale downlink envelopes from previous session"
                 )
-                pendingDownlink.discardAll()
             }
             openIfNeeded(requestId: start.requestId, sessionId: start.sessionId)
         case .audioAppend:
@@ -175,38 +176,37 @@ final class PhoneRealtimeSession {
         endTurn(reason: "lifecycle_\(reason)")
     }
 
-    /// ESS-751：唯一的下行出口。有消费者就直接转发**且不留副本**；没有
-    /// 消费者时才进断连缓冲，并受三条上限约束。
+    /// ESS-751：唯一的下行出口。消费者**真正接手**（持久 outbox 入队成功）
+    /// 才算转发完成且不留副本；它没接住时才进断连缓冲，受三条上限约束。
     private func deliverDownlink(_ envelope: RealtimeDownlinkEnvelope) {
-        guard let onDownlink else {
-            enqueuePendingDownlink(envelope)
-            return
-        }
-        onDownlink(envelope)
-    }
-
-    private func enqueuePendingDownlink(_ envelope: RealtimeDownlinkEnvelope) {
-        let dropped = pendingDownlink.enqueue(
-            envelope,
-            bytes: envelope.audio?.payload.count ?? 0,
-            nowSeconds: Date().timeIntervalSince1970
+        let outcome = pendingDownlink.deliver(
+            envelope, nowSeconds: Date().timeIntervalSince1970, send: onDownlink
         )
-        if dropped > 0 {
-            Self.logger.notice(
-                "realtime pending downlink trimmed dropped=\(dropped, privacy: .public) remaining=\(self.pendingDownlink.count, privacy: .public) bytes=\(self.pendingDownlink.byteCount, privacy: .public)"
-            )
-        }
+        guard outcome.buffered else { return }
+        Self.logger.notice(
+            "realtime downlink buffered for replay dropped=\(outcome.dropped, privacy: .public) pending=\(self.pendingDownlink.pendingCount, privacy: .public) bytes=\(self.pendingDownlink.pendingBytes, privacy: .public)"
+        )
     }
 
-    /// 断连重放：重连后把缓冲里的 envelope 交出去。取走即清空——
-    /// 缓冲的语义是「还没送到的」，送出去就不再是待送。
-    func drainPendingDownlink() -> [RealtimeDownlinkEnvelope] {
-        pendingDownlink.drain()
+    /// 断连重放：WCSession activation / reachability / watch-state 恢复时由
+    /// `PhoneConnectivity` 调用。按序重投，每条恰好一次；仍未被接手的回到
+    /// 同一有界缓冲（保留首次入队时间，时长上限不会被重放刷新）。
+    /// - Returns: 本次被消费者接手的条数。
+    @discardableResult
+    func replayPendingDownlink(trigger: String) -> Int {
+        let outcome = pendingDownlink.replay(
+            nowSeconds: Date().timeIntervalSince1970, send: onDownlink
+        )
+        guard !outcome.isIdle else { return 0 }
+        Self.logger.notice(
+            "realtime downlink replay trigger=\(trigger, privacy: .public) attempted=\(outcome.attempted, privacy: .public) handled=\(outcome.handled, privacy: .public) rebuffered=\(outcome.rebuffered, privacy: .public) dropped=\(outcome.dropped, privacy: .public)"
+        )
+        return outcome.handled
     }
 
     /// 当前缓冲深度（条数 / 字节），供测试与排查对账。
     var pendingDownlinkStats: (count: Int, bytes: Int) {
-        (pendingDownlink.count, pendingDownlink.byteCount)
+        (pendingDownlink.pendingCount, pendingDownlink.pendingBytes)
     }
 
     /// Agent transports push events through callbacks instead of the Bridge
