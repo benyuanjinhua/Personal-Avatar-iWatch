@@ -42,10 +42,19 @@ async function parseJson(response, what) {
 }
 
 export class GatewayClient {
-  constructor({ baseUrl, fetchImpl = fetch, requestTimeoutMs = 10_000, log = () => {} }) {
+  constructor({
+    baseUrl, fetchImpl = fetch, requestTimeoutMs = 10_000, log = () => {},
+    // ESS-744：SSE 入站缓冲上限。上游是本机网关但仍是外部输入——不设上限时
+    // 一条无 `\n\n` 分隔符的流会把整条连接的字节全部堆在 `buffer` 里直到 OOM。
+    // 单事件上限管“一帧太大”，总缓冲上限管“一个 chunk 里塞太多”。
+    sseMaxEventBytes = 256 * 1024,
+    sseMaxBufferBytes = 1024 * 1024,
+  }) {
     this.baseUrl = baseUrl.replace(/\/$/, '')
     this.fetch = fetchImpl
     this.requestTimeoutMs = requestTimeoutMs
+    this.sseMaxEventBytes = sseMaxEventBytes
+    this.sseMaxBufferBytes = Math.max(sseMaxBufferBytes, sseMaxEventBytes)
     this.log = log
   }
 
@@ -137,17 +146,37 @@ export class GatewayClient {
     }
     const decoder = new TextDecoder()
     let buffer = ''
+    // 与 `buffer` 同步维护的字节数：每次只对新增/消费的片段做一次 byteLength，
+    // 总代价与流量线性相关，不会在大缓冲上退化成 O(n²)。
+    let bufferBytes = 0
+    // 抛出即离开 for-await：async iterator 的 return() 会取消上游流并断链，
+    // 调用方（TaskWatcher）按既有路径记 `sse_interrupted` 并退避到 REST 轮询。
+    const overflow = (code, detail) => new GatewayError(code, `taskEvents ${taskId}: ${detail}`)
     for await (const chunk of response.body) {
-      buffer += decoder.decode(chunk, { stream: true })
+      const text = decoder.decode(chunk, { stream: true })
+      buffer += text
+      bufferBytes += Buffer.byteLength(text)
+      if (bufferBytes > this.sseMaxBufferBytes) {
+        throw overflow('ERR_UPSTREAM_STREAM_OVERFLOW', `buffer ${bufferBytes}B > ${this.sseMaxBufferBytes}B`)
+      }
       let idx
       while ((idx = buffer.indexOf('\n\n')) >= 0) {
         const block = buffer.slice(0, idx)
+        const blockBytes = Buffer.byteLength(buffer.slice(0, idx + 2)) - 2
         buffer = buffer.slice(idx + 2)
+        bufferBytes -= blockBytes + 2
+        if (blockBytes > this.sseMaxEventBytes) {
+          throw overflow('ERR_UPSTREAM_EVENT_TOO_LARGE', `event ${blockBytes}B > ${this.sseMaxEventBytes}B`)
+        }
         const dataLine = block.split('\n').find(l => l.startsWith('data:'))
         if (!dataLine) continue
         let payload
         try { payload = JSON.parse(dataLine.slice(5).trim()) } catch { continue } // skip malformed frames
         if (payload && typeof payload.type === 'string') yield payload
+      }
+      // 无分隔符的流永远走不到上面的 while，未成帧的残留同样受单事件上限约束。
+      if (bufferBytes > this.sseMaxEventBytes) {
+        throw overflow('ERR_UPSTREAM_EVENT_TOO_LARGE', `unterminated event ${bufferBytes}B > ${this.sseMaxEventBytes}B`)
       }
     }
   }

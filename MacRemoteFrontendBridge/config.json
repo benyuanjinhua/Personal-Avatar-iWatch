@@ -48,5 +48,11 @@
   "voice_streaming_v2": false,
   "realtime_media_v1": false,
   "realtime_media_max_frame_bytes": 65536,
-  "realtime_media_max_buffered_bytes": 262144
+  "realtime_media_max_buffered_bytes": 262144,
+
+  "ws_max_payload_bytes": 262144,
+  "realtime_media_max_queued_messages": 64,
+  "realtime_media_max_queued_bytes": 4194304,
+  "sse_max_event_bytes": 262144,
+  "sse_max_buffer_bytes": 1048576
 }
