@@ -41,7 +41,10 @@ struct WristAgentWatchApp: App {
                 .onChange(of: scenePhase) { _, newPhase in
                     WatchLog.info(
                         "lifecycle", "scene_phase",
-                        detail: "phase=\(String(describing: newPhase)) session_state=\(String(describing: services.sessionController.state))"
+                        requestId: services.sessionController.activeTurnRequestId,
+                        detail: "phase=\(String(describing: newPhase)) "
+                            + "session_state=\(String(describing: services.sessionController.state)) "
+                            + "session_preserved=\(services.sessionController.isInSession)"
                     )
                     switch newPhase {
                     case .active:

@@ -318,6 +318,16 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertTrue(controller.isInSession)
     }
 
+    /// ESS-695: scenePhase may change while still connecting (wrist-down or
+    /// system overlay). It must not dismiss or tear down the conversation.
+    func testBackgroundWhileConnectingPreservesChannel() {
+        controller.enterSession()
+        controller.noteEnteredBackground()
+        XCTAssertEqual(controller.state, .connecting)
+        XCTAssertEqual(teardownCount, 0)
+        XCTAssertTrue(controller.isInSession)
+    }
+
     /// 待机时进后台 → 无操作。
     func testBackgroundWhenIdleIsNoOp() {
         controller.noteEnteredBackground()
