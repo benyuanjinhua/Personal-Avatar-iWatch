@@ -44,4 +44,23 @@ enum UUIDv7 {
             | UInt64(bytes.4) << 8
             | UInt64(bytes.5)
     }
+
+    /// version nibble 是否为 7。非 v7 的 UUID 前 48 位是随机数，
+    /// `timestampMs(of:)` 读出来是垃圾值——任何拿它做时序判定的调用方
+    /// 都必须先过这道检查（ESS-747）。
+    static func isV7(_ uuid: UUID) -> Bool {
+        (uuid.uuid.6 >> 4) == 0x7
+    }
+
+    /// 只有 UUIDv7 才返回时间戳；其余一律 `nil`，让调用方显式处理
+    /// 「这个 id 不携带时序」而不是拿随机位当时间用。
+    static func turnTimestampMs(of uuid: UUID) -> UInt64? {
+        isV7(uuid) ? timestampMs(of: uuid) : nil
+    }
+
+    /// 字符串入口：非法 UUID / 非 v7 都返回 `nil`。
+    static func turnTimestampMs(ofString string: String) -> UInt64? {
+        guard let uuid = UUID(uuidString: string) else { return nil }
+        return turnTimestampMs(of: uuid)
+    }
 }
