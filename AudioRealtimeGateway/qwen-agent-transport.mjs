@@ -1,5 +1,5 @@
 import WebSocket from 'ws'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 
 // ESS-745: `request_id` is client-supplied and only validated as a string
 // (token-issuer.mjs `#assertScope`); nothing makes it unique beyond the
@@ -24,6 +24,13 @@ const conversationKey = ({ deviceId, sessionId }) =>
 
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/
 
+// ESS-773: replay identity for an upstream audio frame. Keyed on the upstream
+// sequence AND the payload, never on the payload alone — a later frame with
+// identical bytes (silence is the common case) is legitimate audio. Hashed so
+// the per-turn set stays small; it is bounded by the ESS-746 frame budget.
+const replayKey = (upstreamSequence, audio) =>
+  `${upstreamSequence}:${createHash('sha1').update(audio).digest('base64')}`
+
 export class QwenAgentTransport {
   constructor({
     gatewayUrl = 'ws://127.0.0.1:3101/api/realtime',
@@ -39,6 +46,12 @@ export class QwenAgentTransport {
     maxDownlinkFrameBytes = 128 * 1024,
     maxDownlinkFrames = 4096,
     maxDownlinkBytes = 32 * 1024 * 1024,
+    // ESS-773: how long `audio.done` waits for a late `audio.delta` before it
+    // is forwarded. The provider has been observed emitting done while frames
+    // were still in flight; releasing the downstream barrier at that instant
+    // discards the tail. Costs at most this much added latency on the last
+    // frame, and only when the upstream is well behaved.
+    doneSettleMs = 120,
     takeover = true,
     log = () => {},
   } = {}) {
@@ -48,6 +61,7 @@ export class QwenAgentTransport {
     this.maxDownlinkFrameBytes = maxDownlinkFrameBytes
     this.maxDownlinkFrames = maxDownlinkFrames
     this.maxDownlinkBytes = maxDownlinkBytes
+    this.doneSettleMs = doneSettleMs
     this.takeover = takeover
     this.log = log
     this.turns = new Map()
@@ -96,12 +110,14 @@ export class QwenAgentTransport {
       pending: [], pendingBytes: 0, nextOutputSequence: 0,
       downlinkFrames: 0, downlinkBytes: 0,
       connectTimer: null,
+      doneTimer: null, pendingDone: false, seenUpstreamFrames: new Set(),
     }
     const scopeLog = { request_id: requestId, session_id: sessionId, device_id: deviceId, generation }
     turn.supersede = nextRequestId => {
       if (turn.terminal) return
       turn.terminal = true
       clearTimeout(turn.connectTimer)
+      clearTimeout(turn.doneTimer)
       this.log('upstream_turn_superseded', {
         ...scopeLog, superseded_by_request_id: nextRequestId,
       })
@@ -118,6 +134,7 @@ export class QwenAgentTransport {
       if (turn.terminal) return
       turn.terminal = true
       clearTimeout(turn.connectTimer)
+      clearTimeout(turn.doneTimer)
       this.log('upstream_error', { ...scopeLog, code })
       onEvent({ type: 'agent.error', response_id: responseId, code, detail, retriable: true })
       try { turn.ws?.close() } catch { /* best effort */ }
@@ -134,6 +151,33 @@ export class QwenAgentTransport {
         request_id: requestId, session_id: sessionId, generation, code, ...extra,
       })
       fail(code, detail)
+    }
+
+    // ESS-773 done barrier. `audio.done` is not forwarded on arrival: it opens
+    // a settle window that every late `audio.delta` restarts, so `final_sequence`
+    // always covers the frames that were actually forwarded. Anything that ends
+    // the upstream socket while the window is open flushes it rather than
+    // dropping it — a completed response must not surface as a disconnect.
+    const flushDone = () => {
+      if (!turn.pendingDone) return
+      turn.pendingDone = false
+      clearTimeout(turn.doneTimer)
+      turn.doneTimer = null
+      const finalSequence = turn.nextOutputSequence - 1
+      this.log('upstream_audio_done', { ...scopeLog, final_sequence: finalSequence })
+      onEvent({
+        type: 'agent.audio.done', response_id: responseId, final_sequence: finalSequence,
+      })
+    }
+
+    const scheduleDone = () => {
+      clearTimeout(turn.doneTimer)
+      turn.doneTimer = setTimeout(() => {
+        turn.doneTimer = null
+        if (turn.terminal) return
+        flushDone()
+      }, this.doneSettleMs)
+      turn.doneTimer.unref?.()
     }
 
     const sendOrQueue = (event, bytes = 0) => {
@@ -219,29 +263,53 @@ export class QwenAgentTransport {
             })
             return
           }
-          const sequence = Number.isInteger(event.sequence) && event.sequence >= 0
-            ? event.sequence : turn.nextOutputSequence
-          turn.nextOutputSequence = Math.max(turn.nextOutputSequence, sequence + 1)
+          // ESS-773: drop an exact replay of a frame this turn already
+          // forwarded. Only the upstream sequence can witness a replay, so a
+          // frame that arrives without one is always forwarded.
+          const upstreamSequence = Number.isInteger(event.sequence) && event.sequence >= 0
+            ? event.sequence : null
+          if (upstreamSequence !== null) {
+            const key = replayKey(upstreamSequence, audio)
+            if (turn.seenUpstreamFrames.has(key)) {
+              this.log('upstream_audio_duplicate_dropped', {
+                ...scopeLog, upstream_sequence: upstreamSequence,
+              })
+              return
+            }
+            turn.seenUpstreamFrames.add(key)
+          }
+          // ESS-773: the downstream done barrier can only release on a dense
+          // 0..N run, so this adapter — not the provider — owns the contract's
+          // sequence. The upstream value is diagnostic only: it is not
+          // response-scoped, and a gap or restart in it would otherwise strand
+          // the Watch waiting for a frame that is never coming.
+          const sequence = turn.nextOutputSequence++
+          if (turn.pendingDone) {
+            clearTimeout(turn.doneTimer)
+            turn.doneTimer = null
+            this.log('upstream_done_extended_for_late_delta', {
+              ...scopeLog, upstream_sequence: upstreamSequence, sequence,
+            })
+          }
           this.log('upstream_event_received', {
             ...scopeLog, upstream_event_type: 'audio.delta', sequence,
+            upstream_sequence: upstreamSequence,
           })
           this.log('upstream_audio_delta', { ...scopeLog, sequence })
           onEvent({
             type: 'agent.audio.delta', response_id: responseId, sequence,
             sample_rate: event.sampleRate ?? 24_000, codec: 'pcm_s16le', audio: event.audio,
           })
+          if (turn.pendingDone) scheduleDone()
           return
         }
         if (event.type === 'audio.done') {
-          const finalSequence = turn.nextOutputSequence - 1
           this.log('upstream_event_received', {
-            ...scopeLog, upstream_event_type: 'audio.done', final_sequence: finalSequence,
+            ...scopeLog, upstream_event_type: 'audio.done',
+            final_sequence: turn.nextOutputSequence - 1,
           })
-          this.log('upstream_audio_done', { ...scopeLog, final_sequence: finalSequence })
-          onEvent({
-            type: 'agent.audio.done', response_id: responseId,
-            final_sequence: finalSequence,
-          })
+          turn.pendingDone = true
+          scheduleDone()
           return
         }
         if (event.type === 'error' || event.type === 'session.error' || event.type === 'voice.error') {
@@ -250,7 +318,17 @@ export class QwenAgentTransport {
       })
       ws.on('error', error => fail('ERR_UPSTREAM_UNAVAILABLE', error.message))
       ws.on('close', (code, reason) => {
-        if (!turn.terminal) fail('ERR_UPSTREAM_DISCONNECTED', `code=${code} reason=${String(reason)}`)
+        if (turn.terminal) return
+        // The provider may close right after `audio.done`. The response is
+        // complete, so release the barrier instead of reporting a disconnect.
+        if (turn.pendingDone) {
+          flushDone()
+          turn.terminal = true
+          clearTimeout(turn.connectTimer)
+          this.#release(turn)
+          return
+        }
+        fail('ERR_UPSTREAM_DISCONNECTED', `code=${code} reason=${String(reason)}`)
       })
     } catch (error) {
       fail('ERR_UPSTREAM_UNAVAILABLE', error.message)
@@ -272,6 +350,7 @@ export class QwenAgentTransport {
         }
         turn.terminal = true
         clearTimeout(turn.connectTimer)
+        clearTimeout(turn.doneTimer)
         turn.ws?.close()
         this.#release(turn)
       },
@@ -279,6 +358,7 @@ export class QwenAgentTransport {
         if (turn.terminal) return
         turn.terminal = true
         clearTimeout(turn.connectTimer)
+        clearTimeout(turn.doneTimer)
         if (turn.ws?.readyState === WebSocket.OPEN) {
           turn.ws.send(JSON.stringify({ type: 'mute' }))
         }

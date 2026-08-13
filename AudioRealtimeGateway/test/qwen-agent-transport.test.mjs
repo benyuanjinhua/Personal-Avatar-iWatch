@@ -146,6 +146,137 @@ test('late close of a superseded same-requestId turn does not evict its replacem
   newTurn.close()
 })
 
+// ESS-773. The downstream done barrier can only release on a dense 0..N run,
+// so this adapter owns the contract sequence and treats the provider's as
+// diagnostic. These five cases are the contract: restart, replay, legitimate
+// repeated payload, late delta after done, and completion on upstream close.
+test('normalizes restarted upstream sequences and holds done for late audio', async () => {
+  const audio = value => Buffer.from(value).toString('base64')
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+    if (message.type === 'audio.commit') {
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 10, audio: audio('a') }))
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 11, audio: audio('b') }))
+      ws.send(JSON.stringify({ type: 'audio.done' }))
+      setTimeout(() => {
+        // The provider restarts its counter after done. These are new audio,
+        // not response-scoped duplicates, and must extend the done barrier.
+        ws.send(JSON.stringify({ type: 'audio.delta', sequence: 10, audio: audio('c') }))
+        ws.send(JSON.stringify({ type: 'audio.delta', sequence: 11, audio: audio('d') }))
+      }, 10)
+    }
+  })
+  const events = []; const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, doneSettleMs: 60,
+    log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  const turn = transport.openTurn({
+    requestId: 'r3', sessionId: 's3', generation: 1, responseId: 'r3:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  assert.deepEqual(
+    events.filter(event => event.type === 'agent.audio.delta').map(event => event.sequence),
+    [0, 1, 2, 3],
+  )
+  assert.equal(events.at(-1).type, 'agent.audio.done')
+  assert.equal(events.at(-1).final_sequence, 3)
+  assert.ok(logs.some(item => item.evt === 'upstream_done_extended_for_late_delta'))
+  turn.close()
+})
+
+// A duplicate is witnessed by the upstream sequence, not by the clock: the
+// observed replay path (a reliable WCSession copy) can settle far later than
+// any plausible arrival window.
+test('drops an exact upstream replay however late it arrives', async () => {
+  const payload = Buffer.from('same-frame').toString('base64')
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+    if (message.type === 'audio.commit') {
+      const frame = JSON.stringify({ type: 'audio.delta', sequence: 7, audio: payload })
+      ws.send(frame)
+      setTimeout(() => {
+        ws.send(frame)
+        ws.send(JSON.stringify({ type: 'audio.done' }))
+      }, 120)
+    }
+  })
+  const events = []; const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, doneSettleMs: 20,
+    log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  const turn = transport.openTurn({
+    requestId: 'r4', sessionId: 's4', generation: 1, responseId: 'r4:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  assert.equal(events.filter(event => event.type === 'agent.audio.delta').length, 1)
+  assert.equal(events.at(-1).final_sequence, 0)
+  assert.equal(logs.filter(item => item.evt === 'upstream_audio_duplicate_dropped').length, 1)
+  turn.close()
+})
+
+// The mirror of the case above: identical bytes at a NEW upstream sequence are
+// legitimate audio (silence repeats constantly) and must survive.
+test('keeps identical audio that arrives at a new upstream sequence', async () => {
+  const silence = 'AAAA'
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+    if (message.type === 'audio.commit') {
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 0, audio: silence }))
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 1, audio: silence }))
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 2, audio: silence }))
+      ws.send(JSON.stringify({ type: 'audio.done' }))
+    }
+  })
+  const events = []
+  const transport = new QwenAgentTransport({ gatewayUrl: url, doneSettleMs: 20 })
+  const turn = transport.openTurn({
+    requestId: 'r5', sessionId: 's5', generation: 1, responseId: 'r5:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  assert.deepEqual(
+    events.filter(event => event.type === 'agent.audio.delta').map(event => event.sequence),
+    [0, 1, 2],
+  )
+  assert.equal(events.at(-1).final_sequence, 2)
+  turn.close()
+})
+
+// The settle window must not turn a completed response into a disconnect: the
+// provider is free to close the socket the moment it has sent `audio.done`.
+test('releases the pending done when the upstream closes right after it', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+    if (message.type === 'audio.commit') {
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 0, audio: 'AAAA' }))
+      ws.send(JSON.stringify({ type: 'audio.done' }))
+      ws.close(1000, 'complete')
+    }
+  })
+  const events = []
+  const transport = new QwenAgentTransport({ gatewayUrl: url, doneSettleMs: 5_000 })
+  const turn = transport.openTurn({
+    requestId: 'r6', sessionId: 's6', generation: 1, responseId: 'r6:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  assert.deepEqual(events.map(event => event.type), ['agent.audio.delta', 'agent.audio.done'])
+  assert.equal(events.at(-1).final_sequence, 0)
+  turn.close()
+})
+
 test('upstream failure becomes one structured agent error', async () => {
   const url = await upstream(ws => ws.close(1011, 'provider unavailable'))
   const events = []; const logs = []
