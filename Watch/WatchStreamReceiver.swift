@@ -408,6 +408,71 @@ final class WatchStreamReceiver: ObservableObject {
     }
 }
 
+// MARK: - StreamingAudioPlayer 注入缝（ESS-755 阻断 2/3）
+
+/// AVAudioSession 窄缝：将 setCategory / activate / deactivate 封装为
+/// 可注入协议，使 gate 契约测试无需音频硬件、在 hosted CI 稳定运行。
+protocol StreamingAudioPlayerSessionControlling: AnyObject {
+    func setPlaybackCategory() throws
+    func activate() throws
+    func deactivate()
+}
+
+extension AVAudioSession: StreamingAudioPlayerSessionControlling {
+    func setPlaybackCategory() throws {
+        try setCategory(.playback, mode: .default)
+    }
+    func activate() throws {
+        try setActive(true)
+    }
+    func deactivate() {
+        try? setActive(false, options: .notifyOthersOnDeactivation)
+    }
+}
+
+/// PlayerNode 窄缝：播放器只需要 play / stop / 入队三个动作。
+/// 方法名刻意避开 `scheduleBuffer`，防止与 `AVAudioPlayerNode` 自带的
+/// 同名重载族发生解析歧义。
+protocol StreamingAudioPlayerNodeControlling: AnyObject {
+    func play()
+    func stop()
+    func schedule(_ buffer: AVAudioPCMBuffer)
+    func scheduleTail(_ buffer: AVAudioPCMBuffer, onConsumed: @escaping @Sendable () -> Void)
+}
+
+extension AVAudioPlayerNode: StreamingAudioPlayerNodeControlling {
+    func schedule(_ buffer: AVAudioPCMBuffer) {
+        scheduleBuffer(buffer)
+    }
+    func scheduleTail(_ buffer: AVAudioPCMBuffer, onConsumed: @escaping @Sendable () -> Void) {
+        scheduleBuffer(buffer, completionCallbackType: .dataConsumed) { _ in onConsumed() }
+    }
+}
+
+/// AVAudioEngine 窄缝：引擎负责**建图并交付一个可播放的 node**，
+/// 起停走 start / stop。
+///
+/// ESS-755：这里刻意不暴露 `mainMixerNode` / `attach` / `connect`。
+/// 早前版本把这三者放进协议，spy 只好内持一个真 `AVAudioEngine` 去搭图，
+/// 结果在无音频硬件的 hosted runner 上 `connect(_:to:format:)` 直接返回
+/// `-10868`（kAudioUnitErr_FormatNotSupported）把三条契约测试全打挂——
+/// 注入缝形同虚设。把建图整体收进实现方之后，spy 返回纯计数 node，
+/// 测试路径上不再出现任何 AVAudioEngine 实例。
+protocol StreamingAudioEngineControlling: AnyObject {
+    func makePlayerNode(format: AVAudioFormat) -> any StreamingAudioPlayerNodeControlling
+    func start() throws
+    func stop()
+}
+
+extension AVAudioEngine: StreamingAudioEngineControlling {
+    func makePlayerNode(format: AVAudioFormat) -> any StreamingAudioPlayerNodeControlling {
+        let node = AVAudioPlayerNode()
+        attach(node)
+        connect(node, to: mainMixerNode, format: format)
+        return node
+    }
+}
+
 // MARK: - StreamingAudioPlayer (PCM via AVAudioEngine)
 
 /// ESS-748：流播放器的可注入接缝。抽成协议只为一件事——让「起播失败必须
@@ -429,21 +494,38 @@ final class StreamingAudioPlayer: StreamAudioPlaying {
     private let sampleRate: Double
     private let context: String
     private let pcmFormat: AVAudioFormat
-    private let engine: AVAudioEngine
-    private let playerNode: AVAudioPlayerNode
+    private let engine: any StreamingAudioEngineControlling
+    private let playerNode: any StreamingAudioPlayerNodeControlling
+    private let session: any StreamingAudioPlayerSessionControlling
 
     private var isStarted = false
     private var isEndOfStream = false
     private var totalBytes = 0
     private var totalBuffers = 0
+    /// ESS-755 非阻断意见 1：锁存 start() 时的 gate 决定，stop() 按锁存值走——
+    /// 防止 conversation 在 start↔stop 之间 release 导致「没激活却 deactivate」
+    /// 的契约缺口（与 SpeechPlayer.releaseAudioSession 的 sharedSessionOwner 同源）。
+    private var didSkipSessionActivation = false
 
     private static let logger = Logger(
         subsystem: "beer.workspace.wristagent", category: "StreamPlayer"
     )
 
-    init(sampleRate: Int, context: String) {
+    /// ESS-554：ConversationAudioController 持有会话期间返回 true。
+    /// 此时 StreamingAudioPlayer 跳过 AVAudioSession setCategory/setActive，
+    /// 仅起停自身引擎与 playerNode——会话级 `.playAndRecord` 已激活，
+    /// 重配为 `.playback` 会踩塌录音/路由。默认 false = 回合级旧行为。
+    static var sessionExternallyOwned: () -> Bool = { false }
+
+    init(
+        sampleRate: Int,
+        context: String,
+        session: any StreamingAudioPlayerSessionControlling = AVAudioSession.sharedInstance(),
+        engine: any StreamingAudioEngineControlling = AVAudioEngine()
+    ) {
         self.sampleRate = Double(sampleRate)
         self.context = context
+        self.session = session
 
         guard let fmt = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
@@ -454,10 +536,8 @@ final class StreamingAudioPlayer: StreamAudioPlaying {
             fatalError("StreamingAudioPlayer: unsupported PCM format")
         }
         self.pcmFormat = fmt
-        self.engine = AVAudioEngine()
-        self.playerNode = AVAudioPlayerNode()
-        engine.attach(playerNode)
-        engine.connect(playerNode, to: engine.mainMixerNode, format: fmt)
+        self.engine = engine
+        self.playerNode = engine.makePlayerNode(format: fmt)
     }
 
     /// ESS-748：起播失败必须**可判定**。
@@ -471,9 +551,17 @@ final class StreamingAudioPlayer: StreamAudioPlaying {
     func start() throws {
         guard !isStarted else { return }
         do {
-            let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default)
-            try session.setActive(true)
+            didSkipSessionActivation = Self.sessionExternallyOwned()
+            if didSkipSessionActivation {
+                WatchLog.info(
+                    "stream", "session_activation_skipped",
+                    requestId: context,
+                    detail: "reason=conversation_owned"
+                )
+            } else {
+                try session.setPlaybackCategory()
+                try session.activate()
+            }
 
             try engine.start()
             playerNode.play()
@@ -509,7 +597,7 @@ final class StreamingAudioPlayer: StreamAudioPlaying {
             guard let base = ptr.baseAddress else { return }
             memcpy(buffer.int16ChannelData!.pointee, base, pcmData.count)
         }
-        playerNode.scheduleBuffer(buffer)
+        playerNode.schedule(buffer)
         totalBytes += pcmData.count
         totalBuffers += 1
 
@@ -531,10 +619,9 @@ final class StreamingAudioPlayer: StreamAudioPlaying {
             detail: "total_bytes=\(totalBytes) buffers=\(totalBuffers)"
         )
         // 播完当前队列后停止
-        playerNode.scheduleBuffer(
-            AVAudioPCMBuffer(pcmFormat: pcmFormat, frameCapacity: 0)!,
-            completionCallbackType: .dataConsumed
-        ) { [weak self] _ in
+        playerNode.scheduleTail(
+            AVAudioPCMBuffer(pcmFormat: pcmFormat, frameCapacity: 0)!
+        ) { [weak self] in
             Task { @MainActor in
                 self?.stop()
             }
@@ -551,7 +638,16 @@ final class StreamingAudioPlayer: StreamAudioPlaying {
             requestId: context,
             detail: "total_bytes=\(totalBytes) buffers=\(totalBuffers)"
         )
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        if didSkipSessionActivation {
+            WatchLog.info(
+                "stream", "session_release_skipped",
+                requestId: context,
+                detail: "reason=conversation_owned"
+            )
+        } else {
+            session.deactivate()
+        }
+        didSkipSessionActivation = false
     }
 }
 
