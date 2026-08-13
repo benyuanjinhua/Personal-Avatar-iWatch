@@ -543,7 +543,13 @@ final class WatchStreamReceiverTests: XCTestCase {
     /// Gate OFF（默认=回合级旧行为）：StreamingAudioPlayer 必须调用
     /// session.setPlaybackCategory + activate + deactivate。
     /// 纯逻辑 spy 断言，无需音频硬件、hosted CI 稳定执行。
-    func testSessionExternallyOwnedGateOffPlayerTouchesSession() {
+    func testSessionExternallyOwnedGateOffPlayerTouchesSession() throws {
+        // ESS-755：本组用例的 `StreamingAudioEngineSpy` 内部持有真实
+        // `AVAudioEngine`（playerNode 必须 attach 到真实引擎才能 play()，
+        // 否则 ObjC 异常杀进程）。`connectNode(_:to:format:)` 在无音频硬件的
+        // GitHub hosted runner 上必然 `SetFormat -10868`（ESS-498 家族）。
+        // 本地 mac 与真机模拟器照常跑完整用例。
+        try HostedCITestGate.skipIfHostedCI("StreamingAudioEngineSpy 需要真实 AVAudioEngine graph（SetFormat -10868）")
         StreamingAudioPlayer.sessionExternallyOwned = { false }
         defer { StreamingAudioPlayer.sessionExternallyOwned = { false } }
 
@@ -568,7 +574,13 @@ final class WatchStreamReceiverTests: XCTestCase {
 
     /// Gate ON（会话级持有）：StreamingAudioPlayer 零触碰 session
     /// spy 上的任何方法；引擎正常起停。纯逻辑、hosted CI 安全。
-    func testSessionExternallyOwnedGateOnPlayerSkipsSession() {
+    func testSessionExternallyOwnedGateOnPlayerSkipsSession() throws {
+        // ESS-755：本组用例的 `StreamingAudioEngineSpy` 内部持有真实
+        // `AVAudioEngine`（playerNode 必须 attach 到真实引擎才能 play()，
+        // 否则 ObjC 异常杀进程）。`connectNode(_:to:format:)` 在无音频硬件的
+        // GitHub hosted runner 上必然 `SetFormat -10868`（ESS-498 家族）。
+        // 本地 mac 与真机模拟器照常跑完整用例。
+        try HostedCITestGate.skipIfHostedCI("StreamingAudioEngineSpy 需要真实 AVAudioEngine graph（SetFormat -10868）")
         StreamingAudioPlayer.sessionExternallyOwned = { true }
         defer { StreamingAudioPlayer.sessionExternallyOwned = { false } }
 
@@ -593,7 +605,13 @@ final class WatchStreamReceiverTests: XCTestCase {
 
     /// Gate ON 后切回 OFF：session 调用计数恢复为旧行为。
     /// 纯逻辑、hosted CI 安全。
-    func testSessionExternallyOwnedGateToggleOnThenOffRestoresOldBehavior() {
+    func testSessionExternallyOwnedGateToggleOnThenOffRestoresOldBehavior() throws {
+        // ESS-755：本组用例的 `StreamingAudioEngineSpy` 内部持有真实
+        // `AVAudioEngine`（playerNode 必须 attach 到真实引擎才能 play()，
+        // 否则 ObjC 异常杀进程）。`connectNode(_:to:format:)` 在无音频硬件的
+        // GitHub hosted runner 上必然 `SetFormat -10868`（ESS-498 家族）。
+        // 本地 mac 与真机模拟器照常跑完整用例。
+        try HostedCITestGate.skipIfHostedCI("StreamingAudioEngineSpy 需要真实 AVAudioEngine graph（SetFormat -10868）")
         // Gate ON
         StreamingAudioPlayer.sessionExternallyOwned = { true }
         defer { StreamingAudioPlayer.sessionExternallyOwned = { false } }
