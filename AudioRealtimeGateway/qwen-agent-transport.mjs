@@ -24,12 +24,12 @@ const conversationKey = ({ deviceId, sessionId }) =>
 
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/
 
-// ESS-773: replay identity for an upstream audio frame. Keyed on the upstream
-// sequence AND the payload, never on the payload alone — a later frame with
-// identical bytes (silence is the common case) is legitimate audio. Hashed so
-// the per-turn set stays small; it is bounded by the ESS-746 frame budget.
+// ESS-773: replay identity for an upstream audio frame. Composite on purpose —
+// the upstream sequence AND the payload, never the payload alone, since a later
+// frame with identical bytes (silence is the common case) is legitimate audio.
+// Hashed so an entry costs bytes rather than a frame.
 const replayKey = (upstreamSequence, audio) =>
-  `${upstreamSequence}:${createHash('sha1').update(audio).digest('base64')}`
+  `audio.delta:${upstreamSequence}:${createHash('sha1').update(audio).digest('base64')}`
 
 export class QwenAgentTransport {
   constructor({
@@ -52,6 +52,14 @@ export class QwenAgentTransport {
     // discards the tail. Costs at most this much added latency on the last
     // frame, and only when the upstream is well behaved.
     doneSettleMs = 120,
+    // ESS-773 replay window. Deliberately short: it may only recognise a
+    // near-simultaneous exact replay of a frame the upstream already sent.
+    // Outside it, identical audio at the same upstream sequence is treated as
+    // legitimate new audio — the provider's counter is not response-scoped, so
+    // a restart can legitimately re-present a sequence, and silence repeats
+    // constantly. Bounded by TTL and by `maxReplayFingerprints`.
+    duplicateWindowMs = 200,
+    maxReplayFingerprints = 128,
     takeover = true,
     log = () => {},
   } = {}) {
@@ -62,6 +70,8 @@ export class QwenAgentTransport {
     this.maxDownlinkFrames = maxDownlinkFrames
     this.maxDownlinkBytes = maxDownlinkBytes
     this.doneSettleMs = doneSettleMs
+    this.duplicateWindowMs = duplicateWindowMs
+    this.maxReplayFingerprints = maxReplayFingerprints
     this.takeover = takeover
     this.log = log
     this.turns = new Map()
@@ -110,7 +120,7 @@ export class QwenAgentTransport {
       pending: [], pendingBytes: 0, nextOutputSequence: 0,
       downlinkFrames: 0, downlinkBytes: 0,
       connectTimer: null,
-      doneTimer: null, pendingDone: false, seenUpstreamFrames: new Set(),
+      doneTimer: null, pendingDone: false, recentUpstreamFrames: new Map(),
     }
     const scopeLog = { request_id: requestId, session_id: sessionId, device_id: deviceId, generation }
     turn.supersede = nextRequestId => {
@@ -263,20 +273,33 @@ export class QwenAgentTransport {
             })
             return
           }
-          // ESS-773: drop an exact replay of a frame this turn already
-          // forwarded. Only the upstream sequence can witness a replay, so a
-          // frame that arrives without one is always forwarded.
+          // ESS-773: drop a near-simultaneous exact replay, and only that. The
+          // fingerprint needs the upstream sequence to witness a replay at all,
+          // so a frame that arrives without one is always forwarded; and the
+          // window has to expire, because outside it the same fingerprint is
+          // legitimate audio (a restarted counter re-presenting silence).
           const upstreamSequence = Number.isInteger(event.sequence) && event.sequence >= 0
             ? event.sequence : null
           if (upstreamSequence !== null) {
+            const now = Date.now()
+            for (const [seen, at] of turn.recentUpstreamFrames) {
+              if (now - at > this.duplicateWindowMs) turn.recentUpstreamFrames.delete(seen)
+            }
             const key = replayKey(upstreamSequence, audio)
-            if (turn.seenUpstreamFrames.has(key)) {
+            const lastSeenAt = turn.recentUpstreamFrames.get(key)
+            if (lastSeenAt !== undefined && now - lastSeenAt <= this.duplicateWindowMs) {
               this.log('upstream_audio_duplicate_dropped', {
                 ...scopeLog, upstream_sequence: upstreamSequence,
+                age_ms: now - lastSeenAt,
               })
               return
             }
-            turn.seenUpstreamFrames.add(key)
+            turn.recentUpstreamFrames.set(key, now)
+            // Capacity backstop: a flood inside one window must not outgrow the
+            // TTL sweep. Map preserves insertion order, so this drops oldest.
+            while (turn.recentUpstreamFrames.size > this.maxReplayFingerprints) {
+              turn.recentUpstreamFrames.delete(turn.recentUpstreamFrames.keys().next().value)
+            }
           }
           // ESS-773: the downstream done barrier can only release on a dense
           // 0..N run, so this adapter — not the provider — owns the contract's
