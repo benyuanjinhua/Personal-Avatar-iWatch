@@ -93,9 +93,15 @@ export function createGateway(overrides = {}) {
         request_id: scope.request_id, session_id: scope.session_id,
         generation: scope.generation, device_id: scope.device_id,
       })
+      const downlink = createDownlinkGuard({
+        ws, scope, log: (evt, extra) => log(evt, extra),
+        maxBufferedBytes: CONFIG.max_downlink_buffered_bytes,
+        warnBufferedBytes: CONFIG.downlink_backpressure_warn_bytes,
+        closeGraceMs: CONFIG.downlink_close_grace_ms,
+      })
       const session = new RealtimeSession({
         scope,
-        send: text => ws.send(text),
+        send: downlink.send,
         close: (code, reason) => ws.close(code, String(reason).slice(0, 120)),
         agentTransport,
         log: (evt, extra) => log(evt, extra),
@@ -105,13 +111,21 @@ export function createGateway(overrides = {}) {
         maxFrameBytes: CONFIG.max_frame_bytes,
         maxEventsPerSecond: CONFIG.max_events_per_second,
         maxUplinkBytesPerSecond: CONFIG.max_uplink_bytes_per_second,
+        maxDownlinkFrames: CONFIG.max_downlink_frames,
+        maxDownlinkBytes: CONFIG.max_downlink_bytes,
       })
       ws.on('message', (raw, isBinary) => {
         if (isBinary) return session.onBinary()
         session.onFrame(raw.toString('utf8'))
       })
-      ws.once('close', (code, reason) => session.onSocketClose(code, reason?.toString()))
-      ws.once('error', error => session.onSocketClose(1006, 'socket_error:' + error.message))
+      ws.once('close', (code, reason) => {
+        downlink.dispose()
+        session.onSocketClose(code, reason?.toString())
+      })
+      ws.once('error', error => {
+        downlink.dispose()
+        session.onSocketClose(1006, 'socket_error:' + error.message)
+      })
     })
   })
 
@@ -137,6 +151,70 @@ export function createGateway(overrides = {}) {
   }
 
   return { server, wss, devices, issuer, agentTransport, config: CONFIG, log, start, stop }
+}
+
+// Slow-consumer backpressure (ESS-746). `ws.send` never blocks: on a Watch
+// whose radio has stalled the frames pile up in the socket's write buffer and
+// the process pays for them, so the buffer depth is the only signal that the
+// peer stopped draining. Two thresholds: one observable warning, then an
+// explicit disconnect (1013 try-again-later) — the client already reconnects
+// per turn, so cutting a wedged socket is cheaper than growing it. `close()`
+// itself queues behind the backlog, hence the terminate fallback.
+export function createDownlinkGuard({
+  ws, scope, log = () => {},
+  maxBufferedBytes = 4 * 1024 * 1024,
+  warnBufferedBytes = 1 * 1024 * 1024,
+  closeGraceMs = 5_000,
+  setTimer = (fn, ms) => setTimeout(fn, ms),
+  clearTimer = t => clearTimeout(t),
+}) {
+  let tripped = false
+  let warned = false
+  let graceTimer = null
+  const base = () => ({
+    request_id: scope?.request_id ?? null, session_id: scope?.session_id ?? null,
+    generation: scope?.generation ?? null,
+  })
+
+  const send = text => {
+    if (tripped) return
+    const buffered = ws.bufferedAmount ?? 0
+    // Charge the frame we are about to queue, not just the backlog already
+    // there (ESS-792 review): checking `bufferedAmount` alone would let one
+    // more frame cross the cap and only trip on the *next* send, making the
+    // ceiling soft by up to one frame. Projecting keeps it a hard cap.
+    const projected = buffered + Buffer.byteLength(text)
+    if (projected > maxBufferedBytes) {
+      tripped = true
+      log('downlink_backpressure_disconnect', {
+        ...base(), code: 'ERR_SLOW_CONSUMER',
+        buffered_bytes: buffered, projected_bytes: projected, cap: maxBufferedBytes,
+      })
+      try { ws.close(1013, 'ERR_SLOW_CONSUMER') } catch { /* already dead */ }
+      if (closeGraceMs > 0) {
+        graceTimer = setTimer(() => {
+          graceTimer = null
+          try { ws.terminate?.() } catch { /* already dead */ }
+        }, closeGraceMs)
+        graceTimer?.unref?.()
+      }
+      return
+    }
+    if (!warned && projected > warnBufferedBytes) {
+      warned = true
+      log('downlink_backpressure_warning', {
+        ...base(), buffered_bytes: buffered, projected_bytes: projected,
+        warn_at: warnBufferedBytes, cap: maxBufferedBytes,
+      })
+    }
+    ws.send(text)
+  }
+
+  const dispose = () => {
+    if (graceTimer !== null) { clearTimer(graceTimer); graceTimer = null }
+  }
+
+  return { send, dispose, tripped: () => tripped }
 }
 
 function readConfig(path) {
@@ -296,6 +374,9 @@ function createAgentTransport(CONFIG, { log }) {
       gatewayUrl: CONFIG.agent_gateway_url ?? 'ws://127.0.0.1:3101/api/realtime',
       connectTimeoutMs: CONFIG.agent_connect_timeout_ms ?? 10_000,
       maxPendingBytes: CONFIG.agent_max_pending_bytes ?? 2 * 1024 * 1024,
+      maxDownlinkFrameBytes: CONFIG.max_downlink_frame_bytes ?? 128 * 1024,
+      maxDownlinkFrames: CONFIG.max_downlink_frames ?? 4096,
+      maxDownlinkBytes: CONFIG.max_downlink_bytes ?? 32 * 1024 * 1024,
       takeover: CONFIG.agent_takeover_voice !== false,
       log: (evt, extra) => log(evt, extra),
     })

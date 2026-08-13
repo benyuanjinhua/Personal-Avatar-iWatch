@@ -20,6 +20,13 @@
   "max_events_per_second": 200,
   "max_uplink_bytes_per_second": 524288,
 
+  "max_downlink_frame_bytes": 131072,
+  "max_downlink_frames": 4096,
+  "max_downlink_bytes": 33554432,
+  "max_downlink_buffered_bytes": 4194304,
+  "downlink_backpressure_warn_bytes": 1048576,
+  "downlink_close_grace_ms": 5000,
+
   "agent_transport": "agent",
   "agent_gateway_url": "ws://127.0.0.1:3101/api/realtime",
   "agent_connect_timeout_ms": 10000,
