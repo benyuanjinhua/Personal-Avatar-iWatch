@@ -60,6 +60,55 @@ final class RuntimeSessionPolicyTests: XCTestCase {
         XCTAssertFalse(RuntimeSessionPolicy.shouldStartExtendedSession(for: decision))
     }
 
+    /// ESS-689：主球 touch-down 起录时先 defer；touch-up 进入持续会话后，
+    /// 即使仍在录音等待用户开口，也必须消费 defer 并启动 runtime。
+    func testContinuousRecordingConsumesDeferredStartAfterGestureReleased() {
+        let recording = decide(isRecording: true).decision
+
+        XCTAssertFalse(
+            RuntimeSessionPolicy.shouldStartExtendedSession(
+                for: recording,
+                recordingGestureReleased: false
+            ),
+            "手势仍按住时不得启动 runtime，以免系统取消手势"
+        )
+        XCTAssertTrue(
+            RuntimeSessionPolicy.shouldStartExtendedSession(
+                for: recording,
+                recordingGestureReleased: true
+            ),
+            "松手进入持续会话后必须在持续录音态消费 defer"
+        )
+        XCTAssertEqual(recording, .hold(reason: "recording"),
+                       "消费 runtime defer 不得结束录音或改变持有原因")
+    }
+
+    /// ESS-692 复审补强：重复 enter 不得重复触发 reevaluate/start；退出后
+    /// 必须恢复普通 PTT 的“录音中不启动 runtime”门。
+    func testRecordingGateEnterIsIdempotentAndExitRestoresPTTDeferral() {
+        var gate = RuntimeSessionRecordingGate()
+        let recording = decide(isRecording: true).decision
+
+        XCTAssertFalse(gate.recordingGestureReleased)
+        XCTAssertTrue(gate.setContinuousConversationActive(true))
+        XCTAssertTrue(gate.recordingGestureReleased)
+        XCTAssertFalse(gate.setContinuousConversationActive(true),
+                       "重复 enter 必须为空操作")
+        XCTAssertTrue(RuntimeSessionPolicy.shouldStartExtendedSession(
+            for: recording,
+            recordingGestureReleased: gate.recordingGestureReleased
+        ))
+
+        XCTAssertTrue(gate.setContinuousConversationActive(false))
+        XCTAssertFalse(gate.recordingGestureReleased)
+        XCTAssertFalse(gate.setContinuousConversationActive(false),
+                       "重复 exit 必须为空操作")
+        XCTAssertFalse(RuntimeSessionPolicy.shouldStartExtendedSession(
+            for: recording,
+            recordingGestureReleased: gate.recordingGestureReleased
+        ), "退出持续会话后普通 PTT 录音必须继续 defer runtime")
+    }
+
     func testExtendedSessionStartsAfterGestureForActiveTurn() {
         let turn = makeTurn(states: [.recorded, .waitingForMac])
         let decision = decide(turns: [turn]).decision

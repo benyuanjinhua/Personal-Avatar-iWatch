@@ -78,11 +78,15 @@ final class WatchAppServices {
         sessionController.onSessionStateChange = { [weak self] state in
             switch state {
             case .connecting, .listening:
+                self?.pushToTalk.sessionKeeper.setContinuousConversationActive(true)
                 self?.workoutKeeper.start()
             case .idle, .disconnecting:
+                self?.pushToTalk.sessionKeeper.setContinuousConversationActive(false)
                 self?.workoutKeeper.stop()
             case .failed, .hungup:
-                break  // keep alive in failed/hungup — user may retry
+                // 会话页仍可见且用户可能重试，保持 runtime/workout；真正拆链
+                // 进入 disconnecting/idle 时统一释放。
+                self?.pushToTalk.sessionKeeper.setContinuousConversationActive(true)
             }
         }
         // ESS-650 F2-4：语音打断开关（默认 OFF）。gate 判定只在会话层读一次。

@@ -31,9 +31,12 @@ enum RuntimeSessionPolicy {
     /// that gesture on device, producing a 10-60 ms AAC header-only recording.
     /// Defer the system session until release; the newly recorded active turn then
     /// immediately supplies the hold reason for the background wait.
-    static func shouldStartExtendedSession(for decision: Decision) -> Bool {
+    static func shouldStartExtendedSession(
+        for decision: Decision,
+        recordingGestureReleased: Bool = false
+    ) -> Bool {
         guard case .hold(let reason) = decision else { return false }
-        return reason != "recording"
+        return reason != "recording" || recordingGestureReleased
     }
 
     /// ESS-58：会话被系统收回后，回到前台时是否允许自动重持。
@@ -102,5 +105,19 @@ enum RuntimeSessionPolicy {
             )
         }
         return Verdict(decision: .release, reviewAt: nil)
+    }
+}
+
+/// ESS-689：录音态 runtime 启动门的最小状态机。
+/// false = 普通 PTT 手势仍按住；true = touch-up 后持续会话仍在。
+/// 返回值表示状态是否真的变化，调用方据此保证重复 enter/exit 通知幂等。
+struct RuntimeSessionRecordingGate {
+    private(set) var recordingGestureReleased = false
+
+    @discardableResult
+    mutating func setContinuousConversationActive(_ active: Bool) -> Bool {
+        guard recordingGestureReleased != active else { return false }
+        recordingGestureReleased = active
+        return true
     }
 }
