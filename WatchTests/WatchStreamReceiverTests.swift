@@ -567,7 +567,9 @@ final class WatchStreamReceiverTests: XCTestCase {
             sampleRate: 24_000, context: "gate-off",
             session: sessionSpy, engine: engineSpy
         )
-        player.start()
+        // ESS-748：`start()` 已改为 throws（起播失败必须可判定）。本组用例只关心
+        // 会话所有权 gate 是否触碰 AVAudioSession，起播成不成功不是断言对象。
+        try? player.start()
         player.stop()
 
         XCTAssertEqual(sessionSpy.setPlaybackCategoryCalls, 1,
@@ -594,7 +596,9 @@ final class WatchStreamReceiverTests: XCTestCase {
             sampleRate: 24_000, context: "gate-on",
             session: sessionSpy, engine: engineSpy
         )
-        player.start()
+        // ESS-748：`start()` 已改为 throws（起播失败必须可判定）。本组用例只关心
+        // 会话所有权 gate 是否触碰 AVAudioSession，起播成不成功不是断言对象。
+        try? player.start()
         player.stop()
 
         XCTAssertEqual(sessionSpy.setPlaybackCategoryCalls, 0,
@@ -621,7 +625,7 @@ final class WatchStreamReceiverTests: XCTestCase {
             sampleRate: 24_000, context: "gate-on",
             session: sessionA, engine: StreamingAudioEngineSpy()
         )
-        playerA.start()
+        try? playerA.start()
         playerA.stop()
         XCTAssertEqual(sessionA.setPlaybackCategoryCalls, 0)
         XCTAssertEqual(sessionA.activateCalls, 0)
@@ -634,7 +638,7 @@ final class WatchStreamReceiverTests: XCTestCase {
             sampleRate: 24_000, context: "gate-off",
             session: sessionB, engine: StreamingAudioEngineSpy()
         )
-        playerB.start()
+        try? playerB.start()
         playerB.stop()
         XCTAssertEqual(sessionB.setPlaybackCategoryCalls, 1,
                        "gate ON→OFF 切回后 setPlaybackCategory 必须恢复")
