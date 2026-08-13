@@ -48,6 +48,14 @@ export function createGateway(overrides = {}) {
   const issuer = new TokenIssuer({
     maxTtlMs: CONFIG.max_token_ttl_ms, defaultTtlMs: CONFIG.default_token_ttl_ms,
     protocolVersion: CONFIG.protocol_version,
+    // Bounded issuer state (ESS-743): swept on a timer this server owns, and
+    // capped so an authenticated device cannot grow the maps without limit.
+    generationTtlMs: CONFIG.generation_ttl_ms,
+    maxTokens: CONFIG.max_tokens,
+    maxTokensPerDevice: CONFIG.max_tokens_per_device,
+    maxDevices: CONFIG.max_generation_devices,
+    maxSessionsPerDevice: CONFIG.max_generation_sessions_per_device,
+    sweepIntervalMs: CONFIG.token_sweep_interval_ms,
     log: (evt, extra) => log(evt, extra),
   })
   const agentTransport = createAgentTransport(CONFIG, { log, providerKey })
@@ -133,6 +141,7 @@ export function createGateway(overrides = {}) {
     return new Promise((resolveStart, rejectStart) => {
       server.listen({ host: CONFIG.bind, port: CONFIG.port }, err => {
         if (err) return rejectStart(err)
+        issuer.startSweeper()
         log('gateway_ready', {
           bind: CONFIG.bind, port: server.address().port,
           public_host: CONFIG.public_host ?? null,
@@ -145,6 +154,7 @@ export function createGateway(overrides = {}) {
     })
   }
   async function stop() {
+    issuer.stopSweeper()
     return new Promise(resolveStop => {
       wss.close(() => server.close(() => resolveStop()))
     })
