@@ -522,19 +522,33 @@ final class WatchStreamReceiverTests: XCTestCase {
         func deactivate() { deactivateCalls += 1 }
     }
 
+    /// Spy：纯计数 player node，不碰任何音频图。
+    private final class StreamingAudioPlayerNodeSpy: StreamingAudioPlayerNodeControlling {
+        var plays = 0
+        var stops = 0
+        var scheduled = 0
+
+        func play() { plays += 1 }
+        func stop() { stops += 1 }
+        func schedule(_ buffer: AVAudioPCMBuffer) { scheduled += 1 }
+        func scheduleTail(_ buffer: AVAudioPCMBuffer, onConsumed: @escaping @Sendable () -> Void) {
+            scheduled += 1
+        }
+    }
+
     /// Spy：桩化 AVAudioEngine，记录 start / stop 调用次数。
-    /// 内部持有真实 AVAudioEngine 做 graph 搭建（playerNode 必须 attach
-    /// 到真实引擎才能 play()，否则 ObjC 异常杀进程），但 start/stop 走 spy
-    /// 计数——不启动音频 IO，hosted CI 安全。
+    ///
+    /// ESS-755：这里**不得**内持真实 `AVAudioEngine`。前一版这么做过，
+    /// 在无音频硬件的 hosted runner 上 `connect(_:to:format:)` 返回 -10868
+    /// （kAudioUnitErr_FormatNotSupported），三条契约测试全挂
+    /// （run 31675357242）。建图已收进 `makePlayerNode`，spy 直接返回计数 node。
     private final class StreamingAudioEngineSpy: StreamingAudioEngineControlling {
-        private let realEngine = AVAudioEngine()
-        var mainMixerNode: AVAudioMixerNode { realEngine.mainMixerNode }
+        let node = StreamingAudioPlayerNodeSpy()
         var starts = 0
         var stops = 0
 
-        func attachNode(_ node: AVAudioNode) { realEngine.attachNode(node) }
-        func connectNode(_ node1: AVAudioNode, to node2: AVAudioNode, format: AVAudioFormat?) {
-            realEngine.connectNode(node1, to: node2, format: format)
+        func makePlayerNode(format: AVAudioFormat) -> any StreamingAudioPlayerNodeControlling {
+            node
         }
         func start() throws { starts += 1 }
         func stop() { stops += 1 }
@@ -570,6 +584,8 @@ final class WatchStreamReceiverTests: XCTestCase {
                        "gate OFF：stop() 必须调 deactivate 恰好一次")
         XCTAssertEqual(engineSpy.starts, 1, "gate OFF：引擎必须启动")
         XCTAssertEqual(engineSpy.stops, 1, "gate OFF：引擎必须停止")
+        XCTAssertEqual(engineSpy.node.plays, 1, "gate OFF：playerNode 必须起播")
+        XCTAssertEqual(engineSpy.node.stops, 1, "gate OFF：playerNode 必须停播")
     }
 
     /// Gate ON（会话级持有）：StreamingAudioPlayer 零触碰 session
@@ -601,6 +617,9 @@ final class WatchStreamReceiverTests: XCTestCase {
                        "gate ON：不得调 deactivate")
         XCTAssertEqual(engineSpy.starts, 1, "gate ON：引擎仍须启动")
         XCTAssertEqual(engineSpy.stops, 1, "gate ON：引擎仍须停止")
+        // gate ON 的意义是「跳过会话、但照常出声」——出声这一半必须被守护。
+        XCTAssertEqual(engineSpy.node.plays, 1, "gate ON：playerNode 仍须起播")
+        XCTAssertEqual(engineSpy.node.stops, 1, "gate ON：playerNode 仍须停播")
     }
 
     /// Gate ON 后切回 OFF：session 调用计数恢复为旧行为。

@@ -430,22 +430,46 @@ extension AVAudioSession: StreamingAudioPlayerSessionControlling {
     }
 }
 
-/// AVAudioEngine 窄缝：将引擎的 attach / connect / start / stop 封装为
-/// 可注入协议。Spy 实现提供 mainMixerNode 桩，使测试完全脱离音频硬件。
-/// 形参使用 `AVAudioNode` 匹配 `AVAudioEngine` 的 ObjC 桥接签名；
-/// extension 提供显式转发，避免 `AVAudioPlayerNode` 逆变不满足。
+/// PlayerNode 窄缝：播放器只需要 play / stop / 入队三个动作。
+/// 方法名刻意避开 `scheduleBuffer`，防止与 `AVAudioPlayerNode` 自带的
+/// 同名重载族发生解析歧义。
+protocol StreamingAudioPlayerNodeControlling: AnyObject {
+    func play()
+    func stop()
+    func schedule(_ buffer: AVAudioPCMBuffer)
+    func scheduleTail(_ buffer: AVAudioPCMBuffer, onConsumed: @escaping @Sendable () -> Void)
+}
+
+extension AVAudioPlayerNode: StreamingAudioPlayerNodeControlling {
+    func schedule(_ buffer: AVAudioPCMBuffer) {
+        scheduleBuffer(buffer)
+    }
+    func scheduleTail(_ buffer: AVAudioPCMBuffer, onConsumed: @escaping @Sendable () -> Void) {
+        scheduleBuffer(buffer, completionCallbackType: .dataConsumed) { _ in onConsumed() }
+    }
+}
+
+/// AVAudioEngine 窄缝：引擎负责**建图并交付一个可播放的 node**，
+/// 起停走 start / stop。
+///
+/// ESS-755：这里刻意不暴露 `mainMixerNode` / `attach` / `connect`。
+/// 早前版本把这三者放进协议，spy 只好内持一个真 `AVAudioEngine` 去搭图，
+/// 结果在无音频硬件的 hosted runner 上 `connect(_:to:format:)` 直接返回
+/// `-10868`（kAudioUnitErr_FormatNotSupported）把三条契约测试全打挂——
+/// 注入缝形同虚设。把建图整体收进实现方之后，spy 返回纯计数 node，
+/// 测试路径上不再出现任何 AVAudioEngine 实例。
 protocol StreamingAudioEngineControlling: AnyObject {
-    var mainMixerNode: AVAudioMixerNode { get }
-    func attachNode(_ node: AVAudioNode)
-    func connectNode(_ node1: AVAudioNode, to node2: AVAudioNode, format: AVAudioFormat?)
+    func makePlayerNode(format: AVAudioFormat) -> any StreamingAudioPlayerNodeControlling
     func start() throws
     func stop()
 }
 
 extension AVAudioEngine: StreamingAudioEngineControlling {
-    func attachNode(_ node: AVAudioNode) { self.attach(node) }
-    func connectNode(_ node1: AVAudioNode, to node2: AVAudioNode, format: AVAudioFormat?) {
-        self.connect(node1, to: node2, format: format)
+    func makePlayerNode(format: AVAudioFormat) -> any StreamingAudioPlayerNodeControlling {
+        let node = AVAudioPlayerNode()
+        attach(node)
+        connect(node, to: mainMixerNode, format: format)
+        return node
     }
 }
 
@@ -471,7 +495,7 @@ final class StreamingAudioPlayer: StreamAudioPlaying {
     private let context: String
     private let pcmFormat: AVAudioFormat
     private let engine: any StreamingAudioEngineControlling
-    private let playerNode: AVAudioPlayerNode
+    private let playerNode: any StreamingAudioPlayerNodeControlling
     private let session: any StreamingAudioPlayerSessionControlling
 
     private var isStarted = false
@@ -513,9 +537,7 @@ final class StreamingAudioPlayer: StreamAudioPlaying {
         }
         self.pcmFormat = fmt
         self.engine = engine
-        self.playerNode = AVAudioPlayerNode()
-        engine.attachNode(playerNode)
-        engine.connectNode(playerNode, to: engine.mainMixerNode, format: fmt)
+        self.playerNode = engine.makePlayerNode(format: fmt)
     }
 
     /// ESS-748：起播失败必须**可判定**。
@@ -575,7 +597,7 @@ final class StreamingAudioPlayer: StreamAudioPlaying {
             guard let base = ptr.baseAddress else { return }
             memcpy(buffer.int16ChannelData!.pointee, base, pcmData.count)
         }
-        playerNode.scheduleBuffer(buffer)
+        playerNode.schedule(buffer)
         totalBytes += pcmData.count
         totalBuffers += 1
 
@@ -597,10 +619,9 @@ final class StreamingAudioPlayer: StreamAudioPlaying {
             detail: "total_bytes=\(totalBytes) buffers=\(totalBuffers)"
         )
         // 播完当前队列后停止
-        playerNode.scheduleBuffer(
-            AVAudioPCMBuffer(pcmFormat: pcmFormat, frameCapacity: 0)!,
-            completionCallbackType: .dataConsumed
-        ) { [weak self] _ in
+        playerNode.scheduleTail(
+            AVAudioPCMBuffer(pcmFormat: pcmFormat, frameCapacity: 0)!
+        ) { [weak self] in
             Task { @MainActor in
                 self?.stop()
             }
