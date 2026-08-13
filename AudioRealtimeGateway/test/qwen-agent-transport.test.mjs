@@ -168,7 +168,7 @@ test('normalizes restarted upstream sequences and holds done for late audio', as
   })
   const events = []; const logs = []
   const transport = new QwenAgentTransport({
-    gatewayUrl: url, doneSettleMs: 60,
+    gatewayUrl: url, doneSettleMs: 60, reorderWaitMs: 5,
     log: (evt, extra) => logs.push({ evt, ...extra }),
   })
   const turn = transport.openTurn({
@@ -200,7 +200,7 @@ test('drops a near-simultaneous exact upstream replay only once', async () => {
   })
   const events = []; const logs = []
   const transport = new QwenAgentTransport({
-    gatewayUrl: url, doneSettleMs: 20, duplicateWindowMs: 200,
+    gatewayUrl: url, doneSettleMs: 20, duplicateWindowMs: 200, reorderWaitMs: 5,
     log: (evt, extra) => logs.push({ evt, ...extra }),
   })
   const turn = transport.openTurn({
@@ -234,7 +234,7 @@ test('keeps an identical frame that repeats outside the replay window', async ()
   })
   const events = []; const logs = []
   const transport = new QwenAgentTransport({
-    gatewayUrl: url, doneSettleMs: 20, duplicateWindowMs: 20,
+    gatewayUrl: url, doneSettleMs: 20, duplicateWindowMs: 20, reorderWaitMs: 5,
     log: (evt, extra) => logs.push({ evt, ...extra }),
   })
   const turn = transport.openTurn({
@@ -280,6 +280,98 @@ test('keeps identical audio that arrives at a new upstream sequence', async () =
     [0, 1, 2],
   )
   assert.equal(events.at(-1).final_sequence, 2)
+  turn.close()
+})
+
+// ESS-823 blocker 1. The upstream sequence keeps its ORDERING meaning: frames
+// that arrive out of order are reordered before the dense downstream sequence
+// is assigned, so the Watch plays A before B — not arrival order.
+test('reorders an out-of-order upstream pair before assigning the downstream sequence', async () => {
+  const audio = value => Buffer.from(value).toString('base64')
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+    if (message.type === 'audio.commit') {
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 11, audio: audio('B') }))
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 10, audio: audio('A') }))
+      ws.send(JSON.stringify({ type: 'audio.done' }))
+    }
+  })
+  const events = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, doneSettleMs: 20, reorderWaitMs: 30,
+  })
+  const turn = transport.openTurn({
+    requestId: 'r9', sessionId: 's9', generation: 1, responseId: 'r9:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  const deltas = events.filter(event => event.type === 'agent.audio.delta')
+  assert.deepEqual(deltas.map(event => Buffer.from(event.audio, 'base64').toString()), ['A', 'B'])
+  assert.deepEqual(deltas.map(event => event.sequence), [0, 1])
+  assert.equal(events.at(-1).final_sequence, 1)
+  turn.close()
+})
+
+// Mid-stream reorder, with the response anchored at 0 so nothing waits.
+test('fills an out-of-order hole without delaying the frames around it', async () => {
+  const audio = value => Buffer.from(value).toString('base64')
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+    if (message.type === 'audio.commit') {
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 0, audio: audio('A') }))
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 2, audio: audio('C') }))
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 1, audio: audio('B') }))
+      ws.send(JSON.stringify({ type: 'audio.done' }))
+    }
+  })
+  const events = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, doneSettleMs: 20, reorderWaitMs: 200,
+  })
+  const turn = transport.openTurn({
+    requestId: 'r10', sessionId: 's10', generation: 1, responseId: 'r10:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  const deltas = events.filter(event => event.type === 'agent.audio.delta')
+  assert.deepEqual(deltas.map(event => Buffer.from(event.audio, 'base64').toString()), ['A', 'B', 'C'])
+  assert.deepEqual(deltas.map(event => event.sequence), [0, 1, 2])
+  assert.equal(events.at(-1).final_sequence, 2)
+  turn.close()
+})
+
+// ESS-823 blocker 2, the silent-loss counterexample: upstream {0,2,done} must
+// NOT become downstream {0,1,done(1)}. A frame the upstream never delivered is
+// a failure, not a shorter response.
+test('fails closed on a real upstream gap instead of renumbering past it', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+    if (message.type === 'audio.commit') {
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 0, audio: 'AAAA' }))
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 2, audio: 'BBBB' }))
+      ws.send(JSON.stringify({ type: 'audio.done' }))
+    }
+  })
+  const events = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, doneSettleMs: 20, reorderWaitMs: 40,
+  })
+  const turn = transport.openTurn({
+    requestId: 'r11', sessionId: 's11', generation: 1, responseId: 'r11:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.error'))
+  // Only the frame ahead of the hole was forwarded, and no done was invented.
+  assert.equal(events.filter(event => event.type === 'agent.audio.delta').length, 1)
+  assert.ok(!events.some(event => event.type === 'agent.audio.done'))
+  assert.equal(events.at(-1).code, 'ERR_UPSTREAM_SEQUENCE_GAP')
+  assert.equal(events.at(-1).retriable, true)
   turn.close()
 })
 
