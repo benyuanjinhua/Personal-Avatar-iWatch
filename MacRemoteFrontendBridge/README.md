@@ -118,7 +118,9 @@ request_id` 绑定回原请求，转码 AAC/M4A 落 `state/result-audio/`（保�
 - **上限**：单请求 SSE/task 事件数（`max_turn_events`，ESS-41 起只统计 SSE/task
   生命周期事件，Realtime 观测计数单独分账；超预算降级为收敛投影 + 降采样日志，
   绝不取消健康任务，最终兜底是 300s 硬超时）、结果文本（`max_result_chars`）、结果音频
-  （`max_result_audio_bytes`，超限丢音频保文本摘要）。
+  （`max_result_audio_bytes`，超限丢音频保文本摘要）。Turn ledger 使用逐 request 原子文件，
+  终态默认保留 7 天且总量上限 5000（`turn_ledger_terminal_retention_ms` /
+  `turn_ledger_max_turns`）；活跃 turn 不因历史裁剪丢失，旧版 `turn-ledger.json` 在启动时自动迁移。
 - **空音频快速失败**（ESS-41）：解码后不足 `min_audio_ms`（默认 300ms）或 RMS 低于
   `min_audio_rms` 的空/误触音频直接 `ERR_AUDIO_TOO_SHORT`（Watch 提示「没听清，请重
   说」），不进 Realtime 注入与停摆重放机器。

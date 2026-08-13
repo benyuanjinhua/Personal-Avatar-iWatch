@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -182,5 +182,61 @@ describe('terminal result redelivery ledger', () => {
     assert.equal(ledger.dueTerminalDeliveries({ now: 1_100 }).length, 1)
     ledger.acknowledgeResult('req-live')
     assert.equal(ledger.dueTerminalDeliveries({ now: 99_999 }).length, 0)
+  })
+})
+
+describe('ESS-742 bounded sharded persistence', () => {
+  it('migrates a legacy monolithic ledger and recovers it after restart', () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'ledger-migration-'))
+    const createdAt = '2026-08-01T00:00:00.000Z'
+    writeFileSync(join(stateDir, 'turn-ledger.json'), JSON.stringify({ turns: {
+      legacy: {
+        request_id: 'legacy', body_sha256: 'sha', state: 'processing',
+        created_at: createdAt, updated_at: createdAt,
+      },
+    } }))
+
+    const migrated = new TurnLedger({ stateDir, terminalRetentionMs: Infinity })
+    assert.equal(migrated.get('legacy').state, 'processing')
+    assert.equal(migrated.get('legacy').timing.bridge_accepted_at, createdAt)
+    assert.equal(existsSync(join(stateDir, 'turn-ledger.json.migrated')), true)
+
+    const restarted = new TurnLedger({ stateDir, terminalRetentionMs: Infinity })
+    assert.equal(restarted.get('legacy').state, 'processing')
+  })
+
+  it('bounds terminal history by count while preserving active turns', () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'ledger-retention-'))
+    const ledger = new TurnLedger({ stateDir, maxTurns: 100, terminalRetentionMs: Infinity })
+    ledger.create({ requestId: 'active', deviceId: 'watch', bodySha256: 'sha', sessionId: 's' })
+    for (let i = 0; i < 250; i += 1) {
+      const requestId = `terminal-${i}`
+      ledger.create({ requestId, deviceId: 'watch', bodySha256: 'sha', sessionId: 's' })
+      ledger.setResult(requestId, { text: 'done' })
+    }
+
+    assert.equal(ledger.turns.size, 100)
+    assert.ok(ledger.get('active'))
+    assert.equal(readdirSync(join(stateDir, 'turn-ledger.d')).filter(name => name.endsWith('.json')).length, 100)
+    const restarted = new TurnLedger({ stateDir, maxTurns: 100, terminalRetentionMs: Infinity })
+    assert.equal(restarted.turns.size, 100)
+    assert.ok(restarted.get('active'))
+    assert.ok(restarted.get('terminal-249'))
+  })
+
+  it('updates only one bounded record with a large retained ledger', () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'ledger-latency-'))
+    const ledger = new TurnLedger({ stateDir, maxTurns: 2000, terminalRetentionMs: Infinity })
+    for (let i = 0; i < 1000; i += 1) {
+      ledger.create({ requestId: `large-${i}`, deviceId: 'watch', bodySha256: 'sha', sessionId: 's' })
+    }
+    const started = process.hrtime.bigint()
+    ledger.update('large-999', { detail: 'latency_probe' })
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6
+
+    assert.ok(elapsedMs < 50, `single-record update took ${elapsedMs.toFixed(2)}ms`)
+    const record = JSON.parse(readFileSync(ledger.recordPath('large-999'), 'utf8'))
+    assert.equal(record.detail, 'latency_probe')
+    assert.equal(existsSync(join(stateDir, 'turn-ledger.json')), false)
   })
 })

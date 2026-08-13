@@ -77,6 +77,8 @@ export function createBridge(overrides = {}) {
     stateDir,
     maxResultChars: CONFIG.max_result_chars,
     maxResultAudioBytes: CONFIG.max_result_audio_bytes,
+    maxTurns: CONFIG.turn_ledger_max_turns ?? 5000,
+    terminalRetentionMs: CONFIG.turn_ledger_terminal_retention_ms ?? 7 * 24 * 60 * 60 * 1000,
     log,
   })
   const gateway = new GatewayClient({

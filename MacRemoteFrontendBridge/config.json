@@ -34,6 +34,8 @@
   "max_progress_events": 12,
   "max_result_chars": 4000,
   "max_result_audio_bytes": 524288,
+  "turn_ledger_max_turns": 5000,
+  "turn_ledger_terminal_retention_ms": 604800000,
   "max_announcement_pcm_bytes": 5760000,
   "result_audio_retention_ms": 86400000,
   "result_delivery_ttl_ms": 1800000,

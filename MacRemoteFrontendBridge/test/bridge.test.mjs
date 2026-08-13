@@ -208,8 +208,7 @@ describe('direct-answer path', () => {
     assert.equal(delivered.json.type, 'turn.state')
     assert.deepEqual(delivered.json.turn, done)
 
-    const ledgerPath = join(ctx.stateDir, 'turn-ledger.json')
-    const persisted = JSON.parse(readFileSync(ledgerPath, 'utf8')).turns[id]
+    const persisted = JSON.parse(readFileSync(ctx.bridge.ledger.recordPath(id), 'utf8'))
     assert.equal(persisted.delivery_attempts, 1)
     assert.ok(Number.isFinite(Date.parse(persisted.next_delivery_at)))
 
@@ -399,19 +398,15 @@ describe('restart recovery', () => {
     const id = rid()
     await ctxA.client.createTurn(id, pcm(300))
     await waitFor(async () => (await ctxA.client.getTurn(id)).json.task_id === 'task_bg')
-    await ctxA.bridge.stop() // simulated crash mid-background-task (mock keeps running)
-
-    // inject a stuck no-task turn into the persisted ledger (unknown outcome)
-    const ledgerPath = join(stateDir, 'turn-ledger.json')
-    const persisted = JSON.parse(readFileSync(ledgerPath, 'utf8'))
-    persisted.turns.req_unknown_outcome = {
-      ...persisted.turns[id],
-      request_id: 'req_unknown_outcome',
-      task_id: null,
-      state: 'processing',
-      detail: 'realtime_processing',
-    }
-    writeFileSync(ledgerPath, JSON.stringify(persisted))
+    // Inject a stuck no-task turn into the public ledger API (unknown outcome),
+    // then simulate the crash while the mock gateway remains running.
+    ctxA.bridge.ledger.create({
+      requestId: 'req_unknown_outcome', deviceId: 'watch', bodySha256: 'sha', sessionId: 's',
+    })
+    ctxA.bridge.ledger.update('req_unknown_outcome', {
+      state: 'processing', detail: 'realtime_processing', task_id: null,
+    })
+    await ctxA.bridge.stop()
 
     const bridgeB = createBridge({
       port: 0,
