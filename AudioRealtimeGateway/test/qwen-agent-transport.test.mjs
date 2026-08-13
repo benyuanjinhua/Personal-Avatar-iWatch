@@ -63,6 +63,89 @@ test('agent transport forwards real upstream audio with request-scoped logs', as
   turn.close()
 })
 
+// ESS-745: request_id is client-supplied (token-issuer only checks it is a
+// string), and one transport instance serves every connection of the process.
+// Two different devices/sessions may therefore present the SAME request_id.
+test('two sessions sharing a requestId keep independent turns', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+    if (message.type === 'audio.commit') {
+      ws.send(JSON.stringify({ type: 'audio.delta', audio: Buffer.from('b').toString('base64') }))
+      ws.send(JSON.stringify({ type: 'audio.done' }))
+    }
+  })
+  const transport = new QwenAgentTransport({ gatewayUrl: url })
+  const eventsA = []; const eventsB = []
+  const turnA = transport.openTurn({
+    requestId: 'shared-req', sessionId: 'sA', deviceId: 'dA', generation: 1,
+    responseId: 'shared-req:gen1@A', onEvent: event => eventsA.push(event),
+  })
+  const turnB = transport.openTurn({
+    requestId: 'shared-req', sessionId: 'sB', deviceId: 'dB', generation: 1,
+    responseId: 'shared-req:gen1@B', onEvent: event => eventsB.push(event),
+  })
+  // Neither device may evict or supersede the other's book-keeping.
+  assert.equal(transport.turns.size, 2)
+  assert.deepEqual(eventsA, [])
+
+  // Closing A must leave B registered and working.
+  turnA.close()
+  assert.equal(transport.turns.size, 1)
+  assert.equal([...transport.turns.values()][0].sessionId, 'sB')
+  turnB.appendAudio({ bytes: Buffer.from('audio') })
+  turnB.commit()
+  await waitFor(() => eventsB.some(event => event.type === 'agent.audio.done'))
+  assert.ok(eventsB.every(event => event.response_id === 'shared-req:gen1@B'))
+  assert.deepEqual(eventsA, [])
+  turnB.close()
+  assert.equal(transport.turns.size, 0)
+})
+
+// ESS-745: a barge-in retry may reuse the same request_id with generation+1.
+// The superseded socket settles late; its close must not evict the replacement.
+test('late close of a superseded same-requestId turn does not evict its replacement', async () => {
+  const connections = []
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') { connections.push(ws); ws.send(JSON.stringify({ type: 'voice.ready' })) }
+    if (message.type === 'audio.commit') {
+      ws.send(JSON.stringify({ type: 'audio.delta', audio: Buffer.from('b').toString('base64') }))
+      ws.send(JSON.stringify({ type: 'audio.done' }))
+    }
+  })
+  const logs = []
+  const transport = new QwenAgentTransport({ gatewayUrl: url, log: (evt, extra) => logs.push({ evt, ...extra }) })
+  const eventsOld = []; const eventsNew = []
+  const oldTurn = transport.openTurn({
+    requestId: 'r1', sessionId: 's1', deviceId: 'd1', generation: 1,
+    responseId: 'r1:gen1', onEvent: event => eventsOld.push(event),
+  })
+  await waitFor(() => logs.some(item => item.evt === 'upstream_ready' && item.generation === 1))
+
+  const newTurn = transport.openTurn({
+    requestId: 'r1', sessionId: 's1', deviceId: 'd1', generation: 2,
+    responseId: 'r1:gen2', onEvent: event => eventsNew.push(event),
+  })
+  assert.ok(logs.some(item => item.evt === 'upstream_turn_superseded' && item.generation === 1))
+  assert.equal(transport.turns.size, 1)
+  assert.equal([...transport.turns.values()][0].generation, 2)
+
+  // The old upstream socket now settles (close/error arrive after the
+  // replacement was registered) and the old session tears its handle down.
+  await waitFor(() => connections.length === 2)
+  connections[0].close(1011, 'late')
+  oldTurn.close()
+  await new Promise(resolve => setTimeout(resolve, 50))
+
+  assert.equal(transport.turns.size, 1)
+  assert.equal([...transport.turns.values()][0].generation, 2)
+  assert.deepEqual(eventsOld, [])
+  newTurn.appendAudio({ bytes: Buffer.from('audio') })
+  newTurn.commit()
+  await waitFor(() => eventsNew.some(event => event.type === 'agent.audio.done'))
+  assert.ok(eventsNew.every(event => event.response_id === 'r1:gen2'))
+  newTurn.close()
+})
+
 test('upstream failure becomes one structured agent error', async () => {
   const url = await upstream(ws => ws.close(1011, 'provider unavailable'))
   const events = []; const logs = []

@@ -1,6 +1,22 @@
 import WebSocket from 'ws'
 import { randomUUID } from 'node:crypto'
 
+// ESS-745: `request_id` is client-supplied and only validated as a string
+// (token-issuer.mjs `#assertScope`); nothing makes it unique beyond the
+// device/session that minted it, and one QwenAgentTransport instance is
+// shared by every connection of the process (server.mjs `createAgentTransport`).
+// So the active-turn book-keeping must be keyed by the FULL scope, and every
+// removal must prove it is removing its own turn instance — otherwise a late
+// close from an old socket evicts the turn that replaced it.
+const scopeKey = ({ deviceId, sessionId, generation, requestId }) =>
+  JSON.stringify([deviceId ?? null, sessionId ?? null, generation ?? null, requestId ?? null])
+
+// Conversation identity for the one-active-turn rule (ESS-537): a turn may only
+// supersede another turn of the same device + session, never a same-named
+// request that belongs to somebody else.
+const conversationKey = ({ deviceId, sessionId }) =>
+  JSON.stringify([deviceId ?? null, sessionId ?? null])
+
 // Adapter from the secure northbound Gateway contract to the already deployed
 // qwen-audio-agent realtime WSS. The qwen service owns the provider credential;
 // this process only talks to its loopback endpoint, so provider secrets never
@@ -21,7 +37,23 @@ export class QwenAgentTransport {
     this.turns = new Map()
   }
 
-  openTurn({ requestId, sessionId, generation, responseId, onEvent }) {
+  // Remove a turn from the active map ONLY if that slot still holds this exact
+  // turn instance. A superseded/failed socket can settle long after its
+  // replacement was registered; an unconditional delete by key would evict the
+  // live turn and leave an orphan upstream socket nobody can cancel.
+  #release(turn) {
+    if (this.turns.get(turn.key) === turn) this.turns.delete(turn.key)
+  }
+
+  // A turn is current only while it is both non-terminal and still the
+  // registered instance for its scope key.
+  #isCurrent(turn) {
+    return !turn.terminal && this.turns.get(turn.key) === turn
+  }
+
+  openTurn({ requestId, sessionId, deviceId = null, generation, responseId, onEvent }) {
+    const key = scopeKey({ deviceId, sessionId, generation, requestId })
+    const conversation = conversationKey({ deviceId, sessionId })
     // ESS-537: a Watch conversation session may issue a new request before
     // the provider has finished draining the prior response.  The upstream
     // voice service is ownership-oriented, so leaving both sockets alive can
@@ -29,47 +61,50 @@ export class QwenAgentTransport {
     // that point this adapter would (incorrectly) stamp those bytes with the
     // new request's responseId.  Enforce one active request per session and
     // cancel/close the old upstream socket before opening the replacement.
+    //
+    // ESS-745: match on the conversation (device + session), not on session
+    // alone, and supersede every prior turn of that conversation — including
+    // one that reuses the same requestId with a new generation, which the old
+    // `prior.requestId !== requestId` guard let survive as an orphan.  The new
+    // turn is not in the map yet, so nothing here can supersede itself.
     for (const prior of this.turns.values()) {
-      if (prior.sessionId === sessionId && prior.requestId !== requestId) {
-        prior.supersede?.(requestId)
-      }
+      if (prior.conversation === conversation) prior.supersede?.(requestId)
     }
     const upstreamSessionId = `watch-direct-${sessionId}-${generation}`
     const url = new URL(this.gatewayUrl)
     url.searchParams.set('sessionId', upstreamSessionId)
     const turn = {
-      requestId, sessionId, generation, responseId, onEvent,
+      key, conversation,
+      requestId, sessionId, deviceId, generation, responseId, onEvent,
       ws: null, ready: false, terminal: false, committed: false,
       pending: [], pendingBytes: 0, nextOutputSequence: 0,
       connectTimer: null,
     }
+    const scopeLog = { request_id: requestId, session_id: sessionId, device_id: deviceId, generation }
     turn.supersede = nextRequestId => {
       if (turn.terminal) return
       turn.terminal = true
       clearTimeout(turn.connectTimer)
       this.log('upstream_turn_superseded', {
-        request_id: requestId, session_id: sessionId, generation,
-        superseded_by_request_id: nextRequestId,
+        ...scopeLog, superseded_by_request_id: nextRequestId,
       })
       if (turn.ws?.readyState === WebSocket.OPEN) {
         try { turn.ws.send(JSON.stringify({ type: 'response.cancel' })) } catch { /* closing */ }
       }
       try { turn.ws?.close(1000, 'superseded') } catch { /* best effort */ }
-      this.turns.delete(requestId)
+      this.#release(turn)
     }
-    this.turns.set(requestId, turn)
-    this.log('upstream_connecting', { request_id: requestId, session_id: sessionId, generation })
+    this.turns.set(key, turn)
+    this.log('upstream_connecting', scopeLog)
 
     const fail = (code, detail) => {
       if (turn.terminal) return
       turn.terminal = true
       clearTimeout(turn.connectTimer)
-      this.log('upstream_error', {
-        request_id: requestId, session_id: sessionId, generation, code,
-      })
+      this.log('upstream_error', { ...scopeLog, code })
       onEvent({ type: 'agent.error', response_id: responseId, code, detail, retriable: true })
       try { turn.ws?.close() } catch { /* best effort */ }
-      this.turns.delete(requestId)
+      this.#release(turn)
     }
 
     const sendOrQueue = (event, bytes = 0) => {
@@ -95,6 +130,12 @@ export class QwenAgentTransport {
       turn.connectTimer.unref?.()
 
       ws.on('open', () => {
+        // The turn can be superseded/cancelled while the handshake is still in
+        // flight; do not announce a connection nobody owns any more.
+        if (!this.#isCurrent(turn)) {
+          try { ws.close(1000, 'superseded') } catch { /* best effort */ }
+          return
+        }
         ws.send(JSON.stringify({
           type: 'connect', clientType: 'cli', clientLabel: 'watch-direct-gateway',
           clientInstanceId: `gateway_${randomUUID()}`, voiceEnabled: true,
@@ -103,13 +144,18 @@ export class QwenAgentTransport {
         }))
       })
       ws.on('message', raw => {
+        // Every frame is validated against THIS turn instance before it can
+        // touch downstream state: a superseded socket may still be draining
+        // the provider's prior response, and forwarding it would stamp those
+        // bytes with a scope that no longer owns the conversation (ESS-745).
+        if (!this.#isCurrent(turn)) return
         let event
         try { event = JSON.parse(raw.toString()) } catch { return }
         if (event.type === 'voice.ready') {
-          if (turn.terminal || turn.ready) return
+          if (turn.ready) return
           turn.ready = true
           clearTimeout(turn.connectTimer)
-          this.log('upstream_ready', { request_id: requestId, session_id: sessionId, generation })
+          this.log('upstream_ready', scopeLog)
           for (const queued of turn.pending) ws.send(JSON.stringify(queued))
           turn.pending = []
           turn.pendingBytes = 0
@@ -124,12 +170,9 @@ export class QwenAgentTransport {
             ? event.sequence : turn.nextOutputSequence
           turn.nextOutputSequence = Math.max(turn.nextOutputSequence, sequence + 1)
           this.log('upstream_event_received', {
-            request_id: requestId, session_id: sessionId, generation,
-            upstream_event_type: 'audio.delta', sequence,
+            ...scopeLog, upstream_event_type: 'audio.delta', sequence,
           })
-          this.log('upstream_audio_delta', {
-            request_id: requestId, session_id: sessionId, generation, sequence,
-          })
+          this.log('upstream_audio_delta', { ...scopeLog, sequence })
           onEvent({
             type: 'agent.audio.delta', response_id: responseId, sequence,
             sample_rate: event.sampleRate ?? 24_000, codec: 'pcm_s16le', audio: event.audio,
@@ -139,13 +182,9 @@ export class QwenAgentTransport {
         if (event.type === 'audio.done') {
           const finalSequence = turn.nextOutputSequence - 1
           this.log('upstream_event_received', {
-            request_id: requestId, session_id: sessionId, generation,
-            upstream_event_type: 'audio.done', final_sequence: finalSequence,
+            ...scopeLog, upstream_event_type: 'audio.done', final_sequence: finalSequence,
           })
-          this.log('upstream_audio_done', {
-            request_id: requestId, session_id: sessionId, generation,
-            final_sequence: finalSequence,
-          })
+          this.log('upstream_audio_done', { ...scopeLog, final_sequence: finalSequence })
           onEvent({
             type: 'agent.audio.done', response_id: responseId,
             final_sequence: finalSequence,
@@ -181,7 +220,7 @@ export class QwenAgentTransport {
         turn.terminal = true
         clearTimeout(turn.connectTimer)
         turn.ws?.close()
-        this.turns.delete(requestId)
+        this.#release(turn)
       },
       close: () => {
         if (turn.terminal) return
@@ -191,7 +230,7 @@ export class QwenAgentTransport {
           turn.ws.send(JSON.stringify({ type: 'mute' }))
         }
         turn.ws?.close()
-        this.turns.delete(requestId)
+        this.#release(turn)
       },
     }
   }

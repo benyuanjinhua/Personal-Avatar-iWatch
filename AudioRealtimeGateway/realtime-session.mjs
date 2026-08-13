@@ -206,6 +206,10 @@ export class RealtimeSession {
     this.agentTurn = this.agent.openTurn({
       requestId: this.scope.request_id,
       sessionId: this.scope.session_id,
+      // ESS-745: request_id / session_id are client-supplied and unique only
+      // within a device, so the transport needs the whole scope to key its
+      // active turns.
+      deviceId: this.scope.device_id,
       generation: this.scope.generation,
       responseId: this.responseId,
       onEvent: e => this._handleAgentEvent(e),
