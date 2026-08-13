@@ -19,6 +19,20 @@ import { MockGateway } from './mock-gateway.mjs'
 
 const TMP = mkdtempSync(join(tmpdir(), 'ess744-'))
 
+// bridge 的 log 是 createBridge 闭包内定义的，事后无法 monkey-patch；只能拦 stdout。
+async function captureStdout(work) {
+  const originalWrite = process.stdout.write.bind(process.stdout)
+  const captured = []
+  process.stdout.write = (chunk, ...rest) => {
+    if (typeof chunk === 'string' && chunk.startsWith('{"ts"')) {
+      try { captured.push(JSON.parse(chunk)) } catch { /* ignore non-JSON */ }
+    }
+    return originalWrite(chunk, ...rest)
+  }
+  try { await work() } finally { process.stdout.write = originalWrite }
+  return captured
+}
+
 // ---- SSE ------------------------------------------------------------------
 
 // 精确控制分片边界：真实 socket 的 chunk 切分由内核决定，无法稳定复现
@@ -230,5 +244,48 @@ describe('ESS-744 WSS inbound frame and queue bounds', () => {
     await waitFor(() => received.some(event => event.code === 'ERR_STREAM_OVERLOAD'))
     if (ws.readyState !== WebSocket.CLOSED) await closeCode(ws)
     await waitFor(() => bridge.supervisor.mediaSession === null)
+  })
+
+  // ESS-797：断链只是把入口关掉，已经挂在 Promise chain 上的消息此前照跑不误，
+  // 过载判定之后仍有帧打到上游（并顺带刷出二次 ERR_STREAM_CLOSED）。
+  // fail-close 要求过载是单一、幂等的终止态。
+  it('makes overload terminal: no queued message reaches upstream afterwards', async () => {
+    const requestId = 'req_overload_terminal'
+    const sessionId = 'session-overload-terminal'
+    const appendsBefore = mock.audioAppendMessages.length
+    const mediaEventsBefore = mock.mediaEvents.length
+    const logs = await captureStdout(async () => {
+      const { ws, received } = connectMedia(requestId, sessionId)
+      await opened(ws)
+      ws.send(JSON.stringify({ type: 'start', protocol_version: 1, request_id: requestId, session_id: sessionId }))
+      const audio = Buffer.alloc(128, 3).toString('base64')
+      for (let i = 0; i < 500; i += 1) {
+        ws.send(JSON.stringify({ type: 'audio.append', sequence: i, audio }))
+      }
+      await waitFor(() => received.some(event => event.code === 'ERR_STREAM_OVERLOAD'))
+      if (ws.readyState !== WebSocket.CLOSED) await closeCode(ws)
+      await waitFor(() => bridge.supervisor.mediaSession === null)
+      // 让 chain 把剩余排队任务全部走完：旧实现正是在这个窗口里继续转发。
+      await new Promise(resolve => setTimeout(resolve, 200))
+      assert.equal(received.filter(event => event.type === 'error').length, 1)
+    })
+    const mine = logs.filter(entry => entry.request_id === requestId)
+    assert.deepEqual(
+      mine.filter(entry => entry.evt === 'realtime_media' && entry.event === 'stream.input.forwarded'),
+      [], '过载判定之后不得再有任何帧转发到上游',
+    )
+    assert.equal(mock.audioAppendMessages.length, appendsBefore, 'MockGateway 不应再收到音频帧')
+    // 过载后 mediaEvents 只允许增长「拆除动作」——cleanup 的 response.cancel。
+    // 任何客户端驱动的事件都算越过终止态。
+    assert.deepEqual(
+      mock.mediaEvents.slice(mediaEventsBefore).map(event => event.type).filter(type => type !== 'response.cancel'),
+      [], '过载后不得再有客户端驱动的 mediaEvents',
+    )
+    assert.deepEqual(
+      mine.filter(entry => entry.evt === 'realtime_media_error').map(entry => entry.code),
+      ['ERR_STREAM_OVERLOAD'], '结构化错误只报一次，不再有二次 ERR_STREAM_CLOSED 噪声',
+    )
+    assert.equal(mine.filter(entry => entry.evt === 'realtime_media_inbound_overload').length, 1)
+    assert.equal(mine.filter(entry => entry.evt === 'realtime_media_disconnected').length, 1)
   })
 })
