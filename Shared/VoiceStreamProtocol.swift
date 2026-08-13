@@ -142,6 +142,12 @@ enum VoiceStreamFallbackReason: Equatable {
     case backpressure
     case gapTimedOut
     case streamEndedWithGap
+    /// ESS-748：播放器起不来（AVAudioSession / AVAudioEngine 启动失败）。
+    /// 这一条**不由缓冲区产生**，而是播放侧起播失败时由 `WatchStreamReceiver`
+    /// 直接触发——修这条之前它根本不存在：`start()` 吞掉错误返回 Void，
+    /// receiver 照旧保存 player、照旧推进 played sequence，音频静默消失且
+    /// 永远不降级。
+    case playerStartFailed
 }
 
 enum VoiceStreamBufferResult: Equatable {

@@ -30,6 +30,7 @@
 		1DF752190D2F7A81145E12C8 /* WatchHaptics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D32404639DC13C1A992EC83 /* WatchHaptics.swift */; };
 		1E184E9FA5EE8DBC8DE9852E /* VoiceBargeInDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6983995D53E90803381BB8E0 /* VoiceBargeInDetector.swift */; };
 		1E4C2CF87BA6A4A921EBA7E1 /* WatchDebugSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A1B0A3BF7CF87587B6FF3EB /* WatchDebugSettings.swift */; };
+		1EF1000CCC5EE26560C0A31E /* WatchStreamPlayerStartFailureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C236AB589FD3E3793C2E2958 /* WatchStreamPlayerStartFailureTests.swift */; };
 		1EF906148F17573C9B7D948E /* BuildFingerprint.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32C8DAF30CCFE15F09A5351A /* BuildFingerprint.swift */; };
 		20A0B47A1FB2A2099BE53146 /* VoiceStatusEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0EAD7935F2F128D8408C210F /* VoiceStatusEnvelope.swift */; };
 		24ABA6464E98C3CA60DE366E /* WristAgent Watch App.app in Embed Watch Content */ = {isa = PBXBuildFile; fileRef = 2E88D71F4696224E69D652E8 /* WristAgent Watch App.app */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -372,6 +373,7 @@
 		B9D95B86CF79B5796D5EA9DC /* SelfCheck.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SelfCheck.swift; sourceTree = "<group>"; };
 		BF28D500590D9DF5BF4D748A /* ClientLogUplink.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientLogUplink.swift; sourceTree = "<group>"; };
 		C10B09D1AD3BA287A3856E6E /* WristAgentWatchApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WristAgentWatchApp.swift; sourceTree = "<group>"; };
+		C236AB589FD3E3793C2E2958 /* WatchStreamPlayerStartFailureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchStreamPlayerStartFailureTests.swift; sourceTree = "<group>"; };
 		C426A9FB7C2456FD57F1BA1E /* SubtitleScript.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubtitleScript.swift; sourceTree = "<group>"; };
 		C58AEB9B4C54F952DFC96AB2 /* VoiceRelayEvents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceRelayEvents.swift; sourceTree = "<group>"; };
 		C608A2AC1FA2B2981F7EB790 /* MainStatusCopy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainStatusCopy.swift; sourceTree = "<group>"; };
@@ -628,6 +630,7 @@
 				F9C49719F53E734FE041D10B /* VoiceOrbModeTests.swift */,
 				50DEF68818AC545EED28B44F /* WatchDebugSettingsTests.swift */,
 				DADB09FEF300D41C2F68E5BA /* WatchRealtimeMediaAdapterTests.swift */,
+				C236AB589FD3E3793C2E2958 /* WatchStreamPlayerStartFailureTests.swift */,
 				5B3297717E736F5BC5E44F85 /* WatchStreamReceiverTests.swift */,
 			);
 			path = WatchTests;
@@ -1001,6 +1004,7 @@
 				BE736ADFC210C176CA197273 /* VoiceOrbModeTests.swift in Sources */,
 				A3BFF832F44C4739239AB662 /* WatchDebugSettingsTests.swift in Sources */,
 				B338F411DD25A0ACA401E4DD /* WatchRealtimeMediaAdapterTests.swift in Sources */,
+				1EF1000CCC5EE26560C0A31E /* WatchStreamPlayerStartFailureTests.swift in Sources */,
 				A766A36C146CEA01CE487911 /* WatchStreamReceiverTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
