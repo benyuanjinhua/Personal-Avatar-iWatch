@@ -361,26 +361,38 @@ struct RealtimeEventEnvelope: Equatable, Sendable {
     }
 }
 
-// MARK: - RealtimeEnvelopeFlag
+// MARK: - RealtimeConversationIdentityWirePolicy
 
-/// Controls whether the new envelope format (v1) is used on the wire.
+/// ESS-571 Phase 0 dual-write lever for `conversation_id` / `turn_id` on the
+/// Bridge WSS wire.
 ///
-/// During Phase 0 rollout (default):
-///   Both legacy flat-wire AND new envelope fields are emitted (dual-write).
-///   Receivers read whichever is present.
+/// Phase 0 emits the legacy flat keys **and** the new conversation identity
+/// keys on every uplink frame. This type is the single place that decision is
+/// made: `RealtimeBridgeWireCodec.encode` reads it while building each frame,
+/// so flipping `phase0Default` to `.legacyOnly` stops the new keys from being
+/// written anywhere — that is the rollback lever the protocol change needs.
+/// Individual call sites may pass an explicit policy when they need per-frame
+/// control; everything else inherits the default.
 ///
-/// When `preferEnvelopeOnReceive` is true, receivers prefer envelope fields
-/// over legacy flat-wire fields. Both flags are compile-time constants
-/// during Phase 0 — change to `var` only when runtime switching is needed.
+/// ESS-832: the predecessor `RealtimeEnvelopeFlag` (`useV1Envelope` /
+/// `preferEnvelopeOnReceive`) was never read by any code path, so it looked
+/// like a switch while providing no lever at all. It is deleted rather than
+/// wired, because the receive side deliberately stays ungated (below).
+///
+/// **Receiving is not gated on purpose.** `RealtimeBridgeWireCodec.decode`
+/// always extracts these keys when present: a peer may dual-write while we do
+/// not, and there is no legacy counterpart to conflict with — conversation
+/// identity did not exist on the wire before ESS-571.
 ///
 /// Migration order (per ESS-543 v1.2 §1.1): ESS-541 → ESS-537 → dual-write →
 /// dual-read verification → delete old keys.
-enum RealtimeEnvelopeFlag {
-    /// Whether the v1 unified envelope is the active wire format.
-    /// `false` during Phase 0 rollout (dual-write).
-    static let useV1Envelope: Bool = false
+struct RealtimeConversationIdentityWirePolicy: Equatable, Sendable {
+    /// When `false`, encoders must not write `conversation_id` / `turn_id`.
+    let emitsConversationIdentity: Bool
 
-    /// When `true`, receivers should prefer the envelope fields over
-    /// legacy flat-wire fields.
-    static let preferEnvelopeOnReceive: Bool = true
+    /// Phase 0 rollout default: dual-write.
+    static let phase0Default = Self(emitsConversationIdentity: true)
+
+    /// Rollback shape: legacy flat keys only, byte-identical to pre-ESS-571.
+    static let legacyOnly = Self(emitsConversationIdentity: false)
 }
