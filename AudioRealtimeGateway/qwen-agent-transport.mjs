@@ -162,6 +162,9 @@ export class QwenAgentTransport {
       expectedUpstream: 0, anchored: false, reorderBuffer: new Map(), gapTimer: null,
       clientInstanceId, ownershipState: null, ownershipHolderLabel: null,
       responseTimer: null, responded: false, commitSentAt: null,
+      // ESS-842: upstream frame types this turn has already reported as
+      // unhandled (one log line per type per turn, not per frame).
+      ignoredTypes: new Set(),
     }
     const scopeLog = { request_id: requestId, session_id: sessionId, device_id: deviceId, generation }
     turn.supersede = nextRequestId => {
@@ -233,6 +236,55 @@ export class QwenAgentTransport {
           `upstream produced no response within ${this.responseTimeoutMs}ms of audio.commit`)
       }, this.responseTimeoutMs)
       turn.responseTimer.unref?.()
+    }
+
+    // ESS-842 forensics for every upstream frame this adapter does not act on.
+    //
+    // Two of them are named directly by the acceptance criteria and get their
+    // own promoted event so a reviewer can grep for them by name:
+    //
+    //   • `transcript.final` (role=user) IS the ASR final the criteria call
+    //     `speech_final`. **The transcript text is never logged** — it is the
+    //     user's speech. Length and turn id are enough to prove it arrived.
+    //   • `response.started` carries `origin`. Measured on 2026-08-14, the
+    //     upstream also starts responses with `origin: "announcement"` that
+    //     have nothing to do with the user's turn, and their audio is
+    //     forwarded to the Watch as if it were the answer. Logging `origin`
+    //     is what makes that distinguishable at all; changing the forwarding
+    //     is a separate decision and is NOT part of this change.
+    //
+    // Everything else is logged once per type per turn, capped: a turn emits
+    // ~35 `task.progress` frames, and turning a diagnostic into a flood would
+    // just move the blindness somewhere else.
+    const MAX_IGNORED_TYPES = 16
+    const recordUnhandledEvent = event => {
+      const type = typeof event?.type === 'string' ? event.type.slice(0, 64) : 'unknown'
+      if (type === 'transcript.final' && event.role === 'user') {
+        this.log('upstream_speech_final', {
+          ...scopeLog,
+          // 内容不入日志（用户语音）——只留可判定「到了没有」的元数据。
+          content_length: typeof event.content === 'string' ? event.content.length : null,
+          upstream_turn_id: event.turnId ?? null,
+        })
+        return
+      }
+      if (type === 'response.started') {
+        this.log('upstream_response_started', {
+          ...scopeLog,
+          origin: event.origin ?? null,
+          upstream_response_id: event.responseId ?? null,
+          upstream_turn_id: event.turnId ?? null,
+        })
+        return
+      }
+      if (turn.ignoredTypes.has(type)) return
+      if (turn.ignoredTypes.size >= MAX_IGNORED_TYPES) return
+      turn.ignoredTypes.add(type)
+      this.log('upstream_event_ignored', {
+        ...scopeLog, upstream_event_type: type,
+        state: typeof event?.state === 'string' ? event.state.slice(0, 32) : null,
+        upstream_ready: turn.ready,
+      })
     }
 
     // Any frame that belongs to the response (delta, done, or an upstream
@@ -548,7 +600,18 @@ export class QwenAgentTransport {
         if (event.type === 'error' || event.type === 'session.error' || event.type === 'voice.error') {
           noteResponseProgress()
           fail(event.code ?? 'ERR_UPSTREAM_UNAVAILABLE', event.message ?? event.detail ?? 'upstream error')
+          return
         }
+        // ESS-842 §criterion-1 evidence. The acceptance criteria name
+        // `speech_final` and `response.started`, and until now this adapter
+        // could not produce either: it forwards `audio.delta` / `audio.done`
+        // and drops every other upstream frame WITHOUT A TRACE. Measured
+        // against the live upstream on 2026-08-14, one ordinary turn emits
+        // `voice.state` x4, `response.started` x4, `transcript.final` x1 and
+        // `task.progress` x35 — all invisible. That is why the incident could
+        // only be described as "upstream sent nothing": nothing it sent that
+        // we do not handle was ever written down.
+        recordUnhandledEvent(event)
       })
       ws.on('error', error => fail('ERR_UPSTREAM_UNAVAILABLE', error.message))
       ws.on('close', (code, reason) => {
