@@ -434,6 +434,41 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertEqual(captured, "reason=capture_unavailable hold_ms=-1")
     }
 
+    // MARK: - ESS-843 退出原因码（验收标准 4）
+
+    func testExitReasonCodeMapping() {
+        XCTAssertEqual(SessionController.exitReasonCode(for: "用户挂断"), .userExit)
+        XCTAssertEqual(SessionController.exitReasonCode(for: "静默超时"), .silencePolicy)
+        XCTAssertEqual(SessionController.exitReasonCode(for: "auto"), .failedAutoHangup)
+        XCTAssertEqual(SessionController.exitReasonCode(for: "user"), .userExit)
+        XCTAssertEqual(SessionController.exitReasonCode(for: "未知"), .userExit)
+    }
+
+    func testExitSessionRecordsUserExitReason() {
+        controller.enterSession()
+        controller.markChannelReady()
+        controller.exitSession()
+        XCTAssertEqual(controller.lastExitReasonCode, .userExit)
+    }
+
+    func testSilenceHangupRecordsSilencePolicyReason() {
+        controller.enterSession()
+        controller.markChannelReady()
+        controller.enterHungup(rounds: 1, reason: "静默超时")
+        XCTAssertEqual(controller.lastExitReasonCode, .silencePolicy)
+    }
+
+    func testEnterSessionResetsExitReasonToUserExit() {
+        controller.enterSession()
+        controller.markChannelReady()
+        controller.enterHungup(rounds: 1, reason: "静默超时")
+        XCTAssertEqual(controller.lastExitReasonCode, .silencePolicy)
+        fireDelay(SessionController.hungupDismissSeconds)
+        XCTAssertEqual(controller.state, .idle)
+        controller.enterSession()
+        XCTAssertEqual(controller.lastExitReasonCode, .userExit)
+    }
+
     // MARK: - helpers
 
     private func fireDelay(_ delay: TimeInterval, file: StaticString = #filePath, line: UInt = #line) {

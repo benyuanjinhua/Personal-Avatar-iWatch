@@ -27,6 +27,10 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSHealthShareUsageDescription</key>
+	<string>腕语不读取你的健康数据，该授权仅用于语音通话期间的前台保活。</string>
+	<key>NSHealthUpdateUsageDescription</key>
+	<string>腕语需要在语音通话期间记录一次轻量锻炼会话，以保持应用在前台运行、避免降腕后中断对话。</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>腕语仅在开发联调时连接同一局域网内的 Agent Gateway。</string>
 	<key>NSMicrophoneUsageDescription</key>

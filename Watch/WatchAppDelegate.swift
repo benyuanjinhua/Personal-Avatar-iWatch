@@ -82,7 +82,10 @@ final class WatchAppServices {
                 self?.workoutKeeper.start()
             case .idle, .disconnecting:
                 self?.pushToTalk.sessionKeeper.setContinuousConversationActive(false)
-                self?.workoutKeeper.stop()
+                // ESS-843：owner 释放带机器可读 reason（user_exit / silence_policy /
+                // failed_auto_hangup），满足验收标准 4 的可判定覆盖。
+                let reason = self?.sessionController.lastExitReasonCode.rawValue ?? "conversation_exit"
+                self?.workoutKeeper.stop(reason: reason)
             case .failed, .hungup:
                 // 会话页仍可见且用户可能重试，保持 runtime/workout；真正拆链
                 // 进入 disconnecting/idle 时统一释放。
