@@ -226,6 +226,8 @@ upstream nor a Watch that stopped draining can grow the process without limit.
 | `ERR_UPSTREAM_FRAME_INVALID` | — / 1008 | Upstream `audio.delta` payload is not base64 (retriable). |
 | `ERR_UPSTREAM_BUDGET_EXCEEDED` | — / 1008 | Upstream exceeded the per-turn downlink frame/byte budget. |
 | `ERR_DOWNLINK_BUDGET` | — / 1008 | Session downlink budget or sequence window exhausted (not retriable). |
+| `ERR_UPSTREAM_NO_RESPONSE` | — / 1008 | ESS-842: no upstream response frame within `agent_response_timeout_ms` of `audio.commit` (retriable). |
+| `ERR_VOICE_OWNERSHIP_LOST` | — / 1008 | ESS-842: upstream voice ownership was taken by another client mid-turn, so our audio is being discarded (retriable). |
 | `ERR_SLOW_CONSUMER` | — / 1013 | Client stopped draining; `bufferedAmount` passed `max_downlink_buffered_bytes`. Close reason only — no `error` frame, the socket is already backlogged. |
 
 ## Auth
@@ -311,6 +313,7 @@ ceilings do evict, because a dropped token entry can only cause a rejection.
 | `agent_gateway_url` | `ws://127.0.0.1:3101/api/realtime` | Existing qwen-audio-agent endpoint. Keep loopback-only. |
 | `agent_connect_timeout_ms` | `10000` | Fail the northbound turn with a structured upstream timeout. |
 | `agent_max_pending_bytes` | `2097152` | Hard cap while waiting for upstream `voice.ready`. |
+| `agent_response_timeout_ms` | `12000` | ESS-842: how long a committed turn waits for the first upstream response frame before failing closed with `ERR_UPSTREAM_NO_RESPONSE`. `0` disables the deadline. |
 | `agent_takeover_voice` | `true` | Explicit Watch speech takes ownership from a stale/local frontend. |
 | `provider_key_env` | `AUDIO_REALTIME_PROVIDER_KEY` | Legacy readiness metadata only; the qwen service owns the provider credential. |
 

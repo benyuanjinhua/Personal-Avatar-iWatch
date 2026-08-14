@@ -446,3 +446,178 @@ test('upstream failure becomes one structured agent error', async () => {
   assert.equal(events[0].code, 'ERR_UPSTREAM_DISCONNECTED')
   assert.equal(logs.filter(item => item.evt === 'upstream_error').length, 1)
 })
+
+// ESS-842 真机事故：uplink_committed 之后没有 speech_final / response.started /
+// audio.delta / audio.done，客户端等到 1006 断开为止。上游对非 owner 的音频是
+// 静默丢弃（ESS-37 §2.1），所以「上游一句话都不回」必须自己有终止条件。
+test('a committed turn that gets no upstream response fails closed', async () => {
+  const url = await upstream((ws, message) => {
+    // Ready 之后完全沉默：既不回 audio.delta / audio.done，也不回 error。
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+  })
+  const events = []; const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, responseTimeoutMs: 120, log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  const turn = transport.openTurn({
+    requestId: 'r842', sessionId: 's842', deviceId: 'd842', generation: 1,
+    responseId: 'r842:gen1', onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.error'))
+  assert.equal(events.at(-1).code, 'ERR_UPSTREAM_NO_RESPONSE')
+  assert.equal(events.at(-1).retriable, true)
+  const timeout = logs.find(item => item.evt === 'upstream_response_timeout')
+  assert.ok(timeout, 'the deadline must leave forensics behind')
+  assert.equal(timeout.request_id, 'r842')
+  assert.equal(timeout.upstream_ready, true)
+  assert.equal(timeout.timeout_ms, 120)
+  // 没有回答就不许伪造 done：客户端不能把「无回答」当成一次成功回合。
+  assert.ok(!events.some(event => event.type === 'agent.audio.done'))
+  assert.equal(transport.turns.size, 0)
+})
+
+// 对照组：上游正常回答时，deadline 不得误杀一个健康回合。
+test('the response deadline does not fire once the upstream answers', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+    if (message.type === 'audio.commit') {
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 0, audio: 'AAAA' }))
+      // done 故意晚于 responseTimeoutMs 到达：第一帧已经证明上游在回答。
+      setTimeout(() => ws.send(JSON.stringify({ type: 'audio.done' })), 90)
+    }
+  })
+  const events = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, responseTimeoutMs: 40, doneSettleMs: 10,
+  })
+  const turn = transport.openTurn({
+    requestId: 'r843', sessionId: 's843', generation: 1, responseId: 'r843:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  assert.deepEqual(events.map(event => event.type), ['agent.audio.delta', 'agent.audio.done'])
+  assert.ok(!events.some(event => event.type === 'agent.error'))
+  turn.close()
+})
+
+// 握手期间排队的 commit，其 deadline 必须从 voice.ready 真正下发那一刻起表，
+// 而不是从客户端调用 commit() 那一刻——否则慢握手会吃掉整个回答预算。
+test('a commit queued behind the handshake starts its deadline at voice.ready', async () => {
+  let readyGate = null
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') readyGate = () => ws.send(JSON.stringify({ type: 'voice.ready' }))
+  })
+  const events = []; const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, responseTimeoutMs: 100, log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  const turn = transport.openTurn({
+    requestId: 'r844', sessionId: 's844', generation: 1, responseId: 'r844:gen1',
+    onEvent: event => events.push(event),
+  })
+  await waitFor(() => readyGate !== null)
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  // 还没 ready：commit 只是排队，deadline 不该起表，更不该到期。
+  await new Promise(resolve => setTimeout(resolve, 150))
+  assert.deepEqual(events, [])
+  readyGate()
+  await waitFor(() => events.some(event => event.type === 'agent.error'))
+  assert.equal(events.at(-1).code, 'ERR_UPSTREAM_NO_RESPONSE')
+  assert.ok(logs.some(item => item.evt === 'upstream_ready'))
+})
+
+// ESS-37 §2.1：所有权被别人拿走之后，上游对我们的 append/commit 静默丢弃。
+// 与其烧完整个回答 deadline，不如在所有权丢失的当下就带着持有者失败。
+test('ownership lost mid-turn fails the turn with the holder named', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') {
+      ws.send(JSON.stringify({ type: 'voice.ready' }))
+      setTimeout(() => ws.send(JSON.stringify({
+        type: 'voice.ownership', state: 'busy',
+        holder: { type: 'cli', label: 'watch-bridge', instanceId: 'bridge_other' },
+      })), 20)
+    }
+  })
+  const events = []; const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, responseTimeoutMs: 5_000, log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  const turn = transport.openTurn({
+    requestId: 'r845', sessionId: 's845', generation: 1, responseId: 'r845:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.error'))
+  assert.equal(events.at(-1).code, 'ERR_VOICE_OWNERSHIP_LOST')
+  assert.ok(events.at(-1).detail.includes('watch-bridge'))
+  const ownership = logs.find(item => item.evt === 'upstream_ownership')
+  assert.equal(ownership.state, 'busy')
+  assert.equal(ownership.holder_label, 'watch-bridge')
+  assert.equal(ownership.holder_is_self, false)
+})
+
+// 反向保证：网关只是把我们自己的所有权回播回来（ESS-37 的 unmute 幂等回播就是
+// 这一形状），不得被误判成「所有权丢失」而打断一个健康回合。
+test('an ownership echo naming ourselves does not kill the turn', async () => {
+  const seen = []
+  const url = await upstream((ws, message) => {
+    seen.push(message)
+    if (message.type === 'connect') {
+      ws.send(JSON.stringify({ type: 'voice.ready' }))
+      setTimeout(() => ws.send(JSON.stringify({
+        type: 'voice.ownership', state: 'busy',
+        holder: { type: 'cli', label: 'watch-direct-gateway', instanceId: message.clientInstanceId },
+      })), 10)
+    }
+    if (message.type === 'audio.commit') {
+      setTimeout(() => {
+        ws.send(JSON.stringify({ type: 'audio.delta', sequence: 0, audio: 'AAAA' }))
+        ws.send(JSON.stringify({ type: 'audio.done' }))
+      }, 40)
+    }
+  })
+  const events = []; const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, responseTimeoutMs: 2_000, doneSettleMs: 10,
+    log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  const turn = transport.openTurn({
+    requestId: 'r846', sessionId: 's846', generation: 1, responseId: 'r846:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  assert.ok(!events.some(event => event.type === 'agent.error'))
+  assert.equal(logs.find(item => item.evt === 'upstream_ownership').holder_is_self, true)
+  turn.close()
+})
+
+// voice.deactivated 是「被抢占」的明确信号，不需要 holder 就能判定。
+test('voice.deactivated after ready fails the turn immediately', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') {
+      ws.send(JSON.stringify({ type: 'voice.ready' }))
+      setTimeout(() => ws.send(JSON.stringify({ type: 'voice.deactivated' })), 20)
+    }
+  })
+  const events = []; const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, responseTimeoutMs: 5_000, log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  const turn = transport.openTurn({
+    requestId: 'r847', sessionId: 's847', generation: 1, responseId: 'r847:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.error'))
+  assert.equal(events.at(-1).code, 'ERR_VOICE_OWNERSHIP_LOST')
+  assert.equal(logs.find(item => item.evt === 'upstream_ownership').state, 'deactivated')
+})

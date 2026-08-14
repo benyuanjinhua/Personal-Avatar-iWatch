@@ -387,6 +387,7 @@ function createAgentTransport(CONFIG, { log }) {
       maxDownlinkFrameBytes: CONFIG.max_downlink_frame_bytes ?? 128 * 1024,
       maxDownlinkFrames: CONFIG.max_downlink_frames ?? 4096,
       maxDownlinkBytes: CONFIG.max_downlink_bytes ?? 32 * 1024 * 1024,
+      responseTimeoutMs: CONFIG.agent_response_timeout_ms ?? 12_000,
       takeover: CONFIG.agent_takeover_voice !== false,
       log: (evt, extra) => log(evt, extra),
     })
