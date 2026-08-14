@@ -1,5 +1,5 @@
 import WebSocket from 'ws'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 
 // ESS-745: `request_id` is client-supplied and only validated as a string
 // (token-issuer.mjs `#assertScope`); nothing makes it unique beyond the
@@ -24,6 +24,13 @@ const conversationKey = ({ deviceId, sessionId }) =>
 
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/
 
+// ESS-773: replay identity for an upstream audio frame. Composite on purpose —
+// the upstream sequence AND the payload, never the payload alone, since a later
+// frame with identical bytes (silence is the common case) is legitimate audio.
+// Hashed so an entry costs bytes rather than a frame.
+const replayKey = (upstreamSequence, audio) =>
+  `audio.delta:${upstreamSequence}:${createHash('sha1').update(audio).digest('base64')}`
+
 export class QwenAgentTransport {
   constructor({
     gatewayUrl = 'ws://127.0.0.1:3101/api/realtime',
@@ -39,6 +46,27 @@ export class QwenAgentTransport {
     maxDownlinkFrameBytes = 128 * 1024,
     maxDownlinkFrames = 4096,
     maxDownlinkBytes = 32 * 1024 * 1024,
+    // ESS-773: how long `audio.done` waits for a late `audio.delta` before it
+    // is forwarded. The provider has been observed emitting done while frames
+    // were still in flight; releasing the downstream barrier at that instant
+    // discards the tail. Costs at most this much added latency on the last
+    // frame, and only when the upstream is well behaved.
+    doneSettleMs = 120,
+    // ESS-773 replay window. Deliberately short: it may only recognise a
+    // near-simultaneous exact replay of a frame the upstream already sent.
+    // Outside it, identical audio at the same upstream sequence is treated as
+    // legitimate new audio — the provider's counter is not response-scoped, so
+    // a restart can legitimately re-present a sequence, and silence repeats
+    // constantly. Bounded by TTL and by `maxReplayFingerprints`.
+    duplicateWindowMs = 200,
+    maxReplayFingerprints = 128,
+    // ESS-773 reorder / gap barrier. The upstream sequence still decides the
+    // ORDER frames are forwarded in and is what proves the run is complete;
+    // only the number handed downstream is reassigned. A hole is held this
+    // long, then fails the turn — renumbering past it would present a lossy
+    // response to the Watch as a successful one.
+    reorderWaitMs = 300,
+    maxReorderFrames = 64,
     takeover = true,
     log = () => {},
   } = {}) {
@@ -48,6 +76,11 @@ export class QwenAgentTransport {
     this.maxDownlinkFrameBytes = maxDownlinkFrameBytes
     this.maxDownlinkFrames = maxDownlinkFrames
     this.maxDownlinkBytes = maxDownlinkBytes
+    this.doneSettleMs = doneSettleMs
+    this.duplicateWindowMs = duplicateWindowMs
+    this.maxReplayFingerprints = maxReplayFingerprints
+    this.reorderWaitMs = reorderWaitMs
+    this.maxReorderFrames = maxReorderFrames
     this.takeover = takeover
     this.log = log
     this.turns = new Map()
@@ -96,12 +129,16 @@ export class QwenAgentTransport {
       pending: [], pendingBytes: 0, nextOutputSequence: 0,
       downlinkFrames: 0, downlinkBytes: 0,
       connectTimer: null,
+      doneTimer: null, pendingDone: false, recentUpstreamFrames: new Map(),
+      expectedUpstream: 0, anchored: false, reorderBuffer: new Map(), gapTimer: null,
     }
     const scopeLog = { request_id: requestId, session_id: sessionId, device_id: deviceId, generation }
     turn.supersede = nextRequestId => {
       if (turn.terminal) return
       turn.terminal = true
       clearTimeout(turn.connectTimer)
+      clearTimeout(turn.doneTimer)
+      clearTimeout(turn.gapTimer)
       this.log('upstream_turn_superseded', {
         ...scopeLog, superseded_by_request_id: nextRequestId,
       })
@@ -118,6 +155,8 @@ export class QwenAgentTransport {
       if (turn.terminal) return
       turn.terminal = true
       clearTimeout(turn.connectTimer)
+      clearTimeout(turn.doneTimer)
+      clearTimeout(turn.gapTimer)
       this.log('upstream_error', { ...scopeLog, code })
       onEvent({ type: 'agent.error', response_id: responseId, code, detail, retriable: true })
       try { turn.ws?.close() } catch { /* best effort */ }
@@ -134,6 +173,138 @@ export class QwenAgentTransport {
         request_id: requestId, session_id: sessionId, generation, code, ...extra,
       })
       fail(code, detail)
+    }
+
+    // ESS-773 done barrier. `audio.done` is not forwarded on arrival: it opens
+    // a settle window that every late `audio.delta` restarts, so `final_sequence`
+    // always covers the frames that were actually forwarded. Anything that ends
+    // the upstream socket while the window is open flushes it rather than
+    // dropping it — a completed response must not surface as a disconnect.
+    const flushDone = () => {
+      if (!turn.pendingDone) return
+      // A hole is still outstanding: the run is not complete, so it is not done.
+      // The gap timer decides — the frame arrives, or the turn fails closed.
+      if (turn.reorderBuffer.size > 0) return
+      turn.pendingDone = false
+      clearTimeout(turn.doneTimer)
+      turn.doneTimer = null
+      const finalSequence = turn.nextOutputSequence - 1
+      this.log('upstream_audio_done', { ...scopeLog, final_sequence: finalSequence })
+      onEvent({
+        type: 'agent.audio.done', response_id: responseId, final_sequence: finalSequence,
+      })
+    }
+
+    const scheduleDone = () => {
+      clearTimeout(turn.doneTimer)
+      turn.doneTimer = setTimeout(() => {
+        turn.doneTimer = null
+        if (turn.terminal) return
+        flushDone()
+      }, this.doneSettleMs)
+      turn.doneTimer.unref?.()
+    }
+
+    // Forward one accepted frame and stamp it with the downstream contract's
+    // sequence. Ordering has already been settled by `enqueueOrdered`.
+    const emitDelta = frame => {
+      const sequence = turn.nextOutputSequence++
+      if (turn.pendingDone) {
+        clearTimeout(turn.doneTimer)
+        turn.doneTimer = null
+        this.log('upstream_done_extended_for_late_delta', {
+          ...scopeLog, upstream_sequence: frame.upstreamSequence, sequence,
+        })
+      }
+      this.log('upstream_event_received', {
+        ...scopeLog, upstream_event_type: 'audio.delta', sequence,
+        upstream_sequence: frame.upstreamSequence,
+      })
+      this.log('upstream_audio_delta', { ...scopeLog, sequence })
+      onEvent({
+        type: 'agent.audio.delta', response_id: responseId, sequence,
+        sample_rate: frame.sampleRate, codec: 'pcm_s16le', audio: frame.audio,
+      })
+      if (turn.pendingDone) scheduleDone()
+    }
+
+    const drainContiguous = () => {
+      while (turn.reorderBuffer.has(turn.expectedUpstream)) {
+        const buffered = turn.reorderBuffer.get(turn.expectedUpstream)
+        turn.reorderBuffer.delete(turn.expectedUpstream)
+        turn.expectedUpstream += 1
+        turn.anchored = true
+        emitDelta(buffered)
+      }
+      if (turn.reorderBuffer.size === 0) {
+        clearTimeout(turn.gapTimer)
+        turn.gapTimer = null
+      }
+    }
+
+    const armGapTimer = () => {
+      if (turn.gapTimer) return
+      turn.gapTimer = setTimeout(() => {
+        turn.gapTimer = null
+        if (turn.terminal || turn.reorderBuffer.size === 0) return
+        // Nothing has been forwarded yet, so this is not a lost frame — the
+        // response simply did not start where we assumed. Anchor on the lowest
+        // sequence actually offered and continue; only a hole AFTER the first
+        // forwarded frame is evidence that the upstream dropped audio.
+        if (!turn.anchored) {
+          const lowest = Math.min(...turn.reorderBuffer.keys())
+          this.log('upstream_sequence_anchored', { ...scopeLog, upstream_sequence: lowest })
+          turn.expectedUpstream = lowest
+          drainContiguous()
+          if (turn.reorderBuffer.size > 0) armGapTimer()
+          return
+        }
+        fail('ERR_UPSTREAM_SEQUENCE_GAP',
+          `upstream never delivered sequence ${turn.expectedUpstream}`)
+      }, this.reorderWaitMs)
+      turn.gapTimer.unref?.()
+    }
+
+    // ESS-773: the upstream sequence keeps its ordering meaning here — it is
+    // the only thing that can witness a hole — while the number handed
+    // downstream is always the dense contract sequence assigned in `emitDelta`.
+    const enqueueOrdered = frame => {
+      const { upstreamSequence } = frame
+      if (upstreamSequence < turn.expectedUpstream) {
+        // The counter went backwards. An exact near-simultaneous replay was
+        // already dropped upstream of here, so this is a restart carrying new
+        // audio. A hole open at that moment can never be filled by it.
+        if (turn.reorderBuffer.size > 0) {
+          fail('ERR_UPSTREAM_SEQUENCE_GAP',
+            `upstream restarted at ${upstreamSequence} while ${turn.expectedUpstream} was missing`)
+          return
+        }
+        this.log('upstream_sequence_restarted', {
+          ...scopeLog, upstream_sequence: upstreamSequence,
+          expected_upstream_sequence: turn.expectedUpstream,
+        })
+        turn.expectedUpstream = upstreamSequence
+      }
+      if (upstreamSequence === turn.expectedUpstream) {
+        turn.expectedUpstream += 1
+        turn.anchored = true
+        emitDelta(frame)
+        drainContiguous()
+        return
+      }
+      // Ahead of what is owed: hold it until the hole in front of it is filled.
+      if (turn.reorderBuffer.has(upstreamSequence)) {
+        fail('ERR_UPSTREAM_SEQUENCE_GAP',
+          `upstream repeated sequence ${upstreamSequence} while reordering`)
+        return
+      }
+      turn.reorderBuffer.set(upstreamSequence, frame)
+      if (turn.reorderBuffer.size > this.maxReorderFrames) {
+        fail('ERR_UPSTREAM_REORDER_OVERFLOW',
+          `upstream reorder buffer exceeded ${this.maxReorderFrames} frames`)
+        return
+      }
+      armGapTimer()
     }
 
     const sendOrQueue = (event, bytes = 0) => {
@@ -219,29 +390,54 @@ export class QwenAgentTransport {
             })
             return
           }
-          const sequence = Number.isInteger(event.sequence) && event.sequence >= 0
-            ? event.sequence : turn.nextOutputSequence
-          turn.nextOutputSequence = Math.max(turn.nextOutputSequence, sequence + 1)
-          this.log('upstream_event_received', {
-            ...scopeLog, upstream_event_type: 'audio.delta', sequence,
-          })
-          this.log('upstream_audio_delta', { ...scopeLog, sequence })
-          onEvent({
-            type: 'agent.audio.delta', response_id: responseId, sequence,
-            sample_rate: event.sampleRate ?? 24_000, codec: 'pcm_s16le', audio: event.audio,
-          })
+          // ESS-773: drop a near-simultaneous exact replay, and only that. The
+          // fingerprint needs the upstream sequence to witness a replay at all,
+          // so a frame that arrives without one is always forwarded; and the
+          // window has to expire, because outside it the same fingerprint is
+          // legitimate audio (a restarted counter re-presenting silence).
+          const upstreamSequence = Number.isInteger(event.sequence) && event.sequence >= 0
+            ? event.sequence : null
+          if (upstreamSequence !== null) {
+            const now = Date.now()
+            for (const [seen, at] of turn.recentUpstreamFrames) {
+              if (now - at > this.duplicateWindowMs) turn.recentUpstreamFrames.delete(seen)
+            }
+            const key = replayKey(upstreamSequence, audio)
+            const lastSeenAt = turn.recentUpstreamFrames.get(key)
+            if (lastSeenAt !== undefined && now - lastSeenAt <= this.duplicateWindowMs) {
+              this.log('upstream_audio_duplicate_dropped', {
+                ...scopeLog, upstream_sequence: upstreamSequence,
+                age_ms: now - lastSeenAt,
+              })
+              return
+            }
+            turn.recentUpstreamFrames.set(key, now)
+            // Capacity backstop: a flood inside one window must not outgrow the
+            // TTL sweep. Map preserves insertion order, so this drops oldest.
+            while (turn.recentUpstreamFrames.size > this.maxReplayFingerprints) {
+              turn.recentUpstreamFrames.delete(turn.recentUpstreamFrames.keys().next().value)
+            }
+          }
+          // The downstream barrier can only release on a dense 0..N run, so the
+          // number handed downstream is always assigned here — but the upstream
+          // sequence still decides ORDER and still proves the run is complete.
+          // A frame that carries no upstream sequence cannot be ordered against
+          // anything, so it is forwarded as it arrives.
+          const frame = {
+            upstreamSequence, audio: event.audio,
+            sampleRate: event.sampleRate ?? 24_000,
+          }
+          if (upstreamSequence === null) emitDelta(frame)
+          else enqueueOrdered(frame)
           return
         }
         if (event.type === 'audio.done') {
-          const finalSequence = turn.nextOutputSequence - 1
           this.log('upstream_event_received', {
-            ...scopeLog, upstream_event_type: 'audio.done', final_sequence: finalSequence,
+            ...scopeLog, upstream_event_type: 'audio.done',
+            final_sequence: turn.nextOutputSequence - 1,
           })
-          this.log('upstream_audio_done', { ...scopeLog, final_sequence: finalSequence })
-          onEvent({
-            type: 'agent.audio.done', response_id: responseId,
-            final_sequence: finalSequence,
-          })
+          turn.pendingDone = true
+          scheduleDone()
           return
         }
         if (event.type === 'error' || event.type === 'session.error' || event.type === 'voice.error') {
@@ -250,7 +446,19 @@ export class QwenAgentTransport {
       })
       ws.on('error', error => fail('ERR_UPSTREAM_UNAVAILABLE', error.message))
       ws.on('close', (code, reason) => {
-        if (!turn.terminal) fail('ERR_UPSTREAM_DISCONNECTED', `code=${code} reason=${String(reason)}`)
+        if (turn.terminal) return
+        // The provider may close right after `audio.done`. The response is
+        // complete, so release the barrier instead of reporting a disconnect —
+        // but only if nothing is still missing; a close over an open hole is a
+        // disconnect, not a completion.
+        if (turn.pendingDone && turn.reorderBuffer.size === 0) {
+          flushDone()
+          turn.terminal = true
+          clearTimeout(turn.connectTimer)
+          this.#release(turn)
+          return
+        }
+        fail('ERR_UPSTREAM_DISCONNECTED', `code=${code} reason=${String(reason)}`)
       })
     } catch (error) {
       fail('ERR_UPSTREAM_UNAVAILABLE', error.message)
@@ -272,6 +480,8 @@ export class QwenAgentTransport {
         }
         turn.terminal = true
         clearTimeout(turn.connectTimer)
+        clearTimeout(turn.doneTimer)
+        clearTimeout(turn.gapTimer)
         turn.ws?.close()
         this.#release(turn)
       },
@@ -279,6 +489,8 @@ export class QwenAgentTransport {
         if (turn.terminal) return
         turn.terminal = true
         clearTimeout(turn.connectTimer)
+        clearTimeout(turn.doneTimer)
+        clearTimeout(turn.gapTimer)
         if (turn.ws?.readyState === WebSocket.OPEN) {
           turn.ws.send(JSON.stringify({ type: 'mute' }))
         }

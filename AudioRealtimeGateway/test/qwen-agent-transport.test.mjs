@@ -146,6 +146,294 @@ test('late close of a superseded same-requestId turn does not evict its replacem
   newTurn.close()
 })
 
+// ESS-773. The downstream done barrier can only release on a dense 0..N run,
+// so this adapter owns the contract sequence and treats the provider's as
+// diagnostic. These cases are the contract: restart, replay, legitimate
+// repeated payload, late delta after done, and completion on upstream close.
+test('normalizes restarted upstream sequences and holds done for late audio', async () => {
+  const audio = value => Buffer.from(value).toString('base64')
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+    if (message.type === 'audio.commit') {
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 10, audio: audio('a') }))
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 11, audio: audio('b') }))
+      ws.send(JSON.stringify({ type: 'audio.done' }))
+      setTimeout(() => {
+        // The provider restarts its counter after done. These are new audio,
+        // not response-scoped duplicates, and must extend the done barrier.
+        ws.send(JSON.stringify({ type: 'audio.delta', sequence: 10, audio: audio('c') }))
+        ws.send(JSON.stringify({ type: 'audio.delta', sequence: 11, audio: audio('d') }))
+      }, 10)
+    }
+  })
+  const events = []; const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, doneSettleMs: 60, reorderWaitMs: 5,
+    log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  const turn = transport.openTurn({
+    requestId: 'r3', sessionId: 's3', generation: 1, responseId: 'r3:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  assert.deepEqual(
+    events.filter(event => event.type === 'agent.audio.delta').map(event => event.sequence),
+    [0, 1, 2, 3],
+  )
+  assert.equal(events.at(-1).type, 'agent.audio.done')
+  assert.equal(events.at(-1).final_sequence, 3)
+  assert.ok(logs.some(item => item.evt === 'upstream_done_extended_for_late_delta'))
+  turn.close()
+})
+
+test('drops a near-simultaneous exact upstream replay only once', async () => {
+  const payload = Buffer.from('same-frame').toString('base64')
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+    if (message.type === 'audio.commit') {
+      const frame = JSON.stringify({ type: 'audio.delta', sequence: 7, audio: payload })
+      ws.send(frame); ws.send(frame)
+      ws.send(JSON.stringify({ type: 'audio.done' }))
+    }
+  })
+  const events = []; const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, doneSettleMs: 20, duplicateWindowMs: 200, reorderWaitMs: 5,
+    log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  const turn = transport.openTurn({
+    requestId: 'r4', sessionId: 's4', generation: 1, responseId: 'r4:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  assert.equal(events.filter(event => event.type === 'agent.audio.delta').length, 1)
+  assert.equal(events.at(-1).final_sequence, 0)
+  assert.equal(logs.filter(item => item.evt === 'upstream_audio_duplicate_dropped').length, 1)
+  turn.close()
+})
+
+// The window has to expire. The provider's counter is not response-scoped, so
+// the same fingerprint can legitimately reappear later — silence at a restarted
+// sequence is the ordinary case, and suppressing it would delete real audio.
+test('keeps an identical frame that repeats outside the replay window', async () => {
+  const payload = Buffer.from('same-frame').toString('base64')
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+    if (message.type === 'audio.commit') {
+      const frame = JSON.stringify({ type: 'audio.delta', sequence: 7, audio: payload })
+      ws.send(frame)
+      setTimeout(() => {
+        ws.send(frame)
+        ws.send(JSON.stringify({ type: 'audio.done' }))
+      }, 80)
+    }
+  })
+  const events = []; const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, doneSettleMs: 20, duplicateWindowMs: 20, reorderWaitMs: 5,
+    log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  const turn = transport.openTurn({
+    requestId: 'r7', sessionId: 's7', generation: 1, responseId: 'r7:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  assert.deepEqual(
+    events.filter(event => event.type === 'agent.audio.delta').map(event => event.sequence),
+    [0, 1],
+  )
+  assert.equal(events.at(-1).final_sequence, 1)
+  assert.equal(logs.filter(item => item.evt === 'upstream_audio_duplicate_dropped').length, 0)
+  turn.close()
+})
+
+// The mirror of the case above: identical bytes at a NEW upstream sequence are
+// legitimate audio (silence repeats constantly) and must survive.
+test('keeps identical audio that arrives at a new upstream sequence', async () => {
+  const silence = 'AAAA'
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+    if (message.type === 'audio.commit') {
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 0, audio: silence }))
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 1, audio: silence }))
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 2, audio: silence }))
+      ws.send(JSON.stringify({ type: 'audio.done' }))
+    }
+  })
+  const events = []
+  const transport = new QwenAgentTransport({ gatewayUrl: url, doneSettleMs: 20 })
+  const turn = transport.openTurn({
+    requestId: 'r5', sessionId: 's5', generation: 1, responseId: 'r5:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  assert.deepEqual(
+    events.filter(event => event.type === 'agent.audio.delta').map(event => event.sequence),
+    [0, 1, 2],
+  )
+  assert.equal(events.at(-1).final_sequence, 2)
+  turn.close()
+})
+
+// ESS-823 blocker 1. The upstream sequence keeps its ORDERING meaning: frames
+// that arrive out of order are reordered before the dense downstream sequence
+// is assigned, so the Watch plays A before B — not arrival order.
+test('reorders an out-of-order upstream pair before assigning the downstream sequence', async () => {
+  const audio = value => Buffer.from(value).toString('base64')
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+    if (message.type === 'audio.commit') {
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 11, audio: audio('B') }))
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 10, audio: audio('A') }))
+      ws.send(JSON.stringify({ type: 'audio.done' }))
+    }
+  })
+  const events = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, doneSettleMs: 20, reorderWaitMs: 30,
+  })
+  const turn = transport.openTurn({
+    requestId: 'r9', sessionId: 's9', generation: 1, responseId: 'r9:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  const deltas = events.filter(event => event.type === 'agent.audio.delta')
+  assert.deepEqual(deltas.map(event => Buffer.from(event.audio, 'base64').toString()), ['A', 'B'])
+  assert.deepEqual(deltas.map(event => event.sequence), [0, 1])
+  assert.equal(events.at(-1).final_sequence, 1)
+  turn.close()
+})
+
+// Mid-stream reorder, with the response anchored at 0 so nothing waits.
+test('fills an out-of-order hole without delaying the frames around it', async () => {
+  const audio = value => Buffer.from(value).toString('base64')
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+    if (message.type === 'audio.commit') {
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 0, audio: audio('A') }))
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 2, audio: audio('C') }))
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 1, audio: audio('B') }))
+      ws.send(JSON.stringify({ type: 'audio.done' }))
+    }
+  })
+  const events = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, doneSettleMs: 20, reorderWaitMs: 200,
+  })
+  const turn = transport.openTurn({
+    requestId: 'r10', sessionId: 's10', generation: 1, responseId: 'r10:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  const deltas = events.filter(event => event.type === 'agent.audio.delta')
+  assert.deepEqual(deltas.map(event => Buffer.from(event.audio, 'base64').toString()), ['A', 'B', 'C'])
+  assert.deepEqual(deltas.map(event => event.sequence), [0, 1, 2])
+  assert.equal(events.at(-1).final_sequence, 2)
+  turn.close()
+})
+
+// ESS-823 blocker 2, the silent-loss counterexample: upstream {0,2,done} must
+// NOT become downstream {0,1,done(1)}. A frame the upstream never delivered is
+// a failure, not a shorter response.
+test('fails closed on a real upstream gap instead of renumbering past it', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+    if (message.type === 'audio.commit') {
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 0, audio: 'AAAA' }))
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 2, audio: 'BBBB' }))
+      ws.send(JSON.stringify({ type: 'audio.done' }))
+    }
+  })
+  const events = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, doneSettleMs: 20, reorderWaitMs: 40,
+  })
+  const turn = transport.openTurn({
+    requestId: 'r11', sessionId: 's11', generation: 1, responseId: 'r11:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.error'))
+  // Only the frame ahead of the hole was forwarded, and no done was invented.
+  assert.equal(events.filter(event => event.type === 'agent.audio.delta').length, 1)
+  assert.ok(!events.some(event => event.type === 'agent.audio.done'))
+  assert.equal(events.at(-1).code, 'ERR_UPSTREAM_SEQUENCE_GAP')
+  assert.equal(events.at(-1).retriable, true)
+  turn.close()
+})
+
+// ESS-746 × ESS-773. Validation, the frame cap and the per-turn budget all run
+// BEFORE the sequence is assigned, so a frame that fails closed never consumes
+// a downstream sequence and never leaves a hole in the dense run.
+test('a frame rejected by the ESS-746 budget consumes no downstream sequence', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+    if (message.type === 'audio.commit') {
+      for (let sequence = 0; sequence < 6; sequence++) {
+        ws.send(JSON.stringify({ type: 'audio.delta', sequence, audio: 'AAAA' }))
+      }
+      ws.send(JSON.stringify({ type: 'audio.done' }))
+    }
+  })
+  const events = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, doneSettleMs: 20, maxDownlinkFrames: 2,
+  })
+  const turn = transport.openTurn({
+    requestId: 'r8', sessionId: 's8', generation: 1, responseId: 'r8:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.error'))
+  assert.deepEqual(
+    events.filter(event => event.type === 'agent.audio.delta').map(event => event.sequence),
+    [0, 1],
+  )
+  assert.equal(events.at(-1).code, 'ERR_UPSTREAM_BUDGET_EXCEEDED')
+  // Fail closed: no done is manufactured for a turn that was cut off.
+  assert.ok(!events.some(event => event.type === 'agent.audio.done'))
+  turn.close()
+})
+
+// The settle window must not turn a completed response into a disconnect: the
+// provider is free to close the socket the moment it has sent `audio.done`.
+test('releases the pending done when the upstream closes right after it', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+    if (message.type === 'audio.commit') {
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 0, audio: 'AAAA' }))
+      ws.send(JSON.stringify({ type: 'audio.done' }))
+      ws.close(1000, 'complete')
+    }
+  })
+  const events = []
+  const transport = new QwenAgentTransport({ gatewayUrl: url, doneSettleMs: 5_000 })
+  const turn = transport.openTurn({
+    requestId: 'r6', sessionId: 's6', generation: 1, responseId: 'r6:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  assert.deepEqual(events.map(event => event.type), ['agent.audio.delta', 'agent.audio.done'])
+  assert.equal(events.at(-1).final_sequence, 0)
+  turn.close()
+})
+
 test('upstream failure becomes one structured agent error', async () => {
   const url = await upstream(ws => ws.close(1011, 'provider unavailable'))
   const events = []; const logs = []
