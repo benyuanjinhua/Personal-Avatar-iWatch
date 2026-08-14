@@ -34,6 +34,25 @@ final class WorkoutSessionKeeper: NSObject {
     /// Call when the user enters a real-time conversation.
     func start() {
         guard !isActive else { return }
+        // ESS-843: HKWorkoutSession requires HealthKit authorization.
+        // Request workout-type access before starting the session — without
+        // it, the session fails silently and the app is NOT kept foregrounded.
+        let types: Set = [HKObjectType.workoutType()]
+        healthStore.requestAuthorization(toShare: [], read: types) { [weak self] success, error in
+            Task { @MainActor in
+                guard let self else { return }
+                if !success {
+                    Self.logger.error(
+                        "workout_healthkit_auth_failed error=\(error?.localizedDescription ?? "denied")"
+                    )
+                }
+                self.startSession()
+            }
+        }
+    }
+
+    private func startSession() {
+        guard !isActive else { return }
         let config = HKWorkoutConfiguration()
         config.activityType = .other
         config.locationType = .unknown
