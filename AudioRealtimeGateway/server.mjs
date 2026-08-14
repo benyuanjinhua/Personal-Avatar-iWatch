@@ -387,6 +387,10 @@ function createAgentTransport(CONFIG, { log }) {
       maxDownlinkFrameBytes: CONFIG.max_downlink_frame_bytes ?? 128 * 1024,
       maxDownlinkFrames: CONFIG.max_downlink_frames ?? 4096,
       maxDownlinkBytes: CONFIG.max_downlink_bytes ?? 32 * 1024 * 1024,
+      // ESS-842: deadline between `audio.commit` and the upstream's first
+      // response frame. Must stay below the client's own give-up window, or the
+      // Watch dies with a bare 1006 before this typed error can reach it.
+      responseStartTimeoutMs: CONFIG.agent_response_start_timeout_ms ?? 8_000,
       takeover: CONFIG.agent_takeover_voice !== false,
       log: (evt, extra) => log(evt, extra),
     })

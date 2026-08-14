@@ -446,3 +446,128 @@ test('upstream failure becomes one structured agent error', async () => {
   assert.equal(events[0].code, 'ERR_UPSTREAM_DISCONNECTED')
   assert.equal(logs.filter(item => item.evt === 'upstream_error').length, 1)
 })
+
+// ESS-842 —— 2026-08-14 真机事故的回归用例。
+//
+// 事故形态（gateway.log，request_id 019ffe80-5d6d-766a-9cab-6319089cb490）：
+// `uplink_committed frames=93` 之后 upstream 一个事件都没再发——没有
+// audio.delta、没有 audio.done、也没有 error。本适配器当时在 commit 与首帧
+// 之间**没有任何截止时间**，于是无限等待、零日志，用户对着一个不出声的球
+// 干等到自己的 socket 以裸 1006 断开为止。
+//
+// 上游的 commit 确认超时是 30s（qwen-audio-agent
+// server/src/voice/realtime-provider.mjs:306），远晚于客户端放弃的时刻，
+// 所以「等上游自己报错」在物理上救不了这一类故障。
+test('ESS-842: a silent upstream after commit fails the turn instead of hanging', async () => {
+  const url = await upstream((ws, message) => {
+    // 只握手，commit 之后故意什么都不回——复刻事故。
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+  })
+  const events = []; const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, responseStartTimeoutMs: 60,
+    log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  const turn = transport.openTurn({
+    requestId: 'r842', sessionId: 's842', generation: 1, responseId: 'r842:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.error'))
+  const error = events.find(event => event.type === 'agent.error')
+  assert.equal(error.code, 'ERR_UPSTREAM_RESPONSE_TIMEOUT')
+  // 可重试：卡住的是上游这一跳，用户再说一遍就该能通。
+  assert.equal(error.retriable, true)
+  // 停摆的那一跳必须在 bridge.log 上留下名字，而不是只剩一个 1006。
+  const timeout = logs.find(item => item.evt === 'upstream_response_timeout')
+  assert.ok(timeout, 'upstream_response_timeout 必须落日志')
+  assert.equal(timeout.request_id, 'r842')
+  assert.equal(timeout.waited_ms, 60)
+  assert.equal(logs.filter(item => item.evt === 'upstream_error').length, 1)
+})
+
+// 反向约束：这条截止时间只管「上游有没有开口」。一旦第一帧到达，后面回答
+// 说多久都不该被它掐断——否则修一个哑巴 bug 会换来一个把长回答砍半的 bug。
+test('ESS-842: the deadline stops at the first delta, not at the whole answer', async () => {
+  let socket
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+    if (message.type === 'audio.commit') {
+      socket = ws
+      ws.send(JSON.stringify({
+        type: 'audio.delta', sequence: 0,
+        audio: Buffer.from('first').toString('base64'), sampleRate: 24_000,
+      }))
+    }
+  })
+  const events = []
+  const transport = new QwenAgentTransport({ gatewayUrl: url, responseStartTimeoutMs: 40 })
+  const turn = transport.openTurn({
+    requestId: 'r843', sessionId: 's843', generation: 1, responseId: 'r843:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.delta'))
+  // 首帧之后静默远超截止时间——这是正常的长回答间隙，不许判死。
+  await new Promise(resolve => setTimeout(resolve, 160))
+  assert.equal(events.some(event => event.type === 'agent.error'), false)
+  socket.send(JSON.stringify({ type: 'audio.done' }))
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  assert.deepEqual(events.map(event => event.type), ['agent.audio.delta', 'agent.audio.done'])
+  turn.close()
+})
+
+// 时钟从 commit **上线**开始走，不是从 commit() 被调用开始走：voice.ready
+// 之前的 commit 还躺在 turn.pending 里，上游此刻什么都不欠。这一段由
+// connectTimeoutMs 负责，两个计时器不许重叠计费。
+test('ESS-842: a commit queued before voice.ready starts the clock on flush', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') {
+      // 就绪比截止时间还慢——若时钟从 commit() 起算，本轮必然被误杀。
+      setTimeout(() => ws.send(JSON.stringify({ type: 'voice.ready' })), 120)
+    }
+    if (message.type === 'audio.commit') {
+      ws.send(JSON.stringify({
+        type: 'audio.delta', sequence: 0,
+        audio: Buffer.from('reply').toString('base64'), sampleRate: 24_000,
+      }))
+      ws.send(JSON.stringify({ type: 'audio.done' }))
+    }
+  })
+  const events = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, responseStartTimeoutMs: 40, connectTimeoutMs: 2_000,
+  })
+  const turn = transport.openTurn({
+    requestId: 'r844', sessionId: 's844', generation: 1, responseId: 'r844:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  assert.equal(events.some(event => event.type === 'agent.error'), false)
+  turn.close()
+})
+
+// 用户已经挂断/打断的一轮，不许在几秒后再冒出一条错误事件。
+test('ESS-842: cancel and close disarm the response deadline', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+  })
+  const transport = new QwenAgentTransport({ gatewayUrl: url, responseStartTimeoutMs: 30 })
+  for (const [index, teardown] of ['cancel', 'close'].entries()) {
+    const events = []
+    const turn = transport.openTurn({
+      requestId: `r845_${index}`, sessionId: `s845_${index}`, generation: 1,
+      responseId: `r845_${index}:gen1`, onEvent: event => events.push(event),
+    })
+    await waitFor(() => true)
+    turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+    turn.commit()
+    turn[teardown]()
+    await new Promise(resolve => setTimeout(resolve, 120))
+    assert.deepEqual(events, [], `${teardown} 之后不得再有事件`)
+  }
+})
