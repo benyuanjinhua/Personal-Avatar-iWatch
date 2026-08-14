@@ -31,6 +31,23 @@ final class AudioRealtimeAgentSession {
     /// grep queries stay stable across refactors.
     static let logModule = "agent_session"
 
+    /// ESS-842: outer timer that bounds the wait between `audio.commit` and the
+    /// first downlink frame of the response. Injected so tests drive it
+    /// deterministically; production uses the `Task.sleep`-backed default.
+    /// Same seam as `WatchRealtimeMediaAdapter.BarrierTimer`.
+    protocol ResponseWaitTimer: AnyObject {
+        /// Arm (or re-arm) the timer. Cancels any prior pending fire.
+        @MainActor func arm(after seconds: TimeInterval, fire: @escaping @MainActor () -> Void)
+        /// Cancel any pending fire. Idempotent.
+        @MainActor func cancel()
+    }
+
+    /// Error code surfaced (and logged) when the client's own wait budget runs
+    /// out. Distinct from the Gateway's `ERR_UPSTREAM_NO_RESPONSE`: seeing THIS
+    /// code means the Gateway never spoke at all, so the next investigation
+    /// starts at the socket, not at the upstream.
+    static let awaitResponseTimeoutCode = "ERR_CLIENT_AWAIT_RESPONSE_TIMEOUT"
+
     // MARK: - Connection state
 
     enum ConnectionState: Equatable, CustomStringConvertible {
@@ -86,6 +103,10 @@ final class AudioRealtimeAgentSession {
     private var currentTurn: TurnIdentity?
     private var heartbeatTimer: Timer?
     private var pendingUplink: [AudioRealtimeAgentCodec.UplinkFrame] = []
+    /// ESS-842: armed when `audio.commit` actually leaves for the Gateway,
+    /// cancelled by the first frame of the response.
+    private let responseWaitTimer: ResponseWaitTimer
+    private(set) var isAwaitingResponse = false
 
     /// Emitted on every `ConnectionState` transition.
     var onConnectionStateChange: ((ConnectionState) -> Void)?
@@ -107,9 +128,14 @@ final class AudioRealtimeAgentSession {
 
     // MARK: - Init
 
-    init(config: AudioRealtimeAgentConfig, sessionId: String = UUID().uuidString) {
+    init(
+        config: AudioRealtimeAgentConfig,
+        sessionId: String = UUID().uuidString,
+        responseWaitTimer: ResponseWaitTimer = TaskBasedResponseWaitTimer()
+    ) {
         self.config = config
         self.sessionId = sessionId
+        self.responseWaitTimer = responseWaitTimer
     }
 
     // MARK: - Public API
@@ -179,6 +205,8 @@ final class AudioRealtimeAgentSession {
             sequence: finalSequence
         )
         guard let transport, case .connected = connectionState else {
+            // Queued behind `ready`; the wait budget starts when the frame
+            // really leaves, in `flushPendingUplink`.
             pendingUplink.append(frame)
             return
         }
@@ -188,6 +216,7 @@ final class AudioRealtimeAgentSession {
                 self?.handleTransportFailure(reason: "commit_failed")
             }
         }
+        armResponseWait(requestId: requestId, generation: generation)
     }
 
     /// Send cancel (user barge-in).
@@ -207,6 +236,7 @@ final class AudioRealtimeAgentSession {
     /// Tear down.
     func disconnect(reason: String) {
         stopHeartbeat()
+        cancelResponseWait()
         transport?.close(reason: reason)
         transport = nil
         pendingUplink.removeAll(keepingCapacity: false)
@@ -266,6 +296,7 @@ final class AudioRealtimeAgentSession {
                 )
                 return
             }
+            cancelResponseWait()
             currentTurn?.deliveredSequences.insert(seq)
             Self.logger.info(
                 "agent audio.delta rid=\(rid.prefix(8), privacy: .public) gen=\(gen) resp=\(respId.prefix(8), privacy: .public) seq=\(seq) bytes=\(audioBytes.count)"
@@ -287,6 +318,7 @@ final class AudioRealtimeAgentSession {
         case .audioDone(let sid, let rid, let respId, let gen, let finalSeq):
             guard sid == sessionId, let turn = currentTurn,
                   turn.requestId == rid else { return }
+            cancelResponseWait()
             currentTurn?.finalSequence = finalSeq
             Self.logger.info(
                 "agent audio.done rid=\(rid.prefix(8), privacy: .public) gen=\(gen) resp=\(respId.prefix(8), privacy: .public) final_seq=\(finalSeq)"
@@ -301,6 +333,7 @@ final class AudioRealtimeAgentSession {
 
         case .cancelAck(let sid, let rid, let gen, let cancelledRespId):
             guard sid == sessionId else { return }
+            cancelResponseWait()
             Self.logger.info(
                 "agent cancel.ack rid=\(rid.prefix(8), privacy: .public) gen=\(gen) cancelled_resp=\(cancelledRespId.prefix(8), privacy: .public)"
             )
@@ -308,6 +341,7 @@ final class AudioRealtimeAgentSession {
 
         case .error(let code, let sid, let rid, let gen, let retriable, let detail):
             guard sid == sessionId else { return }
+            cancelResponseWait()
             Self.logger.error(
                 "agent error code=\(code, privacy: .public) rid=\(rid.prefix(8), privacy: .public) gen=\(gen) retriable=\(retriable) detail=\(detail ?? "nil", privacy: .public)"
             )
@@ -359,6 +393,7 @@ final class AudioRealtimeAgentSession {
 
     private func handleTransportFailure(reason: String) {
         stopHeartbeat()
+        cancelResponseWait()
         // F4: maxReconnectAttempts = 0 — single-use tokens make reconnect
         // impossible without a fresh token. Fail immediately.
         transition(to: .failed(sessionId: sessionId, reason: reason))
@@ -372,13 +407,69 @@ final class AudioRealtimeAgentSession {
         guard let transport, !pendingUplink.isEmpty else { return }
         let frames = pendingUplink
         pendingUplink.removeAll(keepingCapacity: false)
+        var flushedCommit: (requestId: String, generation: Int)?
         for frame in frames {
+            if case .audioCommit(_, let requestId, let generation, _) = frame {
+                flushedCommit = (requestId, generation)
+            }
             transport.send(frame) { error in
                 if let error {
                     Self.logger.error("pending uplink flush failed: \(String(describing: error), privacy: .public)")
                 }
             }
         }
+        // ESS-842: a commit that waited for `ready` only reaches the Gateway
+        // here, so this is where its wait budget starts.
+        if let flushedCommit {
+            armResponseWait(requestId: flushedCommit.requestId, generation: flushedCommit.generation)
+        }
+    }
+
+    // MARK: - ESS-842 response wait budget
+
+    /// Start (or restart) the post-commit wait budget.
+    ///
+    /// The budget deliberately outlasts the Gateway's own committed-turn
+    /// deadline (`AudioRealtimeAgentConfig.gatewayResponseDeadline` + delivery
+    /// margin): the Gateway is the party that knows WHY there is no answer, so
+    /// the client must still be listening when it says so. This timer only
+    /// fires when even that never arrives — and then it leaves an explicit
+    /// reason instead of the bare `1006` the incident left behind.
+    private func armResponseWait(requestId: String, generation: Int) {
+        isAwaitingResponse = true
+        PhoneAgentClientLog.info(
+            module: Self.logModule, event: "await_response_started",
+            requestId: requestId, sessionId: sessionId,
+            detail: "budget_s=\(config.responseWaitTimeout) gen=\(generation)"
+        )
+        responseWaitTimer.arm(after: config.responseWaitTimeout) { [weak self] in
+            self?.handleResponseWaitTimeout(requestId: requestId, generation: generation)
+        }
+    }
+
+    /// Cancel the budget — the response has started (or the turn is over).
+    private func cancelResponseWait() {
+        guard isAwaitingResponse else { return }
+        isAwaitingResponse = false
+        responseWaitTimer.cancel()
+    }
+
+    private func handleResponseWaitTimeout(requestId: String, generation: Int) {
+        guard isAwaitingResponse else { return }
+        isAwaitingResponse = false
+        Self.logger.error(
+            "agent await response timeout rid=\(requestId.prefix(8), privacy: .public) gen=\(generation)"
+        )
+        PhoneAgentClientLog.error(
+            module: Self.logModule, event: "await_response_timeout",
+            requestId: requestId, sessionId: sessionId,
+            detail: "budget_s=\(config.responseWaitTimeout) gen=\(generation)",
+            code: Self.awaitResponseTimeoutCode
+        )
+        onError?(Self.awaitResponseTimeoutCode, requestId, generation, true, "no downlink within client wait budget")
+        // Close with a reason. A turn that ends here must be greppable as
+        // `await_response_timeout`, never as an unexplained 1006.
+        disconnect(reason: "await_response_timeout")
     }
 
     // MARK: - Testing hooks
@@ -400,5 +491,32 @@ final class AudioRealtimeAgentSession {
             "agent session state → \(newState.description, privacy: .public)"
         )
         onConnectionStateChange?(newState)
+    }
+}
+
+/// ESS-842 default `ResponseWaitTimer`. Same `Task { Task.sleep }` shape as
+/// `TaskBasedBarrierTimer` so both outer timers behave identically under
+/// cancellation and app lifecycle. `arm(...)` cancels any prior scheduling.
+@MainActor
+final class TaskBasedResponseWaitTimer: AudioRealtimeAgentSession.ResponseWaitTimer {
+    private var task: Task<Void, Never>?
+
+    /// Non-isolated init so the session's default argument can build one from
+    /// a nonisolated context; `task` is only touched from `arm` / `cancel`.
+    nonisolated init() {}
+
+    func arm(after seconds: TimeInterval, fire: @escaping @MainActor () -> Void) {
+        task?.cancel()
+        let nanos = UInt64(max(0, seconds) * 1_000_000_000)
+        task = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: nanos)
+            guard !Task.isCancelled else { return }
+            fire()
+        }
+    }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
     }
 }

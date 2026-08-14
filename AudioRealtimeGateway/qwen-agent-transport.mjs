@@ -67,6 +67,29 @@ export class QwenAgentTransport {
     // response to the Watch as a successful one.
     reorderWaitMs = 300,
     maxReorderFrames = 64,
+    // ESS-842: how long a committed turn may wait for the upstream to produce
+    // ANY part of its response before the turn fails closed. Without it the
+    // committed turn has no deadline at all: the upstream discards audio from
+    // a non-owner connection silently (ESS-37 §2.1), so a lost-ownership turn
+    // sits at `uplink_committed` forever and the client waits on a socket that
+    // will never speak.
+    //
+    // 8 s, NOT the Bridge's 12 s (ESS-37 §3): a deadline is only worth having
+    // if the error it produces reaches a client that is still listening, and
+    // the only measured client survival window after commit is the incident's
+    // 10.153 s (`uplink_committed=12:21:03.156` → `peer_closed=12:21:13.309`).
+    // 8 s + delivery margin fits inside it; 12 s does not.
+    //
+    // That argument only bounds the deadline from ABOVE. The lower bound is
+    // measured too (PR #325): window = the 2026-08-10 / -11 / -12 gateway.log
+    // rotations, n=9 successful turns, `uplink_committed` → first
+    // `upstream_audio_delta` = 0.17 / 0.63 / 1.09 / 1.11 / 1.15 / 1.75 / 1.80 /
+    // 2.81 / 3.46 s. 8 s is 2.3x the slowest of those, so a slow-but-healthy
+    // answer is not killed. Both bounds are pinned by
+    // `test/ess842-response-deadline.test.mjs` against the shipped config, and
+    // the client side is mirrored by `AudioRealtimeAgentConfig.responseWaitTimeout`.
+    // n=9 is a thin sample (R-04.4), which is why this stays a config knob.
+    responseTimeoutMs = 8_000,
     takeover = true,
     log = () => {},
   } = {}) {
@@ -81,6 +104,7 @@ export class QwenAgentTransport {
     this.maxReplayFingerprints = maxReplayFingerprints
     this.reorderWaitMs = reorderWaitMs
     this.maxReorderFrames = maxReorderFrames
+    this.responseTimeoutMs = responseTimeoutMs
     this.takeover = takeover
     this.log = log
     this.turns = new Map()
@@ -122,6 +146,11 @@ export class QwenAgentTransport {
     const upstreamSessionId = `watch-direct-${sessionId}-${generation}`
     const url = new URL(this.gatewayUrl)
     url.searchParams.set('sessionId', upstreamSessionId)
+    // ESS-842: our own client identity on the upstream, kept on the turn so an
+    // ownership event can be compared against it. The upstream reports the
+    // holder of the single voice slot; without knowing who WE are, a `busy`
+    // frame cannot be told apart from an echo of our own ownership.
+    const clientInstanceId = `gateway_${randomUUID()}`
     const turn = {
       key, conversation,
       requestId, sessionId, deviceId, generation, responseId, onEvent,
@@ -131,6 +160,8 @@ export class QwenAgentTransport {
       connectTimer: null,
       doneTimer: null, pendingDone: false, recentUpstreamFrames: new Map(),
       expectedUpstream: 0, anchored: false, reorderBuffer: new Map(), gapTimer: null,
+      clientInstanceId, ownershipState: null, ownershipHolderLabel: null,
+      responseTimer: null, responded: false, commitSentAt: null,
     }
     const scopeLog = { request_id: requestId, session_id: sessionId, device_id: deviceId, generation }
     turn.supersede = nextRequestId => {
@@ -139,6 +170,7 @@ export class QwenAgentTransport {
       clearTimeout(turn.connectTimer)
       clearTimeout(turn.doneTimer)
       clearTimeout(turn.gapTimer)
+      clearTimeout(turn.responseTimer)
       this.log('upstream_turn_superseded', {
         ...scopeLog, superseded_by_request_id: nextRequestId,
       })
@@ -157,6 +189,7 @@ export class QwenAgentTransport {
       clearTimeout(turn.connectTimer)
       clearTimeout(turn.doneTimer)
       clearTimeout(turn.gapTimer)
+      clearTimeout(turn.responseTimer)
       this.log('upstream_error', { ...scopeLog, code })
       onEvent({ type: 'agent.error', response_id: responseId, code, detail, retriable: true })
       try { turn.ws?.close() } catch { /* best effort */ }
@@ -173,6 +206,42 @@ export class QwenAgentTransport {
         request_id: requestId, session_id: sessionId, generation, code, ...extra,
       })
       fail(code, detail)
+    }
+
+    // ESS-842 committed-turn deadline. Armed the moment `audio.commit` really
+    // reaches the upstream socket (not when the client asks for it — a queued
+    // commit is still covered by the connect timeout), disarmed by the first
+    // frame that proves a response exists. On expiry the turn fails closed
+    // with a typed, retriable error so the client learns "no answer" instead
+    // of waiting on a silent socket until it dies as a bare 1006.
+    const armResponseDeadline = () => {
+      if (this.responseTimeoutMs <= 0) return
+      if (turn.terminal || turn.responded || turn.responseTimer) return
+      turn.commitSentAt = Date.now()
+      turn.responseTimer = setTimeout(() => {
+        turn.responseTimer = null
+        if (turn.terminal || turn.responded) return
+        this.log('upstream_response_timeout', {
+          ...scopeLog,
+          waited_ms: Date.now() - turn.commitSentAt,
+          timeout_ms: this.responseTimeoutMs,
+          upstream_ready: turn.ready,
+          ownership_state: turn.ownershipState,
+          ownership_holder_label: turn.ownershipHolderLabel,
+        })
+        fail('ERR_UPSTREAM_NO_RESPONSE',
+          `upstream produced no response within ${this.responseTimeoutMs}ms of audio.commit`)
+      }, this.responseTimeoutMs)
+      turn.responseTimer.unref?.()
+    }
+
+    // Any frame that belongs to the response (delta, done, or an upstream
+    // error) proves the upstream is answering; the deadline has done its job.
+    const noteResponseProgress = () => {
+      if (turn.responded) return
+      turn.responded = true
+      clearTimeout(turn.responseTimer)
+      turn.responseTimer = null
     }
 
     // ESS-773 done barrier. `audio.done` is not forwarded on arrival: it opens
@@ -307,18 +376,22 @@ export class QwenAgentTransport {
       armGapTimer()
     }
 
+    // Returns true when the event actually reached the upstream socket, false
+    // when it was queued (or dropped because the turn is over) — the commit
+    // deadline may only start once the upstream has really been told.
     const sendOrQueue = (event, bytes = 0) => {
-      if (turn.terminal) return
+      if (turn.terminal) return false
       if (turn.ready && turn.ws?.readyState === WebSocket.OPEN) {
         turn.ws.send(JSON.stringify(event))
-        return
+        return true
       }
       if (turn.pendingBytes + bytes > this.maxPendingBytes) {
         fail('ERR_UPSTREAM_BUFFER_LIMIT', 'upstream was not ready before the audio buffer filled')
-        return
+        return false
       }
       turn.pending.push(event)
       turn.pendingBytes += bytes
+      return false
     }
 
     try {
@@ -338,7 +411,7 @@ export class QwenAgentTransport {
         }
         ws.send(JSON.stringify({
           type: 'connect', clientType: 'cli', clientLabel: 'watch-direct-gateway',
-          clientInstanceId: `gateway_${randomUUID()}`, voiceEnabled: true,
+          clientInstanceId: turn.clientInstanceId, voiceEnabled: true,
           manualTurnDetection: true, takeover: this.takeover,
           timeZone: 'Asia/Shanghai', locale: 'zh-CN',
         }))
@@ -354,18 +427,49 @@ export class QwenAgentTransport {
         if (event.type === 'voice.ready') {
           if (turn.ready) return
           turn.ready = true
+          turn.ownershipState = 'active'
           clearTimeout(turn.connectTimer)
           this.log('upstream_ready', scopeLog)
           for (const queued of turn.pending) ws.send(JSON.stringify(queued))
           turn.pending = []
           turn.pendingBytes = 0
+          // A commit that was queued behind the handshake only reaches the
+          // upstream here, so this is where its deadline starts.
+          if (turn.committed) armResponseDeadline()
           return
         }
-        if (event.type === 'voice.ownership' && event.state === 'busy' && !turn.ready) {
-          fail('ERR_VOICE_BUSY', 'upstream voice ownership is busy')
+        if (event.type === 'voice.ownership' || event.type === 'voice.deactivated') {
+          const holder = event.holder ?? null
+          const holderIsSelf = holder?.instanceId === turn.clientInstanceId
+          turn.ownershipState = event.type === 'voice.deactivated'
+            ? 'deactivated' : (event.state ?? null)
+          turn.ownershipHolderLabel = holder?.label ?? null
+          // ESS-842 forensics: the single fact that decides whether a silent
+          // upstream is "still thinking" or "discarding our audio" was never
+          // recorded. It is cheap, and the holder identity is a client label,
+          // not a credential.
+          this.log('upstream_ownership', {
+            ...scopeLog, event_type: event.type,
+            state: turn.ownershipState, holder_label: turn.ownershipHolderLabel,
+            holder_is_self: holderIsSelf, upstream_ready: turn.ready,
+          })
+          if (!turn.ready) {
+            if (event.state === 'busy') fail('ERR_VOICE_BUSY', 'upstream voice ownership is busy')
+            return
+          }
+          // Ownership lost mid-turn. The upstream drops a non-owner's
+          // `audio.append` / `audio.commit` without answering (ESS-37 §2.1),
+          // so continuing would spend the whole response deadline on audio
+          // that is being thrown away. Fail now, with the holder named.
+          if (event.type === 'voice.deactivated'
+            || (event.state === 'busy' && !holderIsSelf)) {
+            fail('ERR_VOICE_OWNERSHIP_LOST',
+              `upstream voice ownership lost mid-turn (holder=${turn.ownershipHolderLabel ?? 'unknown'})`)
+          }
           return
         }
         if (event.type === 'audio.delta' && event.audio) {
+          noteResponseProgress()
           const audio = event.audio
           if (typeof audio !== 'string' || audio.length % 4 !== 0 || !BASE64.test(audio)) {
             rejectFrame('ERR_UPSTREAM_FRAME_INVALID', 'audio payload is not base64', {
@@ -432,6 +536,7 @@ export class QwenAgentTransport {
           return
         }
         if (event.type === 'audio.done') {
+          noteResponseProgress()
           this.log('upstream_event_received', {
             ...scopeLog, upstream_event_type: 'audio.done',
             final_sequence: turn.nextOutputSequence - 1,
@@ -441,6 +546,7 @@ export class QwenAgentTransport {
           return
         }
         if (event.type === 'error' || event.type === 'session.error' || event.type === 'voice.error') {
+          noteResponseProgress()
           fail(event.code ?? 'ERR_UPSTREAM_UNAVAILABLE', event.message ?? event.detail ?? 'upstream error')
         }
       })
@@ -455,6 +561,7 @@ export class QwenAgentTransport {
           flushDone()
           turn.terminal = true
           clearTimeout(turn.connectTimer)
+          clearTimeout(turn.responseTimer)
           this.#release(turn)
           return
         }
@@ -471,7 +578,7 @@ export class QwenAgentTransport {
       commit: () => {
         if (turn.committed || turn.terminal) return
         turn.committed = true
-        sendOrQueue({ type: 'audio.commit' })
+        if (sendOrQueue({ type: 'audio.commit' })) armResponseDeadline()
       },
       cancel: () => {
         if (turn.terminal) return
@@ -482,6 +589,7 @@ export class QwenAgentTransport {
         clearTimeout(turn.connectTimer)
         clearTimeout(turn.doneTimer)
         clearTimeout(turn.gapTimer)
+        clearTimeout(turn.responseTimer)
         turn.ws?.close()
         this.#release(turn)
       },
@@ -491,6 +599,7 @@ export class QwenAgentTransport {
         clearTimeout(turn.connectTimer)
         clearTimeout(turn.doneTimer)
         clearTimeout(turn.gapTimer)
+        clearTimeout(turn.responseTimer)
         if (turn.ws?.readyState === WebSocket.OPEN) {
           turn.ws.send(JSON.stringify({ type: 'mute' }))
         }

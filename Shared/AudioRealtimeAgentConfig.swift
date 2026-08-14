@@ -29,17 +29,40 @@ struct AudioRealtimeAgentConfig: Sendable, Equatable {
     /// Device identity for scope binding (sent as `device_id` URL query param).
     let deviceId: String
     let connectionTimeout: TimeInterval
+    /// ESS-842: how long the client keeps waiting after `audio.commit` before
+    /// it gives up on its own. It must stay **longer** than the Gateway's
+    /// committed-turn deadline plus delivery margin — otherwise the client
+    /// leaves first and the Gateway's structured `error` frame lands on a
+    /// socket nobody is reading, which is exactly the failure the incident
+    /// left behind as a bare `close_code=1006`.
+    ///
+    /// The ordering is asserted by `AudioRealtimeAgentSessionTests`
+    /// (`testResponseWaitBudgetOutlastsGatewayDeadline`) against
+    /// `gatewayResponseDeadline`.
+    let responseWaitTimeout: TimeInterval
     /// Default heartbeat interval matches Gateway's default (15 s).
     let heartbeatInterval: TimeInterval
     /// 0 = no reconnect. Single-use tokens make reconnect structurally
     /// impossible without a fresh token (F4).
     let maxReconnectAttempts: Int
 
+    /// ESS-842 client-side mirror of the Gateway's shipped
+    /// `agent_response_timeout_ms` (`AudioRealtimeGateway/config.json`, 8000 ms).
+    /// Kept as a named constant so the wait-budget ordering is a checked
+    /// invariant instead of two numbers that silently drift apart.
+    static let gatewayResponseDeadline: TimeInterval = 8.0
+
+    /// Margin the Gateway's `error` frame needs to travel and be handled
+    /// (matches `ERROR_DELIVERY_MARGIN_MS` in
+    /// `AudioRealtimeGateway/test/ess842-response-deadline.test.mjs`).
+    static let gatewayErrorDeliveryMargin: TimeInterval = 1.5
+
     init(
         gatewayURL: URL,
         authToken: String,
         deviceId: String,
         connectionTimeout: TimeInterval = 10.0,
+        responseWaitTimeout: TimeInterval = 15.0,
         heartbeatInterval: TimeInterval = 15.0,
         maxReconnectAttempts: Int = 0
     ) {
@@ -47,6 +70,7 @@ struct AudioRealtimeAgentConfig: Sendable, Equatable {
         self.authToken = authToken
         self.deviceId = deviceId
         self.connectionTimeout = connectionTimeout
+        self.responseWaitTimeout = responseWaitTimeout
         self.heartbeatInterval = heartbeatInterval
         self.maxReconnectAttempts = maxReconnectAttempts
     }

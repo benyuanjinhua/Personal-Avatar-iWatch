@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test test/token-issuer.test.mjs test/token-issuer-soak.test.mjs test/realtime-session.test.mjs test/cancel-generation.test.mjs test/heartbeat-rate-limit.test.mjs test/structured-logs.test.mjs test/wss-e2e.test.mjs test/startup-failure.test.mjs test/qwen-agent-transport.test.mjs test/downlink-budget.test.mjs"
+    "test": "node --test test/token-issuer.test.mjs test/token-issuer-soak.test.mjs test/realtime-session.test.mjs test/cancel-generation.test.mjs test/heartbeat-rate-limit.test.mjs test/structured-logs.test.mjs test/wss-e2e.test.mjs test/startup-failure.test.mjs test/qwen-agent-transport.test.mjs test/downlink-budget.test.mjs test/ess842-response-deadline.test.mjs"
   },
   "dependencies": {
     "ws": "^8.21.1"
