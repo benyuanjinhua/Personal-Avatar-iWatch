@@ -229,4 +229,87 @@ final class RealtimeBridgeWireCodecTests: XCTestCase {
         XCTAssertTrue(wireLines[2].contains("\"sequence\":1"))
         XCTAssertTrue(wireLines[3].contains("\"type\":\"audio.commit\""))
     }
+
+    // MARK: - ESS-832: dual-write flag is a real lever, in both states
+
+    /// ESS-829 blocker 1: the rollout flag used to be declared but never read,
+    /// so "turn dual-write off" was not actually reachable. These two cases
+    /// pin both states of `RealtimeEnvelopeFlag.dualWriteConversationIds`.
+    private var identityFrames: [(String, RealtimeBridgeWireCodec.UplinkFlatFrame)] {
+        let conversationId = "01920000-0000-7000-8000-00000000000a"
+        let turnId = "01920000-0000-7000-8000-00000000000b"
+        let start = RealtimeStreamStart(
+            requestId: requestId, sessionId: sessionId,
+            format: .uplinkPCM16, capturedAtMs: 1_800_000_000_000
+        )
+        let commit = RealtimeStreamCommit(
+            requestId: requestId, sessionId: sessionId,
+            sequence: 0, capturedAtMs: 1_800_000_000_000
+        )
+        return [
+            ("start", .start(start, conversationId: conversationId, turnId: turnId)),
+            ("audio.commit", .audioCommit(commit, conversationId: conversationId, turnId: turnId)),
+            ("playback.started", .playbackStarted(
+                requestId: requestId, sessionId: sessionId, responseId: "resp_1",
+                conversationId: conversationId, turnId: turnId
+            )),
+            ("close", .close(
+                requestId: requestId, sessionId: sessionId, reason: "done",
+                conversationId: conversationId, turnId: turnId
+            )),
+        ]
+    }
+
+    func testDualWriteOnEmitsConversationAndTurnIds() throws {
+        for (label, frame) in identityFrames {
+            let text = try XCTUnwrap(
+                RealtimeBridgeWireCodec.encode(frame, dualWriteConversationIds: true),
+                "\(label) 必须可编码"
+            )
+            guard let obj = decodedJSON(text) else { return XCTFail("\(label) invalid json") }
+            XCTAssertEqual(obj["type"] as? String, label)
+            XCTAssertEqual(
+                obj["conversation_id"] as? String, "01920000-0000-7000-8000-00000000000a",
+                "\(label) 开启双写时必须带 conversation_id"
+            )
+            XCTAssertEqual(
+                obj["turn_id"] as? String, "01920000-0000-7000-8000-00000000000b",
+                "\(label) 开启双写时必须带 turn_id"
+            )
+        }
+    }
+
+    func testDualWriteOffRestoresPreESS571WireShape() throws {
+        for (label, frame) in identityFrames {
+            let off = try XCTUnwrap(
+                RealtimeBridgeWireCodec.encode(frame, dualWriteConversationIds: false),
+                "\(label) 必须可编码"
+            )
+            guard let offObj = decodedJSON(off) else { return XCTFail("\(label) invalid json") }
+            XCTAssertNil(offObj["conversation_id"], "\(label) 关闭双写后不得写出 conversation_id")
+            XCTAssertNil(offObj["turn_id"], "\(label) 关闭双写后不得写出 turn_id")
+
+            // The legacy flat shape must be byte-identical to a frame that
+            // never carried the identity fields — the keys are purely additive.
+            let on = try XCTUnwrap(RealtimeBridgeWireCodec.encode(frame, dualWriteConversationIds: true))
+            guard var onObj = decodedJSON(on) else { return XCTFail("\(label) invalid json") }
+            onObj.removeValue(forKey: "conversation_id")
+            onObj.removeValue(forKey: "turn_id")
+            XCTAssertEqual(
+                NSDictionary(dictionary: onObj), NSDictionary(dictionary: offObj),
+                "\(label) 双写只应新增键，不得改动既有字段"
+            )
+        }
+    }
+
+    func testDualWriteDefaultsToRolloutFlag() throws {
+        let frame = identityFrames[0].1
+        let defaulted = try XCTUnwrap(RealtimeBridgeWireCodec.encode(frame))
+        let explicit = try XCTUnwrap(
+            RealtimeBridgeWireCodec.encode(
+                frame, dualWriteConversationIds: RealtimeEnvelopeFlag.dualWriteConversationIds
+            )
+        )
+        XCTAssertEqual(defaulted, explicit, "默认参数必须取自 rollout flag")
+    }
 }

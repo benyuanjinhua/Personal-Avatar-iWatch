@@ -13,8 +13,11 @@ import Foundation
 /// Uplink  : { "type": "playback.ended",   "request_id": "...", "session_id": "...", "response_id": "...", "bytes_played": N }
 /// Uplink  : { "type": "close",          "request_id": "...", "session_id": "...", "reason": "..." }
 ///
-/// ESS-571 Phase 0: when `RealtimeEnvelopeFlag.useV1Envelope` is set, each
-/// message also carries `conversation_id` and `turn_id` for dual-write.
+/// ESS-571 Phase 0: every uplink message additionally carries
+/// `conversation_id` and `turn_id` when the frame supplies them and
+/// `RealtimeEnvelopeFlag.dualWriteConversationIds` is on (the default). These
+/// are additive — the flat shape above is unchanged, so a receiver that
+/// ignores unknown keys is unaffected.
 ///
 ///   Downlink: { "type": "audio.delta",    "request_id": "...", "session_id": "...", "sequence": N, "sample_rate": 24000, "codec": "pcm_s16le", "audio": "<base64>" }
 ///   Downlink: { "type": "transcript.delta"/"transcript.final", "request_id": "...", "session_id": "...", "text": "..." }
@@ -89,7 +92,13 @@ enum RealtimeBridgeWireCodec {
         }
     }
 
-    static func encode(_ frame: UplinkFlatFrame) -> String? {
+    /// - Parameter dualWriteConversationIds: whether to emit the additive
+    ///   `conversation_id` / `turn_id` keys. Defaults to the rollout flag;
+    ///   the parameter exists so both states are reachable from tests.
+    static func encode(
+        _ frame: UplinkFlatFrame,
+        dualWriteConversationIds: Bool = RealtimeEnvelopeFlag.dualWriteConversationIds
+    ) -> String? {
         var payload: [String: Any] = [:]
         var convId: String? = nil
         var tId: String? = nil
@@ -137,9 +146,13 @@ enum RealtimeBridgeWireCodec {
             payload["session_id"] = sessionId
             payload["reason"] = reason
         }
-        // ESS-571 Phase 0: dual-write conversation/turn IDs when present
-        if let cid = convId { payload["conversation_id"] = cid }
-        if let tid = tId { payload["turn_id"] = tid }
+        // ESS-571 Phase 0: dual-write conversation/turn IDs when present.
+        // ESS-832: gated so the additive keys can be switched off without
+        // reverting the identity model.
+        if dualWriteConversationIds {
+            if let cid = convId { payload["conversation_id"] = cid }
+            if let tid = tId { payload["turn_id"] = tid }
+        }
         guard let data = try? JSONSerialization.data(
             withJSONObject: payload,
             options: [.sortedKeys]
