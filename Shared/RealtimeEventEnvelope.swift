@@ -363,24 +363,28 @@ struct RealtimeEventEnvelope: Equatable, Sendable {
 
 // MARK: - RealtimeEnvelopeFlag
 
-/// Controls whether the new envelope format (v1) is used on the wire.
+/// Wire-format levers for the ESS-571 conversation identity rollout.
 ///
-/// During Phase 0 rollout (default):
-///   Both legacy flat-wire AND new envelope fields are emitted (dual-write).
-///   Receivers read whichever is present.
-///
-/// When `preferEnvelopeOnReceive` is true, receivers prefer envelope fields
-/// over legacy flat-wire fields. Both flags are compile-time constants
-/// during Phase 0 — change to `var` only when runtime switching is needed.
+/// Phase 0 (current): the flat Bridge wire shape stays authoritative and each
+/// uplink frame additionally carries `conversation_id` / `turn_id`. The v1
+/// unified envelope is defined and tested, but is not yet the wire format.
 ///
 /// Migration order (per ESS-543 v1.2 §1.1): ESS-541 → ESS-537 → dual-write →
 /// dual-read verification → delete old keys.
+///
+/// ESS-832: this type previously declared `useV1Envelope` /
+/// `preferEnvelopeOnReceive`, which no code ever read — they described a
+/// rollback lever that did not exist. Only a flag the encoder actually reads
+/// belongs here.
 enum RealtimeEnvelopeFlag {
-    /// Whether the v1 unified envelope is the active wire format.
-    /// `false` during Phase 0 rollout (dual-write).
-    static let useV1Envelope: Bool = false
-
-    /// When `true`, receivers should prefer the envelope fields over
-    /// legacy flat-wire fields.
-    static let preferEnvelopeOnReceive: Bool = true
+    /// Whether uplink frames carry the additive `conversation_id` / `turn_id`
+    /// keys alongside the legacy flat-wire fields.
+    ///
+    /// Read by `RealtimeBridgeWireCodec.encode(_:)`. Set to `false` to fall
+    /// back to the pre-ESS-571 wire shape without reverting the identity model
+    /// — the escape hatch for a receiver that rejects unknown keys.
+    ///
+    /// Compile-time constant during Phase 0; change to `var` only when runtime
+    /// switching is actually needed.
+    static let dualWriteConversationIds: Bool = true
 }
