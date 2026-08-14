@@ -621,3 +621,26 @@ test('voice.deactivated after ready fails the turn immediately', async () => {
   assert.equal(events.at(-1).code, 'ERR_VOICE_OWNERSHIP_LOST')
   assert.equal(logs.find(item => item.evt === 'upstream_ownership').state, 'deactivated')
 })
+
+// 边界补齐（PR #325 的用例并入）：用户已经挂断 / 打断的一轮，不许在
+// deadline 到期时再冒出一条错误事件——那会打断的是它的**下一轮**。
+// 实现里 cancel/close/supersede 都清了表，这里把它钉住。
+test('ESS-842: cancel and close disarm the committed-turn deadline', async () => {
+  const url = await upstream((ws, message) => {
+    // 只握手，之后永远沉默——deadline 若没被撤，必然到期。
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+  })
+  const transport = new QwenAgentTransport({ gatewayUrl: url, responseTimeoutMs: 30 })
+  for (const [index, teardown] of ['cancel', 'close'].entries()) {
+    const events = []
+    const turn = transport.openTurn({
+      requestId: `r842t_${index}`, sessionId: `s842t_${index}`, generation: 1,
+      responseId: `r842t_${index}:gen1`, onEvent: event => events.push(event),
+    })
+    turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+    turn.commit()
+    turn[teardown]()
+    await new Promise(resolve => setTimeout(resolve, 120))
+    assert.deepEqual(events, [], `${teardown} 之后不得再有 deadline 事件`)
+  }
+})

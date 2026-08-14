@@ -68,8 +68,7 @@ Gateway deadline 8s  +  送达余量 1.5s  =  9.5s   <   实测客户端窗口 1
 ```
 
 - Gateway 侧：`agent_response_timeout_ms=8000`（`AudioRealtimeGateway/config.json`），
-  由 `test/ess842-response-deadline.test.mjs` 直接读出厂配置断言 `deadline + 1500ms ≤ 10153ms`，
-  同时断言 `deadline ≥ 5000ms`（不许短到误杀慢但正常的回答）。
+  由 `test/ess842-response-deadline.test.mjs` 直接读出厂配置断言 `deadline + 1500ms ≤ 10153ms`。
 - 客户端侧：`AudioRealtimeAgentConfig.responseWaitTimeout=15s`，commit 真正发出时起表，
   首帧 `audio.delta` / `audio.done` / `error` / `cancel.ack` 撤表；耗尽则记
   `await_response_timeout` + `ERR_CLIENT_AWAIT_RESPONSE_TIMEOUT` 并**带 reason 关闭**，
@@ -77,6 +76,23 @@ Gateway deadline 8s  +  送达余量 1.5s  =  9.5s   <   实测客户端窗口 1
 
 **为什么客户端预算更长**：知道「为什么没有回答」的是 Gateway，客户端唯一该做的是等它说完。客户端这条
 预算只在连 Gateway 都不说话时才触发，触发时也只是把裸 1006 换成一条可 grep 的明确原因。
+
+### 5.1 下界同样要有实测依据（并入 PR #325 的取证）
+
+上面那条只把 deadline 从**上面**卡住（不能太晚）。只有上界的话，3s 也能满足它，却会当场制造一个
+把正常回答砍半的新缺陷——所以下界必须同等强度地钉住。
+
+数据窗口：`gateway.log.20260810 / 0811 / 0812` 三个轮转；样本量 n=9（窗口内全部成功回合）；
+口径：`uplink_committed` → 首个 `upstream_audio_delta`：
+
+```
+0.17  0.63  1.09  1.11  1.15  1.75  1.80  2.81  3.46   (秒)
+```
+
+最慢 3.46s，8s ≈ 2.3 倍。测试改为断言 `deadline ≥ 2 × 3460ms`，取代原先没有依据的 `≥ 5000ms`。
+
+按 R-04.4：**n=9 是局部窗口，不是分布**，不得当成普遍规律。这正是 deadline 做成配置项
+`agent_response_timeout_ms` 而不是写死常量的原因，也是 §6 要求真机 5 轮之后回看 TTFT 分布的原因。
 
 ## 6. 遗留
 

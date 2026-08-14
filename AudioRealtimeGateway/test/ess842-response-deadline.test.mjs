@@ -25,6 +25,15 @@ const OBSERVED_CLIENT_WINDOW_MS = 10_153
 // 错误帧从「定时器到期」到「客户端收到」要走 fail() → error 帧 → close(1008)
 // 一整条路，外加一次 WAN/WSS 往返。留 1.5s，宽于任何实测的下行送达耗时。
 const ERROR_DELIVERY_MARGIN_MS = 1_500
+// 下界的实测依据（PR #325 取证，与上界同等强度）。数据窗口：
+// `gateway.log.20260810 / 0811 / 0812` 三个轮转；样本量 n=9（窗口内全部成功回合）；
+// 口径：`uplink_committed` → 首个 `upstream_audio_delta`：
+//   0.17 / 0.63 / 1.09 / 1.11 / 1.15 / 1.75 / 1.80 / 2.81 / 3.46 s
+// 最慢 3.46s。deadline 必须显著高于它，否则会把「慢但正常」的回答判死——
+// 这一侧若不钉住，3s 也能满足上界，却会当场制造一个把回答砍半的新缺陷。
+// n=9 偏薄（R-04.4：不把局部窗口的结论说成普遍规律），故 deadline 做成配置项，
+// 且这里只钉「≥ 实测最慢的 2 倍」这一条可复核的下界。
+const OBSERVED_SLOWEST_ANSWER_MS = 3_460
 
 describe('ESS-842 committed-turn deadline', () => {
   it('ships a deadline that fires inside the observed client window', () => {
@@ -37,8 +46,13 @@ describe('ESS-842 committed-turn deadline', () => {
       deadline + ERROR_DELIVERY_MARGIN_MS <= OBSERVED_CLIENT_WINDOW_MS,
       `deadline(${deadline}ms) + 送达余量(${ERROR_DELIVERY_MARGIN_MS}ms) 必须 ≤ 实测客户端存活窗口 ${OBSERVED_CLIENT_WINDOW_MS}ms`,
     )
-    // 另一侧的下限：deadline 不能短到误杀一个正常回答的回合。
-    assert.ok(deadline >= 5_000, `deadline(${deadline}ms) 过短会误杀慢但正常的回答`)
+    // 另一侧的下界：deadline 不能短到误杀一个「慢但正常」的回答。上界钉的是
+    // 「不能太晚」，这一条钉的是「不能太早」——两侧都钉住，8s 才不是一个
+    // 只满足单边约束的巧合值。
+    assert.ok(
+      deadline >= 2 * OBSERVED_SLOWEST_ANSWER_MS,
+      `deadline(${deadline}ms) 必须 ≥ 实测最慢回答 ${OBSERVED_SLOWEST_ANSWER_MS}ms 的 2 倍，否则会误杀慢但正常的回答`,
+    )
   })
 
   describe('delivery path', () => {

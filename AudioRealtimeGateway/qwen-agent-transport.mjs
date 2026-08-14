@@ -78,10 +78,17 @@ export class QwenAgentTransport {
     // if the error it produces reaches a client that is still listening, and
     // the only measured client survival window after commit is the incident's
     // 10.153 s (`uplink_committed=12:21:03.156` → `peer_closed=12:21:13.309`).
-    // 8 s + delivery margin fits inside it; 12 s does not. The invariant is
-    // pinned by `test/ess842-response-deadline.test.mjs` against the shipped
-    // config and mirrored client-side by
-    // `AudioRealtimeAgentConfig.responseWaitTimeout`.
+    // 8 s + delivery margin fits inside it; 12 s does not.
+    //
+    // That argument only bounds the deadline from ABOVE. The lower bound is
+    // measured too (PR #325): window = the 2026-08-10 / -11 / -12 gateway.log
+    // rotations, n=9 successful turns, `uplink_committed` → first
+    // `upstream_audio_delta` = 0.17 / 0.63 / 1.09 / 1.11 / 1.15 / 1.75 / 1.80 /
+    // 2.81 / 3.46 s. 8 s is 2.3x the slowest of those, so a slow-but-healthy
+    // answer is not killed. Both bounds are pinned by
+    // `test/ess842-response-deadline.test.mjs` against the shipped config, and
+    // the client side is mirrored by `AudioRealtimeAgentConfig.responseWaitTimeout`.
+    // n=9 is a thin sample (R-04.4), which is why this stays a config knob.
     responseTimeoutMs = 8_000,
     takeover = true,
     log = () => {},
