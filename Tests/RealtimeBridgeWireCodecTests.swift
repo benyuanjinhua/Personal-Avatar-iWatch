@@ -199,6 +199,150 @@ final class RealtimeBridgeWireCodecTests: XCTestCase {
         XCTAssertNil(RealtimeBridgeWireCodec.decode(data))
     }
 
+    // MARK: - ESS-832 dual-write policy contract
+
+    private let conversationId = "d3f0aaaa-0000-4000-8000-00000000000a"
+    private let turnId = "d3f0bbbb-0000-4000-8000-00000000000b"
+
+    /// Every uplink frame type, built with the supplied conversation identity.
+    /// Passing `nil` for both yields the pre-ESS-571 shape.
+    private func uplinkFrames(
+        conversationId: String?, turnId: String?
+    ) -> [(name: String, frame: RealtimeBridgeWireCodec.UplinkFlatFrame)] {
+        let start = RealtimeStreamStart(
+            requestId: requestId, sessionId: sessionId,
+            format: .uplinkPCM16, capturedAtMs: 1_800_000_000_000
+        )
+        let chunk = VoiceStreamChunk(
+            requestId: requestId, streamId: sessionId, direction: .uplink,
+            sequence: 3, capturedAtMs: 1_800_000_000_000,
+            codec: "pcm_s16le", sampleRate: 16_000, payload: Data([0x01, 0x02])
+        )
+        let commit = RealtimeStreamCommit(
+            requestId: requestId, sessionId: sessionId,
+            sequence: 3, capturedAtMs: 1_800_000_000_000
+        )
+        return [
+            ("start", .start(start, conversationId: conversationId, turnId: turnId)),
+            ("audio.append", .audioAppend(chunk, conversationId: conversationId, turnId: turnId)),
+            ("audio.commit", .audioCommit(commit, conversationId: conversationId, turnId: turnId)),
+            ("playback.started", .playbackStarted(
+                requestId: requestId, sessionId: sessionId, responseId: "resp-1",
+                conversationId: conversationId, turnId: turnId
+            )),
+            ("playback.ended", .playbackEnded(
+                requestId: requestId, sessionId: sessionId, responseId: "resp-1",
+                bytesPlayed: 42, conversationId: conversationId, turnId: turnId
+            )),
+            ("close", .close(
+                requestId: requestId, sessionId: sessionId, reason: "user_exit",
+                conversationId: conversationId, turnId: turnId
+            ))
+        ]
+    }
+
+    /// The switch must be honest about which state it ships in: Phase 0 is
+    /// dual-write, `.legacyOnly` is the rollback.
+    func testDualWritePolicyStatesAreExplicit() {
+        XCTAssertTrue(RealtimeConversationIdentityWirePolicy.phase0Default.emitsConversationIdentity)
+        XCTAssertFalse(RealtimeConversationIdentityWirePolicy.legacyOnly.emitsConversationIdentity)
+    }
+
+    func testDualWriteOnEmitsConversationIdentityOnEveryUplinkFrame() throws {
+        for (name, frame) in uplinkFrames(conversationId: conversationId, turnId: turnId) {
+            let text = try XCTUnwrap(
+                RealtimeBridgeWireCodec.encode(frame, policy: .phase0Default),
+                "\(name) 未能编码"
+            )
+            guard let obj = decodedJSON(text) else { return XCTFail("\(name) invalid json") }
+            XCTAssertEqual(obj["type"] as? String, name)
+            XCTAssertEqual(obj["conversation_id"] as? String, conversationId, "\(name) 缺少 conversation_id")
+            XCTAssertEqual(obj["turn_id"] as? String, turnId, "\(name) 缺少 turn_id")
+        }
+    }
+
+    /// The negative contract ESS-829 called out as missing: with dual-write
+    /// off, the new keys must not reach the wire at all — and the payload must
+    /// be byte-identical to the pre-ESS-571 frame, not merely key-free.
+    func testDualWriteOffOmitsConversationIdentityOnEveryUplinkFrame() throws {
+        let withIdentity = uplinkFrames(conversationId: conversationId, turnId: turnId)
+        let withoutIdentity = uplinkFrames(conversationId: nil, turnId: nil)
+        for (index, (name, frame)) in withIdentity.enumerated() {
+            let text = try XCTUnwrap(
+                RealtimeBridgeWireCodec.encode(frame, policy: .legacyOnly),
+                "\(name) 未能编码"
+            )
+            guard let obj = decodedJSON(text) else { return XCTFail("\(name) invalid json") }
+            XCTAssertNil(obj["conversation_id"], "\(name) 关闭双写后仍写出 conversation_id")
+            XCTAssertNil(obj["turn_id"], "\(name) 关闭双写后仍写出 turn_id")
+
+            let legacy = try XCTUnwrap(RealtimeBridgeWireCodec.encode(withoutIdentity[index].frame))
+            XCTAssertEqual(text, legacy, "\(name) 关闭双写后与 ESS-571 之前的载荷不一致")
+        }
+    }
+
+    /// The envelope-level overload must thread the policy down to the frame
+    /// encoder — otherwise the lever exists but the production call path
+    /// (coordinator → `encode(_: RealtimeUplinkEnvelope)`) bypasses it.
+    func testEnvelopeEncodeHonoursDualWritePolicy() throws {
+        let start = RealtimeStreamStart(
+            requestId: requestId, sessionId: sessionId,
+            format: .uplinkPCM16, capturedAtMs: 1_800_000_000_000
+        )
+        let envelopes: [(String, RealtimeUplinkEnvelope)] = [
+            ("start", .start(start, conversationId: conversationId, turnId: turnId)),
+            ("playback.started", RealtimeUplinkEnvelope(
+                protocolVersion: RealtimeWireVersion.uplink,
+                kind: .playbackStarted, start: nil, append: nil, commit: nil,
+                playback: RealtimePlaybackReceipt(
+                    requestId: requestId, sessionId: sessionId,
+                    responseId: "resp-1", bytesPlayed: nil
+                ),
+                fallback: nil,
+                conversationId: conversationId, turnId: turnId
+            )),
+            ("close", RealtimeUplinkEnvelope(
+                protocolVersion: RealtimeWireVersion.uplink,
+                kind: .fallback, start: nil, append: nil, commit: nil,
+                playback: nil,
+                fallback: RealtimeUplinkFallbackDescriptor(
+                    requestId: requestId, sessionId: sessionId, reason: "bridge_died"
+                ),
+                conversationId: conversationId, turnId: turnId
+            ))
+        ]
+        for (name, envelope) in envelopes {
+            let dualWrite = try XCTUnwrap(RealtimeBridgeWireCodec.encode(envelope))
+            let dualWriteObj = try XCTUnwrap(decodedJSON(dualWrite))
+            XCTAssertEqual(dualWriteObj["conversation_id"] as? String, conversationId, "\(name) 默认应双写")
+            XCTAssertEqual(dualWriteObj["turn_id"] as? String, turnId, "\(name) 默认应双写")
+
+            let legacyOnly = try XCTUnwrap(
+                RealtimeBridgeWireCodec.encode(envelope, policy: .legacyOnly)
+            )
+            let legacyObj = try XCTUnwrap(decodedJSON(legacyOnly))
+            XCTAssertNil(legacyObj["conversation_id"], "\(name) 关闭双写后仍写出 conversation_id")
+            XCTAssertNil(legacyObj["turn_id"], "\(name) 关闭双写后仍写出 turn_id")
+        }
+    }
+
+    /// Receiving stays ungated on purpose: a peer may dual-write while we do
+    /// not, so decode must still surface the identity keys.
+    func testDecodeIsNotGatedByDualWritePolicy() throws {
+        let bridgeMessage: [String: Any] = [
+            "type": "transcript.final",
+            "request_id": requestId,
+            "session_id": sessionId,
+            "text": "hi",
+            "conversation_id": conversationId,
+            "turn_id": turnId
+        ]
+        let data = try JSONSerialization.data(withJSONObject: bridgeMessage)
+        let envelope = try XCTUnwrap(RealtimeBridgeWireCodec.decode(data))
+        XCTAssertEqual(envelope.conversationId, conversationId)
+        XCTAssertEqual(envelope.turnId, turnId)
+    }
+
     // MARK: - Round-trip via coordinator
 
     func testCoordinatorProducesBridgeShapedFrames() {

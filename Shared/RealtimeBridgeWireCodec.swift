@@ -13,8 +13,13 @@ import Foundation
 /// Uplink  : { "type": "playback.ended",   "request_id": "...", "session_id": "...", "response_id": "...", "bytes_played": N }
 /// Uplink  : { "type": "close",          "request_id": "...", "session_id": "...", "reason": "..." }
 ///
-/// ESS-571 Phase 0: when `RealtimeEnvelopeFlag.useV1Envelope` is set, each
-/// message also carries `conversation_id` and `turn_id` for dual-write.
+/// ESS-571 Phase 0 dual-write: uplink messages also carry `conversation_id`
+/// and `turn_id` next to the legacy flat keys, whenever the encoder is handed
+/// those IDs and `RealtimeConversationIdentityWirePolicy.emitsConversationIdentity`
+/// is `true` (the Phase 0 default). Encoding with
+/// `RealtimeConversationIdentityWirePolicy.legacyOnly` restores the
+/// pre-ESS-571 payload exactly. Downlink decoding is never gated — see that
+/// type's documentation.
 ///
 ///   Downlink: { "type": "audio.delta",    "request_id": "...", "session_id": "...", "sequence": N, "sample_rate": 24000, "codec": "pcm_s16le", "audio": "<base64>" }
 ///   Downlink: { "type": "transcript.delta"/"transcript.final", "request_id": "...", "session_id": "...", "text": "..." }
@@ -45,20 +50,24 @@ enum RealtimeBridgeWireCodec {
     /// bridge-forwardable payload (e.g. adapter-local fallback signals).
     ///
     /// ESS-571: when `envelope.conversationId` or `envelope.turnId` are
-    /// non-nil, they are appended to the JSON payload as dual-write fields.
-    static func encode(_ envelope: RealtimeUplinkEnvelope) -> String? {
+    /// non-nil **and** `policy.emitsConversationIdentity` is `true`, they are
+    /// appended to the JSON payload as dual-write fields.
+    static func encode(
+        _ envelope: RealtimeUplinkEnvelope,
+        policy: RealtimeConversationIdentityWirePolicy = .phase0Default
+    ) -> String? {
         let convId = envelope.conversationId
         let tId = envelope.turnId
         switch envelope.kind {
         case .streamStart:
             guard let start = envelope.start else { return nil }
-            return encode(UplinkFlatFrame.start(start, conversationId: convId, turnId: tId))
+            return encode(UplinkFlatFrame.start(start, conversationId: convId, turnId: tId), policy: policy)
         case .audioAppend:
             guard let chunk = envelope.append else { return nil }
-            return encode(.audioAppend(chunk, conversationId: convId, turnId: tId))
+            return encode(.audioAppend(chunk, conversationId: convId, turnId: tId), policy: policy)
         case .audioCommit:
             guard let commit = envelope.commit else { return nil }
-            return encode(.audioCommit(commit, conversationId: convId, turnId: tId))
+            return encode(.audioCommit(commit, conversationId: convId, turnId: tId), policy: policy)
         case .playbackStarted:
             guard let receipt = envelope.playback else { return nil }
             return encode(.playbackStarted(
@@ -66,7 +75,7 @@ enum RealtimeBridgeWireCodec {
                 sessionId: receipt.sessionId,
                 responseId: receipt.responseId,
                 conversationId: convId, turnId: tId
-            ))
+            ), policy: policy)
         case .playbackEnded:
             guard let receipt = envelope.playback else { return nil }
             return encode(.playbackEnded(
@@ -75,7 +84,7 @@ enum RealtimeBridgeWireCodec {
                 responseId: receipt.responseId,
                 bytesPlayed: receipt.bytesPlayed ?? 0,
                 conversationId: convId, turnId: tId
-            ))
+            ), policy: policy)
         case .fallback:
             guard let descriptor = envelope.fallback else { return nil }
             return encode(.close(
@@ -83,13 +92,16 @@ enum RealtimeBridgeWireCodec {
                 sessionId: descriptor.sessionId,
                 reason: descriptor.reason,
                 conversationId: convId, turnId: tId
-            ))
+            ), policy: policy)
         case .bargeInRequest:
             return nil
         }
     }
 
-    static func encode(_ frame: UplinkFlatFrame) -> String? {
+    static func encode(
+        _ frame: UplinkFlatFrame,
+        policy: RealtimeConversationIdentityWirePolicy = .phase0Default
+    ) -> String? {
         var payload: [String: Any] = [:]
         var convId: String? = nil
         var tId: String? = nil
@@ -137,9 +149,13 @@ enum RealtimeBridgeWireCodec {
             payload["session_id"] = sessionId
             payload["reason"] = reason
         }
-        // ESS-571 Phase 0: dual-write conversation/turn IDs when present
-        if let cid = convId { payload["conversation_id"] = cid }
-        if let tid = tId { payload["turn_id"] = tid }
+        // ESS-571 Phase 0: dual-write conversation/turn IDs when present.
+        // ESS-832: gated on the policy so dual-write can actually be turned
+        // off — with `.legacyOnly` the payload is byte-identical to pre-571.
+        if policy.emitsConversationIdentity {
+            if let cid = convId { payload["conversation_id"] = cid }
+            if let tid = tId { payload["turn_id"] = tid }
+        }
         guard let data = try? JSONSerialization.data(
             withJSONObject: payload,
             options: [.sortedKeys]
