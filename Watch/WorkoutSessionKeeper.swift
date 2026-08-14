@@ -50,7 +50,7 @@ final class WorkoutSessionKeeper: NSObject {
         guard enabledProvider() else {
             WatchLog.info(
                 "workout", "workout_session_skipped",
-                detail: "reason=capability_disabled session_preserved=true"
+                detail: "reason=capability_disabled session_preserved=false"
             )
             return
         }
@@ -75,14 +75,17 @@ final class WorkoutSessionKeeper: NSObject {
             try session.startActivity(with: Date())
             try builder.beginCollection(withStart: Date()) { _, _ in }
             isActive = true
-            WatchLog.info("workout", "workout_session_started")
+            WatchLog.info(
+                "workout", "workout_session_started",
+                detail: "session_preserved=true"
+            )
         } catch {
             self.session = nil
             self.builder = nil
             isActive = false
             WatchLog.error(
                 "workout", "workout_session_start_failed",
-                detail: "session_preserved=true", error: error
+                detail: "session_preserved=false", error: error
             )
         }
     }
@@ -126,7 +129,7 @@ extension WorkoutSessionKeeper: HKWorkoutSessionDelegate {
         Task { @MainActor in
             WatchLog.error(
                 "workout", "workout_session_failed",
-                detail: "session_preserved=true", error: error
+                detail: "session_preserved=false", error: error
             )
             self.isActive = false
             self.session = nil

@@ -28,6 +28,10 @@ struct WristAgentWatchApp: App {
                     services.debugSettings.logStateAtLaunch()
                     // ESS-45：降腕后 frontmost 保持从默认 ~8s 延长到 70s，
                     // 与 ExtendedRuntimeSession（VoiceSessionKeeper）叠加覆盖长任务等待。
+                    // 注意：watchOS 26+ 已废弃此 API（模拟器日志
+                    // `frontmostTimeoutExtended is no longer supported`，设了也无效）。
+                    // 前台保活已由 WorkoutSessionKeeper（HKWorkoutSession，ESS-540 F6 /
+                    // ESS-843）承担，这里保留仅为旧系统兼容，不再作为保活依据。
                     WKExtension.shared().isFrontmostTimeoutExtended = true
                     WatchLog.info("lifecycle", "frontmost_timeout_extended")
                     services.bootstrap(reason: "scene_task")
