@@ -31,9 +31,9 @@
 
 ## 3. 本 PR 的修复
 
-1. **committed 回合 deadline**（`agent_response_timeout_ms`，默认 12000ms，与 ESS-37 的
-   `first_event_timeout_ms` 同源同值）：commit **真正发到上游 socket**那一刻起表（排队中的 commit 在
-   `voice.ready` 冲刷时起表，慢握手不吃回答预算），第一帧 `audio.delta` / `audio.done` / `error` 到达即撤表。
+1. **committed 回合 deadline**（`agent_response_timeout_ms`，默认 8000ms）：commit **真正发到上游 socket**
+   那一刻起表（排队中的 commit 在 `voice.ready` 冲刷时起表，慢握手不吃回答预算），第一帧
+   `audio.delta` / `audio.done` / `error` 到达即撤表。
    到期 → `ERR_UPSTREAM_NO_RESPONSE`（retriable）+ `upstream_response_timeout` 日志（带 waited_ms、
    upstream_ready、ownership_state），并关闭上游 socket——按 ESS-37 §2.1 第 4 条，关闭即释放上游所有权，
    下一回合拿到的是干净会话。
@@ -53,11 +53,33 @@ commit 之后按 request_id grep 这几个事件，三选一必然命中：
 | 看到 | 结论 |
 |---|---|
 | `upstream_ownership ... holder_is_self=false` / `state=deactivated` | 所有权被抢，§2 的强嫌疑成立 |
-| `upstream_response_timeout waited_ms≈12000 ownership_state=active` | 我们仍是 owner，上游自己不回答——问题在 qwen/provider 侧 |
+| `upstream_response_timeout waited_ms≈8000 ownership_state=active` | 我们仍是 owner，上游自己不回答——问题在 qwen/provider 侧 |
 | 什么都没有，客户端先断 | 断链先于超时，归「Watch 会话未保活」姊妹单 |
+| 客户端 `await_response_timeout` | 连 Gateway 都没说话，先查这条 WSS 本身 |
 
-## 5. 遗留
+## 5. 两端等待预算的相对时序（ESS-844 阻断项 1）
+
+deadline 只有在**错误帧还能送到一个仍在线的客户端**时才有意义。事故里唯一实测到的客户端存活窗口是
+10.153s（`uplink_committed=12:21:03.156` → `peer_closed=12:21:13.309`），12s 的 deadline 落在窗口之外——
+同一时序复现时客户端先走，新增的 error/1008 谁也收不到。因此两端预算按下面的顺序钉死：
+
+```
+Gateway deadline 8s  +  送达余量 1.5s  =  9.5s   <   实测客户端窗口 10.153s   ≤   客户端等待预算 15s
+```
+
+- Gateway 侧：`agent_response_timeout_ms=8000`（`AudioRealtimeGateway/config.json`），
+  由 `test/ess842-response-deadline.test.mjs` 直接读出厂配置断言 `deadline + 1500ms ≤ 10153ms`，
+  同时断言 `deadline ≥ 5000ms`（不许短到误杀慢但正常的回答）。
+- 客户端侧：`AudioRealtimeAgentConfig.responseWaitTimeout=15s`，commit 真正发出时起表，
+  首帧 `audio.delta` / `audio.done` / `error` / `cancel.ack` 撤表；耗尽则记
+  `await_response_timeout` + `ERR_CLIENT_AWAIT_RESPONSE_TIMEOUT` 并**带 reason 关闭**，
+  由 `AudioRealtimeAgentSessionTests.testResponseWaitBudgetOutlastsGatewayDeadline` 钉住顺序。
+
+**为什么客户端预算更长**：知道「为什么没有回答」的是 Gateway，客户端唯一该做的是等它说完。客户端这条
+预算只在连 Gateway 都不说话时才触发，触发时也只是把裸 1006 换成一条可 grep 的明确原因。
+
+## 6. 遗留
 
 - 超时后**不重放**：只失败一次（retriable），不像 ESS-37 那样重建 + 幂等重放。真机确认根因之前不加这层复杂度。
-- `agent_response_timeout_ms=12000` 是沿用 ESS-37 的经验值，不是本次实测值。若真机显示客户端等待耐心短于
-  12s，这个值要连同客户端耐心一起调，否则错误帧会发给一个已经走掉的客户端。
+- 8s / 15s 都是从**一次**事故窗口推出来的，不是分布。真机连续 5 轮跑完后应回看 TTFT 分布：若 P95 首帧
+  逼近 8s，deadline 与客户端预算要一起上调，顺序不变。

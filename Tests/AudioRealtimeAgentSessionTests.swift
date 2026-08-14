@@ -259,4 +259,127 @@ final class AudioRealtimeAgentSessionTests: XCTestCase {
         XCTAssertNotNil(session.onAudioDelta)
         XCTAssertTrue(chunks.isEmpty)
     }
+
+    // MARK: - ESS-842 post-commit wait budget
+
+    /// Manual timer so the budget is exercised without waiting real seconds.
+    final class ManualResponseWaitTimer: AudioRealtimeAgentSession.ResponseWaitTimer {
+        private(set) var armedAfter: TimeInterval?
+        private(set) var cancelCount = 0
+        private var fire: (@MainActor () -> Void)?
+
+        nonisolated init() {}
+
+        func arm(after seconds: TimeInterval, fire: @escaping @MainActor () -> Void) {
+            armedAfter = seconds
+            self.fire = fire
+        }
+
+        func cancel() {
+            cancelCount += 1
+            armedAfter = nil
+            fire = nil
+        }
+
+        /// Fire whatever is armed, exactly as the real timer would on expiry.
+        @MainActor func expire() {
+            let pending = fire
+            fire = nil
+            pending?()
+        }
+    }
+
+    private func makeCommittedSession(
+        timer: ManualResponseWaitTimer,
+        waitTimeout: TimeInterval = 15.0
+    ) -> AudioRealtimeAgentSession {
+        let session = AudioRealtimeAgentSession(
+            config: AudioRealtimeAgentConfig(
+                gatewayURL: URL(string: "wss://agent.example.com/api/realtime")!,
+                authToken: authToken, deviceId: deviceId,
+                responseWaitTimeout: waitTimeout
+            ),
+            sessionId: sessionId,
+            responseWaitTimer: timer
+        )
+        session.connect(requestId: requestId, generation: 1)
+        // Commit while the handshake is still open: the frame queues, and the
+        // budget must NOT start until `ready` actually flushes it.
+        session.commitUplink(requestId: requestId, generation: 1, finalSequence: 3)
+        XCTAssertNil(timer.armedAfter, "排队中的 commit 不该起表")
+        XCTAssertFalse(session.isAwaitingResponse)
+        session.handleForTesting(event: .ready(
+            sessionId: sessionId, requestId: requestId, generation: 1,
+            responseId: "\(requestId):gen1", heartbeatIntervalMs: 15_000, protocolVersion: 1
+        ))
+        return session
+    }
+
+    /// 阻断项 1 的相对时序不变量：客户端等待预算必须活得比 Gateway 的
+    /// committed-turn deadline + 送达余量更久，否则 Gateway 的结构化错误会发给一个
+    /// 已经走掉的客户端 —— 那正是事故里只留下 1006 的形状。
+    func testResponseWaitBudgetOutlastsGatewayDeadline() {
+        let config = makeConfig()
+        XCTAssertGreaterThan(
+            config.responseWaitTimeout,
+            AudioRealtimeAgentConfig.gatewayResponseDeadline
+                + AudioRealtimeAgentConfig.gatewayErrorDeliveryMargin,
+            "客户端必须等得过 Gateway 的 deadline 加送达余量"
+        )
+        // 事故实测：commit 之后客户端只被观测到存活 10.153s。预算不得短于它，
+        // 否则我们会主动制造同一个「客户端先走」的形状。
+        XCTAssertGreaterThanOrEqual(config.responseWaitTimeout, 10.153)
+    }
+
+    func testCommitArmsWaitBudgetOnlyWhenTheFrameLeaves() {
+        let timer = ManualResponseWaitTimer()
+        let session = makeCommittedSession(timer: timer)
+        XCTAssertEqual(timer.armedAfter, 15.0, "commit 冲刷后才起表，且用配置的预算")
+        XCTAssertTrue(session.isAwaitingResponse)
+    }
+
+    func testFirstAudioDeltaCancelsTheWaitBudget() {
+        let timer = ManualResponseWaitTimer()
+        let session = makeCommittedSession(timer: timer)
+        session.handleForTesting(event: .audioDelta(
+            sessionId: sessionId, requestId: requestId, responseId: "\(requestId):gen1",
+            generation: 1, sequence: 0, sampleRate: 24_000, codec: "pcm_s16le",
+            audioBytes: Data([0, 1, 2, 3])
+        ))
+        XCTAssertFalse(session.isAwaitingResponse)
+        XCTAssertEqual(timer.cancelCount, 1)
+        // 一个迟到的过期回调不得再打断已经在回答的回合。
+        timer.expire()
+        XCTAssertFalse(session.isAwaitingResponse)
+    }
+
+    /// Gateway 的 error 帧就是我们在等的那个「答案」——收到就撤表，不再自杀式关闭。
+    func testGatewayErrorCancelsTheWaitBudget() {
+        let timer = ManualResponseWaitTimer()
+        let session = makeCommittedSession(timer: timer)
+        session.handleForTesting(event: .error(
+            code: "ERR_UPSTREAM_NO_RESPONSE", sessionId: sessionId, requestId: requestId,
+            generation: 1, retriable: true, detail: "upstream produced no response"
+        ))
+        XCTAssertFalse(session.isAwaitingResponse)
+        XCTAssertEqual(timer.cancelCount, 1)
+    }
+
+    /// 预算耗尽（连 Gateway 的错误帧都没等到）时，必须留下明确原因，
+    /// 而不是事故里那条无从解释的 1006。
+    func testExhaustedWaitBudgetSurfacesAnExplicitReason() {
+        let timer = ManualResponseWaitTimer()
+        let session = makeCommittedSession(timer: timer)
+        var errors: [(String, String, Int, Bool)] = []
+        session.onError = { code, rid, gen, retriable, _ in
+            errors.append((code, rid, gen, retriable))
+        }
+        timer.expire()
+        XCTAssertEqual(errors.count, 1)
+        XCTAssertEqual(errors.first?.0, AudioRealtimeAgentSession.awaitResponseTimeoutCode)
+        XCTAssertEqual(errors.first?.1, requestId)
+        XCTAssertEqual(errors.first?.3, true, "无回答是可重试的，不是协议违约")
+        XCTAssertFalse(session.isAwaitingResponse)
+        XCTAssertEqual(session.connectionState, .closed)
+    }
 }

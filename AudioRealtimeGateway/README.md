@@ -313,7 +313,7 @@ ceilings do evict, because a dropped token entry can only cause a rejection.
 | `agent_gateway_url` | `ws://127.0.0.1:3101/api/realtime` | Existing qwen-audio-agent endpoint. Keep loopback-only. |
 | `agent_connect_timeout_ms` | `10000` | Fail the northbound turn with a structured upstream timeout. |
 | `agent_max_pending_bytes` | `2097152` | Hard cap while waiting for upstream `voice.ready`. |
-| `agent_response_timeout_ms` | `12000` | ESS-842: how long a committed turn waits for the first upstream response frame before failing closed with `ERR_UPSTREAM_NO_RESPONSE`. `0` disables the deadline. |
+| `agent_response_timeout_ms` | `8000` | ESS-842: how long a committed turn waits for the first upstream response frame before failing closed with `ERR_UPSTREAM_NO_RESPONSE`. Must stay below the client's post-commit wait budget (`AudioRealtimeAgentConfig.responseWaitTimeout`, 15 s) and inside the incident's measured 10.153 s client window — pinned by `test/ess842-response-deadline.test.mjs`. `0` disables the deadline. |
 | `agent_takeover_voice` | `true` | Explicit Watch speech takes ownership from a stale/local frontend. |
 | `provider_key_env` | `AUDIO_REALTIME_PROVIDER_KEY` | Legacy readiness metadata only; the qwen service owns the provider credential. |
 

@@ -72,10 +72,17 @@ export class QwenAgentTransport {
     // committed turn has no deadline at all: the upstream discards audio from
     // a non-owner connection silently (ESS-37 §2.1), so a lost-ownership turn
     // sits at `uplink_committed` forever and the client waits on a socket that
-    // will never speak. 12 s matches the Bridge's `first_event_timeout_ms`
-    // (ESS-37 §3) — the same upstream, the same "is the event loop alive at
-    // all" question.
-    responseTimeoutMs = 12_000,
+    // will never speak.
+    //
+    // 8 s, NOT the Bridge's 12 s (ESS-37 §3): a deadline is only worth having
+    // if the error it produces reaches a client that is still listening, and
+    // the only measured client survival window after commit is the incident's
+    // 10.153 s (`uplink_committed=12:21:03.156` → `peer_closed=12:21:13.309`).
+    // 8 s + delivery margin fits inside it; 12 s does not. The invariant is
+    // pinned by `test/ess842-response-deadline.test.mjs` against the shipped
+    // config and mirrored client-side by
+    // `AudioRealtimeAgentConfig.responseWaitTimeout`.
+    responseTimeoutMs = 8_000,
     takeover = true,
     log = () => {},
   } = {}) {
