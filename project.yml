@@ -58,6 +58,18 @@ targets:
         WKCompanionAppBundleIdentifier: $(WRISTAGENT_BUNDLE_ID)
         WKApplication: true
         WKRunsIndependentlyOfCompanionApp: true
+        # ESS-843：HKWorkoutSession 前台保活的显式开关，与
+        # Watch/WristAgentWatch.entitlements 的 com.apple.developer.healthkit
+        # 成对出现。缺 entitlement 时 WorkoutSessionKeeper fail-closed 跳过，
+        # 绝不乐观探测（entitlement 缺失的构建调 HKWorkoutSession 会被系统
+        # 直接终止进程）。
+        HealthKitWorkoutKeepAliveEnabled: true
+        # ESS-843：HealthKit 授权用途说明。requestAuthorization(toShare:) 请求
+        # workout type 的 share（写）授权时，缺 NSHealthUpdateUsageDescription
+        # 会直接崩溃；NSHealthShareUsageDescription 与 read 集合配套，
+        # 当前 read 为空但保留键位以避免误报与未来扩展。
+        NSHealthShareUsageDescription: 腕语不读取你的健康数据，该授权仅用于语音通话期间的前台保活。
+        NSHealthUpdateUsageDescription: 腕语需要在语音通话期间记录一次轻量锻炼会话，以保持应用在前台运行、避免降腕后中断对话。
         # ESS-45：audio = 熄屏/后台继续播结果语音；self-care = ExtendedRuntimeSession
         # 类型（系统上限 10 分钟），覆盖录音→等待→播放的整个语音回合。
         WKBackgroundModes:
@@ -70,6 +82,10 @@ targets:
           - audio
     entitlements:
       path: Watch/WristAgentWatch.entitlements
+      properties:
+        # ESS-843：HKWorkoutSession 前台保活所需的 HealthKit capability。
+        # 与上面 HealthKitWorkoutKeepAliveEnabled 成对，缺一不可。
+        com.apple.developer.healthkit: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(WRISTAGENT_BUNDLE_ID).watchkitapp

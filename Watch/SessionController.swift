@@ -254,6 +254,9 @@ final class SessionController: ObservableObject {
     /// `conversation_id` / `turn_id` 真相在 `RealtimeMediaSession.ConversationHandle`
     /// （唯一铸造点），本序号只是会话层日志的可读游标，不另铸 id。
     private(set) var turnIndex = 0
+    /// ESS-843：最近一次会话结束的原因码（默认 user_exit）。keep-alive 层
+    /// （WorkoutSessionKeeper）据此在释放 owner 时落明确 reason。
+    private(set) var lastExitReasonCode: ExitReasonCode = .userExit
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -265,6 +268,7 @@ final class SessionController: ObservableObject {
     /// （会话中点球在 Wave 1 无语义，F4 的手动打断降级在后续 Wave 决定）。
     func enterSession() {
         guard state == .idle else { return }
+        lastExitReasonCode = .userExit
         state = .connecting
         enteredAt = Date()
         showConnectingDots = false
@@ -701,6 +705,7 @@ final class SessionController: ObservableObject {
 
     /// 进入 P7 挂断态。显示摘要，1.2s 后回 idle。
     func enterHungup(rounds: Int, reason: String) {
+        lastExitReasonCode = Self.exitReasonCode(for: reason)
         state = .hungup
         failedReason = nil
         failedRetryable = false
@@ -864,6 +869,16 @@ final class SessionController: ObservableObject {
         }
     }
 
+    /// ESS-843：展示文案 → 机器可读的会话结束原因码（纯函数，便于钉住映射）。
+    /// 验收标准 4：用户主动退出 / 120 秒策略触发才释放 owner，并记录明确 reason。
+    static func exitReasonCode(for reason: String) -> ExitReasonCode {
+        switch reason {
+        case "静默超时": return .silencePolicy
+        case "auto": return .failedAutoHangup
+        default: return .userExit
+        }
+    }
+
     /// 文案纪律（PRD 异常链 A/B）：说清「怎么办」，不出现错误码。
     /// 建立中失败 → 引导用户检查 iPhone；会话中断开 → 告知本轮已结束。
     static func failureCopy(forState state: State) -> String {
@@ -913,6 +928,15 @@ final class SessionController: ObservableObject {
     enum OrbReleaseAction: Equatable {
         case enter
         case reject(EnterRejection)
+    }
+
+    /// ESS-843：机器可读的会话结束原因（供 keep-alive owner 释放记账）。
+    /// 验收标准 4 要求「用户主动退出 / 120 秒策略触发时才释放 owner，并记录
+    /// 明确 reason」——本枚举把展示文案映射为可 grep 的原因码。
+    enum ExitReasonCode: String {
+        case userExit = "user_exit"
+        case silencePolicy = "silence_policy"
+        case failedAutoHangup = "failed_auto_hangup"
     }
 
     /// 主屏球松手的唯一判定点（纯函数，便于 WatchTests 钉死）。
