@@ -21,6 +21,11 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     /// ESS-751：显式 storage 而不是 `lazy var`——连通性回调要能判断「会话是否
     /// 已经存在」再决定要不要重放，用 `lazy var` 光是查询就会触发 WSS 构造。
     private var realtimeSessionStorage: PhoneRealtimeSession?
+    /// `ready` is a one-shot control message. WCSession can briefly report the
+    /// Watch unreachable while the realtime WSS is already active; dropping
+    /// it there leaves the Watch in `.connecting` until its timeout cancels
+    /// recording. Keep the latest turn-scoped value and replay on reachability.
+    private var pendingRealtimeChannelReady: RealtimeChannelReady?
     private var realtimeSession: PhoneRealtimeSession {
         if let existing = realtimeSessionStorage { return existing }
         let session = PhoneRealtimeSession(transportFactory: { [weak self] requestId, sessionId in
@@ -172,6 +177,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
                 }
             }
             // 会话刚激活正是此前静默丢弃的时刻，这里必须补投。
+            self.replayRealtimeChannelReady(trigger: "activation")
             self.replayRealtimeDownlink(trigger: "activation")
             self.flushDownlink(trigger: "activation")
             self.relay.resumeEvents(trigger: "wc-activation")
@@ -186,6 +192,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
 
     nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
         Task { @MainActor in
+            self.replayRealtimeChannelReady(trigger: "reachability")
             self.replayRealtimeDownlink(trigger: "reachability")
             self.flushDownlink(trigger: "reachability")
             self.relay.resumeEvents(trigger: "wc-reachability")
@@ -194,6 +201,7 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
 
     nonisolated func sessionWatchStateDidChange(_ session: WCSession) {
         Task { @MainActor in
+            self.replayRealtimeChannelReady(trigger: "watch-state")
             self.replayRealtimeDownlink(trigger: "watch-state")
             self.flushDownlink(trigger: "watch-state")
             self.relay.resumeEvents(trigger: "wc-watch-state")
@@ -340,32 +348,54 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     }
 
     private func sendRealtimeChannelReady(requestId: String, sessionId: String) {
-        guard let data = try? JSONEncoder().encode(RealtimeChannelReady(
-            requestId: requestId, sessionId: sessionId
-        )) else { return }
+        let ready = RealtimeChannelReady(requestId: requestId, sessionId: sessionId)
+        pendingRealtimeChannelReady = ready
+        deliverRealtimeChannelReady(ready, trigger: "session_active")
+    }
+
+    private func replayRealtimeChannelReady(trigger: String) {
+        guard let ready = pendingRealtimeChannelReady else { return }
+        deliverRealtimeChannelReady(ready, trigger: trigger)
+    }
+
+    private func deliverRealtimeChannelReady(_ ready: RealtimeChannelReady, trigger: String) {
+        guard let data = try? JSONEncoder().encode(ready) else { return }
         let session = WCSession.default
         guard session.activationState == .activated, session.isReachable else {
             PhoneAgentClientLog.info(
                 module: "agent_transport", event: "channel_ready_deferred",
-                requestId: requestId, sessionId: sessionId,
-                detail: "reason=watch_unreachable"
+                requestId: ready.requestId, sessionId: ready.sessionId,
+                detail: "reason=watch_unreachable trigger=\(trigger)"
             )
             return
+        }
+        // Clear optimistically so repeated reachability callbacks do not emit
+        // duplicates. An asynchronous WCSession failure restores this exact
+        // turn only if no newer ready value has superseded it.
+        if pendingRealtimeChannelReady == ready {
+            pendingRealtimeChannelReady = nil
         }
         session.sendMessage(
             [RealtimeMediaMessage.channelReadyEnvelopeKey: data],
             replyHandler: nil,
-            errorHandler: { error in
-                PhoneAgentClientLog.error(
-                    module: "agent_transport", event: "channel_ready_send_failed",
-                    requestId: requestId, sessionId: sessionId,
-                    detail: error.localizedDescription, code: "ERR_CHANNEL_READY_SEND"
-                )
+            errorHandler: { [weak self] error in
+                Task { @MainActor in
+                    if self?.pendingRealtimeChannelReady == nil {
+                        self?.pendingRealtimeChannelReady = ready
+                    }
+                    PhoneAgentClientLog.error(
+                        module: "agent_transport", event: "channel_ready_send_failed",
+                        requestId: ready.requestId, sessionId: ready.sessionId,
+                        detail: "trigger=\(trigger) \(error.localizedDescription)",
+                        code: "ERR_CHANNEL_READY_SEND"
+                    )
+                }
             }
         )
         PhoneAgentClientLog.info(
             module: "agent_transport", event: "channel_ready_sent",
-            requestId: requestId, sessionId: sessionId
+            requestId: ready.requestId, sessionId: ready.sessionId,
+            detail: "trigger=\(trigger)"
         )
     }
 
