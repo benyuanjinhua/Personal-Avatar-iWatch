@@ -345,7 +345,7 @@ function writeJson(res, status, obj) {
 
 function extractBearer(header) {
   if (!header || typeof header !== 'string') return null
-  const match = /^Bearer\s+(rtk_[A-Za-z0-9]+)$/.exec(header.trim())
+  const match = /^Bearer\s+(rtk_[A-Za-z0-9_]+)$/.exec(header.trim())
   return match ? match[1] : null
 }
 
