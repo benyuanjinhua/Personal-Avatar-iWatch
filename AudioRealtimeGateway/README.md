@@ -412,7 +412,14 @@ Diagnostic commands:
 launchctl list beer.workspace.wristagent.gateway
 launchctl print gui/$(id -u)/beer.workspace.wristagent.gateway
 tail -f /Users/jacksonmac/Services/Personal-Avatar-iWatch/AudioRealtimeGateway/logs/gateway.log
+node Scripts/server-deploy-gate.mjs \
+  --deploy /Users/jacksonmac/Services/Personal-Avatar-iWatch
 ```
+
+The deploy gate is mandatory before an install notification. It exits non-zero
+unless the production checkout is exactly at `origin/main` and both server
+modules have no tracked-file drift. Fetch `origin` immediately before running
+the gate so the comparison uses the current remote tip.
 
 `KeepAlive: true` means launchd auto-restarts the process on any exit
 (SIGKILL included); the 5-second `ThrottleInterval` is the minimum time
