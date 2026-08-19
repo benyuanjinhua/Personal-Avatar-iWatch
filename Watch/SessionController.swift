@@ -244,6 +244,11 @@ final class SessionController: ObservableObject {
     private var hungupDismissToken: SessionDelayToken?
     /// ESS-652: 会话内轮数。
     private var completedRounds = 0
+    /// ESS-869：就绪超时降级为整段上传的**缺陷计数**。每发生一次
+    /// `session_ready_timeout_salvage` 就 +1；它不是正常兜底，出现即说明实时
+    /// 链路没能建立。计数随 `session_ready_timeout_salvage` 事件落进日志，并在
+    /// 挂断小结（`session_call_summary`）里汇总，供按会话聚合判缺陷。
+    private(set) var readyTimeoutSalvageCount = 0
 
     /// ESS-600：当前**被认领**的回合 request_id。所有回合事件都必须携带
     /// request_id 并与它相等才被受理——这是「旧 request / 旧 generation 的
@@ -285,10 +290,13 @@ final class SessionController: ObservableObject {
             // ESS-600：超时**不许无反馈丢弃已录语音**。用户已经对着表说了
             // 5 秒，realtime 快通道没通不等于话没法送达——先把已录音频经
             // 可靠通道（完整文件 / transferFile）抢救出去，再报失败退出。
+            // ESS-869：这一事件**升格为缺陷信号**——出现即计数并在会话日志里
+            // 以 error 级标红，不再当作正常兜底；计数随事件与挂断小结落盘。
+            self.readyTimeoutSalvageCount += 1
             WatchLog.error(
                 "session", "session_ready_timeout_salvage",
                 requestId: self.activeTurnRequestId,
-                detail: "timeout_s=\(Int(Self.readyTimeoutSeconds)) capturing=\(self.isCapturingLocally)",
+                detail: "timeout_s=\(Int(Self.readyTimeoutSeconds)) capturing=\(self.isCapturingLocally) salvage_count=\(self.readyTimeoutSalvageCount)",
                 code: "ERR_SESSION_READY_TIMEOUT"
             )
             if self.isCapturingLocally { self.onSalvageTurn?() }
@@ -716,15 +724,20 @@ final class SessionController: ObservableObject {
         // 仍是上一轮的值，迟到事件会被 acceptsTurnEvent 放行——正是 ESS-642
         // 修过的「旧回合污染新会话」事故面。这里补齐。
         resetTurnStateOnExit()
-        hungupSummary = "已结束 · \(rounds) 轮（\(reason)）"
+        if readyTimeoutSalvageCount > 0 {
+            hungupSummary = "已结束 · \(rounds) 轮（\(reason)）· 实时链路降级 \(readyTimeoutSalvageCount) 次"
+        } else {
+            hungupSummary = "已结束 · \(rounds) 轮（\(reason)）"
+        }
         WatchLog.info("session", "session_call_summary",
-                      detail: "rounds=\(rounds) reason=\(reason)")
+                      detail: "rounds=\(rounds) reason=\(reason) ready_timeout_salvage_count=\(readyTimeoutSalvageCount)")
         onTeardownChannel?()
         hungupDismissToken = scheduleDelay(Self.hungupDismissSeconds) { [weak self] in
             guard let self, self.state == .hungup else { return }
             self.state = .idle
             self.hungupSummary = nil
             self.completedRounds = 0
+            self.readyTimeoutSalvageCount = 0
             WatchLog.info(
                 "session", "session_page_exited",
                 detail: "reason=\(reason) rounds=\(rounds) destination=idle"

@@ -18,6 +18,38 @@ enum RealtimeDownlinkDeliveryPolicy {
     }
 }
 
+/// ESS-869: the realtime channel-ready control message is one-shot and must
+/// never be silently dropped. This policy decides which WCSession delivery
+/// path to use for the current session state, so the iPhone never hits the
+/// `guard isReachable else { return }` that used to lose the ready entirely.
+///
+/// - `.interactive`: `sendMessage` — low latency, best effort.
+/// - `.durable`: `transferUserInfo` — system-managed reliable queue that
+///   delivers as soon as the Watch is reachable, without depending on the
+///   phone app observing a reachability change.
+/// - `.none`: the session is not activated (or the Watch app is missing),
+///   so nothing can be handed to the system yet. The caller keeps the
+///   turn-scoped pending value and replays on activation.
+///
+/// There is deliberately **no** `.drop` case: a ready always resolves to an
+/// in-memory pending replay or a system-managed delivery path.
+enum RealtimeChannelReadyDeliveryPolicy {
+    enum Action: Equatable {
+        case interactive
+        case durable
+        case none
+    }
+
+    static func action(
+        isActivated: Bool,
+        isReachable: Bool,
+        isWatchAppInstalled: Bool
+    ) -> Action {
+        guard isActivated, isWatchAppInstalled else { return .none }
+        return isReachable ? .interactive : .durable
+    }
+}
+
 /// ESS-321 wire envelope for the Watch → iPhone hop.
 ///
 /// The Watch fast channel is `WCSession.sendMessageData`, which carries an
