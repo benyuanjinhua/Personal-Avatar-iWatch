@@ -111,6 +111,10 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
     private let audioEngine: AVAudioEngine
     private let playerNode: AVAudioPlayerNode
     private let format: AVAudioFormat
+    /// ESS-843 方案 B：`.voiceChat` AEC 模式会压低播放音量。对下行 PCM16
+    /// 采样做线性增益补偿。4.0 ≈ +12dB——实测「声音太小」的补偿量，后续
+    /// 真机可调。仅作用于下行播放，不影响录音/回声消除。
+    var outputGain: Float = 4.0
     /// ESS-554：`.conversation` 时会话与引擎生命周期归
     /// ConversationAudioController——enqueue 不再做 `.playAndRecord →
     /// .playback` 翻转与每轮引擎重启（ESS-535 重启逻辑上移为会话级）。
@@ -298,9 +302,24 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         }
         pcmBuffer.frameLength = frameCount
         guard let channel = pcmBuffer.int16ChannelData?.pointee else { return nil }
-        payload.withUnsafeBytes { raw in
-            if let base = raw.bindMemory(to: Int16.self).baseAddress {
-                channel.update(from: base, count: Int(frameCount))
+        let gain = outputGain
+        if gain == 1.0 {
+            payload.withUnsafeBytes { raw in
+                if let base = raw.bindMemory(to: Int16.self).baseAddress {
+                    channel.update(from: base, count: Int(frameCount))
+                }
+            }
+        } else {
+            // ESS-843 方案 B：对每个 Int16 采样做线性增益并 clamp 到 Int16 范围，
+            // 补偿 .voiceChat 音量压低。放大先做再截断，避免溢出失真。
+            payload.withUnsafeBytes { raw in
+                guard let base = raw.bindMemory(to: Int16.self).baseAddress else { return }
+                for i in 0..<Int(frameCount) {
+                    let sample = Int16(littleEndian: base[i])
+                    let scaled = Float(sample) * gain
+                    let clamped = max(Float(Int16.min), min(Float(Int16.max), scaled))
+                    channel[i] = Int16(clamped)
+                }
             }
         }
         return pcmBuffer
