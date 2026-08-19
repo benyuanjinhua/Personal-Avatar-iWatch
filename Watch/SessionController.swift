@@ -188,10 +188,15 @@ final class SessionController: ObservableObject {
     static let failureNoticeSeconds: TimeInterval = 2.0
     /// 首次引导停留时长。PRD §3.5.7：3 秒淡出。
     static let firstRunGuideSeconds: TimeInterval = 3.0
-    /// 单轮时长上限（PRD F2 异常：单轮 60 秒强制结束）。取 58s——
-    /// 抢在 AudioRecorder 的 60s 系统硬顶之前走正常 finishRecording 提交，
-    /// 避免撞上「自动停录后 isRecording=false」的收尾死角。【待调】
-    static let turnCapSeconds: TimeInterval = 58.0
+    /// 单轮时长上限（PRD F2 异常：单轮 60 秒强制结束）。抢在 AudioRecorder
+    /// 的 60s 系统硬顶之前走正常 finishRecording 提交。
+    ///
+    /// ESS-865：58s 是**不够**的——本计时器从 `session_channel_ready` 起算，
+    /// 而 60s 硬顶从 `record_started` 起算，两者之间隔着一整个建立窗口
+    /// （真机 `establish_ms=1650`）。真机 L1：cap 到点时录音已跑 61.9s
+    /// （`raw_ms=61912`），AVAudioRecorder 早已自停。留 10s 余量覆盖建立窗口
+    /// 抖动；正常路径由 VAD 断句提交，本条只是上限兜底。
+    static let turnCapSeconds: TimeInterval = AudioRecorder.maxDuration - 10.0
     /// ESS-600：`thinking` 的有界执行上限。回答永远不来（Bridge 静默 /
     /// `done` 零音频 / 下行整段丢）时，没有这条兜底会话就永久卡在思考态，
     /// 麦克风关着、球在转，用户只能杀 App——比报错更糟。到点如实记

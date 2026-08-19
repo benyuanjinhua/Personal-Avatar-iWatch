@@ -23,6 +23,10 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         adapter.onVADEvent = { vadEvents.append($0) }
 
         adapter.beginTurn(requestId: "57557557-5575-4575-8575-575575575575")
+        // ESS-865：判定门改为「底噪 × 信噪比」后，头 300ms 是底噪预热窗
+        // （见 `LocalVADEndpointer.noiseFloorWarmupFrames`）。生产时序本来就是
+        // 「起采 → 环境底噪若干帧 → 用户开口」，这里补上这三帧与真机一致。
+        for _ in 0..<3 { recorder.feed(Self.pcmFrame(rms: 0)) }
         recorder.feed(Self.pcmFrame(rms: 0.08))
         recorder.feed(Self.pcmFrame(rms: 0.08))
         for _ in 0..<7 { recorder.feed(Self.pcmFrame(rms: 0)) }
@@ -33,6 +37,95 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         XCTAssertEqual(vadEvents.count, 2)
         guard case .speechFinal(_, .silence) = vadEvents.last else {
             return XCTFail("expected silence speech.final")
+        }
+    }
+
+    // MARK: - ESS-865
+
+    /// 真机断点的闭环回归：`.voiceChat`(AEC) 电平的说话（0.006 RMS，低于历史
+    /// 固定门 0.018）必须走完 `PCM frames → speech_final → audio.commit`，
+    /// 并且 append 与 commit 挂在同一个 request/turn 上。
+    ///
+    /// 真机 L1 对照（request_id 01a017b1-3cdd-72e1-9137-94cc6b9a836c）：
+    /// 616 帧 `uplink_ack_received`、0 条 `speech_started`、0 条 `speech_final`，
+    /// 回合悬到 `session_turn_cap_reached cap_s=58`。
+    func testAttenuatedSpeechCompletesFrameToCommitLoopOnOneTurn() {
+        let recorder = MockRecorder()
+        let player = MockPlayer()
+        let transport = MockTransport()
+        let adapter = WatchRealtimeMediaAdapter(
+            recorder: recorder,
+            player: player,
+            transport: transport,
+            vadConfiguration: LocalVADConfiguration(),
+            automaticallyCommitOnSpeechFinal: true
+        )
+        var vadEvents: [LocalVADEvent] = []
+        adapter.onVADEvent = { vadEvents.append($0) }
+
+        let requestId = "01a017b1-3cdd-72e1-9137-94cc6b9a836c"
+        let handle = adapter.beginTurn(requestId: requestId)
+        for _ in 0..<3 { recorder.feed(Self.pcmFrame(rms: 0.0005)) }  // 起采后的环境底噪
+        for _ in 0..<10 { recorder.feed(Self.pcmFrame(rms: 0.006)) }  // 1s 被 AEC 压低的说话
+        for _ in 0..<7 { recorder.feed(Self.pcmFrame(rms: 0.0005)) }  // 700ms 停说
+
+        XCTAssertEqual(vadEvents.count, 2, "必须先起判再断句：\(vadEvents)")
+        guard case .speechFinal(_, .silence) = vadEvents.last else {
+            return XCTFail("停说 700ms 必须以 silence 断句，实际 \(String(describing: vadEvents.last))")
+        }
+        XCTAssertEqual(transport.commitEvents.count, 1, "断句必须产生且只产生一次 commit")
+        XCTAssertFalse(transport.appendEvents.isEmpty, "commit 之前必须有真实 PCM 上行")
+        XCTAssertEqual(transport.commitEvents.first?.requestId, requestId)
+        XCTAssertEqual(Set(transport.appendEvents.map(\.requestId)), [requestId])
+        XCTAssertTrue(adapter.hasCommittedUplink, "已提交的回合必须可被 PTT 层识别")
+        XCTAssertEqual(handle.requestId, requestId)
+    }
+
+    /// 取证：每一轮都必须落得下 `vad_level`（能量 + 门限 + 底噪）。
+    /// 缺了它，真机上「VAD 为什么不断句」就只能靠猜——本单第一轮真机
+    /// 正是因此无法定位（日志里既没有电平也没有门限）。
+    func testVADLevelEvidenceIsEmittedForEveryTurn() {
+        let events = EventLog()
+        WatchLog.setObserver { module, event, _, detail, code in
+            events.record(module: module, event: event, detail: detail, code: code)
+        }
+        defer { WatchLog.setObserver(nil) }
+
+        let recorder = MockRecorder()
+        let adapter = WatchRealtimeMediaAdapter(
+            recorder: recorder,
+            player: MockPlayer(),
+            transport: MockTransport(),
+            vadConfiguration: LocalVADConfiguration(),
+            automaticallyCommitOnSpeechFinal: true
+        )
+        adapter.beginTurn(requestId: "57557557-5575-4575-8575-575575575575")
+        recorder.feed(Self.pcmFrame(rms: 0.0005))
+
+        XCTAssertGreaterThanOrEqual(
+            events.count(module: "vad", event: "vad_level", detailContains: "threshold="),
+            1,
+            "首帧就必须落一条 vad_level，否则「帧没进 VAD」与「进了没跨门」无法区分"
+        )
+        XCTAssertGreaterThanOrEqual(
+            events.count(module: "vad", event: "vad_level", detailContains: "noise_floor="),
+            1
+        )
+    }
+
+    private final class EventLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var records: [(module: String, event: String, detail: String?, code: String?)] = []
+        func record(module: String, event: String, detail: String?, code: String?) {
+            lock.lock(); defer { lock.unlock() }
+            records.append((module, event, detail, code))
+        }
+        func count(module: String, event: String, detailContains fragment: String? = nil) -> Int {
+            lock.lock(); defer { lock.unlock() }
+            return records.filter {
+                $0.module == module && $0.event == event
+                    && (fragment == nil || $0.detail?.contains(fragment!) == true)
+            }.count
         }
     }
 

@@ -147,6 +147,12 @@ final class WatchRealtimeMediaAdapter {
     /// 混响会被当成用户开口（Watch 无 AEC）。把守卫带过回合边界，让新一轮
     /// 的头 `playbackGuardMs` 不参与断句判定。
     private var vadGuardUntilMs: Int64 = 0
+    /// ESS-865：上一次落 `vad_level` 取证的帧时刻。真机排查「VAD 为什么不
+    /// 断句」此前没有任何电平/门限观测点，只能靠猜——这条周期采样是本单
+    /// 唯一能在下一次真机跑里直接判定「门高了还是麦克风哑了」的证据。
+    private var vadLastLevelLogAtMs: Int64?
+    /// 取证采样周期。2s 一条，一轮 55s 上限最多 28 条，不淹没日志。
+    private static let vadLevelLogIntervalMs: Int64 = 2_000
 
     // MARK: - ESS-650 语音打断（F2-2 / F2-3）
 
@@ -314,6 +320,7 @@ final class WatchRealtimeMediaAdapter {
         didSignalChannelReady = false
         currentResponseId = nil
         vadFrameStartedAtMs = Self.uptimeMs()
+        vadLastLevelLogAtMs = nil
         // ESS-600：守卫带过回合边界（见 `vadGuardUntilMs`）。
         vadEndpointer?.reset(atMs: max(vadFrameStartedAtMs, vadGuardUntilMs))
         // `session.beginTurn(...)` fires a `.turnFinished(...)` for any
@@ -479,22 +486,24 @@ final class WatchRealtimeMediaAdapter {
 
     private func consumeVAD(_ frame: Data) {
         guard var endpointer = vadEndpointer else { return }
-        let events = endpointer.processPCM16(frame, frameStartedAtMs: vadFrameStartedAtMs)
+        let frameStartedAtMs = vadFrameStartedAtMs
+        let events = endpointer.processPCM16(frame, frameStartedAtMs: frameStartedAtMs)
         vadFrameStartedAtMs += Int64(
             frame.count / MemoryLayout<Int16>.size * 1_000 / vadSampleRate
         )
         vadEndpointer = endpointer
+        logVADLevelIfDue(metrics: endpointer.metrics, frameStartedAtMs: frameStartedAtMs)
         for event in events {
             switch event {
             case .speechStarted(let atMs):
                 WatchLog.info(
                     "vad", "speech_started", requestId: currentTurn?.requestId,
-                    detail: "at_ms=\(atMs)"
+                    detail: "at_ms=\(atMs) \(endpointer.metrics.logDetail)"
                 )
             case .speechFinal(let atMs, let reason):
                 WatchLog.info(
                     "vad", "speech_final", requestId: currentTurn?.requestId,
-                    detail: "at_ms=\(atMs) reason=\(reason.rawValue)"
+                    detail: "at_ms=\(atMs) reason=\(reason.rawValue) \(endpointer.metrics.logDetail)"
                 )
                 if automaticallyCommitOnSpeechFinal {
                     recorder.stop()
@@ -503,6 +512,19 @@ final class WatchRealtimeMediaAdapter {
             }
             onVADEvent?(event)
         }
+    }
+
+    /// ESS-865：周期性落一条能量/门限取证。首帧必落一条（`vadLastLevelLogAtMs`
+    /// 初值为 nil），因此「一轮里一条 vad_level 都没有」本身就是「帧根本
+    /// 没进 VAD」的判据，与「进了 VAD 但没跨门」可以直接区分开。
+    private func logVADLevelIfDue(metrics: LocalVADMetrics, frameStartedAtMs: Int64) {
+        if let last = vadLastLevelLogAtMs,
+           frameStartedAtMs - last < Self.vadLevelLogIntervalMs { return }
+        vadLastLevelLogAtMs = frameStartedAtMs
+        WatchLog.info(
+            "vad", "vad_level", requestId: currentTurn?.requestId,
+            detail: "at_ms=\(frameStartedAtMs) \(metrics.logDetail)"
+        )
     }
 
     static func uptimeMs() -> Int64 {
@@ -545,6 +567,10 @@ final class WatchRealtimeMediaAdapter {
     func bargeIn() {
         session.bargeInDownlink()
     }
+
+    /// ESS-865：本回合上行是否已提交（供 PTT 层判定「未提交回合」的清理
+    /// 是否还成立）。
+    var hasCommittedUplink: Bool { session.didCommitUplink }
 
     /// Cancel the current turn (user cancel, watch app deactivated, etc.).
     func cancel(reason: RealtimeMediaSession.FinishReason = .cancelled) {

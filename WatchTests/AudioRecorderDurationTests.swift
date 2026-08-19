@@ -267,6 +267,52 @@ final class AudioRecorderDurationTests: XCTestCase {
         XCTAssertGreaterThan(recording.durationMs, 0, "duration_ms 必须 >0")
     }
 
+    // MARK: - ESS-865 60s 边界不得误报「从未起录」
+
+    /// 真机 L1（2026-08-19T01:45:49.184Z）：
+    /// `recording_never_started wall_clock_ms=60000 bytes=261121 was_recording=false`。
+    /// `record(forDuration: 60)` 到点自停后 `isRecording` 同样是 false，但容器里
+    /// 是一整轮真实音频——这一轮被整体丢弃，随后 `unsubmitted_turn_aborted`
+    /// → `session_channel_failed` → 退回表盘。容器里读得出音频时不得判「从未起录」。
+    func testAutoStopAtMaxDurationIsNotMisreadAsNeverStarted() {
+        XCTAssertFalse(
+            AudioRecorder.isRecordingNeverStarted(
+                wasRecording: false, byteCount: 261_121, assetMs: 60_000
+            ),
+            "60s 自停 + 261KB 音频必须照常提交，不得判为从未起录"
+        )
+    }
+
+    /// ESS-375 的原判据不放松：短按下 `record()` 还没真正起采，容器里只有
+    /// 预分配头（~24KB）且 asset 读不出时长。
+    func testShortPressWithEmptyContainerStillCountsAsNeverStarted() {
+        XCTAssertTrue(
+            AudioRecorder.isRecordingNeverStarted(
+                wasRecording: false, byteCount: 24_588, assetMs: nil
+            )
+        )
+        XCTAssertTrue(
+            AudioRecorder.isRecordingNeverStarted(
+                wasRecording: false, byteCount: 24_588, assetMs: 0
+            )
+        )
+        // asset 读不出来时，仍按字节量兜底——即使 isRecording 曾为 true。
+        XCTAssertTrue(
+            AudioRecorder.isRecordingNeverStarted(
+                wasRecording: true, byteCount: 12_000, assetMs: nil
+            )
+        )
+    }
+
+    /// 正常录完：起采过、字节量足、asset 有时长。
+    func testNormalRecordingIsNeverMisclassified() {
+        XCTAssertFalse(
+            AudioRecorder.isRecordingNeverStarted(
+                wasRecording: true, byteCount: 42_887, assetMs: 4_318
+            )
+        )
+    }
+
     private final class EventLog: @unchecked Sendable {
         private let lock = NSLock()
         private var records: [(module: String, event: String, detail: String?, code: String?)] = []
