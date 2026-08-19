@@ -298,17 +298,24 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         }
 
         // ESS-375: 录音从未真正开始 → 清理无效 M4A 文件后抛出专用错误。
-        // 判定条件（OR）：① stop() 前 recorder.isRecording 为 false，或
-        // ② 文件字节数 ≤ M4A 容器头近似值（24,588B），双重兜底确保不误判。
+        // 判定条件：文件字节数 ≤ M4A 容器头近似值（24,588B），即容器里不含
+        // 任何真实音频帧。
+        //
+        // ESS-871 修：「was_recording」不再作为判定依据。`AVAudioRecorder.isRecording`
+        // 在两种情况下都会是 false——① record() 返回后硬件从未开始采集（真·
+        // 从未开始）；② `record(forDuration: 60)` 到点自动停录。后者磁盘上躺着一份
+        // 完整的 60 秒有效录音（bytes=261121），却被误判为「从未开始」并整轮作废，
+        // 与 `record_started` 60 秒前明确打过的事实自相矛盾。文件字节数才是唯一
+        // 可靠信号：超过容器开销即证明有真实音频流入。`was_recording` 仅留作取证
+        // 对账字段写进日志。
         //
         // bytes=24588 来源说明（R-04.3 待验证）：
         // 08-04/08-05 四次真机取证均得此值（跨两天、跨录音一字节不差），
         // 推断为 AVAudioRecorder 在 record(forDuration:) 时预分配的 M4A
         // 容器结构（ftyp+moov+空 mdat）。由于样本在手表上不可导出做 ffprobe
         // box dump，此结论当前属实证推断（empirical, 4/4 consistent），
-        // 需真机验证时补充 ffprobe 取证。代码层用双重守卫（isRecording +
-        // 字节数 ≤ 容器开销阈值）兜底，即使该值随系统版本变化也不漏判。
-        if !wasRecording || data.count <= Self.m4aContainerOverheadApprox {
+        // 需真机验证时补充 ffprobe 取证。
+        if data.count <= Self.m4aContainerOverheadApprox {
             WatchLog.error(
                 "recorder", "recording_never_started",
                 detail: "wall_clock_ms=\(wallClockMs) bytes=\(data.count) was_recording=\(wasRecording) container_overhead=\(Self.m4aContainerOverheadApprox)",

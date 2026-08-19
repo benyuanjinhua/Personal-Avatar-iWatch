@@ -265,8 +265,10 @@ final class SessionControllerTests: XCTestCase {
     // MARK: - 单轮上限（PRD F2 异常的 Wave 1 兜底）
 
     /// 就绪后到达单轮上限 → 视同说完，提交本轮（VAD 落地前的上限兜底）。
+    /// ESS-871：上限在本地采集开始时（markLocalCapture）arm，非通道就绪。
     func testTurnCapCommitsAfterReady() {
         controller.enterSession()
+        controller.markLocalCapture(active: true)
         controller.markChannelReady()
         fireDelay(SessionController.turnCapSeconds)
         XCTAssertEqual(commitCount, 1)
@@ -275,6 +277,7 @@ final class SessionControllerTests: XCTestCase {
     /// 上限计时只在聆听中有效——退出后不得再触发提交。
     func testTurnCapCancelledOnExit() {
         controller.enterSession()
+        controller.markLocalCapture(active: true)
         controller.markChannelReady()
         controller.exitSession()
         fireDelay(SessionController.turnCapSeconds)

@@ -141,6 +141,14 @@ final class WatchRealtimeMediaAdapter {
     private let vadSampleRate: Int
     private let automaticallyCommitOnSpeechFinal: Bool
     private var vadFrameStartedAtMs: Int64 = 0
+    /// ESS-871：逐帧能量滚动窗口，用于 `vad/frame_energy` 取证。VAD 自身
+    /// 不落任何帧能量，60 秒 616 帧全低于阈值时「麦克风哑了」和「阈值定
+    /// 高了」无法区分——这里每帧累加 RMS，按秒冲刷 min/max/mean + 阈值。
+    private var vadEnergyWindowFrames = 0
+    private var vadEnergyWindowSumRms = 0.0
+    private var vadEnergyWindowMinRms = Double.greatestFiniteMagnitude
+    private var vadEnergyWindowMaxRms = 0.0
+    private var vadEnergyWindowEndedAtMs: Int64 = 0
     /// ESS-600：回答播完后的 VAD 静默窗，**跨回合保留**。
     /// `beginTurn` 里的 `reset(atMs:)` 会把守卫清成「此刻」——在自动重新
     /// 聆听下这正好把守卫清掉了：上一轮回答刚播完就开麦，扬声器余音与
@@ -314,6 +322,7 @@ final class WatchRealtimeMediaAdapter {
         didSignalChannelReady = false
         currentResponseId = nil
         vadFrameStartedAtMs = Self.uptimeMs()
+        resetVADEnergyWindow(anchorMs: vadFrameStartedAtMs)
         // ESS-600：守卫带过回合边界（见 `vadGuardUntilMs`）。
         vadEndpointer?.reset(atMs: max(vadFrameStartedAtMs, vadGuardUntilMs))
         // `session.beginTurn(...)` fires a `.turnFinished(...)` for any
@@ -367,6 +376,7 @@ final class WatchRealtimeMediaAdapter {
         let effectiveAtMs = atMs ?? Self.uptimeMs()
         vadEndpointer?.playbackEnded(atMs: effectiveAtMs)
         vadFrameStartedAtMs = effectiveAtMs
+        resetVADEnergyWindow(anchorMs: effectiveAtMs)
         vadGuardUntilMs = effectiveAtMs + (vadEndpointer?.configuration.playbackGuardMs ?? 0)
     }
 
@@ -478,12 +488,22 @@ final class WatchRealtimeMediaAdapter {
     }
 
     private func consumeVAD(_ frame: Data) {
+        // ESS-871：先量帧能量再喂 VAD。能量窗口独立于 endpointer 是否挂载——
+        // 只要麦克风帧还在进（`onFrame` 仍被调用），`vad/frame_energy` 就照常
+        // 冲刷，取证不因 VAD 未接线/未命中而缺失。
+        let frameRms = LocalVADEndpointer.rms(ofPCM16: frame)
+        vadEnergyWindowFrames += 1
+        vadEnergyWindowSumRms += frameRms
+        vadEnergyWindowMinRms = min(vadEnergyWindowMinRms, frameRms)
+        vadEnergyWindowMaxRms = max(vadEnergyWindowMaxRms, frameRms)
+
         guard var endpointer = vadEndpointer else { return }
         let events = endpointer.processPCM16(frame, frameStartedAtMs: vadFrameStartedAtMs)
         vadFrameStartedAtMs += Int64(
             frame.count / MemoryLayout<Int16>.size * 1_000 / vadSampleRate
         )
         vadEndpointer = endpointer
+        flushVADFrameEnergyIfDue()
         for event in events {
             switch event {
             case .speechStarted(let atMs):
@@ -503,6 +523,34 @@ final class WatchRealtimeMediaAdapter {
             }
             onVADEvent?(event)
         }
+    }
+
+    /// ESS-871：按秒冲刷 `vad/frame_energy`，含 min/max/mean RMS 与当前
+    /// `speechRMS` 阈值。一次正常说话应给出「峰值远超阈值」的区间；若峰值
+    /// 也贴地（≈0），则指向麦克风采到近静音而非阈值问题。
+    private func flushVADFrameEnergyIfDue() {
+        guard vadEnergyWindowFrames > 0,
+              vadFrameStartedAtMs - vadEnergyWindowEndedAtMs >= 1_000 else { return }
+        let mean = vadEnergyWindowSumRms / Double(vadEnergyWindowFrames)
+        let threshold = vadEndpointer?.configuration.speechRMS
+        WatchLog.info(
+            "vad", "frame_energy", requestId: currentTurn?.requestId,
+            detail: "at_ms=\(vadFrameStartedAtMs) frames=\(vadEnergyWindowFrames)"
+                + " rms_min=\(String(format: "%.5f", vadEnergyWindowMinRms))"
+                + " rms_max=\(String(format: "%.5f", vadEnergyWindowMaxRms))"
+                + " rms_mean=\(String(format: "%.5f", mean))"
+                + " threshold=\(threshold.map { String(format: "%.5f", $0) } ?? "nil")"
+        )
+        resetVADEnergyWindow(anchorMs: vadFrameStartedAtMs)
+    }
+
+    /// ESS-871：回合/播放边界重置逐帧能量窗口，锚到当前帧时钟。
+    private func resetVADEnergyWindow(anchorMs: Int64) {
+        vadEnergyWindowFrames = 0
+        vadEnergyWindowSumRms = 0
+        vadEnergyWindowMinRms = Double.greatestFiniteMagnitude
+        vadEnergyWindowMaxRms = 0
+        vadEnergyWindowEndedAtMs = anchorMs
     }
 
     static func uptimeMs() -> Int64 {
