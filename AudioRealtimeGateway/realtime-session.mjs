@@ -442,10 +442,20 @@ export class RealtimeSession {
     }
     if (this.firstDownlinkAt === null) {
       this.firstDownlinkAt = this.now()
+      const pcm = pcm16Level(decodeAudio(event.audio))
       this.log('downlink_first_frame', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
         response_id: this.responseId, sequence: event.sequence,
       })
+      if (pcm) {
+        // ESS-891: comparable to the Watch's `downlink_pcm_level` — the
+        // Gateway-side half of the source-vs-player RMS comparison.
+        this.log('downlink_pcm_level', {
+          request_id: this.scope.request_id, session_id: this.scope.session_id,
+          response_id: this.responseId, sequence: event.sequence,
+          ...pcm,
+        })
+      }
     }
     this._sendJson({
       type: 'audio.delta',
@@ -701,4 +711,29 @@ function decodeAudio(value) {
   if (typeof value !== 'string') return Buffer.alloc(0)
   if (!value.length || value.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) return Buffer.alloc(0)
   return Buffer.from(value, 'base64')
+}
+
+// ESS-891: PCM16 level metering for the low-volume diagnosis. Mirrors the
+// Watch-side `PCM16LevelMeter` math so `downlink_pcm_level` is directly
+// comparable across Gateway and Watch logs.
+export function pcm16Level(buf) {
+  const sampleCount = Math.floor(buf.length / 2)
+  if (sampleCount <= 0) return null
+  let sumSquares = 0
+  let peak = 0
+  for (let i = 0; i < sampleCount; i++) {
+    const s = buf.readInt16LE(i * 2)
+    sumSquares += s * s
+    const a = Math.abs(s)
+    if (a > peak) peak = a
+  }
+  const rms = Math.sqrt(sumSquares / sampleCount)
+  const round2 = v => (Number.isFinite(v) ? Math.round(v * 100) / 100 : v)
+  return {
+    rms: round2(rms),
+    peak,
+    rms_dbfs: round2(rms > 0 ? 20 * Math.log10(rms / 32768) : -Infinity),
+    peak_dbfs: round2(peak > 0 ? 20 * Math.log10(peak / 32768) : -Infinity),
+    frames: sampleCount,
+  }
 }

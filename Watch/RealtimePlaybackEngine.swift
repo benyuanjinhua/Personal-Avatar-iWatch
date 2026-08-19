@@ -137,6 +137,9 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
     /// tracker's returned receipts become the `.started/.ended` events we
     /// forward through `onPlaybackEvent`.
     private var tracker = RealtimePlaybackReceiptTracker()
+    /// ESS-891: turn-scoped PCM level evidence for the low-volume diagnosis.
+    private var pcmLevelAccumulator = PCM16LevelAccumulator()
+    private var didLogFirstChunkLevel = false
 
     /// Coordinator subscribes here so the session can turn playback receipts
     /// into `playback.started` / `playback.ended` on the wire.
@@ -182,6 +185,12 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
             isRunning = true
         }
         playerNode.play()
+        // ESS-891: reset per-turn level evidence and emit the playback-path
+        // snapshot (route / outputVolume / gain / format) for the low-volume
+        // diagnosis.
+        pcmLevelAccumulator.reset()
+        didLogFirstChunkLevel = false
+        logPlaybackPathEvidence(requestId: turn.requestId)
     }
 
     func enqueue(playables: [RealtimeDownlinkPlayback.PlayableChunk]) {
@@ -202,6 +211,7 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
             guard let pcmBuffer = buffer(for: playable.chunk.payload) else { continue }
             let payloadBytes = playable.chunk.payload.count
             let responseId = playable.responseId
+            recordPCMLevel(payload: playable.chunk.payload, requestId: turn.requestId, responseId: responseId)
             tracker.enqueue(responseId: responseId, bytes: payloadBytes)
 
             // `.dataPlayedBack` fires once the buffer has actually been played
@@ -253,9 +263,12 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         if barge {
             bargeIn(clearedBytes: 0)
         } else {
+            logPCMAggregate()
             playerNode.stop()
             playerNode.reset()
         }
+        pcmLevelAccumulator.reset()
+        didLogFirstChunkLevel = false
         currentTurn = nil
         tracker.reset()
         // ESS-509: release the playback audio session so other players can
@@ -304,5 +317,58 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
             }
         }
         return pcmBuffer
+    }
+
+    // MARK: - ESS-891 low-volume evidence
+
+    /// Folds each downlink chunk into the turn accumulator and logs the first
+    /// chunk's level — the "Watch player input" side of the Gateway-vs-Watch
+    /// RMS comparison.
+    private func recordPCMLevel(payload: Data, requestId: String, responseId: String?) {
+        guard let level = PCM16LevelMeter.measure(payload) else { return }
+        pcmLevelAccumulator.accumulate(level)
+        guard !didLogFirstChunkLevel else { return }
+        didLogFirstChunkLevel = true
+        WatchLog.info(
+            "player", "downlink_pcm_level", requestId: requestId,
+            detail: "response_id=\(responseId ?? "") \(level.detail) \(playbackPathEvidence())"
+        )
+    }
+
+    /// Logs the aggregate RMS/peak of everything played this turn.
+    private func logPCMAggregate() {
+        guard let requestId = currentTurn?.requestId,
+              let level = pcmLevelAccumulator.level, !pcmLevelAccumulator.isEmpty else { return }
+        WatchLog.info(
+            "player", "downlink_pcm_aggregate", requestId: requestId,
+            detail: level.detail
+        )
+    }
+
+    /// One-time per-turn snapshot of the playback path: route, system output
+    /// volume, player/mixer gain and the downlink format.
+    private func logPlaybackPathEvidence(requestId: String) {
+        WatchLog.info(
+            "player", "playback_path_evidence", requestId: requestId,
+            detail: playbackPathEvidence()
+        )
+    }
+
+    /// Reads the live AVAudioSession / engine gain knobs without mutating them.
+    private func playbackPathEvidence() -> String {
+        let session = AVAudioSession.sharedInstance()
+        let route = session.currentRoute.outputs
+            .map { "\($0.portType.rawValue)(\($0.portName))" }
+            .joined(separator: "+")
+        let routeField = route.isEmpty ? "none" : route
+        return String(
+            format: "route_out=%@ output_volume=%.3f player_node_gain=%.3f mixer_gain=%.3f sample_rate=%.0f channels=%d",
+            routeField,
+            Double(session.outputVolume),
+            Double(playerNode.volume),
+            Double(audioEngine.mainMixerNode.outputVolume),
+            format.sampleRate,
+            Int(format.channelCount)
+        )
     }
 }

@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 
-import { RealtimeSession } from '../realtime-session.mjs'
+import { RealtimeSession, pcm16Level } from '../realtime-session.mjs'
 import { ScriptedAgentTransport } from '../agent-transport.mjs'
 
 function harness(overrides = {}) {
@@ -377,5 +377,31 @@ describe('RealtimeSession — heartbeat', () => {
     session.onFrame(JSON.stringify({ type: 'ping', nonce: 'abc' }))
     const pong = sent.find(e => e.type === 'pong')
     assert.equal(pong?.nonce, 'abc')
+  })
+})
+
+describe('pcm16Level (ESS-891)', () => {
+  function pcm(samples) {
+    const buf = Buffer.alloc(samples.length * 2)
+    samples.forEach((s, i) => buf.writeInt16LE(s, i * 2))
+    return buf
+  }
+
+  it('measures silence as zero rms/peak', () => {
+    const level = pcm16Level(pcm([0, 0, 0, 0]))
+    assert.equal(level.rms, 0)
+    assert.equal(level.peak, 0)
+    assert.equal(level.frames, 4)
+  })
+
+  it('measures a full-scale sample as 32767 peak', () => {
+    const level = pcm16Level(pcm([32767, -32767]))
+    assert.equal(level.peak, 32767)
+    assert.equal(level.rms, 32767)
+  })
+
+  it('reports the -6.02 dBFS reference for a half-scale constant signal', () => {
+    const level = pcm16Level(pcm([16384, 16384, 16384, 16384]))
+    assert.ok(Math.abs(level.peak_dbfs - (-6.02)) < 0.05, `peak_dbfs=${level.peak_dbfs}`)
   })
 })
