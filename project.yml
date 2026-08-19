@@ -123,3 +123,17 @@ schemes:
       config: Debug
     archive:
       config: Release
+
+  WristAgent Watch App:
+    build:
+      targets:
+        WristAgent Watch App: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - WristAgent Watch Tests
+      gatherCoverageData: false
+    archive:
+      config: Release
