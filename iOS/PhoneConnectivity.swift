@@ -250,6 +250,12 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     private func handleRealtimeUplink(data: Data) {
         guard let envelope = try? JSONDecoder().decode(RealtimeUplinkEnvelope.self, from: data),
               envelope.protocolVersion == RealtimeWireVersion.uplink else { return }
+        // ESS-843 降级：万能 token 模式下跳过 token 铸造/缓冲，直接转发。
+        // token 铸造的异步时序正是丢帧根因——绕过它，让音频帧即刻直达 WSS。
+        if !AudioRealtimeAgentFeatureFlag.devUniversalToken.isEmpty {
+            forwardRealtimeEnvelope(envelope)
+            return
+        }
         guard agentFlag.isDirectPathEnabled else {
             forwardRealtimeEnvelope(envelope)
             return
@@ -545,11 +551,18 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
                           let gatewayURL = URL(string: agentFlag.gatewayURLString) else {
                         throw AgentSessionTokenError.invalidGatewayURL
                     }
-                    let issued = try await AgentSessionTokenClient(
-                        gatewayURL: gatewayURL, credentials: credentials
-                    ).mint(requestId: requestId, sessionId: sessionId, generation: generation)
+                    // ESS-843 降级：万能 token 模式直接复用，不再铸造。
+                    let token: String
+                    if !AudioRealtimeAgentFeatureFlag.devUniversalToken.isEmpty {
+                        token = AudioRealtimeAgentFeatureFlag.devUniversalToken
+                    } else {
+                        let issued = try await AgentSessionTokenClient(
+                            gatewayURL: gatewayURL, credentials: credentials
+                        ).mint(requestId: requestId, sessionId: sessionId, generation: generation)
+                        token = issued.token
+                    }
                     guard let freshConfig = agentFlag.resolveConfig(
-                        ephemeralToken: issued.token, deviceId: credentials.deviceId
+                        ephemeralToken: token, deviceId: credentials.deviceId
                     ) else {
                         throw AgentSessionTokenError.invalidGatewayURL
                     }
