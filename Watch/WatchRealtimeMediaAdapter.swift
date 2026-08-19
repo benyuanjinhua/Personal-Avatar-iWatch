@@ -496,12 +496,19 @@ final class WatchRealtimeMediaAdapter {
         vadEnergyWindowSumRms += frameRms
         vadEnergyWindowMinRms = min(vadEnergyWindowMinRms, frameRms)
         vadEnergyWindowMaxRms = max(vadEnergyWindowMaxRms, frameRms)
-
-        guard var endpointer = vadEndpointer else { return }
-        let events = endpointer.processPCM16(frame, frameStartedAtMs: vadFrameStartedAtMs)
-        vadFrameStartedAtMs += Int64(
+        let frameDurationMs = Int64(
             frame.count / MemoryLayout<Int16>.size * 1_000 / vadSampleRate
         )
+
+        guard var endpointer = vadEndpointer else {
+            // ESS-871：无 endpointer 时也推进帧时钟并照常冲刷能量窗口，兑现
+            // 上方「不因 VAD 未接线而缺失」的契约——否则时钟冻住、冲刷永不触发。
+            vadFrameStartedAtMs += frameDurationMs
+            flushVADFrameEnergyIfDue()
+            return
+        }
+        let events = endpointer.processPCM16(frame, frameStartedAtMs: vadFrameStartedAtMs)
+        vadFrameStartedAtMs += frameDurationMs
         vadEndpointer = endpointer
         flushVADFrameEnergyIfDue()
         for event in events {
