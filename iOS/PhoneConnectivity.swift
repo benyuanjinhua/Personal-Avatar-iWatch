@@ -319,16 +319,28 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
                 byteCount: chunk.payload.count
               )) else { return }
         let session = WCSession.default
-        guard session.activationState == .activated, session.isReachable else { return }
-        session.sendMessage(
-            [RealtimeMediaMessage.uplinkAckEnvelopeKey: data],
-            replyHandler: nil,
-            errorHandler: { error in
-                Self.logger.info(
-                    "realtime uplink ack lost request=\(chunk.requestId.prefix(8), privacy: .public) sequence=\(chunk.sequence, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
-                )
-            }
-        )
+        guard session.activationState == .activated else { return }
+        if session.isReachable {
+            session.sendMessage(
+                [RealtimeMediaMessage.uplinkAckEnvelopeKey: data],
+                replyHandler: nil,
+                errorHandler: { error in
+                    Self.logger.info(
+                        "realtime uplink ack lost request=\(chunk.requestId.prefix(8), privacy: .public) sequence=\(chunk.sequence, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+                    )
+                }
+            )
+        } else {
+            // ESS-843: Watch may be unreachable during recording. Fall back
+            // to the durable outbox so the ACK is delivered when reachable
+            // instead of being silently dropped.
+            enqueueDownlink(
+                requestId: chunk.requestId,
+                kind: .relayStatus,
+                key: RealtimeMediaMessage.uplinkAckEnvelopeKey,
+                data: data
+            )
+        }
     }
 
     private func sendRealtimeChannelReady(requestId: String, sessionId: String) {
@@ -336,29 +348,38 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
             requestId: requestId, sessionId: sessionId
         )) else { return }
         let session = WCSession.default
-        guard session.activationState == .activated, session.isReachable else {
-            PhoneAgentClientLog.info(
-                module: "agent_transport", event: "channel_ready_deferred",
-                requestId: requestId, sessionId: sessionId,
-                detail: "reason=watch_unreachable"
+        guard session.activationState == .activated else { return }
+        if session.isReachable {
+            session.sendMessage(
+                [RealtimeMediaMessage.channelReadyEnvelopeKey: data],
+                replyHandler: nil,
+                errorHandler: { error in
+                    PhoneAgentClientLog.error(
+                        module: "agent_transport", event: "channel_ready_send_failed",
+                        requestId: requestId, sessionId: sessionId,
+                        detail: error.localizedDescription, code: "ERR_CHANNEL_READY_SEND"
+                    )
+                }
             )
-            return
+            PhoneAgentClientLog.info(
+                module: "agent_transport", event: "channel_ready_sent",
+                requestId: requestId, sessionId: sessionId
+            )
+        } else {
+            // ESS-843: Watch may be unreachable during recording. Fall back
+            // to the durable outbox instead of silently dropping the ready.
+            enqueueDownlink(
+                requestId: requestId,
+                kind: .relayStatus,
+                key: RealtimeMediaMessage.channelReadyEnvelopeKey,
+                data: data
+            )
+            PhoneAgentClientLog.info(
+                module: "agent_transport", event: "channel_ready_queued",
+                requestId: requestId, sessionId: sessionId,
+                detail: "reason=watch_unreachable durable=true"
+            )
         }
-        session.sendMessage(
-            [RealtimeMediaMessage.channelReadyEnvelopeKey: data],
-            replyHandler: nil,
-            errorHandler: { error in
-                PhoneAgentClientLog.error(
-                    module: "agent_transport", event: "channel_ready_send_failed",
-                    requestId: requestId, sessionId: sessionId,
-                    detail: error.localizedDescription, code: "ERR_CHANNEL_READY_SEND"
-                )
-            }
-        )
-        PhoneAgentClientLog.info(
-            module: "agent_transport", event: "channel_ready_sent",
-            requestId: requestId, sessionId: sessionId
-        )
     }
 
     private static func turnIdentity(for envelope: RealtimeUplinkEnvelope) -> (requestId: String, sessionId: String)? {

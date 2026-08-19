@@ -185,6 +185,18 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         if let data = userInfo[RealtimeMediaMessage.downlinkEnvelopeKey] as? Data {
             Task { @MainActor in self.applyRealtimeDownlink(data) }
         }
+        // ESS-843: iPhone falls back to durable transferUserInfo when the
+        // Watch is momentarily unreachable during recording. The realtime
+        // ACK and channel-ready must be handled here too, otherwise the
+        // Watch never learns the channel is ready and times out.
+        if let data = userInfo[RealtimeMediaMessage.uplinkAckEnvelopeKey] as? Data,
+           let ack = try? JSONDecoder().decode(RealtimeUplinkAck.self, from: data) {
+            Task { @MainActor in self.realtimeAdapter?.receiveUplinkAck(ack) }
+        }
+        if let data = userInfo[RealtimeMediaMessage.channelReadyEnvelopeKey] as? Data,
+           let ready = try? JSONDecoder().decode(RealtimeChannelReady.self, from: data) {
+            Task { @MainActor in self.realtimeAdapter?.receiveChannelReady(ready) }
+        }
         guard let data = userInfo[VoiceStatusMessage.envelopeKey] as? Data else { return }
         Task { @MainActor in self.applyVoiceStatus(data) }
     }
