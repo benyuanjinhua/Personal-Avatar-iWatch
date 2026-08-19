@@ -146,6 +146,50 @@ describe('Gateway end-to-end', () => {
     assert.equal(status, 401)
   })
 
+  // ESS-885: the dev universal token value must match the extractBearer
+  // regex (`rtk_[A-Za-z0-9]+`). The old literal `rtk_dev_universal` had
+  // underscores and was rejected as missing_bearer.
+  it('admits the dev universal token (ESS-885)', async () => {
+    const body = scopeBody()
+    const url = `ws://127.0.0.1:${gateway.server.address().port}/api/realtime`
+      + `?device_id=${body.device_id}&session_id=${body.session_id}`
+      + `&request_id=${body.request_id}&generation=${body.generation}`
+    const captured = collectLogs()
+    try {
+      const ws = new WebSocket(url, { headers: { authorization: 'Bearer rtk_devuniversal' } })
+      await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject) })
+      ws.close()
+      await new Promise(resolve => ws.once('close', resolve))
+      await new Promise(resolve => setTimeout(resolve, 50))
+    } finally {
+      captured.restore()
+    }
+    const upgrade = captured.lines.find(l => l.evt === 'ws_upgrade' && l.token_mode === 'universal')
+    assert.ok(upgrade, 'expected ws_upgrade with token_mode=universal')
+    assert.equal(upgrade.request_id, body.request_id)
+  })
+
+  it('rejects a bearer token containing underscores (ESS-885 root cause)', async () => {
+    const body = scopeBody()
+    const url = `ws://127.0.0.1:${gateway.server.address().port}/api/realtime`
+      + `?device_id=${body.device_id}&session_id=${body.session_id}`
+      + `&request_id=${body.request_id}&generation=${body.generation}`
+    const captured = collectLogs()
+    let status
+    try {
+      const ws = new WebSocket(url, { headers: { authorization: 'Bearer rtk_dev_universal' } })
+      status = await new Promise(resolve => {
+        ws.on('unexpected-response', (_, response) => resolve(response.statusCode))
+        ws.on('error', () => resolve(null))
+      })
+    } finally {
+      captured.restore()
+    }
+    assert.equal(status, 401)
+    const rejected = captured.lines.find(l => l.evt === 'ws_upgrade_rejected' && l.reason === 'missing_bearer')
+    assert.ok(rejected, 'expected ws_upgrade_rejected(reason=missing_bearer)')
+  })
+
   it('rejects a WSS upgrade whose token has already been consumed (replay)', async () => {
     const body = scopeBody()
     const mint = await mintToken(body)

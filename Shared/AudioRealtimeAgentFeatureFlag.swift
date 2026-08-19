@@ -34,7 +34,11 @@ struct AudioRealtimeAgentFeatureFlag {
     /// 整条周期管理，直接拿这个 token 建 WSS；Gateway 侧对同一字面量放行。
     /// 目的：让 token 管理不再影响实时主链路。正式上线前必须清空并恢复
     /// 单次 token 流程。
-    static let devUniversalToken = "rtk_dev_universal"
+    ///
+    /// ESS-885：字面量必须符合 Gateway `extractBearer` 的正则
+    /// `rtk_[A-Za-z0-9]+`——`rtk_` 之后只能是字母数字，不能有下划线。
+    /// 曾用 `rtk_dev_universal` 因含下划线被拒成 `missing_bearer`。
+    static let devUniversalToken = "rtk_devuniversal"
 
     private let defaults: UserDefaults
 

@@ -89,7 +89,7 @@ export function createGateway(overrides = {}) {
     // ESS-843 降级：开发期万能 token。与客户端同字面量直接放行，跳过
     // issuer.consume 的单次消耗/失效/scope 校验——让 token 管理不再影响
     // 实时主链路。上线前必须删除并恢复单次 token 流程。
-    const UNIVERSAL_TOKEN = CONFIG.dev_universal_token ?? 'rtk_dev_universal'
+    const UNIVERSAL_TOKEN = CONFIG.dev_universal_token ?? 'rtk_devuniversal'
     let scope
     if (bearer === UNIVERSAL_TOKEN) {
       scope = {

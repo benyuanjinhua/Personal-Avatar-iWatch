@@ -85,6 +85,36 @@ final class AudioRealtimeAgentTransport {
 
     // MARK: - Factory
 
+    /// Build the WSS upgrade request: Gateway URL + scope query params +
+    /// `Authorization: Bearer <token>` header. Extracted from `create` so
+    /// protocol-level tests can assert the bearer actually reaches the
+    /// URLSession WebSocket upgrade (ESS-885).
+    static func makeUpgradeRequest(
+        config: AudioRealtimeAgentConfig,
+        sessionId: String,
+        requestId: String,
+        generation: Int
+    ) -> URLRequest? {
+        guard var components = URLComponents(
+            url: config.gatewayURL, resolvingAgainstBaseURL: false
+        ) else { return nil }
+        var queryItems = components.queryItems ?? []
+        queryItems.append(URLQueryItem(name: "device_id", value: config.deviceId))
+        queryItems.append(URLQueryItem(name: "session_id", value: sessionId))
+        queryItems.append(URLQueryItem(name: "request_id", value: requestId))
+        queryItems.append(URLQueryItem(name: "generation", value: String(generation)))
+        components.queryItems = queryItems
+        guard let resolvedURL = components.url else { return nil }
+
+        var request = URLRequest(url: resolvedURL)
+        request.timeoutInterval = config.connectionTimeout
+        request.setValue(
+            "Bearer \(config.authToken)",
+            forHTTPHeaderField: "Authorization"
+        )
+        return request
+    }
+
     /// Create a transport from an `AudioRealtimeAgentConfig`.
     ///
     /// The Gateway URL is extended with `?device_id=&session_id=&request_id=
@@ -102,24 +132,9 @@ final class AudioRealtimeAgentTransport {
         requestId: String,
         generation: Int
     ) -> AudioRealtimeAgentTransport? {
-        guard var components = URLComponents(
-            url: config.gatewayURL, resolvingAgainstBaseURL: false
+        guard let request = makeUpgradeRequest(
+            config: config, sessionId: sessionId, requestId: requestId, generation: generation
         ) else { return nil }
-        let deviceId = config.deviceId
-        var queryItems = components.queryItems ?? []
-        queryItems.append(URLQueryItem(name: "device_id", value: deviceId))
-        queryItems.append(URLQueryItem(name: "session_id", value: sessionId))
-        queryItems.append(URLQueryItem(name: "request_id", value: requestId))
-        queryItems.append(URLQueryItem(name: "generation", value: String(generation)))
-        components.queryItems = queryItems
-        guard let resolvedURL = components.url else { return nil }
-
-        var request = URLRequest(url: resolvedURL)
-        request.timeoutInterval = config.connectionTimeout
-        request.setValue(
-            "Bearer \(config.authToken)",
-            forHTTPHeaderField: "Authorization"
-        )
 
         let closeObserver = CloseObserver(
             requestId: requestId, sessionId: sessionId, generation: generation
