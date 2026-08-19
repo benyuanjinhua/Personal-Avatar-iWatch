@@ -137,6 +137,11 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
     /// tracker's returned receipts become the `.started/.ended` events we
     /// forward through `onPlaybackEvent`.
     private var tracker = RealtimePlaybackReceiptTracker()
+    /// ESS-891：本回合下行 PCM 响度取证。首帧落一条全字段日志（与 Gateway
+    /// 首帧 RMS 对账），此后累计 peak，回答播完时落一条汇总。
+    private var downlinkFirstChunkLogged = false
+    private var downlinkPeakRMS = 0.0
+    private var downlinkPeakDBFS = -Double.infinity
 
     /// Coordinator subscribes here so the session can turn playback receipts
     /// into `playback.started` / `playback.ended` on the wire.
@@ -166,6 +171,9 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         stop(barge: false)
         currentTurn = turn
         tracker.reset()
+        downlinkFirstChunkLogged = false
+        downlinkPeakRMS = 0
+        downlinkPeakDBFS = -.infinity
         if lifecycleOwner() == .conversation {
             // ESS-554：引擎由 controller 在会话 acquire 时启动并跨回合保持；
             // 本地 isRunning 记账与引擎真实状态对齐，仅在未跑时兜底启动。
@@ -202,6 +210,13 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
             guard let pcmBuffer = buffer(for: playable.chunk.payload) else { continue }
             let payloadBytes = playable.chunk.payload.count
             let responseId = playable.responseId
+            let level = PCM16Loudness.analyze(playable.chunk.payload)
+            downlinkPeakRMS = max(downlinkPeakRMS, level.rms)
+            downlinkPeakDBFS = max(downlinkPeakDBFS, level.peakDBFS)
+            if !downlinkFirstChunkLogged {
+                downlinkFirstChunkLogged = true
+                logDownlinkPCMLevel(level: level, frame: "first")
+            }
             tracker.enqueue(responseId: responseId, bytes: payloadBytes)
 
             // `.dataPlayedBack` fires once the buffer has actually been played
@@ -285,7 +300,45 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
                 requestId: turn.requestId, sessionId: turn.sessionId,
                 responseId: ended.responseId, bytesPlayed: ended.bytesPlayed
             ))
+            logDownlinkPCMSummary()
         }
+    }
+
+    // MARK: - ESS-891 下行响度取证
+
+    /// 首帧取证：下行 PCM 的 rms/peak、实际输出路由、系统输出音量、播放器
+    /// 增益与采样率/声道数。与 Gateway 的 `upstream_pcm_level frame=first`
+    /// 按同一 request_id 对账，即可证明是否发生幅度衰减。
+    private func logDownlinkPCMLevel(level: PCM16Loudness.Level, frame: String) {
+        let session = AVAudioSession.sharedInstance()
+        let route = session.currentRoute.outputs
+            .map { "\($0.portType.rawValue)(\($0.portName))" }
+            .joined(separator: "+")
+        WatchLog.info(
+            "realtime", "downlink_pcm_level",
+            requestId: currentTurn?.requestId,
+            detail: "frame=\(frame) "
+                + "rms=\(Self.fixed(level.rms)) peak_rms=\(Self.fixed(level.peak)) "
+                + "rms_dbfs=\(Self.fixed(level.rmsDBFS)) peak_dbfs=\(Self.fixed(level.peakDBFS)) "
+                + "sample_rate=\(Int(format.sampleRate)) channel_count=\(Int(format.channelCount)) "
+                + "output_route=\(route.isEmpty ? "none" : route) "
+                + "system_output_volume=\(Self.fixed(Double(session.outputVolume))) "
+                + "player_volume=\(Self.fixed(Double(playerNode.volume))) "
+                + "mixer_volume=\(Self.fixed(Double(audioEngine.mainMixerNode.outputVolume)))"
+        )
+    }
+
+    private func logDownlinkPCMSummary() {
+        guard downlinkFirstChunkLogged else { return }
+        WatchLog.info(
+            "realtime", "downlink_pcm_level",
+            requestId: currentTurn?.requestId,
+            detail: "frame=summary peak_rms=\(Self.fixed(downlinkPeakRMS)) peak_dbfs=\(Self.fixed(downlinkPeakDBFS))"
+        )
+    }
+
+    private static func fixed(_ value: Double) -> String {
+        String(format: "%.5f", value)
     }
 
     private func buffer(for payload: Data) -> AVAudioPCMBuffer? {

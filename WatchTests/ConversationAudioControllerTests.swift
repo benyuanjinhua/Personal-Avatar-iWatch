@@ -31,6 +31,8 @@ final class ConversationAudioControllerTests: XCTestCase {
         private(set) var activations = 0
         private(set) var deactivations = 0
         private(set) var categories: [AVAudioSession.Category] = []
+        private(set) var modes: [AVAudioSession.Mode] = []
+        private(set) var options: [AVAudioSession.CategoryOptions] = []
         /// 第 N 次 setActive(true) 抛错（1 起计），用于走 ESS-61 阶梯。
         var failActivationsBefore = 0
         private var activateCalls = 0
@@ -42,6 +44,8 @@ final class ConversationAudioControllerTests: XCTestCase {
             options: AVAudioSession.CategoryOptions
         ) throws {
             categories.append(category)
+            modes.append(mode)
+            self.options.append(options)
         }
 
         func setActive(_ active: Bool, options: AVAudioSession.SetActiveOptions) throws {
@@ -111,6 +115,34 @@ final class ConversationAudioControllerTests: XCTestCase {
         WatchLog.setObserver(nil)
         collector = nil
         super.tearDown()
+    }
+
+    // MARK: - ESS-891：VoiceChat + 扬声器路径选择
+
+    /// 语音打断开启时，会话必须配 `.voiceChat` 模式（AEC 前提），而不是
+    /// `.spokenAudio`。这是「电话式对话」扬声器路径选择的确定性口径——
+    /// 路由/增益事故排查前必须先钉住 mode 的选择本身。
+    func testVoiceBargeInEnabledSelectsVoiceChatMode() throws {
+        let session = FakeSession()
+        let controller = ConversationAudioController(
+            session: session, captureControl: FakeEngine(), playbackControl: FakeEngine()
+        )
+        controller.voiceBargeInEnabled = { true }
+        try controller.beginConversation(conversationId: "conv-voicechat")
+        XCTAssertEqual(session.modes.last, .voiceChat)
+        XCTAssertEqual(controller.lastConfiguredMode, .voiceChat)
+    }
+
+    /// 语音打断关闭时，会话使用 `.spokenAudio`（不启用 AEC 的常规通话路径）。
+    func testVoiceBargeInDisabledSelectsSpokenAudioMode() throws {
+        let session = FakeSession()
+        let controller = ConversationAudioController(
+            session: session, captureControl: FakeEngine(), playbackControl: FakeEngine()
+        )
+        controller.voiceBargeInEnabled = { false }
+        try controller.beginConversation(conversationId: "conv-spoken")
+        XCTAssertEqual(session.modes.last, .spokenAudio)
+        XCTAssertEqual(controller.lastConfiguredMode, .spokenAudio)
     }
 
     // MARK: - AC1：会话级计数（fake，CI 安全）

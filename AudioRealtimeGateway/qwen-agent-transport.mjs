@@ -24,6 +24,29 @@ const conversationKey = ({ deviceId, sessionId }) =>
 
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/
 
+// ESS-891: downlink PCM loudness forensics. The same rms/peak metric the Watch
+// player logs for its incoming PCM, computed here on the first upstream frame
+// so the two can be compared per request_id to prove (or rule out) amplitude
+// attenuation between the provider and the Watch speaker.
+export const dbfs = linear => (linear > 0 ? 20 * Math.log10(linear) : -Infinity)
+
+export function pcm16Level(audioBase64) {
+  const buf = Buffer.from(audioBase64, 'base64')
+  const samples = Math.floor(buf.length / 2)
+  if (samples === 0) return { samples: 0, rms: 0, peak: 0 }
+  let sumSquares = 0
+  let peak = 0
+  for (let i = 0; i < samples; i++) {
+    const value = buf.readInt16LE(i * 2) / 32768
+    sumSquares += value * value
+    const magnitude = Math.abs(value)
+    if (magnitude > peak) peak = magnitude
+  }
+  return { samples, rms: Math.sqrt(sumSquares / samples), peak }
+}
+
+const round5 = value => (Number.isFinite(value) ? Math.round(value * 1e5) / 1e5 : value)
+
 // ESS-773: replay identity for an upstream audio frame. Composite on purpose —
 // the upstream sequence AND the payload, never the payload alone, since a later
 // frame with identical bytes (silence is the common case) is legitimate audio.
@@ -157,6 +180,7 @@ export class QwenAgentTransport {
       ws: null, ready: false, terminal: false, committed: false,
       pending: [], pendingBytes: 0, nextOutputSequence: 0,
       downlinkFrames: 0, downlinkBytes: 0,
+      pcmFrames: 0, pcmPeakRms: 0, pcmFirstLogged: false,
       connectTimer: null,
       doneTimer: null, pendingDone: false, recentUpstreamFrames: new Map(),
       expectedUpstream: 0, anchored: false, reorderBuffer: new Map(), gapTimer: null,
@@ -258,6 +282,12 @@ export class QwenAgentTransport {
       clearTimeout(turn.doneTimer)
       turn.doneTimer = null
       const finalSequence = turn.nextOutputSequence - 1
+      if (turn.pcmFirstLogged) {
+        this.log('upstream_pcm_level', {
+          ...scopeLog, frame: 'summary', frames: turn.pcmFrames,
+          peak_rms: round5(turn.pcmPeakRms), peak_dbfs: round5(dbfs(turn.pcmPeakRms)),
+        })
+      }
       this.log('upstream_audio_done', { ...scopeLog, final_sequence: finalSequence })
       onEvent({
         type: 'agent.audio.done', response_id: responseId, final_sequence: finalSequence,
@@ -290,6 +320,18 @@ export class QwenAgentTransport {
         upstream_sequence: frame.upstreamSequence,
       })
       this.log('upstream_audio_delta', { ...scopeLog, sequence })
+      const level = pcm16Level(frame.audio)
+      turn.pcmFrames += 1
+      turn.pcmPeakRms = Math.max(turn.pcmPeakRms, level.rms)
+      if (!turn.pcmFirstLogged) {
+        turn.pcmFirstLogged = true
+        this.log('upstream_pcm_level', {
+          ...scopeLog, frame: 'first',
+          rms: round5(level.rms), peak_rms: round5(level.peak),
+          rms_dbfs: round5(dbfs(level.rms)), peak_dbfs: round5(dbfs(level.peak)),
+          sample_rate: frame.sampleRate, samples: level.samples,
+        })
+      }
       onEvent({
         type: 'agent.audio.delta', response_id: responseId, sequence,
         sample_rate: frame.sampleRate, codec: 'pcm_s16le', audio: frame.audio,
