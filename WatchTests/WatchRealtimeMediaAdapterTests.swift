@@ -36,6 +36,65 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         }
     }
 
+    /// ESS-871：`vad/frame_energy` 取证埋点。每 1 秒（10 个 100ms 帧）冲刷
+    /// 一条，含 min/max/mean RMS 与当前 speechRMS 阈值——用来区分「麦克风
+    /// 哑了」与「阈值定高了」。
+    func testVADFrameEnergyLoggedOncePerSecond() {
+        let recorder = MockRecorder()
+        let player = MockPlayer()
+        let transport = MockTransport()
+        let adapter = WatchRealtimeMediaAdapter(
+            recorder: recorder,
+            player: player,
+            transport: transport,
+            vadConfiguration: LocalVADConfiguration()
+        )
+        var energyEvents: [(event: String, detail: String?)] = []
+        WatchLog.setObserver { module, event, _, detail, _ in
+            if module == "vad", event == "frame_energy" {
+                energyEvents.append((event, detail))
+            }
+        }
+        defer { WatchLog.setObserver(nil) }
+
+        adapter.beginTurn(requestId: "57557557-5575-4575-8575-575575575575")
+        // 10 × 100ms = 1s，正好触发一次窗口冲刷；少一帧都不该冲刷。
+        for _ in 0..<10 { recorder.feed(Self.pcmFrame(rms: 0.08)) }
+
+        XCTAssertEqual(energyEvents.count, 1)
+        let detail = energyEvents.first?.detail ?? ""
+        XCTAssertTrue(detail.contains("frames=10"), "unexpected detail: \(detail)")
+        XCTAssertTrue(detail.contains("rms_min="), detail)
+        XCTAssertTrue(detail.contains("rms_max="), detail)
+        XCTAssertTrue(detail.contains("rms_mean="), detail)
+        XCTAssertTrue(detail.contains("threshold="), detail)
+    }
+
+    /// ESS-871（架构复审补充）：无 endpointer（vadConfiguration 未传）时，
+    /// 帧时钟仍推进、`vad/frame_energy` 仍按秒冲刷——兑现「取证不因 VAD
+    /// 未接线而缺失」的契约。
+    func testVADFrameEnergyLoggedWithoutEndpointer() {
+        let recorder = MockRecorder()
+        let player = MockPlayer()
+        let transport = MockTransport()
+        let adapter = WatchRealtimeMediaAdapter(
+            recorder: recorder,
+            player: player,
+            transport: transport,
+            vadConfiguration: nil
+        )
+        var energyEventCount = 0
+        WatchLog.setObserver { module, event, _, _, _ in
+            if module == "vad", event == "frame_energy" { energyEventCount += 1 }
+        }
+        defer { WatchLog.setObserver(nil) }
+
+        adapter.beginTurn(requestId: "57557557-5575-4575-8575-575575575575")
+        for _ in 0..<10 { recorder.feed(Self.pcmFrame(rms: 0.08)) }
+
+        XCTAssertEqual(energyEventCount, 1)
+    }
+
     private static func pcmFrame(rms: Double) -> Data {
         var sample = Int16((rms * Double(Int16.max)).rounded()).littleEndian
         let bytes = withUnsafeBytes(of: &sample) { Data($0) }

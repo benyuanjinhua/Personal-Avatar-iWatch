@@ -188,10 +188,13 @@ final class SessionController: ObservableObject {
     static let failureNoticeSeconds: TimeInterval = 2.0
     /// 首次引导停留时长。PRD §3.5.7：3 秒淡出。
     static let firstRunGuideSeconds: TimeInterval = 3.0
-    /// 单轮时长上限（PRD F2 异常：单轮 60 秒强制结束）。取 58s——
-    /// 抢在 AudioRecorder 的 60s 系统硬顶之前走正常 finishRecording 提交，
-    /// 避免撞上「自动停录后 isRecording=false」的收尾死角。【待调】
-    static let turnCapSeconds: TimeInterval = 58.0
+    /// 单轮时长上限（PRD F2 异常：单轮 60 秒强制结束）。取 55s——
+    /// 抢在 AudioRecorder 的 60s 系统硬顶之前走正常 finishRecording 提交。
+    /// ESS-871：上限现锚定在 `markLocalCapture(active:)`（本地采集开始），
+    /// 与录音起点同钟，因此 55s + 抖动仍稳在 60s 硬顶之内（≥5s 余量）；
+    /// 旧实现锚在通道就绪（比录音晚 establish_ms≈1.65s），58s 实际约在
+    /// 录音 60s 时才触发，正面撞上自动停录造成 ERR_DURATION_OVERFLOW。
+    static let turnCapSeconds: TimeInterval = 55.0
     /// ESS-600：`thinking` 的有界执行上限。回答永远不来（Bridge 静默 /
     /// `done` 零音频 / 下行整段丢）时，没有这条兜底会话就永久卡在思考态，
     /// 麦克风关着、球在转，用户只能杀 App——比报错更糟。到点如实记
@@ -305,9 +308,18 @@ final class SessionController: ObservableObject {
 
     /// ESS-600：本地采集真的开始/停止了（AudioRecorder 层事实）。与网络
     /// ready 独立——建立期就能如实显示「表在听」。
+    /// ESS-871：单轮上限锚点从 markChannelReady 移到此处。markLocalCapture
+    /// 是每一轮（首轮 + 自动重听）都会真实触发的「采集开始」信号，且比
+    /// 通道就绪早 establish_ms——上限从此与录音起点同钟，不再因通道建立
+    /// 耗时而推后。
     func markLocalCapture(active: Bool) {
         guard isCapturingLocally != active else { return }
         isCapturingLocally = active
+        if active {
+            armTurnCap()
+        } else {
+            turnCapToken?.cancel(); turnCapToken = nil
+        }
     }
 
     // MARK: - 真实通道事件（唯一的就绪/失败驱动源）
@@ -334,7 +346,8 @@ final class SessionController: ObservableObject {
             "session", "session_next_listening", requestId: activeTurnRequestId,
             detail: "turn_index=\(turnIndex) reason=channel_ready"
         )
-        armTurnCap()
+        // ESS-871：单轮上限不再在这里 arm——已移到 markLocalCapture(active:)
+        // 锚定采集起点，避免通道建立耗时推后上限。
         // ESS-652: start silence governance on first entry to listening.
         armSilenceTimer()
     }
@@ -628,7 +641,9 @@ final class SessionController: ObservableObject {
             detail: "turn_index=\(turnIndex) reason=\(reason)"
         )
         if Self.hapticOnAutoRelisten { playHaptic(.ready) }
-        armTurnCap()
+        // ESS-871：上限已由 markLocalCapture(active: true) 在 onStartTurn 的
+        // 同步部分（pressBegan → onLocalCaptureChanged(true)）完成 arm，这里
+        // 不再重复 arm（重复 arm 会把锚点悄悄往后挪）。
         // ESS-652: arm silence governance timer for the new turn.
         armSilenceTimer()
     }
