@@ -46,6 +46,9 @@ final class SessionAutoRelistenTests: XCTestCase {
         XCTAssertNotNil(session.onSalvageTurn, "ready 超时的语音抢救出口未接")
         XCTAssertNotNil(session.onTeardownChannel)
         XCTAssertNotNil(session.onCommitTurn)
+        // ESS-865：VAD 起判必须真的接到会话层——没接上，纯静音与真说话在
+        // 单轮上限处就区分不开（复审阻断 2）。
+        XCTAssertNotNil(pushToTalk.onSessionSpeechDetected, "本地 VAD 起判的出口未接")
         XCTAssertNotNil(pushToTalk.onRealtimeChannelReady, "通道就绪未接 → 永远进不了会话")
         XCTAssertNotNil(pushToTalk.onRealtimeChannelFailed)
         XCTAssertNotNil(pushToTalk.onSessionTurnCommitted, "提交事件未接 → 永远进不了 thinking")

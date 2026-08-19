@@ -16,6 +16,9 @@ public struct LocalVADConfiguration: Equatable, Sendable {
     public var noiseFloorRatio: Double
     /// 噪声底的最小统计窗口。窗内取最小值作为底噪估计（min-statistics）。
     public var noiseWindowMs: Int64
+    /// 起判前 pre-roll 的最长回溯跨度。判定门下降时按新门重判这段历史，
+    /// 救回「一开麦就说话、底噪只能从语音帧里估」那条时序（ESS-865 复审阻断 1）。
+    public var preRollMs: Int64
     public var speechStartMs: Int64
     public var endpointSilenceMs: Int64
     public var playbackGuardMs: Int64
@@ -30,6 +33,7 @@ public struct LocalVADConfiguration: Equatable, Sendable {
         minimumSpeechRMS: Double = 0.0035,
         noiseFloorRatio: Double = 3.0,
         noiseWindowMs: Int64 = 2_000,
+        preRollMs: Int64 = 8_000,
         speechStartMs: Int64 = 100,
         endpointSilenceMs: Int64 = 700,
         playbackGuardMs: Int64 = 300,
@@ -41,6 +45,7 @@ public struct LocalVADConfiguration: Equatable, Sendable {
         precondition(minimumSpeechRMS <= speechRMS)
         precondition(noiseFloorRatio >= 1)
         precondition(noiseWindowMs > 0)
+        precondition(preRollMs > 0)
         precondition(speechStartMs > 0)
         precondition(endpointSilenceMs > 0)
         precondition(playbackGuardMs >= 0)
@@ -50,6 +55,7 @@ public struct LocalVADConfiguration: Equatable, Sendable {
         self.minimumSpeechRMS = minimumSpeechRMS
         self.noiseFloorRatio = noiseFloorRatio
         self.noiseWindowMs = noiseWindowMs
+        self.preRollMs = preRollMs
         self.speechStartMs = speechStartMs
         self.endpointSilenceMs = endpointSilenceMs
         self.playbackGuardMs = playbackGuardMs
@@ -115,19 +121,19 @@ public struct LocalVADEndpointer: Sendable {
     private var lastRMS: Double = 0
     private var peakRMS: Double = 0
 
-    /// 预热帧数：底噪估计至少要这么多帧才作数，`speechStarted` 也要等到
-    /// 预热完成才确认。
+    /// ESS-865 复审整改：起判前的 pre-roll。缓存「还没被判成语音」的帧能量，
+    /// 供判定门下降后回溯重判。
     ///
-    /// 为什么起判也要等：预热窗内判定门只能取绝对下限（最灵敏），稳态环境噪声
-    /// 会被判成说话；若此时就确认起判，噪声房间里每一轮都会「起判 → 0.7s 后
-    /// 断句 → 提交一段噪声 → 没听清 → 重新聆听」空转。等 300ms 拿到底噪再确认，
-    /// 噪声就落在门下。代价只是「起判时刻」晚 300ms——**音频本身一帧不丢**
-    /// （所有帧从第 0 帧起照常上行），候选起点也保留原时刻。
-    private static let noiseFloorWarmupFrames = 3
-
-    private var isNoiseFloorWarmedUp: Bool {
-        observedFrameCount >= Self.noiseFloorWarmupFrames
-    }
+    /// 为什么需要回溯：第 0 帧就开口说话时，底噪估计手上只有语音帧，
+    /// 最小统计必然把说话电平本身当成底噪，门被顶到 `rms × ratio` 之上，
+    /// 于是**这一整段说话永远跨不过门**——正是本单要救的 AEC 低电平时序。
+    /// 靠「前 N 帧一定是环境音」的假设来回避是错的（复审阻断 1）。
+    /// 真正能区分「0.006 是说话」与「0.010 是稳态噪声」的信息只有一个：
+    /// 后者从头到尾没有更安静的时刻，前者停说后有。所以判据只能延后到
+    /// 安静期出现、底噪真正落下来时再回头补判。
+    ///
+    /// 回溯只影响**判定**，不影响音频：所有帧从第 0 帧起照常上行。
+    private var preRoll: [(startedAtMs: Int64, endedAtMs: Int64, rms: Double)] = []
 
     public init(configuration: LocalVADConfiguration = LocalVADConfiguration()) {
         self.configuration = configuration
@@ -151,6 +157,7 @@ public struct LocalVADEndpointer: Sendable {
         speechFrameCount = 0
         lastRMS = 0
         peakRMS = 0
+        preRoll.removeAll(keepingCapacity: true)
     }
 
     /// 回答播完：开一段回声守卫窗，并把本轮聆听窗重新起算（用户的下一句
@@ -161,6 +168,7 @@ public struct LocalVADEndpointer: Sendable {
         guardUntilMs = atMs + configuration.playbackGuardMs
         turnStartedAtMs = guardUntilMs
         windowStartedAtMs = guardUntilMs
+        preRoll.removeAll(keepingCapacity: true)
     }
 
     /// 当前判定门。噪声底 × 信噪比，被 `[minimumSpeechRMS, speechRMS]` 夹住。
@@ -169,10 +177,14 @@ public struct LocalVADEndpointer: Sendable {
             max(configuration.minimumSpeechRMS, noiseFloorRMS * configuration.noiseFloorRatio))
     }
 
-    /// 当前底噪估计。预热完成前返回「刚好让门落在绝对下限」的值。
+    /// 当前底噪估计。还没有任何帧时返回「刚好让门落在绝对下限」的值。
+    ///
+    /// 第一帧起就把观测值算进来：这一侧**故意保守**（噪声房间第 0 帧就把门
+    /// 顶到 `rms × ratio`，稳态噪声当场落在门下），冷启动就说话被压住的那一段
+    /// 由 pre-roll 回溯补回来，见 `replayPreRollIfThresholdDropped`。
     public var noiseFloorRMS: Double {
         let observed = min(currentWindowMinRMS, previousWindowMinRMS)
-        guard isNoiseFloorWarmedUp, observed.isFinite else {
+        guard observed.isFinite else {
             return configuration.minimumSpeechRMS / configuration.noiseFloorRatio
         }
         return observed
@@ -196,9 +208,13 @@ public struct LocalVADEndpointer: Sendable {
         guard frameDurationMs > 0 else { return [] }
         let frameEndedAtMs = frameStartedAtMs + frameDurationMs
 
-        // 上限从**本轮起点**算，不再要求「已经起判过语音」。真机上正是
-        // 「一次都没起判」那条路径把回合悬到 60s 录音自停之后（ESS-865）。
-        if frameEndedAtMs - turnStartedAtMs >= configuration.maximumTurnMs {
+        // 单轮硬上限。ESS-865 复审整改：**只对已经起判过语音的回合**成立。
+        // 从未检测到语音的纯静音不得在这里伪造一次 `speech_final`——那会被
+        // 上层无条件 `commitUplink()` 提交成一段静音，回合离开 listening，
+        // 30s/75s 提示与 120s 静默挂断从此永远到不了（复审阻断 2）。
+        // 静音的归属是会话层的静默治理，不是断句器。
+        if speechStartedAtMs != nil,
+           frameEndedAtMs - turnStartedAtMs >= configuration.maximumTurnMs {
             isFinal = true
             return [.speechFinal(atMs: frameEndedAtMs, reason: .maximumDuration)]
         }
@@ -207,7 +223,16 @@ public struct LocalVADEndpointer: Sendable {
         guard frameStartedAtMs >= guardUntilMs else { return [] }
 
         let rms = Self.rms(ofPCM16: pcm)
+        let thresholdBefore = thresholdRMS
         observeNoiseFloor(rms: rms, frameEndedAtMs: frameEndedAtMs)
+
+        var events: [LocalVADEvent] = []
+        // 底噪落下来了 → 之前被高门压住的 pre-roll 需要按新门重判。
+        if thresholdRMS < thresholdBefore, speechStartedAtMs == nil,
+           let replayed = replayPreRoll() {
+            events.append(replayed)
+        }
+
         let isSpeech = rms >= thresholdRMS
         if isSpeech { speechFrameCount += 1 }
 
@@ -216,22 +241,65 @@ public struct LocalVADEndpointer: Sendable {
             if speechStartedAtMs == nil {
                 let candidateStart = speechCandidateStartedAtMs ?? frameStartedAtMs
                 speechCandidateStartedAtMs = candidateStart
-                if isNoiseFloorWarmedUp,
-                   frameEndedAtMs - candidateStart >= configuration.speechStartMs {
+                if frameEndedAtMs - candidateStart >= configuration.speechStartMs {
                     speechStartedAtMs = candidateStart
-                    return [.speechStarted(atMs: candidateStart)]
+                    events.append(.speechStarted(atMs: candidateStart))
                 }
             }
-            return []
+            return events
         }
 
+        if speechStartedAtMs == nil {
+            // 还没起判：留一份 pre-roll 供门下降后回判。
+            appendPreRoll(startedAtMs: frameStartedAtMs, endedAtMs: frameEndedAtMs, rms: rms)
+        }
         speechCandidateStartedAtMs = nil
-        guard speechStartedAtMs != nil, let lastSpeechAtMs else { return [] }
+        guard speechStartedAtMs != nil, let lastSpeechAtMs else { return events }
         if frameEndedAtMs - lastSpeechAtMs >= configuration.endpointSilenceMs {
             isFinal = true
-            return [.speechFinal(atMs: frameEndedAtMs, reason: .silence)]
+            events.append(.speechFinal(atMs: frameEndedAtMs, reason: .silence))
         }
-        return []
+        return events
+    }
+
+    private mutating func appendPreRoll(startedAtMs: Int64, endedAtMs: Int64, rms: Double) {
+        preRoll.append((startedAtMs, endedAtMs, rms))
+        while let first = preRoll.first,
+              endedAtMs - first.startedAtMs > configuration.preRollMs {
+            preRoll.removeFirst()
+        }
+    }
+
+    /// 判定门下降后回头重判 pre-roll。找到「连续跨门且累计 ≥ speechStartMs」
+    /// 的那一段，按它的真实起点补发 `speechStarted`，并把 `lastSpeechAtMs`
+    /// 对齐到该段最后一帧的结束时刻——断句计时因此接得上，不会因为回溯
+    /// 而把已经说完的话再多等 700ms。
+    ///
+    /// 只在「本轮还没起判」时调用；一旦起判，pre-roll 不再增长也不再回放。
+    private mutating func replayPreRoll() -> LocalVADEvent? {
+        let threshold = thresholdRMS
+        var runStart: Int64?
+        var runEnd: Int64?
+        for frame in preRoll {
+            if frame.rms >= threshold {
+                if runStart == nil { runStart = frame.startedAtMs }
+                runEnd = frame.endedAtMs
+            } else {
+                if let start = runStart, let end = runEnd,
+                   end - start >= configuration.speechStartMs {
+                    break
+                }
+                runStart = nil
+                runEnd = nil
+            }
+        }
+        guard let start = runStart, let end = runEnd,
+              end - start >= configuration.speechStartMs else { return nil }
+        speechStartedAtMs = start
+        lastSpeechAtMs = end
+        speechCandidateStartedAtMs = nil
+        preRoll.removeAll(keepingCapacity: true)
+        return .speechStarted(atMs: start)
     }
 
     /// 滑动最小统计。子窗满一个 `noiseWindowMs` 就轮转，噪声底取「当前子窗

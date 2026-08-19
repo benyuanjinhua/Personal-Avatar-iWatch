@@ -335,6 +335,7 @@ final class SessionController: ObservableObject {
         // ESS-600：通道就绪 = 第 1 轮正式进入聆听相位。这一轮的采集早在
         // 点球 touch-down 就起来了，此处只是认领，不重新发起。
         turnPhase = .listening
+        didDetectSpeechThisTurn = false
         WatchLog.info(
             "session", "session_next_listening", requestId: activeTurnRequestId,
             detail: "turn_index=\(turnIndex) reason=channel_ready"
@@ -344,12 +345,45 @@ final class SessionController: ObservableObject {
         armSilenceTimer()
     }
 
-    /// 单轮上限兜底：到点视同说完提交本轮，不让「聆听」悬在
+    /// ESS-865 复审整改：本轮本地 VAD 是否真的听到过人说话。
+    /// 每轮聆听开始时清零，`speech_started` 到达时置位。
+    private(set) var didDetectSpeechThisTurn = false
+
+    /// 本地 VAD 起判（由 `PushToTalkController` 从 adapter 转发）。
+    func markSpeechDetected(requestId: String) {
+        guard state == .listening, turnPhase == .listening else { return }
+        guard let active = activeTurnRequestId, active == requestId else {
+            WatchLog.info(
+                "session", "session_stale_turn_event", requestId: requestId,
+                detail: "event=speech_detected active_request_id=\(activeTurnRequestId ?? "nil") turn_index=\(turnIndex)"
+            )
+            return
+        }
+        guard !didDetectSpeechThisTurn else { return }
+        didDetectSpeechThisTurn = true
+        WatchLog.info(
+            "session", "session_speech_detected", requestId: requestId,
+            detail: "turn_index=\(turnIndex)"
+        )
+    }
+
+    /// 单轮上限兜底：**说过话的**回合到点视同说完提交本轮，不让「聆听」悬在
     /// 已停录的死麦克风上（VAD 断句是常态路径，本条只是上限）。
+    ///
+    /// ESS-865 复审阻断 2：从未听到人说话的回合到点**不提交**。提交等于把一段
+    /// 静音送上去，回合随即离开 listening，`armSilenceTimer` 的 75s 提示与 120s
+    /// 挂断都以 `turnPhase == .listening` 为前提，从此永远到不了——用户放下手
+    /// 走开，会话会一直挂着而不是按策略自己收。静音的归属是静默治理。
     private func armTurnCap() {
         turnCapToken?.cancel()
         turnCapToken = scheduleDelay(Self.turnCapSeconds) { [weak self] in
             guard let self, self.state == .listening, self.turnPhase == .listening else { return }
+            guard self.didDetectSpeechThisTurn else {
+                WatchLog.info("session", "session_turn_cap_skipped",
+                              requestId: self.activeTurnRequestId,
+                              detail: "cap_s=\(Int(Self.turnCapSeconds)) reason=no_speech_detected")
+                return
+            }
             WatchLog.info("session", "session_turn_cap_reached",
                           requestId: self.activeTurnRequestId,
                           detail: "cap_s=\(Int(Self.turnCapSeconds))")
@@ -628,6 +662,7 @@ final class SessionController: ObservableObject {
         turnIndex += 1
         activeTurnRequestId = requestId
         turnPhase = .listening
+        didDetectSpeechThisTurn = false
         WatchLog.info(
             "session", "session_next_listening", requestId: requestId,
             detail: "turn_index=\(turnIndex) reason=\(reason)"
@@ -1037,6 +1072,10 @@ enum SessionTurnWiring {
         }
         pushToTalk.onLocalCaptureChanged = { [weak session] active in
             session?.markLocalCapture(active: active)
+        }
+        // ESS-865：本地 VAD 起判 → 会话层记账本轮「确实有人说话」。
+        pushToTalk.onSessionSpeechDetected = { [weak session] requestId in
+            session?.markSpeechDetected(requestId: requestId)
         }
         // ESS-650 F2-2 / F2-3：打断监听的起停与命中回调。
         session.onBeginBargeInListening = { [weak pushToTalk] in

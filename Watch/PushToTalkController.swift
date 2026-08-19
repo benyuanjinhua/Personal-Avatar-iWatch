@@ -104,6 +104,11 @@ final class PushToTalkController: ObservableObject {
     var onSessionTurnAborted: ((_ requestId: String, _ reason: String) -> Void)?
     /// 本地采集起停（与网络 ready 独立呈现）。
     var onLocalCaptureChanged: ((_ active: Bool) -> Void)?
+    /// ESS-865 复审整改：本轮**本地 VAD 真的听到人说话了**。
+    /// 会话层据此决定单轮上限到点要不要提交——从未听到人说话的回合到点提交
+    /// 等于把一段静音送上去，回合离开 listening，静默治理（30s/75s 提示、
+    /// 120s 挂断）从此永远到不了。
+    var onSessionSpeechDetected: ((_ requestId: String) -> Void)?
     /// ESS-650 F2-3：语音打断命中（携带 `detect_ms`）。会话层据此走与点球
     /// **同一个** `interruptSpeaking` 入口，只是 `source` 不同——两条路径落到
     /// 不同状态机，误触发率就永远算不出来（ESS-655 口径 3）。
@@ -1151,7 +1156,16 @@ final class PushToTalkController: ObservableObject {
         // ESS-575: when VAD auto-commits on speech end, finish the AAC
         // recording so the file fallback and retry cache are set up.
         adapter.onVADEvent = { [weak self] event in
-            guard let self, case .speechFinal = event,
+            guard let self else { return }
+            if case .speechStarted = event {
+                // ESS-865：把「真的听到人说话了」如实交给会话层，供单轮上限
+                // 判定。用 adapter 的当前回合 id，与会话认领的那一轮对齐。
+                if let requestId = self.realtimeAdapter?.currentTurn?.requestId {
+                    self.onSessionSpeechDetected?(requestId)
+                }
+                return
+            }
+            guard case .speechFinal = event,
                   self.state == .recording, self.recorder.isRecording else { return }
             self.finishRecording()
         }

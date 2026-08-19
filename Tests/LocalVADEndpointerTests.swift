@@ -89,13 +89,52 @@ struct LocalVADEndpointerTests {
         ])
     }
 
-    /// 一次都没起判过也必须有终点。真机上正是这条缺口把回合悬到 60s 录音
-    /// 自停之后（`session_turn_cap_reached` → `recording_never_started`）。
-    @Test func maximumDurationFinalizesEvenWhenSpeechNeverDetected() {
+    /// ESS-865 复审阻断 2：**从未检测到语音的纯静音不得伪造断句**。
+    /// 上层对任何 `speechFinal` 都会无条件 `commitUplink()`；一旦提交，回合就
+    /// 离开 listening，会话层 30s/75s 提示与 120s 静默挂断从此永远到不了。
+    /// 静音的归属是会话层的静默治理，不是断句器。
+    @Test func pureSilenceNeverFabricatesFinalAtMaximumDuration() {
         var vad = LocalVADEndpointer(configuration: LocalVADConfiguration(maximumTurnMs: 5_000))
-        let events = feed(&vad, rms: 0.0005, frames: 60, startingAt: 0)
+        let events = feed(&vad, rms: 0.0005, frames: 120, startingAt: 0)   // 12s，远超 5s 上限
 
-        #expect(events == [.speechFinal(atMs: 5_000, reason: .maximumDuration)])
+        #expect(events.isEmpty)
+        #expect(!vad.metrics.didDetectSpeech)
+    }
+
+    /// 但**说过话**的回合仍必须在上限处提交——持续说话不能悬到录音硬顶之后。
+    @Test func continuousSpeechStillFinalizesAtMaximumDuration() {
+        var vad = LocalVADEndpointer(configuration: LocalVADConfiguration(maximumTurnMs: 5_000))
+        let events = feed(&vad, rms: 0.08, frames: 120, startingAt: 0)
+
+        #expect(events.first == .speechStarted(atMs: 0))
+        #expect(events.last == .speechFinal(atMs: 5_000, reason: .maximumDuration))
+    }
+
+    /// ESS-865 复审阻断 1 的回归钉子：**用户一开麦就说话**（第 0 帧起就是
+    /// AEC 电平 0.006 RMS），此时底噪只能从语音帧里估，最小统计必然把说话
+    /// 电平本身当成底噪、把门顶到 0.018。停说后安静期到来、门落下来，
+    /// pre-roll 必须被回判，补出 `speechStarted` 并正常断句。
+    @Test func speechFromFirstFrameIsRecoveredOnceNoiseFloorSettles() {
+        var vad = LocalVADEndpointer()
+        var events = feed(&vad, rms: 0.006, frames: 10, startingAt: 0)      // 1s 说话，从第 0 帧起
+        #expect(events.isEmpty, "门被语音自身顶高时，起判只能延后，不能靠假设前几帧是环境音")
+
+        events += feed(&vad, rms: 0.0005, frames: 7, startingAt: 1_000)     // 停说 700ms
+
+        #expect(events == [
+            .speechStarted(atMs: 0),
+            .speechFinal(atMs: 1_700, reason: .silence)
+        ])
+    }
+
+    /// 回判不得把稳态噪声也救回来：噪声从头到尾没有更安静的时刻，
+    /// 判定门永远不下降，pre-roll 因此永远不会被回放。
+    @Test func preRollReplayDoesNotResurrectSteadyNoise() {
+        var vad = LocalVADEndpointer()
+        var events = feed(&vad, rms: 0.01, frames: 30, startingAt: 0)
+        events += feed(&vad, rms: 0.01, frames: 30, startingAt: 3_000)
+
+        #expect(events.isEmpty)
     }
 
     /// 单轮上限必须小于 `AudioRecorder.maxDuration`（60s），否则提交发生在

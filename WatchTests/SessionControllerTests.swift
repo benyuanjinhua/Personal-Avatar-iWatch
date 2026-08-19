@@ -264,10 +264,11 @@ final class SessionControllerTests: XCTestCase {
 
     // MARK: - 单轮上限（PRD F2 异常的 Wave 1 兜底）
 
-    /// 就绪后到达单轮上限 → 视同说完，提交本轮（VAD 落地前的上限兜底）。
+    /// 就绪 + 本地 VAD 确实听到人说话后到达单轮上限 → 视同说完，提交本轮。
     func testTurnCapCommitsAfterReady() {
         controller.enterSession()
         controller.markChannelReady()
+        controller.markSpeechDetected(requestId: controller.activeTurnRequestId!)
         fireDelay(SessionController.turnCapSeconds)
         XCTAssertEqual(commitCount, 1)
     }
@@ -276,7 +277,67 @@ final class SessionControllerTests: XCTestCase {
     func testTurnCapCancelledOnExit() {
         controller.enterSession()
         controller.markChannelReady()
+        controller.markSpeechDetected(requestId: controller.activeTurnRequestId!)
         controller.exitSession()
+        fireDelay(SessionController.turnCapSeconds)
+        XCTAssertEqual(commitCount, 0)
+    }
+
+    // MARK: - ESS-865 复审阻断 2：纯静音不得被上限提交掉
+
+    /// 从未听到人说话的回合，单轮上限到点**不提交**。
+    /// 一旦提交，回合离开 listening，静默治理的 75s/120s guard 全部失效。
+    func testTurnCapDoesNotCommitWhenNoSpeechWasEverDetected() {
+        controller.enterSession()
+        controller.markChannelReady()
+
+        fireDelay(SessionController.turnCapSeconds)
+
+        XCTAssertEqual(commitCount, 0, "纯静音不得被伪造成一次提交")
+        XCTAssertEqual(controller.turnPhase, .listening, "必须继续留在聆听相位，交给静默治理")
+        XCTAssertFalse(controller.didDetectSpeechThisTurn)
+    }
+
+    /// 完整静默治理链路在「一句话都没说」时必须可达：
+    /// 50s 上限不提交 → 30s 提示 → 75s 提示 + 触觉 → 120s 挂断。
+    func testSilenceGovernanceReachesHangupWhenNothingWasSaid() {
+        controller.enterSession()
+        controller.markChannelReady()
+
+        fireDelay(SessionController.turnCapSeconds)
+        XCTAssertEqual(commitCount, 0)
+
+        // 30s 软提示：会话继续，不退回表盘。
+        fireDelay(SessionController.silenceHint1Seconds)
+        XCTAssertEqual(controller.state, .listening)
+        XCTAssertEqual(teardownCount, 0)
+
+        // 75s 提示（相对上一级 45s），带一次 .failure 触觉。
+        let secondStage = SessionController.silenceHint2Seconds - SessionController.silenceHint1Seconds
+        fireLatestDelay(secondStage)
+        XCTAssertTrue(haptics.contains(.failure), "75s 提示必须有触觉，实际 \(haptics!)")
+        XCTAssertEqual(controller.state, .listening)
+
+        // 120s 挂断（相对上一级 45s）。
+        let hangupStage = SessionController.silenceHangupSeconds - SessionController.silenceHint2Seconds
+        fireLatestDelay(hangupStage)
+        XCTAssertEqual(controller.state, .hungup, "120s 静默必须按策略挂断")
+    }
+
+    /// 单轮上限必须早于 AudioRecorder 的 60s 系统硬顶——否则提交发生在
+    /// AVAudioRecorder 自停之后，本地 AAC 收尾会走进「从未起录」误判（ESS-865）。
+    func testTurnCapFiresBeforeRecorderHardStop() {
+        XCTAssertLessThan(SessionController.turnCapSeconds, AudioRecorder.maxDuration)
+    }
+
+    /// 不属于当前轮的 `speech_detected` 不得解锁上限提交。
+    func testStaleSpeechDetectedDoesNotUnlockTurnCap() {
+        controller.enterSession()
+        controller.markChannelReady()
+
+        controller.markSpeechDetected(requestId: "req-stale")
+
+        XCTAssertFalse(controller.didDetectSpeechThisTurn)
         fireDelay(SessionController.turnCapSeconds)
         XCTAssertEqual(commitCount, 0)
     }
@@ -470,6 +531,16 @@ final class SessionControllerTests: XCTestCase {
     }
 
     // MARK: - helpers
+
+    /// 静默治理是嵌套调度，两级的相对延迟都是 45s。`fireDelay` 取的是**最早**
+    /// 那条，会把已经触发过的那一级重复触发；这里取**最新**排入的一条。
+    private func fireLatestDelay(_ delay: TimeInterval, file: StaticString = #filePath, line: UInt = #line) {
+        guard let entry = scheduled.last(where: { abs($0.delay - delay) < 0.001 }) else {
+            XCTFail("没有延迟为 \(delay)s 的待触发闭包", file: file, line: line)
+            return
+        }
+        entry.fire()
+    }
 
     private func fireDelay(_ delay: TimeInterval, file: StaticString = #filePath, line: UInt = #line) {
         guard let entry = scheduled.first(where: { abs($0.delay - delay) < 0.001 }) else {
