@@ -188,7 +188,8 @@ final class AudioRealtimeAgentSessionTests: XCTestCase {
         flag.setGatewayURLString("wss://agent.example.com/api/realtime")
         let config = flag.resolveConfig(ephemeralToken: authToken, deviceId: "iphone-x")
         XCTAssertNotNil(config)
-        XCTAssertEqual(config?.authToken, authToken)
+        // ESS-843: devUniversalToken 非空时 resolveConfig 用它替代 ephemeralToken。
+        XCTAssertEqual(config?.authToken, AudioRealtimeAgentFeatureFlag.devUniversalToken)
         XCTAssertEqual(config?.deviceId, "iphone-x")
     }
 

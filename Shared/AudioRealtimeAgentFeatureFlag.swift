@@ -30,6 +30,12 @@ struct AudioRealtimeAgentFeatureFlag {
     static let devDefaultGatewayURLString =
         "wss://jackson-macmac-mini.magic.workspace.beer:8444/api/realtime"
 
+    /// ESS-843 降级：开发期万能 token。非空时跳过 token 铸造/失效/刷新
+    /// 整条周期管理，直接拿这个 token 建 WSS；Gateway 侧对同一字面量放行。
+    /// 目的：让 token 管理不再影响实时主链路。正式上线前必须清空并恢复
+    /// 单次 token 流程。
+    static let devUniversalToken = "rtk_dev_universal"
+
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {
@@ -78,6 +84,10 @@ struct AudioRealtimeAgentFeatureFlag {
     /// direct path is disabled, the URL/unconfigured, or the ephemeral
     /// token is missing (the caller must supply the token separately since
     /// it's single-use and never persisted).
+    ///
+    /// ESS-843: when `devUniversalToken` is non-empty, it is used verbatim as
+    /// the auth token and the ephemeral token is ignored — skipping token
+    /// minting entirely for the dev path.
     func resolveConfig(
         ephemeralToken: String,
         deviceId: String,
@@ -85,11 +95,11 @@ struct AudioRealtimeAgentFeatureFlag {
     ) -> AudioRealtimeAgentConfig? {
         guard isDirectPathEnabled else { return nil }
         let urlString = gatewayURLString
-        guard !urlString.isEmpty, !deviceId.isEmpty, !ephemeralToken.isEmpty else {
-            return nil
-        }
+        guard !urlString.isEmpty, !deviceId.isEmpty else { return nil }
+        let token = Self.devUniversalToken.isEmpty ? ephemeralToken : Self.devUniversalToken
+        guard !token.isEmpty else { return nil }
         switch AudioRealtimeAgentConfig.validate(
-            urlString: urlString, authToken: ephemeralToken,
+            urlString: urlString, authToken: token,
             deviceId: deviceId, allowInsecure: allowInsecure
         ) {
         case .success(let config): return config

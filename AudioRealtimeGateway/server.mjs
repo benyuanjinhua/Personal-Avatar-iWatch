@@ -86,15 +86,31 @@ export function createGateway(overrides = {}) {
       request_id: url.searchParams.get('request_id') ?? '',
       generation: Number(url.searchParams.get('generation')),
     }
+    // ESS-843 降级：开发期万能 token。与客户端同字面量直接放行，跳过
+    // issuer.consume 的单次消耗/失效/scope 校验——让 token 管理不再影响
+    // 实时主链路。上线前必须删除并恢复单次 token 流程。
+    const UNIVERSAL_TOKEN = CONFIG.dev_universal_token ?? 'rtk_dev_universal'
     let scope
-    try { scope = issuer.consume(bearer, presentedScope) }
-    catch (error) {
-      log('ws_upgrade_rejected', {
-        code: error.code ?? 'ERR_TOKEN_INVALID',
-        request_id: presentedScope.request_id || null,
-        session_id: presentedScope.session_id || null,
+    if (bearer === UNIVERSAL_TOKEN) {
+      scope = {
+        ...presentedScope,
+        device_id: presentedScope.device_id || 'dev_universal',
+      }
+      log('ws_upgrade', {
+        request_id: scope.request_id, session_id: scope.session_id,
+        generation: scope.generation, device_id: scope.device_id,
+        token_mode: 'universal',
       })
-      return refuseUpgrade(socket, error.status ?? 401, error.code ?? 'ERR_TOKEN_INVALID')
+    } else {
+      try { scope = issuer.consume(bearer, presentedScope) }
+      catch (error) {
+        log('ws_upgrade_rejected', {
+          code: error.code ?? 'ERR_TOKEN_INVALID',
+          request_id: presentedScope.request_id || null,
+          session_id: presentedScope.session_id || null,
+        })
+        return refuseUpgrade(socket, error.status ?? 401, error.code ?? 'ERR_TOKEN_INVALID')
+      }
     }
     wss.handleUpgrade(req, socket, head, ws => {
       log('ws_upgrade', {
