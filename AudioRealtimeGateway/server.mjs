@@ -527,9 +527,14 @@ function writeJson(res, status, obj) {
   res.end(JSON.stringify(obj))
 }
 
-function extractBearer(header) {
+// ESS-886: the character class must include `_`. Minted tokens are
+// `rtk_<hex>`, but the ESS-843 dev universal token is `rtk_dev_universal` —
+// with `[A-Za-z0-9]` only, the first underscore after `rtk_` made the regex
+// fail and every universal-token upgrade died at the `missing_bearer` gate
+// (server.mjs:80) before ever reaching the allow branch (server.mjs:94).
+export function extractBearer(header) {
   if (!header || typeof header !== 'string') return null
-  const match = /^Bearer\s+(rtk_[A-Za-z0-9]+)$/.exec(header.trim())
+  const match = /^Bearer\s+(rtk_[A-Za-z0-9_]+)$/.exec(header.trim())
   return match ? match[1] : null
 }
 
