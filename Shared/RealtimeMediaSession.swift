@@ -125,6 +125,11 @@ final class RealtimeMediaSession {
     var activeTurn: TurnHandle? { currentTurn }
     var activeConversationId: String? { conversation?.conversationId }
 
+    /// ESS-865：本回合上行是否已经发出 `audio.commit`。已提交的回合不得再被
+    /// 「本地 AAC 收尾失败」当成未提交回合取消——音频已经在飞，取消会经
+    /// `uplinkFallback` 把整个会话判成通道失败并退回表盘。
+    var didCommitUplink: Bool { uplink?.didCommit == true }
+
     /// Start or replace the continuous conversation boundary. The identifier
     /// stays stable across all subsequent `beginTurn` calls until `closeConversation`.
     @discardableResult

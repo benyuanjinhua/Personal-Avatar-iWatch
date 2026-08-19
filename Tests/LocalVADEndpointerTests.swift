@@ -19,19 +19,21 @@ struct LocalVADEndpointerTests {
 
     @Test func fiveHundredMillisecondPauseDoesNotFinalize() {
         var vad = LocalVADEndpointer()
-        var events = feed(&vad, rms: 0.08, frames: 2, startingAt: 0)
-        events += feed(&vad, rms: 0, frames: 5, startingAt: 200)
-        events += feed(&vad, rms: 0.08, frames: 1, startingAt: 700)
+        var events = feed(&vad, rms: 0.08, frames: 3, startingAt: 0)
+        events += feed(&vad, rms: 0, frames: 5, startingAt: 300)
+        events += feed(&vad, rms: 0.08, frames: 1, startingAt: 800)
 
         #expect(events == [.speechStarted(atMs: 0)])
     }
 
+    /// ESS-865：预热窗（300ms）内的帧只用来估底噪，`speechStarted` 的**候选
+    /// 起点**仍是第一帧——起判时刻不因预热而漂移。
     @Test func playbackGuardSuppressesEchoFrames() {
         var vad = LocalVADEndpointer()
         vad.playbackEnded(atMs: 1_000)
 
         var events = feed(&vad, rms: 0.2, frames: 3, startingAt: 1_000)
-        events += feed(&vad, rms: 0.2, frames: 1, startingAt: 1_300)
+        events += feed(&vad, rms: 0.2, frames: 3, startingAt: 1_300)
 
         #expect(events == [.speechStarted(atMs: 1_300)])
     }
@@ -42,6 +44,147 @@ struct LocalVADEndpointerTests {
 
         #expect(events.first == .speechStarted(atMs: 0))
         #expect(events.last == .speechFinal(atMs: 60_000, reason: .maximumDuration))
+    }
+
+    // MARK: - ESS-865
+
+    /// 本单的回归钉子。真机 `.voiceChat`（AEC）路径下说话电平远低于历史固定门
+    /// 0.018（-35 dBFS）：08-11 起 13 次录音一次 `speech_started` 都没有，回合
+    /// 一路悬到 60s 录音自停。同样的电平现在必须能起判并在 700ms 静音后断句。
+    @Test func attenuatedSpeechBelowLegacyFixedThresholdStillEndpoints() {
+        let attenuated = 0.006
+        #expect(attenuated < LocalVADConfiguration().speechRMS, "样本必须低于历史固定门，否则钉不住回归")
+
+        var vad = LocalVADEndpointer()
+        var events = feed(&vad, rms: 0.0005, frames: 3, startingAt: 0)      // 采集起来后的环境底噪
+        events += feed(&vad, rms: attenuated, frames: 10, startingAt: 300)  // 1s 说话
+        events += feed(&vad, rms: 0.0005, frames: 7, startingAt: 1_300)     // 700ms 静音
+
+        #expect(events == [
+            .speechStarted(atMs: 300),
+            .speechFinal(atMs: 2_000, reason: .silence)
+        ])
+    }
+
+    /// 稳态环境噪声不得被当成说话——否则每一轮都会「起判 → 断句 → 提交噪声 →
+    /// 没听清 → 重新聆听」空转。
+    @Test func steadyBackgroundNoiseNeverStartsSpeech() {
+        var vad = LocalVADEndpointer()
+        let events = feed(&vad, rms: 0.01, frames: 50, startingAt: 0)
+
+        #expect(events.isEmpty)
+        #expect(vad.thresholdRMS > 0.01)
+    }
+
+    /// 同一环境噪声之上的真实说话仍要起判并断句。
+    @Test func speechAboveBackgroundNoiseStillEndpoints() {
+        var vad = LocalVADEndpointer()
+        var events = feed(&vad, rms: 0.01, frames: 20, startingAt: 0)       // 2s 环境噪声
+        events += feed(&vad, rms: 0.09, frames: 10, startingAt: 2_000)      // 1s 说话
+        events += feed(&vad, rms: 0.01, frames: 7, startingAt: 3_000)       // 700ms 回到噪声
+
+        #expect(events == [
+            .speechStarted(atMs: 2_000),
+            .speechFinal(atMs: 3_700, reason: .silence)
+        ])
+    }
+
+    /// ESS-865 复审阻断 2：**从未检测到语音的纯静音不得伪造断句**。
+    /// 上层对任何 `speechFinal` 都会无条件 `commitUplink()`；一旦提交，回合就
+    /// 离开 listening，会话层 30s/75s 提示与 120s 静默挂断从此永远到不了。
+    /// 静音的归属是会话层的静默治理，不是断句器。
+    @Test func pureSilenceNeverFabricatesFinalAtMaximumDuration() {
+        var vad = LocalVADEndpointer(configuration: LocalVADConfiguration(maximumTurnMs: 5_000))
+        let events = feed(&vad, rms: 0.0005, frames: 120, startingAt: 0)   // 12s，远超 5s 上限
+
+        #expect(events.isEmpty)
+        #expect(!vad.metrics.didDetectSpeech)
+    }
+
+    /// 但**说过话**的回合仍必须在上限处提交——持续说话不能悬到录音硬顶之后。
+    @Test func continuousSpeechStillFinalizesAtMaximumDuration() {
+        var vad = LocalVADEndpointer(configuration: LocalVADConfiguration(maximumTurnMs: 5_000))
+        let events = feed(&vad, rms: 0.08, frames: 120, startingAt: 0)
+
+        #expect(events.first == .speechStarted(atMs: 0))
+        #expect(events.last == .speechFinal(atMs: 5_000, reason: .maximumDuration))
+    }
+
+    /// ESS-865 复审阻断 1 的回归钉子：**用户一开麦就说话**（第 0 帧起就是
+    /// AEC 电平 0.006 RMS），此时底噪只能从语音帧里估，最小统计必然把说话
+    /// 电平本身当成底噪、把门顶到 0.018。停说后安静期到来、门落下来，
+    /// pre-roll 必须被回判，补出 `speechStarted` 并正常断句。
+    @Test func speechFromFirstFrameIsRecoveredOnceNoiseFloorSettles() {
+        var vad = LocalVADEndpointer()
+        var events = feed(&vad, rms: 0.006, frames: 10, startingAt: 0)      // 1s 说话，从第 0 帧起
+        #expect(events.isEmpty, "门被语音自身顶高时，起判只能延后，不能靠假设前几帧是环境音")
+
+        events += feed(&vad, rms: 0.0005, frames: 7, startingAt: 1_000)     // 停说 700ms
+
+        #expect(events == [
+            .speechStarted(atMs: 0),
+            .speechFinal(atMs: 1_700, reason: .silence)
+        ])
+    }
+
+    /// 回判不得把稳态噪声也救回来：噪声从头到尾没有更安静的时刻，
+    /// 判定门永远不下降，pre-roll 因此永远不会被回放。
+    @Test func preRollReplayDoesNotResurrectSteadyNoise() {
+        var vad = LocalVADEndpointer()
+        var events = feed(&vad, rms: 0.01, frames: 30, startingAt: 0)
+        events += feed(&vad, rms: 0.01, frames: 30, startingAt: 3_000)
+
+        #expect(events.isEmpty)
+    }
+
+    /// 单轮上限必须小于 `AudioRecorder.maxDuration`（60s），否则提交发生在
+    /// AVAudioRecorder 自停之后，本地 AAC 收尾会走进「从未起录」误判。
+    @Test func defaultMaximumTurnLeavesHeadroomBeforeRecorderHardStop() {
+        #expect(LocalVADConfiguration().maximumTurnMs < 60_000)
+    }
+
+    /// 判定门永远被绝对上下限夹住：既不会比历史固定门更迟钝，也不会低到
+    /// 把底噪当说话。
+    @Test func thresholdStaysWithinConfiguredBounds() {
+        let configuration = LocalVADConfiguration()
+        var quiet = LocalVADEndpointer(configuration: configuration)
+        _ = feed(&quiet, rms: 0.00001, frames: 10, startingAt: 0)
+        #expect(quiet.thresholdRMS >= configuration.minimumSpeechRMS)
+
+        var loud = LocalVADEndpointer(configuration: configuration)
+        _ = feed(&loud, rms: 0.5, frames: 10, startingAt: 0)
+        #expect(loud.thresholdRMS <= configuration.speechRMS)
+    }
+
+    /// 取证：每轮能量/门限必须可读，否则真机上「为什么不断句」再次不可判定。
+    @Test func metricsExposeEnergyEvidence() {
+        var vad = LocalVADEndpointer()
+        _ = feed(&vad, rms: 0.0005, frames: 3, startingAt: 0)
+        _ = feed(&vad, rms: 0.06, frames: 5, startingAt: 300)
+
+        let metrics = vad.metrics
+        #expect(metrics.frameCount == 8)
+        #expect(metrics.speechFrameCount == 5)
+        #expect(abs(metrics.peakRMS - 0.06) < 0.001)
+        #expect(metrics.didDetectSpeech)
+        #expect(metrics.logDetail.contains("threshold="))
+        #expect(metrics.logDetail.contains("speech_detected=true"))
+    }
+
+    /// 与 `WatchRealtimeMediaAdapterTests.testVADFinalAutomaticallyCommitsExactlyOnce`
+    /// 完全同一串帧（3 帧底噪 → 2 帧说话 → 8 帧静音）。adapter 只是把帧转给
+    /// 本类型，所以这条在 SwiftPM 侧确定性地钉住那条 Watch 用例的断言
+    /// （events.count == 2 且末条是 silence 断句）。
+    @Test func adapterFrameSequenceYieldsExactlyStartAndSilenceFinal() {
+        var vad = LocalVADEndpointer()
+        var events = feed(&vad, rms: 0, frames: 3, startingAt: 0)
+        events += feed(&vad, rms: 0.08, frames: 2, startingAt: 300)
+        events += feed(&vad, rms: 0, frames: 8, startingAt: 500)
+
+        #expect(events == [
+            .speechStarted(atMs: 300),
+            .speechFinal(atMs: 1_200, reason: .silence)
+        ])
     }
 
     @Test func rmsReadsLittleEndianPCM16() {

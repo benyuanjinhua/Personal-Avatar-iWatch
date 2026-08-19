@@ -308,10 +308,21 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         // box dump，此结论当前属实证推断（empirical, 4/4 consistent），
         // 需真机验证时补充 ffprobe 取证。代码层用双重守卫（isRecording +
         // 字节数 ≤ 容器开销阈值）兜底，即使该值随系统版本变化也不漏判。
-        if !wasRecording || data.count <= Self.m4aContainerOverheadApprox {
+        //
+        // ESS-865：`!wasRecording` 单独一条**不足以**判定「从未起录」。
+        // `record(forDuration: maxDuration)` 到点会自停，此后 `isRecording`
+        // 同样是 false，但容器里躺着一整轮真实音频。真机 L1
+        // （2026-08-19T01:45:49.184Z）：`bytes=261121 was_recording=false`
+        // 的 60 秒录音被当成「从未起录」整轮丢弃，随后 `unsubmitted_turn_aborted`
+        // → `session_channel_failed` → 退回表盘。判据因此收紧为「容器里有没有
+        // 真实音频」：`asset_ms > 0` 一票否决「从未起录」。asset 读不出来时
+        // （容器损坏/未 finalize）维持 ESS-375 的原判据不放松。
+        if Self.isRecordingNeverStarted(
+            wasRecording: wasRecording, byteCount: data.count, assetMs: assetMs
+        ) {
             WatchLog.error(
                 "recorder", "recording_never_started",
-                detail: "wall_clock_ms=\(wallClockMs) bytes=\(data.count) was_recording=\(wasRecording) container_overhead=\(Self.m4aContainerOverheadApprox)",
+                detail: "wall_clock_ms=\(wallClockMs) bytes=\(data.count) was_recording=\(wasRecording) asset_ms=\(assetMs.map(String.init) ?? "-") container_overhead=\(Self.m4aContainerOverheadApprox)",
                 code: "ERR_AUDIO_TOO_SHORT"
             )
             // ESS-375 L2 fix: 无效 M4A 文件必须在 throw 前清理。
@@ -321,6 +332,15 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
             currentURL = nil
             recorder = nil
             throw RecorderError.recordingNeverStarted
+        }
+
+        // ESS-865：录音器在收尾之前就自己停了（`record(forDuration:)` 到点），
+        // 但音频完好。留一条可 grep 的取证，与被误判丢弃的旧行为区分开。
+        if !wasRecording {
+            WatchLog.info(
+                "recorder", "record_auto_stopped_at_max",
+                detail: "asset_ms=\(assetMs.map(String.init) ?? "-") wall_clock_ms=\(wallClockMs) bytes=\(data.count) max_ms=\(Int(Self.maxDuration * 1000))"
+            )
         }
 
         // ESS-538: 录音被降腕息屏/会话中断截断、容器内只剩不可用残片 →
@@ -415,6 +435,23 @@ final class AudioRecorder: NSObject, ObservableObject, AVAudioRecorderDelegate {
         guard let start = recordingStartUptime else { return 0 }
         let elapsedNs = DispatchTime.now().uptimeNanoseconds &- start.uptimeNanoseconds
         return Self.sanitizeDurationMs(rawMs: Int(elapsedNs / 1_000_000))
+    }
+
+    /// ESS-865：「从未起录」的判据。抽成 static 纯函数便于单测直接钉边界
+    /// （真实起录在模拟器上不可达）。
+    ///
+    /// - Parameters:
+    ///   - wasRecording: `stop()` 之前 `AVAudioRecorder.isRecording` 的值。
+    ///   - byteCount: 落盘 M4A 的字节数。
+    ///   - assetMs: `AVURLAsset` 读到的容器内音频时长（读不出来为 nil）。
+    static func isRecordingNeverStarted(
+        wasRecording: Bool, byteCount: Int, assetMs: Int?
+    ) -> Bool {
+        // 容器里有可读且非零的音频 = 硬件确实采集过。`record(forDuration:)`
+        // 到点自停这条路径必然落在这里（isRecording 已 false，音频完好）。
+        if let assetMs, assetMs > 0 { return false }
+        // asset 读不出来时维持 ESS-375 原判据。
+        return !wasRecording || byteCount <= m4aContainerOverheadApprox
     }
 
     /// ESS-219 验收标准：`duration_ms` 超过录音上限视为计算错误，留痕后截断。

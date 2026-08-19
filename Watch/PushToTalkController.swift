@@ -104,6 +104,11 @@ final class PushToTalkController: ObservableObject {
     var onSessionTurnAborted: ((_ requestId: String, _ reason: String) -> Void)?
     /// 本地采集起停（与网络 ready 独立呈现）。
     var onLocalCaptureChanged: ((_ active: Bool) -> Void)?
+    /// ESS-865 复审整改：本轮**本地 VAD 真的听到人说话了**。
+    /// 会话层据此决定单轮上限到点要不要提交——从未听到人说话的回合到点提交
+    /// 等于把一段静音送上去，回合离开 listening，静默治理（30s/75s 提示、
+    /// 120s 挂断）从此永远到不了。
+    var onSessionSpeechDetected: ((_ requestId: String) -> Void)?
     /// ESS-650 F2-3：语音打断命中（携带 `detect_ms`）。会话层据此走与点球
     /// **同一个** `interruptSpeaking` 入口，只是 `source` 不同——两条路径落到
     /// 不同状态机，误触发率就永远算不出来（ESS-655 口径 3）。
@@ -905,12 +910,29 @@ final class PushToTalkController: ObservableObject {
         // ESS-600：本轮零提交（太短 / 收尾抛错）时把 request_id 交回会话层，
         // 由它退避后重开采集——否则会话会停在一个已经停录的死麦克风上。
         let turnRequestId = streamRequestId?.uuidString.lowercased()
+        // ESS-865：VAD 自动断句先提交上行、再收尾 AAC（ESS-575 的顺序）。
+        // 收尾这一步失败时本轮**不是**零提交——音频已经在飞，答案随时会来。
+        // 这种情况下报「回合中止」会让会话退避重开一轮，把在飞的答案落到
+        // 下一轮上（旧音频补播）；报「已提交」才是事实。
+        let uplinkAlreadyCommitted = turnRequestId.map { requestId in
+            realtimeAdapter?.currentTurn?.requestId == requestId
+                && realtimeAdapter?.hasCommittedUplink == true
+        } ?? false
         var abortReason: String?
         defer {
             state = .idle
             releaseRequestedWhileStarting = false
-            if let abortReason, let turnRequestId {
-                onSessionTurnAborted?(turnRequestId, abortReason)
+            if let turnRequestId {
+                if uplinkAlreadyCommitted, abortReason != nil {
+                    WatchLog.info(
+                        "realtime", "local_finish_failed_after_commit",
+                        requestId: turnRequestId,
+                        detail: "abort_reason=\(abortReason ?? "nil") outcome=turn_committed"
+                    )
+                    onSessionTurnCommitted?(turnRequestId)
+                } else if let abortReason {
+                    onSessionTurnAborted?(turnRequestId, abortReason)
+                }
             }
             flushPendingAutoPlay()
         }
@@ -977,8 +999,20 @@ final class PushToTalkController: ObservableObject {
         if let requestId = streamRequestId?.uuidString.lowercased() {
             pendingFallbackReason.removeValue(forKey: requestId)
             if let adapter = realtimeAdapter, adapter.currentTurn?.requestId == requestId {
-                WatchLog.info("realtime", "unsubmitted_turn_aborted", requestId: requestId)
-                adapter.cancel(reason: .cancelled)
+                // ESS-865：VAD 自动断句会先提交上行，再由 onVADEvent 收尾 AAC。
+                // 若收尾这一步抛错（中断/太短），回合其实**已经提交**，音频在飞，
+                // 答案随时可能回来。此时 cancel 会经 `uplinkFallback` 上报
+                // `session_channel_failed`，把整段会话打死并退回表盘——正是
+                // 本单要消掉的第二个现象。已提交的回合只留证，不取消。
+                if adapter.hasCommittedUplink {
+                    WatchLog.info(
+                        "realtime", "abort_skipped_committed_turn", requestId: requestId,
+                        detail: "reason=uplink_already_committed"
+                    )
+                } else {
+                    WatchLog.info("realtime", "unsubmitted_turn_aborted", requestId: requestId)
+                    adapter.cancel(reason: .cancelled)
+                }
             }
         }
         streamRequestId = nil
@@ -1122,7 +1156,16 @@ final class PushToTalkController: ObservableObject {
         // ESS-575: when VAD auto-commits on speech end, finish the AAC
         // recording so the file fallback and retry cache are set up.
         adapter.onVADEvent = { [weak self] event in
-            guard let self, case .speechFinal = event,
+            guard let self else { return }
+            if case .speechStarted = event {
+                // ESS-865：把「真的听到人说话了」如实交给会话层，供单轮上限
+                // 判定。用 adapter 的当前回合 id，与会话认领的那一轮对齐。
+                if let requestId = self.realtimeAdapter?.currentTurn?.requestId {
+                    self.onSessionSpeechDetected?(requestId)
+                }
+                return
+            }
+            guard case .speechFinal = event,
                   self.state == .recording, self.recorder.isRecording else { return }
             self.finishRecording()
         }
