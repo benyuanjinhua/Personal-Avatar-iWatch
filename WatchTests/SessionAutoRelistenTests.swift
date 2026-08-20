@@ -79,6 +79,41 @@ final class SessionAutoRelistenTests: XCTestCase {
         XCTAssertEqual(h.startedTurns.count, 2, "播完必须自动开下一轮，无需再次按键")
     }
 
+    /// ESS-944：真机首轮的真实时序是「submit/commit 先于首个 uplink ack」
+    /// （VAD 自动断句 + WSS 建立延迟）。旧实现把先到的 markTurnCommitted
+    /// 静默丢弃，首轮相位卡在 listening，play_finished 触发不了
+    /// auto-relisten——整段会话从第二轮起空转。这里用生产接线本体复现该
+    /// 顺序，断言闭环恢复。
+    func testTurnCommittedBeforeChannelReadyStillRelistens() {
+        let h = makeHarness()
+
+        h.session.enterSession()
+        guard let handle = h.startedTurns.last else { return XCTFail("首轮未起") }
+
+        // 提交先于就绪（真机 L1 顺序）。
+        h.pushToTalk.onSessionTurnCommitted?(handle.requestId)
+        XCTAssertEqual(h.session.turnPhase, .idle, "就绪前只记账，不推进相位")
+
+        // 首个真实 ack 才把通道打到就绪。
+        for _ in 0..<8 { h.recorder.feed(Harness.pcmFrame(rms: 0)) }
+        guard let chunk = h.transport.appendEvents.last else {
+            return XCTFail("上行未产生 audio.append，无法构造真实 ack")
+        }
+        h.adapter.receiveUplinkAck(RealtimeUplinkAck(
+            requestId: handle.requestId, sessionId: handle.sessionId,
+            sequence: chunk.sequence, byteCount: chunk.payload.count
+        ))
+        XCTAssertEqual(h.session.state, .listening)
+        XCTAssertEqual(h.session.turnPhase, .thinking, "提交先到 → 就绪后直接进入 thinking")
+
+        h.emitPlaybackStarted()
+        XCTAssertEqual(h.session.turnPhase, .speaking)
+
+        h.emitPlaybackEnded()
+        XCTAssertEqual(h.session.turnPhase, .listening, "播完应自动回到聆听")
+        XCTAssertEqual(h.startedTurns.count, 2, "播完必须自动开下一轮")
+    }
+
     // MARK: - 阻断 2：事件语义必须真实
 
     /// realtime 播放失败不得记成播完。会话仍要恢复到可说话，但事件必须
