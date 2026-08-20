@@ -19,9 +19,10 @@ enum ConversationAudioGate {
     static let defaultEnabled = true
 }
 
-/// Compile-time transport contract. `sendMessageData` is reachable-only and
-/// best-effort: it must never be used as a durable queue. A failed stream falls
-/// back once to the existing reliable complete-file path.
+/// Compile-time transport contract for the legacy gate-OFF/PTT path.
+/// Realtime conversation (conversation gate ON) is direct and must not fall
+/// back through the Mac Bridge, because both clients would compete for the
+/// upstream single-owner realtime slot (ESS-945).
 enum VoiceStreamTransportSemantics: Equatable {
     case reachableBestEffort
     case reliableCompleteFileFallback

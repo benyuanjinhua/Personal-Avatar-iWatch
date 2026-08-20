@@ -1441,6 +1441,21 @@ final class PushToTalkController: ObservableObject {
         requestId: String,
         reason: RealtimeUplinkStream.FallbackReason
     ) {
+        // ESS-945 architecture boundary: realtime conversation is direct
+        // Watch -> iPhone -> Gateway -> Qwen.  The Mac Bridge is the legacy
+        // complete-file/PTT path and must never compete for the upstream
+        // single-owner realtime slot.  Keep the old fallback only when the
+        // conversation gate is OFF (ordinary PTT compatibility).
+        guard !conversationAudioEnabled() else {
+            pendingRealtimeRecording.removeValue(forKey: requestId)
+            pendingFallbackReason.removeValue(forKey: requestId)
+            WatchLog.info(
+                "realtime", "legacy_bridge_fallback_suppressed",
+                requestId: requestId,
+                detail: "reason=\(reason) architecture=direct_realtime"
+            )
+            return
+        }
         let uuid = UUID(uuidString: requestId) ?? UUIDv7.generate()
         let envelope = VoiceRequestEnvelope.voiceRequest(
             requestId: uuid,

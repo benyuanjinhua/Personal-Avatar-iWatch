@@ -128,6 +128,7 @@ final class PushToTalkDeferredFallbackTests: XCTestCase {
     /// adapter-driven cases are skipped.
     func testDeferredFallbackDrainFiresExactlyOneUploadWithoutAdapter() {
         let controller = PushToTalkController()
+        controller.conversationAudioEnabled = { false }
         let requestId = "77777777-7777-7777-7777-777777777901"
         let tmpURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("ess501-\(UUID().uuidString).m4a")
@@ -154,5 +155,32 @@ final class PushToTalkDeferredFallbackTests: XCTestCase {
         )
         XCTAssertEqual(controller.submittedFullFileFallbackCount, 1,
                        "重复 drain 必须幂等")
+    }
+
+    /// ESS-945: the direct realtime conversation must never hand a failed or
+    /// cancelled turn to the legacy Mac Bridge, otherwise both paths compete
+    /// for the upstream single-owner voice slot.
+    func testConversationModeNeverUploadsLegacyFullFileFallback() {
+        let controller = PushToTalkController()
+        controller.conversationAudioEnabled = { true }
+        let requestId = "77777777-7777-7777-7777-777777777945"
+        let tmpURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ess945-\(UUID().uuidString).m4a")
+        try? Data(repeating: 0x33, count: 128).write(to: tmpURL)
+        defer { try? FileManager.default.removeItem(at: tmpURL) }
+        let recording = AudioRecorder.Recording(
+            fileURL: tmpURL,
+            data: (try? Data(contentsOf: tmpURL)) ?? Data(),
+            durationMs: 1_500
+        )
+
+        controller.retainRealtimeRecording(recording, forRequestId: requestId)
+        controller.simulateDeferredFallbackDrainForTests(
+            requestId: requestId,
+            reason: .transportFailed
+        )
+
+        XCTAssertEqual(controller.submittedFullFileFallbackCount, 0,
+                       "direct realtime must not enter the legacy Bridge path")
     }
 }
