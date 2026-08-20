@@ -83,16 +83,16 @@ final class SessionAutoRelistenTests: XCTestCase {
     /// （VAD 自动断句 + WSS 建立延迟）。旧实现把先到的 markTurnCommitted
     /// 静默丢弃，首轮相位卡在 listening，play_finished 触发不了
     /// auto-relisten——整段会话从第二轮起空转。这里用生产接线本体复现该
-    /// 顺序，断言闭环恢复。
-    func testTurnCommittedBeforeChannelReadyStillRelistens() {
+    /// 顺序并跑满 5 轮，断言闭环恢复且每轮都自动开下一轮。
+    func testTurnCommittedBeforeChannelReadyAcrossFiveTurns() {
         let h = makeHarness()
+        let rounds = 5
 
+        // 第 1 轮：提交先于就绪（真机 L1 顺序）。
         h.session.enterSession()
-        guard let handle = h.startedTurns.last else { return XCTFail("首轮未起") }
-
-        // 提交先于就绪（真机 L1 顺序）。
-        h.pushToTalk.onSessionTurnCommitted?(handle.requestId)
-        XCTAssertEqual(h.session.turnPhase, .idle, "就绪前只记账，不推进相位")
+        guard let firstHandle = h.startedTurns.last else { return XCTFail("首轮未起") }
+        h.pushToTalk.onSessionTurnCommitted?(firstHandle.requestId)
+        XCTAssertEqual(h.session.turnPhase, .thinking, "提交先到 → 直接进入 thinking")
 
         // 首个真实 ack 才把通道打到就绪。
         for _ in 0..<8 { h.recorder.feed(Harness.pcmFrame(rms: 0)) }
@@ -100,18 +100,30 @@ final class SessionAutoRelistenTests: XCTestCase {
             return XCTFail("上行未产生 audio.append，无法构造真实 ack")
         }
         h.adapter.receiveUplinkAck(RealtimeUplinkAck(
-            requestId: handle.requestId, sessionId: handle.sessionId,
+            requestId: firstHandle.requestId, sessionId: firstHandle.sessionId,
             sequence: chunk.sequence, byteCount: chunk.payload.count
         ))
         XCTAssertEqual(h.session.state, .listening)
-        XCTAssertEqual(h.session.turnPhase, .thinking, "提交先到 → 就绪后直接进入 thinking")
+        XCTAssertEqual(h.session.turnPhase, .thinking, "就绪不得覆盖已推进的 thinking 相位")
 
-        h.emitPlaybackStarted()
-        XCTAssertEqual(h.session.turnPhase, .speaking)
+        for round in 1...rounds {
+            // 第 1 轮已进入 thinking（提交先于就绪）；后续轮次就绪后再提交。
+            if round > 1 {
+                h.commitCurrentTurn()
+                XCTAssertEqual(h.session.turnPhase, .thinking, "第 \(round) 轮提交后应进入思考")
+            }
+            h.emitPlaybackStarted(responseId: "resp-\(round)")
+            XCTAssertEqual(h.session.turnPhase, .speaking, "第 \(round) 轮首帧渲染后应进入回答")
+            h.emitPlaybackEnded(responseId: "resp-\(round)")
+            XCTAssertEqual(h.session.turnPhase, .listening, "第 \(round) 轮播完应自动回到聆听")
+        }
 
-        h.emitPlaybackEnded()
-        XCTAssertEqual(h.session.turnPhase, .listening, "播完应自动回到聆听")
-        XCTAssertEqual(h.startedTurns.count, 2, "播完必须自动开下一轮")
+        XCTAssertEqual(h.startedTurns.count, rounds + 1, "5 轮播完应发起第 6 轮")
+        XCTAssertEqual(h.session.turnIndex, rounds + 1)
+        XCTAssertEqual(h.log.count(of: "play_finished"), rounds)
+        XCTAssertEqual(h.log.count(of: "session_answer_finished"), rounds)
+        XCTAssertEqual(h.log.count(of: "session_turn_committed"), rounds, "每轮都只提交一次")
+        XCTAssertEqual(h.log.count(of: "session_turn_event_dropped"), 0, "正常五轮不应丢任何相位事件")
     }
 
     // MARK: - 阻断 2：事件语义必须真实

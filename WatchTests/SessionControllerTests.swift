@@ -104,8 +104,8 @@ final class SessionControllerTests: XCTestCase {
 
     /// ESS-944：VAD 自动断句把首轮提交提前到建立窗口内，submit 先于首个
     /// uplink ack 到达（真机 L1：uplink_committed 02:48:01.4 先于首个 ack）。
-    /// 此时 markTurnCommitted 不得被静默丢弃——就绪后应直接进入 thinking，
-    /// 而不是假装还在听、把 play_finished 触发的 auto-relisten 整段打死。
+    /// 此时 markTurnCommitted 不得被静默丢弃——connecting 期间直接进入
+    /// thinking，就绪后不得把它写回 listening。
     func testTurnCommittedBeforeChannelReadyEntersThinking() {
         controller.enterSession()
         let requestId = controller.activeTurnRequestId!
@@ -115,14 +115,14 @@ final class SessionControllerTests: XCTestCase {
             return "req-next"
         }
 
-        // 提交先于就绪：只记账，不推进相位、不丢事件。
+        // 提交先于就绪：直接推进到 thinking，不丢事件。
         controller.markTurnCommitted(requestId: requestId)
         XCTAssertEqual(controller.state, .connecting)
-        XCTAssertEqual(controller.turnPhase, .idle)
+        XCTAssertEqual(controller.turnPhase, .thinking, "提交先到 → 直接进入 thinking")
 
         controller.markChannelReady()
         XCTAssertEqual(controller.state, .listening)
-        XCTAssertEqual(controller.turnPhase, .thinking, "提交先到 → 就绪后直接进入 thinking")
+        XCTAssertEqual(controller.turnPhase, .thinking, "就绪不得覆盖已推进的 thinking 相位")
 
         // 相位对了，realtime 播放事件才能一路走到自动重新聆听。
         controller.markAnswerStarted(requestId: requestId)
