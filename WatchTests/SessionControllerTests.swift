@@ -102,6 +102,48 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertFalse(controller.showConnectingDots)
     }
 
+    /// ESS-944：VAD 自动断句把首轮提交提前到建立窗口内，submit 先于首个
+    /// uplink ack 到达（真机 L1：uplink_committed 02:48:01.4 先于首个 ack）。
+    /// 此时 markTurnCommitted 不得被静默丢弃——connecting 期间直接进入
+    /// thinking，就绪后不得把它写回 listening。
+    func testTurnCommittedBeforeChannelReadyEntersThinking() {
+        controller.enterSession()
+        let requestId = controller.activeTurnRequestId!
+        var startTurnCount = 0
+        controller.onStartTurn = {
+            startTurnCount += 1
+            return "req-next"
+        }
+
+        // 提交先于就绪：直接推进到 thinking，不丢事件。
+        controller.markTurnCommitted(requestId: requestId)
+        XCTAssertEqual(controller.state, .connecting)
+        XCTAssertEqual(controller.turnPhase, .thinking, "提交先到 → 直接进入 thinking")
+
+        controller.markChannelReady()
+        XCTAssertEqual(controller.state, .listening)
+        XCTAssertEqual(controller.turnPhase, .thinking, "就绪不得覆盖已推进的 thinking 相位")
+
+        // 相位对了，realtime 播放事件才能一路走到自动重新聆听。
+        controller.markAnswerStarted(requestId: requestId)
+        XCTAssertEqual(controller.turnPhase, .speaking)
+        controller.markAnswerFinished(requestId: requestId)
+        XCTAssertEqual(controller.turnPhase, .listening)
+        XCTAssertEqual(startTurnCount, 1, "播完必须自动开下一轮")
+    }
+
+    /// ESS-944：提交先于就绪只对「本会话认领的那一轮」生效；陈旧回合的
+    /// 提交（request_id 对不上）照旧丢弃留证，不得污染下一轮。
+    func testStaleTurnCommittedBeforeChannelReadyIsDropped() {
+        controller.enterSession()
+        controller.markTurnCommitted(requestId: "req-stale")
+        XCTAssertEqual(controller.state, .connecting)
+
+        controller.markChannelReady()
+        XCTAssertEqual(controller.state, .listening)
+        XCTAssertEqual(controller.turnPhase, .listening, "陈旧回合不得被认领")
+    }
+
     /// 迟到的 ready（退出后才到的 ack）不得把会话拉回 listening。
     func testLateReadyAfterExitIsIgnored() {
         controller.enterSession()

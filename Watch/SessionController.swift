@@ -334,6 +334,16 @@ final class SessionController: ObservableObject {
         presentFirstRunGuideIfNeeded()
         // ESS-600：通道就绪 = 第 1 轮正式进入聆听相位。这一轮的采集早在
         // 点球 touch-down 就起来了，此处只是认领，不重新发起。
+        // ESS-944：提交可能先于就绪（VAD 自动断句 + WSS 建立延迟），此时
+        // turnPhase 已被 markTurnCommitted 推进到 thinking——就绪只补
+        // state 转换与触觉，绝不把「正在等回答」的回合改写回 listening。
+        if turnPhase != .idle {
+            WatchLog.info(
+                "session", "session_channel_ready_phase_preserved", requestId: activeTurnRequestId,
+                detail: "turn_index=\(turnIndex) phase=\(turnPhase.logName) reason=turn_already_advanced"
+            )
+            return
+        }
         turnPhase = .listening
         didDetectSpeechThisTurn = false
         WatchLog.info(
@@ -397,7 +407,13 @@ final class SessionController: ObservableObject {
     /// 不匹配一律丢弃并留证——这是迟到音频/迟到播放事件不得污染下一轮的
     /// 会话层防线（realtime 侧还有 currentTurn/generation 两道，各司其职）。
     private func acceptsTurnEvent(_ requestId: String, event: String) -> Bool {
-        guard state == .listening else { return false }
+        guard state == .listening else {
+            WatchLog.info(
+                "session", "session_turn_event_dropped", requestId: requestId,
+                detail: "event=\(event) state=\(state.logName) phase=\(turnPhase.logName) reason=not_listening turn_index=\(turnIndex)"
+            )
+            return false
+        }
         guard let active = activeTurnRequestId, active == requestId else {
             WatchLog.info(
                 "session", "session_stale_turn_event", requestId: requestId,
@@ -410,9 +426,32 @@ final class SessionController: ObservableObject {
 
     /// 本轮上行**真正提交**（`submit` 走完，realtime commit 或完整文件二选一）。
     /// listening → thinking。
+    ///
+    /// ESS-944：先校验 request_id 归属（陈旧回合照旧丢弃留证），再分状态。
+    /// 提交可能先于就绪（VAD 自动断句 + WSS 建立延迟）：connecting 期间
+    /// turnPhase 还是 .idle，但「已提交」是事实，直接推进到 thinking；
+    /// markChannelReady 据此不覆盖已推进的相位。
     func markTurnCommitted(requestId: String) {
-        guard acceptsTurnEvent(requestId, event: "turn_committed") else { return }
-        guard turnPhase == .listening else { return }
+        guard let active = activeTurnRequestId, active == requestId else {
+            WatchLog.info(
+                "session", "session_stale_turn_event", requestId: requestId,
+                detail: "event=turn_committed active_request_id=\(activeTurnRequestId ?? "nil") turn_index=\(turnIndex)"
+            )
+            return
+        }
+        let phaseReady: Bool
+        switch state {
+        case .listening: phaseReady = turnPhase == .listening
+        case .connecting: phaseReady = turnPhase == .idle
+        default: phaseReady = false
+        }
+        guard phaseReady else {
+            WatchLog.info(
+                "session", "session_turn_event_dropped", requestId: requestId,
+                detail: "event=turn_committed state=\(state.logName) phase=\(turnPhase.logName) reason=phase_not_ready turn_index=\(turnIndex)"
+            )
+            return
+        }
         turnCapToken?.cancel(); turnCapToken = nil
         turnPhase = .thinking
         WatchLog.info(
@@ -457,7 +496,13 @@ final class SessionController: ObservableObject {
     /// `answer_started → answer_finished`；永不到达则由超时把会话捞回聆听。
     func markAnswerInterim(requestId: String) {
         guard acceptsTurnEvent(requestId, event: "answer_interim") else { return }
-        guard turnPhase == .speaking || turnPhase == .thinking else { return }
+        guard turnPhase == .speaking || turnPhase == .thinking else {
+            WatchLog.info(
+                "session", "session_turn_event_dropped", requestId: requestId,
+                detail: "event=answer_interim state=\(state.logName) phase=\(turnPhase.logName) reason=phase_not_speaking_or_thinking turn_index=\(turnIndex)"
+            )
+            return
+        }
         let fromPhase = turnPhase
         turnPhase = .thinking
         // ESS-650：interim 播完退回等待态，已不在 speaking，停采。
@@ -473,7 +518,13 @@ final class SessionController: ObservableObject {
     /// thinking → speaking。收到 delta、入队、落盘都不算起播。
     func markAnswerStarted(requestId: String) {
         guard acceptsTurnEvent(requestId, event: "answer_started") else { return }
-        guard turnPhase == .thinking else { return }
+        guard turnPhase == .thinking else {
+            WatchLog.info(
+                "session", "session_turn_event_dropped", requestId: requestId,
+                detail: "event=answer_started state=\(state.logName) phase=\(turnPhase.logName) reason=phase_not_thinking turn_index=\(turnIndex)"
+            )
+            return
+        }
         thinkingToken?.cancel(); thinkingToken = nil
         turnPhase = .speaking
         WatchLog.info(
@@ -561,9 +612,18 @@ final class SessionController: ObservableObject {
     /// 一个既不听也不说的死态里（那正是「每轮按一次」都不如的体验）。
     func markAnswerFinished(requestId: String, success: Bool = true, reason: String = "playback_finished") {
         guard acceptsTurnEvent(requestId, event: "answer_finished") else { return }
-        guard turnPhase == .speaking || turnPhase == .thinking else { return }
+        guard turnPhase == .speaking || turnPhase == .thinking else {
+            WatchLog.info(
+                "session", "session_turn_event_dropped", requestId: requestId,
+                detail: "event=answer_finished state=\(state.logName) phase=\(turnPhase.logName) reason=phase_not_speaking_or_thinking turn_index=\(turnIndex)"
+            )
+            return
+        }
         let fromPhase = turnPhase
         if success {
+            // ESS-944：rounds 口径对齐 play_finished——只有回答真实播完才计一轮，
+            // 失败/打断/中止不计数（验收标准 4）。
+            markRoundCompleted()
             WatchLog.info(
                 "session", "session_answer_finished", requestId: requestId,
                 detail: "turn_index=\(turnIndex) from=\(fromPhase.logName) reason=\(reason)"
@@ -645,8 +705,6 @@ final class SessionController: ObservableObject {
         guard state == .listening else { return }
         relistenToken?.cancel(); relistenToken = nil
         thinkingToken?.cancel(); thinkingToken = nil
-        // ESS-652: the previous round just completed.
-        markRoundCompleted()
         guard let requestId = onStartTurn?() else {
             // 启动失败不许假装还在听。真实失败事件（录音启动失败 /
             // 通道死亡）会经 markChannelFailed 把会话收口。
