@@ -161,6 +161,11 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         self.audioEngine = audioEngine
         self.lifecycleOwner = lifecycleOwner
         self.playerNode = AVAudioPlayerNode()
+        // ESS-891 取证驱动：真机 downlink_pcm_level 显示系统 output_volume
+        // 固定 0.5（Watch 硬件默认），源 PCM rms_dbfs=-17.38 正常。用
+        // playerNode.volume=2.0 补偿系统减半，恢复正常响度（AVFoundation
+        // 支持 >1.0 放大）。只影响下行播放节点，不碰录音/回声消除。
+        self.playerNode.volume = 2.0
         audioEngine.attach(playerNode)
         audioEngine.connect(playerNode, to: audioEngine.mainMixerNode, format: audioFormat)
     }
