@@ -155,4 +155,29 @@ final class PushToTalkDeferredFallbackTests: XCTestCase {
         XCTAssertEqual(controller.submittedFullFileFallbackCount, 1,
                        "重复 drain 必须幂等")
     }
+
+    /// ESS-945: a lifecycle cancellation after realtime completion is not a
+    /// delivery failure and must not submit the retained m4a again.
+    func testCompletedRealtimeTurnSuppressesFullFileFallback() {
+        let controller = PushToTalkController()
+        let requestId = "77777777-7777-7777-7777-777777777945"
+        let tmpURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ess945-\(UUID().uuidString).m4a")
+        try? Data(repeating: 0x45, count: 128).write(to: tmpURL)
+        defer { try? FileManager.default.removeItem(at: tmpURL) }
+        let recording = AudioRecorder.Recording(
+            fileURL: tmpURL,
+            data: (try? Data(contentsOf: tmpURL)) ?? Data(),
+            durationMs: 1_500
+        )
+
+        controller.retainRealtimeRecording(recording, forRequestId: requestId)
+        controller.markRealtimeCompletedForTests(requestId: requestId, source: "play_finished")
+        controller.simulateDeferredFallbackDrainForTests(
+            requestId: requestId, reason: .cancelled
+        )
+
+        XCTAssertEqual(controller.submittedFullFileFallbackCount, 0)
+        XCTAssertTrue(controller.deferredFallbackReasons.isEmpty)
+    }
 }

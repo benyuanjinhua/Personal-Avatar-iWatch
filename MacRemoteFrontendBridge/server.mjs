@@ -732,7 +732,10 @@ export function createBridge(overrides = {}) {
     // retry of an accepted turn replays even if limits later changed (§6).
     const existing = ledger.get(requestId)
     if (existing) {
-      if (existing.body_sha256 !== bodySha) throw new ApiError(ERR.IDEMPOTENCY_CONFLICT)
+      if (existing.body_sha256 !== bodySha) {
+        log({ evt: 'duplicate_turn_rejected', request_id: requestId, reason: 'body_conflict' })
+        throw new ApiError(ERR.IDEMPOTENCY_CONFLICT)
+      }
       log({ evt: 'turn_replayed', request_id: requestId })
       return {
         status: 202,

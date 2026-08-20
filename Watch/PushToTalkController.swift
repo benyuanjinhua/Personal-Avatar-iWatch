@@ -172,6 +172,10 @@ final class PushToTalkController: ObservableObject {
     /// adapter's single-shot flag already prevents re-entry, so this map
     /// tracks the "already promised, still owed" outstanding fallbacks.
     private var pendingFallbackReason: [String: RealtimeUplinkStream.FallbackReason] = [:]
+    /// ESS-945: request ids whose realtime answer is already complete. A
+    /// foreground/lifecycle cancel may arrive much later; it is cleanup, not
+    /// evidence that the user's audio still needs reliable-path recovery.
+    private var completedRealtimeRequestIds: Set<String> = []
     /// A release can arrive while AVAudioRecorder is still being prepared. Keep
     /// it pending and finish only after record() has actually succeeded.
     private var releaseRequestedWhileStarting = false
@@ -1226,7 +1230,11 @@ final class PushToTalkController: ObservableObject {
             self?.onSessionAnswerStarted?(handle.requestId)
         }
         adapter.onAnswerPlaybackFinished = { [weak self] handle, bytes in
+            self?.markRealtimeCompleted(requestId: handle.requestId, source: "play_finished")
             self?.onSessionAnswerFinished?(handle.requestId, true, "realtime_rendered:\(bytes)")
+        }
+        adapter.onDownlinkCompleted = { [weak self] handle in
+            self?.markRealtimeCompleted(requestId: handle.requestId, source: "downlink_done")
         }
         adapter.onAnswerPlaybackFailed = { [weak self] handle, code in
             self?.onSessionAnswerFinished?(handle.requestId, false, "realtime_\(code)")
@@ -1421,6 +1429,16 @@ final class PushToTalkController: ObservableObject {
         handle: RealtimeMediaSession.TurnHandle,
         reason: RealtimeUplinkStream.FallbackReason
     ) {
+        guard !completedRealtimeRequestIds.contains(handle.requestId) else {
+            pendingRealtimeRecording.removeValue(forKey: handle.requestId)
+            pendingFallbackReason.removeValue(forKey: handle.requestId)
+            WatchLog.info(
+                "realtime", "fallback_full_file_suppressed",
+                requestId: handle.requestId,
+                detail: "reason=\(reason) completion=realtime_complete"
+            )
+            return
+        }
         if let recording = pendingRealtimeRecording.removeValue(forKey: handle.requestId) {
             submitFullFileFallback(recording: recording, requestId: handle.requestId, reason: reason)
         } else {
@@ -1441,6 +1459,16 @@ final class PushToTalkController: ObservableObject {
         requestId: String,
         reason: RealtimeUplinkStream.FallbackReason
     ) {
+        guard !completedRealtimeRequestIds.contains(requestId) else {
+            pendingRealtimeRecording.removeValue(forKey: requestId)
+            pendingFallbackReason.removeValue(forKey: requestId)
+            WatchLog.info(
+                "realtime", "fallback_full_file_suppressed",
+                requestId: requestId,
+                detail: "reason=\(reason) completion=realtime_complete"
+            )
+            return
+        }
         let uuid = UUID(uuidString: requestId) ?? UUIDv7.generate()
         let envelope = VoiceRequestEnvelope.voiceRequest(
             requestId: uuid,
@@ -1478,6 +1506,28 @@ final class PushToTalkController: ObservableObject {
     /// request id. Production paths do not read this.
     var deferredFallbackReasons: [String: RealtimeUplinkStream.FallbackReason] {
         pendingFallbackReason
+    }
+
+    private func markRealtimeCompleted(requestId: String, source: String) {
+        // Bound the in-memory tombstones. UUID request ids do not repeat in
+        // normal operation; retaining a small recent window is sufficient to
+        // absorb delayed lifecycle callbacks without growing for app uptime.
+        if completedRealtimeRequestIds.count >= 128,
+           let oldestArbitraryEntry = completedRealtimeRequestIds.first {
+            completedRealtimeRequestIds.remove(oldestArbitraryEntry)
+        }
+        completedRealtimeRequestIds.insert(requestId)
+        pendingRealtimeRecording.removeValue(forKey: requestId)
+        pendingFallbackReason.removeValue(forKey: requestId)
+        WatchLog.info(
+            "realtime", "fallback_completion_guard_armed", requestId: requestId,
+            detail: "source=\(source)"
+        )
+    }
+
+    /// ESS-945 deterministic seam: runtime callbacks use the same helper.
+    func markRealtimeCompletedForTests(requestId: String, source: String = "test") {
+        markRealtimeCompleted(requestId: requestId, source: source)
     }
 
     /// ESS-331 seam for tests: count of `transport.send(envelope:recording:)`

@@ -112,6 +112,10 @@ final class WatchRealtimeMediaAdapter {
     /// 只有本回合（requestId + sessionId 双匹配）的事件才上报；上一轮的迟到
     /// `.ended` 在这里就被 `currentTurn` 挡掉，并留证 `stale_playback_dropped`。
     var onAnswerPlaybackFinished: (@MainActor (RealtimeMediaSession.TurnHandle, _ bytesPlayed: Int) -> Void)?
+    /// ESS-945: the complete downlink has crossed the sequence barrier. From
+    /// this point a later lifecycle cancel must not resurrect the same user
+    /// audio through the full-file fallback path.
+    var onDownlinkCompleted: (@MainActor (RealtimeMediaSession.TurnHandle) -> Void)?
     /// ESS-600：realtime 播放失败。失败不得伪装成播完——会话层据此走
     /// `session_answer_failed` 的显式恢复路径。
     var onAnswerPlaybackFailed: (@MainActor (RealtimeMediaSession.TurnHandle, _ code: String) -> Void)?
@@ -771,6 +775,7 @@ final class WatchRealtimeMediaAdapter {
                     requestId: currentTurn?.requestId,
                     detail: "response_id=\(responseId ?? "nil") final_seq=\(final) waited_ms=0"
                 )
+                if let handle = currentTurn { onDownlinkCompleted?(handle) }
             case .zeroAudio(let responseId):
                 // -1 zero-audio contract. No `.ended` is expected; no
                 // `player.finish(...)` because there is nothing to drain.
@@ -780,6 +785,7 @@ final class WatchRealtimeMediaAdapter {
                     requestId: currentTurn?.requestId,
                     detail: "response_id=\(responseId ?? "nil") final_seq=-1"
                 )
+                if let handle = currentTurn { onDownlinkCompleted?(handle) }
             case .waiting(let missing, let responseId):
                 // ESS-527: arm the outer timer so a barrier that never
                 // fills is bounded. `checkBarrierRelease` on the coordinator
@@ -806,6 +812,7 @@ final class WatchRealtimeMediaAdapter {
                     code: "ERR_DONE_MISSING_FINAL_SEQUENCE"
                 )
                 player.finish(responseId: responseId)
+                if let handle = currentTurn { onDownlinkCompleted?(handle) }
             case .droppedStaleGeneration(let incoming, let active):
                 WatchLog.info(
                     "realtime", "stale_generation_dropped",
@@ -839,6 +846,7 @@ final class WatchRealtimeMediaAdapter {
                 requestId: currentTurn?.requestId,
                 detail: "response_id=\(responseId ?? "nil") final_seq=\(final)"
             )
+            if let handle = currentTurn { onDownlinkCompleted?(handle) }
         case .bargeInRequested(let handle, let fromGeneration):
             // Barge-in dumps every buffered downlink byte and moves the gate
             // into `.pending`; whatever the barrier was waiting on is now
