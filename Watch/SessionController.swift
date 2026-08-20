@@ -1,3 +1,4 @@
+import AVFoundation
 import Combine
 import Foundation
 
@@ -109,6 +110,10 @@ final class SessionController: ObservableObject {
     @Published private(set) var hungupSummary: String?
     /// ESS-652: 思考慢提示（25s 无回答），球下方文字。
     @Published private(set) var thinkingSlowHint = false
+    /// ESS-891：回答真实起播时系统输出音量过低 → 提示用户调高音量。应用
+    /// 无法编程式改系统音量（`AVAudioSession.outputVolume` 只读），这是唯一
+    /// 可行动的应用侧手段。仅 speaking 期间有效，离开 speaking 即清除。
+    @Published private(set) var lowVolumeHint = false
 
     /// 会话是否存续（连接中/聆听中）。视图据此切换双模 UI 与手势集。
     var isInSession: Bool {
@@ -122,6 +127,9 @@ final class SessionController: ObservableObject {
 
     /// 触觉播放接缝：生产由 WatchAppServices 接到 WatchHaptics；测试记调用。
     var playHaptic: (Haptic) -> Void = { _ in }
+    /// ESS-891：系统输出音量读取接缝。生产默认读真实 AVAudioSession；
+    /// 测试注入固定值做 0.5/1.0 对照（真机对照的确定性镜像）。
+    var readOutputVolume: () -> Float = { AVAudioSession.sharedInstance().outputVolume }
     /// 延迟执行接缝：生产用 Task.sleep；测试收集闭包手动触发，零睡眠。
     /// 返回取消令牌；已取消的闭包不得再触发语义（由本控制器用令牌失效兜底）。
     var scheduleDelay: (TimeInterval, @escaping @MainActor () -> Void) -> SessionDelayToken =
@@ -208,6 +216,9 @@ final class SessionController: ObservableObject {
     /// 声音再次触发 VAD，形成「太短 → 报错 → 又太短」的自激循环。
     /// 1.5s【待调】≈ 一句错误提示语音的长度。
     static let abortedTurnRelistenDelaySeconds: TimeInterval = 1.5
+    /// ESS-891：系统输出音量（0.0–1.0）低于此值时提示调高音量。真机取证
+    /// `output_volume=0.500` 已不可听，取 0.6 留出余量，覆盖 50% 及以下。
+    static let lowVolumeHintThreshold: Float = 0.6
     // MARK: ESS-652 超时与静默治理
     /// 思考慢提示：提交后无回答 > 此值显示慢提示。
     static let thinkingSlowHintSeconds: TimeInterval = 25.0
@@ -505,6 +516,7 @@ final class SessionController: ObservableObject {
         }
         let fromPhase = turnPhase
         turnPhase = .thinking
+        lowVolumeHint = false
         // ESS-650：interim 播完退回等待态，已不在 speaking，停采。
         stopBargeInListening(reason: "answer_interim")
         WatchLog.info(
@@ -531,6 +543,18 @@ final class SessionController: ObservableObject {
             "session", "session_answer_started", requestId: requestId,
             detail: "turn_index=\(turnIndex) phase=speaking"
         )
+        // ESS-891：回答真实起播时读一次系统输出音量。应用无法编程式调高
+        // 系统音量，过低时给一行可行动提示（用户旋转表冠调高）。
+        let volume = readOutputVolume()
+        lowVolumeHint = Self.shouldSurfaceLowVolumeHint(outputVolume: volume)
+        if lowVolumeHint {
+            WatchLog.info(
+                "session", "session_low_volume_hint", requestId: requestId,
+                detail: "output_volume=\(Self.volumeText(volume)) "
+                    + "threshold=\(Self.volumeText(Self.lowVolumeHintThreshold)) "
+                    + "turn_index=\(turnIndex)"
+            )
+        }
         // ESS-650 F2-2：gate ON 时 speaking 期间常开采集（只进 VAD、零上行）。
         // gate OFF 时**根本不开麦**——「回答时也在听」是要给用户明确承诺的，
         // 开关关着却在采集属于隐私违背，不是省事。
@@ -705,6 +729,7 @@ final class SessionController: ObservableObject {
         guard state == .listening else { return }
         relistenToken?.cancel(); relistenToken = nil
         thinkingToken?.cancel(); thinkingToken = nil
+        lowVolumeHint = false
         guard let requestId = onStartTurn?() else {
             // 启动失败不许假装还在听。真实失败事件（录音启动失败 /
             // 通道死亡）会经 markChannelFailed 把会话收口。
@@ -928,6 +953,7 @@ final class SessionController: ObservableObject {
         activeTurnRequestId = nil
         turnIndex = 0
         isCapturingLocally = false
+        lowVolumeHint = false
     }
     private func stopBargeInListeningOnTeardown() {
         stopBargeInListening(reason: "session_exit")
@@ -990,6 +1016,16 @@ final class SessionController: ObservableObject {
         case .listening, .disconnecting, .idle, .failed, .hungup:
             return "连接断了，本轮对话已结束"
         }
+    }
+
+    /// ESS-891：是否该提示调高音量（纯函数，便于钉住阈值）。
+    static func shouldSurfaceLowVolumeHint(outputVolume: Float) -> Bool {
+        outputVolume < lowVolumeHintThreshold
+    }
+
+    /// ESS-891：音量读数转日志固定精度（0.0–1.0）。
+    private static func volumeText(_ volume: Float) -> String {
+        String(format: "%.3f", volume)
     }
 
     private func cancelConnectingTimers() {

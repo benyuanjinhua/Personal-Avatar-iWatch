@@ -333,6 +333,20 @@ struct WatchContentView: View {
                         .transition(.opacity)
                 }
 
+                // ESS-891：回答播放中系统音量过低 → 一行可行动提示。
+                if session.lowVolumeHint {
+                    Text("音量较低，旋转表冠调高")
+                        .font(.caption)
+                        .foregroundStyle(.cyan)
+                        .lineLimit(1)
+                        .padding(.horizontal, 12)
+                        .position(
+                            x: proxy.size.width / 2,
+                            y: proxy.size.height * 0.5 + orbSize / 2 + 20
+                        )
+                        .transition(.opacity)
+                }
+
                 // X：右下角常驻，任何会话态可点——隐私开关，触控区
                 // ≥44×44pt。会话中球不接手势，不存在「点 X 误触球」的
                 // 重叠面（PRD §3.5.3 的不重叠规则由此结构性满足）。
@@ -369,6 +383,7 @@ struct WatchContentView: View {
             .animation(.easeInOut(duration: 0.2), value: session.showConnectingDots)
             .animation(.easeInOut(duration: 0.2), value: session.failureNotice)
             .animation(.easeInOut(duration: 0.3), value: session.showFirstRunGuide)
+            .animation(.easeInOut(duration: 0.3), value: session.lowVolumeHint)
         }
     }
 
