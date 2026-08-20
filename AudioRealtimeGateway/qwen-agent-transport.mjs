@@ -545,6 +545,21 @@ export class QwenAgentTransport {
           scheduleDone()
           return
         }
+        // Metadata is optional for the direct Watch stream (RealtimeSession
+        // ignores unknown agent events) but required by the full-file job
+        // executor so Bridge can preserve text and background task semantics.
+        if (event.type === 'transcript.final') {
+          noteResponseProgress()
+          onEvent({ type: 'agent.transcript.final', response_id: responseId,
+            role: event.role, content: typeof event.content === 'string' ? event.content : '' })
+          return
+        }
+        if (event.type.startsWith('task.') && event.task?.id) {
+          noteResponseProgress()
+          onEvent({ type: 'agent.task', response_id: responseId,
+            task: { id: String(event.task.id), status: event.task.status ?? event.type.slice(5) } })
+          return
+        }
         if (event.type === 'error' || event.type === 'session.error' || event.type === 'voice.error') {
           noteResponseProgress()
           fail(event.code ?? 'ERR_UPSTREAM_UNAVAILABLE', event.message ?? event.detail ?? 'upstream error')

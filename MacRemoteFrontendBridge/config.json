@@ -18,6 +18,11 @@
   "pairing_code_ttl_ms": 600000,
 
   "gateway_url": "http://127.0.0.1:3101",
+  "audio_realtime_gateway_url": "https://127.0.0.1:8444",
+  "fallback_jobs_enabled": true,
+  "fallback_hmac_secret_env": "FALLBACK_JOB_HMAC_SECRET",
+  "fallback_job_poll_ms": 100,
+  "fallback_job_wait_ms": 35000,
   "device_id": "jackson-iphone",
   "idle_disconnect_ms": 900000,
   "turn_timeout_ms": 120000,

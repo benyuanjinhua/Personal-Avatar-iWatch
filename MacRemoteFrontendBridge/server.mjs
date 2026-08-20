@@ -10,8 +10,8 @@
 //   WSS  /v1/voice/events             state / permission / result events
 //   GET  /v1/health
 //
-// Southbound (loopback gateway only, upstream public protocol — §7):
-//   WS   /api/realtime?sessionId=watch-bridge-v1-<device>   (audio inject)
+// Southbound: full-file fallback uses the loopback AudioRealtimeGateway HMAC
+// job API. Only Gateway owns the qwen voice WebSocket in production.
 //   SSE  /api/tasks/:id/events, GET/DELETE /api/tasks/:id, POST /api/permissions/:id
 //
 // Red lines enforced by construction: the bridge never invokes the Codex CLI,
@@ -37,6 +37,8 @@ import { VoiceStreamDownlink, VoiceStreamingNegotiator } from './voice-stream-do
 import { VoiceStreamUplink } from './voice-stream-uplink.mjs'
 import { PendingAnnouncementStreams } from './pending-announcement-streams.mjs'
 import { RealtimeMediaSession } from './realtime-media-session.mjs'
+import { FallbackJobClient } from './fallback-job-client.mjs'
+import { FallbackJobOutbox } from './fallback-job-outbox.mjs'
 
 const BASE = dirname(fileURLToPath(import.meta.url))
 
@@ -81,6 +83,7 @@ export function createBridge(overrides = {}) {
     terminalRetentionMs: CONFIG.turn_ledger_terminal_retention_ms ?? 7 * 24 * 60 * 60 * 1000,
     log,
   })
+  const fallbackOutbox = new FallbackJobOutbox({ stateDir })
   const gateway = new GatewayClient({
     baseUrl: CONFIG.gateway_url,
     sseMaxEventBytes: CONFIG.sse_max_event_bytes ?? 256 * 1024,
@@ -113,6 +116,30 @@ export function createBridge(overrides = {}) {
     maxTurnAttempts: CONFIG.max_turn_attempts,
     log: (...args) => log({ evt: 'supervisor', detail: args.map(String).join(' ').slice(0, 500) }),
   })
+  // Deterministic Bridge tests explicitly enable allow_test_pcm and retain
+  // their scripted supervisor as a test double. Production never selects this
+  // branch: its only full-file path is the authenticated Gateway job client.
+  const fallbackJobs = overrides.fallbackJobClient ?? (CONFIG.allow_test_pcm === true ? {
+    submitAndWait: async ({ requestId, audio: pcm16k, context = {} }) => {
+      const result = await supervisor.injectTurn(pcm16k, {
+        label: requestId, shouldRun: () => true,
+        parentRequestId: context.parentRequestId ?? null,
+        contextSummary: context.contextSummary ?? null,
+      })
+      return {
+        audio24k_base64: result.audio24k?.toString('base64') ?? null,
+        assistant_transcript: result.assistantTranscript ?? null,
+        user_transcript: result.userTranscript ?? null,
+        task_id: result.taskId ?? null,
+      }
+    },
+  } : new FallbackJobClient({
+    baseUrl: CONFIG.audio_realtime_gateway_url ?? 'http://127.0.0.1:8444',
+    secret: process.env[CONFIG.fallback_hmac_secret_env ?? 'FALLBACK_JOB_HMAC_SECRET'] ?? '',
+    pollMs: CONFIG.fallback_job_poll_ms ?? 100,
+    timeoutMs: CONFIG.fallback_job_wait_ms ?? 35_000,
+    log,
+  }))
   // D1 主路径（ESS-34）：本会话 Realtime WS 上的权限请求即会话级归属证明
   // （网关只下发 sessionId 匹配的任务权限事件），写开关关闭时定向 reject。
   supervisor.onPermissionRequested = task => watcher.denyRealtimePermission(task)
@@ -586,17 +613,22 @@ export function createBridge(overrides = {}) {
       }
 
       if (ledger.get(requestId)?.state === 'cancelled') return
-      ledger.update(requestId, { state: 'processing', detail: 'realtime_processing' })
-      const result = await supervisor.injectTurn(pcm16k, {
-        label: requestId,
-        parentRequestId: context.parentRequestId ?? null,
-        contextSummary: context.contextSummary ?? null,
-        // 串行队列：work deadline 在轮到本 turn 注入时重挂——按受理时刻起算
-        // 的话，积压队尾在排队期就被判死（ESS-36 真机 4×ERR_WORK_TIMEOUT）。
-        onStart: () => armWorkDeadline(requestId),
-        // 排队期间已被取消/超时判死的 turn 不再浪费一个 Realtime 会话轮次
-        shouldRun: () => !['completed', 'failed', 'cancelled'].includes(ledger.get(requestId)?.state),
+      ledger.update(requestId, { state: 'processing', detail: 'fallback_job_queued' })
+      if (CONFIG.fallback_jobs_enabled !== true && CONFIG.allow_test_pcm !== true) {
+        throw Object.assign(new Error('fallback jobs disabled'), { code: 'gateway_unavailable' })
+      }
+      log({ evt: 'fallback_job_submitting', request_id: requestId, audio_sha256: sha256hex(pcm16k) })
+      const fallbackResult = await fallbackJobs.submitAndWait({
+        requestId, audio: pcm16k, audioSha256: sha256hex(pcm16k), context,
       })
+      const result = {
+        taskId: fallbackResult?.task_id ?? null,
+        assistantTranscript: fallbackResult?.assistant_transcript ?? null,
+        userTranscript: fallbackResult?.user_transcript ?? null,
+        audio24k: fallbackResult?.audio24k_base64 ? Buffer.from(fallbackResult.audio24k_base64, 'base64') : null,
+        responseIds: [`${requestId}:fallback`],
+      }
+      log({ evt: 'fallback_job_completed', request_id: requestId })
 
       if (ledger.get(requestId)?.state === 'cancelled') {
         // Result arrived after a cancel during injection — do not overwrite.
@@ -676,6 +708,7 @@ export function createBridge(overrides = {}) {
         audio: resultAudioMeta,
         extra: { source: 'realtime_direct', user_transcript: result.userTranscript },
       }, 'completed')
+      fallbackOutbox.settle(requestId, 'completed')
     } catch (error) {
       const turn = ledger.get(requestId)
       if (!turn || ['completed', 'failed', 'cancelled'].includes(turn.state)) return
@@ -696,6 +729,15 @@ export function createBridge(overrides = {}) {
       } else if (error.code === 'ERR_TRANSCRIPT_DISCARDED') {
         // 语音未被识别为有效指令：稳定错误码，Watch 端可提示"没听清，请重说"
         ledger.fail(requestId, 'ERR_TRANSCRIPT_DISCARDED')
+      } else if (error.code === 'gateway_unavailable' || error.code === 'ERR_NOT_FOUND') {
+        log({ evt: 'fallback_job_failed', request_id: requestId, reason: 'gateway_unavailable' })
+        ledger.fail(requestId, 'ERR_UPSTREAM_UNAVAILABLE')
+      } else if (error.code === 'queue_timeout') {
+        log({ evt: 'fallback_job_failed', request_id: requestId, reason: 'queue_timeout' })
+        ledger.fail(requestId, 'ERR_WORK_TIMEOUT')
+      } else if (error.code) {
+        log({ evt: 'fallback_job_failed', request_id: requestId, reason: String(error.code).slice(0, 80) })
+        ledger.fail(requestId, 'ERR_PROCESSING_FAILED')
       } else if (error.stalled || error.sessionDead || error.connectionLost) {
         // 停摆已重放仍失败 / 重建后会话仍无响应：快速终态，禁止头部阻塞
         log({ evt: 'turn_stalled', request_id: requestId, err: String(error.message).slice(0, 300) })
@@ -706,6 +748,8 @@ export function createBridge(overrides = {}) {
       }
     } finally {
       disarmWorkDeadline(requestId)
+      const finalState = ledger.get(requestId)?.state
+      if (['completed', 'failed', 'cancelled'].includes(finalState)) fallbackOutbox.settle(requestId, finalState)
     }
   }
 
@@ -753,6 +797,10 @@ export function createBridge(overrides = {}) {
     if (audioBuf.length > CONFIG.max_audio_bytes) throw new ApiError(ERR.AUDIO_TOO_LARGE)
     if (sha256hex(audioBuf) !== meta.sha256) throw new ApiError(ERR.AUDIO_HASH_MISMATCH)
 
+    const persisted = fallbackOutbox.accept({
+      requestId, audio: audioBuf, meta, context: { parentRequestId, contextSummary },
+    })
+    if (persisted.status === 'conflict') throw new ApiError(ERR.IDEMPOTENCY_CONFLICT)
     const { turn } = ledger.create({
       requestId,
       deviceId: authInfo.deviceId,
@@ -1695,6 +1743,13 @@ export function createBridge(overrides = {}) {
   const servers = []
   function start() {
     recover()
+    for (const record of fallbackOutbox.pending()) {
+      const turn = ledger.get(record.request_id)
+      if (turn && !turn.task_id && !['completed', 'failed', 'cancelled'].includes(turn.state)) {
+        processTurn(record.request_id, fallbackOutbox.readAudio(record), record.meta, record.context).catch(error =>
+          log({ evt: 'fallback_recovery_failed', request_id: record.request_id, reason: String(error.message) }))
+      }
+    }
     resultAudio.startSweeper()
     const tlsOpts = {
       cert: readFileSync(resolve(BASE, CONFIG.tls_cert)),

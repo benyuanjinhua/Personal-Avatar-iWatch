@@ -26,6 +26,9 @@ import { TokenIssuer, IssuerError } from './token-issuer.mjs'
 import { RealtimeSession } from './realtime-session.mjs'
 import { MockAgentTransport } from './agent-transport.mjs'
 import { QwenAgentTransport } from './qwen-agent-transport.mjs'
+import { FallbackJobQueue } from './fallback-job-queue.mjs'
+import { createFallbackExecutor } from './fallback-executor.mjs'
+import { verifyServiceRequest } from './service-auth.mjs'
 
 const BASE = dirname(fileURLToPath(import.meta.url))
 
@@ -59,11 +62,23 @@ export function createGateway(overrides = {}) {
     log: (evt, extra) => log(evt, extra),
   })
   const agentTransport = createAgentTransport(CONFIG, { log, providerKey })
+  const realtimeTurns = new Map()
+  const fallbackSecret = process.env[CONFIG.fallback_hmac_secret_env ?? 'FALLBACK_JOB_HMAC_SECRET'] ?? ''
+  const fallbackQueue = new FallbackJobQueue({
+    stateDir, execute: createFallbackExecutor({
+      agentTransport, timeoutMs: CONFIG.fallback_upstream_timeout_ms ?? 30_000,
+    }),
+    turnState: requestId => realtimeTurns.get(requestId) ?? null,
+    maxJobs: CONFIG.fallback_queue_max_jobs ?? 64,
+    queueTimeoutMs: CONFIG.fallback_queue_timeout_ms ?? 30_000,
+    log: (evt, extra) => log(evt, extra),
+  })
 
   const wss = new WebSocketServer({ noServer: true })
 
   const server = createHttpListener(CONFIG, {
     devices, issuer, log, protocolVersion: CONFIG.protocol_version,
+    fallbackQueue, fallbackSecret,
   })
 
   server.on('upgrade', (req, socket, head) => {
@@ -117,15 +132,24 @@ export function createGateway(overrides = {}) {
         request_id: scope.request_id, session_id: scope.session_id,
         generation: scope.generation, device_id: scope.device_id,
       })
-      const downlink = createDownlinkGuard({
+      realtimeTurns.set(scope.request_id, 'active'); fallbackQueue.markTurnState(scope.request_id, 'active')
+      const guarded = createDownlinkGuard({
         ws, scope, log: (evt, extra) => log(evt, extra),
         maxBufferedBytes: CONFIG.max_downlink_buffered_bytes,
         warnBufferedBytes: CONFIG.downlink_backpressure_warn_bytes,
         closeGraceMs: CONFIG.downlink_close_grace_ms,
       })
+      const send = text => {
+        try {
+          const event = JSON.parse(text)
+          if (event.type === 'audio.done') { realtimeTurns.set(scope.request_id, 'downlink_done'); fallbackQueue.markTurnState(scope.request_id, 'downlink_done') }
+          if (event.type === 'error') { realtimeTurns.set(scope.request_id, 'failed'); fallbackQueue.markTurnState(scope.request_id, 'failed') }
+        } catch { /* RealtimeSession emits JSON only; guard remains authoritative */ }
+        guarded.send(text); void fallbackQueue.drain()
+      }
       const session = new RealtimeSession({
         scope,
-        send: downlink.send,
+        send,
         close: (code, reason) => ws.close(code, String(reason).slice(0, 120)),
         agentTransport,
         log: (evt, extra) => log(evt, extra),
@@ -140,14 +164,23 @@ export function createGateway(overrides = {}) {
       })
       ws.on('message', (raw, isBinary) => {
         if (isBinary) return session.onBinary()
+        try {
+          const event = JSON.parse(raw.toString('utf8'))
+          if (event.type === 'playback.ended') {
+            realtimeTurns.set(scope.request_id, 'playback_ended'); fallbackQueue.markTurnState(scope.request_id, 'playback_ended'); void fallbackQueue.drain()
+          }
+        } catch { /* session validates and reports malformed frames */ }
         session.onFrame(raw.toString('utf8'))
       })
       ws.once('close', (code, reason) => {
-        downlink.dispose()
+        guarded.dispose()
+        if (realtimeTurns.get(scope.request_id) === 'active') { realtimeTurns.set(scope.request_id, 'failed'); fallbackQueue.markTurnState(scope.request_id, 'failed') }
+        void fallbackQueue.drain()
         session.onSocketClose(code, reason?.toString())
       })
       ws.once('error', error => {
-        downlink.dispose()
+        guarded.dispose()
+        realtimeTurns.set(scope.request_id, 'failed'); fallbackQueue.markTurnState(scope.request_id, 'failed'); void fallbackQueue.drain()
         session.onSocketClose(1006, 'socket_error:' + error.message)
       })
     })
@@ -176,7 +209,7 @@ export function createGateway(overrides = {}) {
     })
   }
 
-  return { server, wss, devices, issuer, agentTransport, config: CONFIG, log, start, stop }
+  return { server, wss, devices, issuer, agentTransport, fallbackQueue, config: CONFIG, log, start, stop }
 }
 
 // Slow-consumer backpressure (ESS-746). `ws.send` never blocks: on a Watch
@@ -247,7 +280,7 @@ function readConfig(path) {
   try { return JSON.parse(readFileSync(path, 'utf8')) } catch { return {} }
 }
 
-function createHttpListener(CONFIG, { devices, issuer, log, protocolVersion }) {
+function createHttpListener(CONFIG, { devices, issuer, log, protocolVersion, fallbackQueue, fallbackSecret }) {
   const requestHandler = (req, res) => {
     const ip = peerIp(req.socket)
     if (!sourceAllowed(CONFIG, req.socket)) {
@@ -257,6 +290,14 @@ function createHttpListener(CONFIG, { devices, issuer, log, protocolVersion }) {
     const url = new URL(req.url, 'https://x')
     if (req.method === 'GET' && url.pathname === '/v1/health') {
       return writeJson(res, 200, { ok: true, service: 'audio-realtime-gateway', protocol_version: protocolVersion })
+    }
+    const fallbackMatch = /^\/v1\/fallback-jobs\/([^/]+)$/.exec(url.pathname)
+    if (CONFIG.fallback_jobs_enabled === true && fallbackMatch && ['POST', 'GET'].includes(req.method)) {
+      return handleFallbackJob(req, res, {
+        queue: fallbackQueue, secret: fallbackSecret, log, pathName: url.pathname,
+        requestId: decodeURIComponent(fallbackMatch[1]), method: req.method,
+        maxBytes: CONFIG.fallback_max_audio_bytes ?? 5 * 1024 * 1024,
+      })
     }
     if (req.method === 'POST' && url.pathname === '/v1/realtime/session-token') {
       return handleSignedJson(req, res, ({ body, deviceId }) => {
@@ -334,6 +375,43 @@ function handleSignedJson(req, res, act, { devices, log, pathName }) {
       log('http_error', { path: pathName, detail: String(error?.message ?? error).slice(0, 256) })
       return writeJson(res, 500, { error: 'ERR_INTERNAL' })
     }
+  })
+}
+
+function handleFallbackJob(req, res, { queue, secret, log, pathName, requestId, method, maxBytes }) {
+  const chunks = []; let bytes = 0
+  req.on('data', chunk => {
+    bytes += chunk.length
+    if (bytes > Math.ceil(maxBytes * 1.4) + 4096) {
+      writeJson(res, 413, { error: 'ERR_BODY_TOO_LARGE' }); req.destroy(); return
+    }
+    chunks.push(chunk)
+  })
+  req.on('end', () => {
+    const rawBody = Buffer.concat(chunks)
+    if (!verifyServiceRequest({ secret, headers: req.headers, method, path: pathName, body: rawBody })) {
+      log('fallback_job_rejected', { request_id: requestId, reason: 'auth_failed' })
+      return writeJson(res, 401, { status: 'rejected', reason: 'auth_failed' })
+    }
+    if (req.headers['x-request-id'] !== requestId) {
+      return writeJson(res, 400, { status: 'rejected', reason: 'request_id_mismatch' })
+    }
+    if (method === 'GET') {
+      const job = queue.get(requestId)
+      return job ? writeJson(res, 200, job) : writeJson(res, 404, { error: 'ERR_NOT_FOUND' })
+    }
+    let body
+    try { body = JSON.parse(rawBody.toString('utf8')) }
+    catch { return writeJson(res, 400, { status: 'rejected', reason: 'bad_json' }) }
+    if (body.request_id !== requestId || body.codec !== 'pcm_s16le_16k') {
+      return writeJson(res, 400, { status: 'rejected', reason: 'invalid_job' })
+    }
+    let audio
+    try { audio = Buffer.from(body.audio_base64, 'base64') } catch { audio = Buffer.alloc(0) }
+    if (!audio.length || audio.length > maxBytes) return writeJson(res, 413, { status: 'rejected', reason: 'audio_too_large' })
+    const result = queue.submit({ requestId, audio, audioSha256: body.audio_sha256 })
+    const status = result.status === 'accepted' || result.status === 'duplicate' ? 202 : 409
+    writeJson(res, status, { request_id: requestId, ...result })
   })
 }
 

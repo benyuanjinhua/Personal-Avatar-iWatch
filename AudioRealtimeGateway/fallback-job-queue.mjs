@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 const TERMINAL = new Set(['completed', 'rejected', 'failed', 'timed_out'])
@@ -14,10 +14,12 @@ export class FallbackJobQueue {
     queueTimeoutMs = 30_000, now = () => Date.now(), log = () => {} }) {
     if (!stateDir || typeof execute !== 'function') throw new Error('stateDir and execute are required')
     this.dir = join(stateDir, 'fallback-jobs')
+    this.turnStatesPath = join(stateDir, 'fallback-turn-states.json')
     this.execute = execute; this.turnState = turnState
     this.maxJobs = maxJobs; this.queueTimeoutMs = queueTimeoutMs
-    this.now = now; this.log = log; this.jobs = new Map(); this.draining = false
+    this.now = now; this.log = log; this.jobs = new Map(); this.turnStates = new Map(); this.draining = false
     mkdirSync(this.dir, { recursive: true })
+    try { this.turnStates = new Map(Object.entries(JSON.parse(readFileSync(this.turnStatesPath, 'utf8')))) } catch { /* first boot */ }
     this.#load()
   }
 
@@ -32,7 +34,7 @@ export class FallbackJobQueue {
       return same ? { status: 'duplicate', state: prior.state }
         : { status: 'rejected', reason: 'idempotency_conflict' }
     }
-    const state = this.turnState(requestId)
+    const state = this.#turnState(requestId)
     if (state === 'downlink_done' || state === 'playback_ended' || state === 'completed') {
       this.log('fallback_job_rejected', { request_id: requestId, reason: 'turn_already_completed' })
       return { status: 'rejected', reason: 'turn_already_completed' }
@@ -58,7 +60,7 @@ export class FallbackJobQueue {
         if (this.now() - job.accepted_at >= this.queueTimeoutMs) {
           this.#settle(job, 'timed_out', 'queue_timeout'); continue
         }
-        const state = this.turnState(job.request_id)
+        const state = this.#turnState(job.request_id)
         if (state === 'active' || state === 'owner_busy') continue
         if (state === 'downlink_done' || state === 'playback_ended' || state === 'completed') {
           this.#settle(job, 'rejected', 'turn_already_completed'); continue
@@ -77,6 +79,11 @@ export class FallbackJobQueue {
   }
 
   get(requestId) { const job = this.jobs.get(requestId); return job ? { ...job, audio_base64: undefined } : null }
+  markTurnState(requestId, state) {
+    this.turnStates.set(requestId, state)
+    const temp = `${this.turnStatesPath}.tmp`; writeFileSync(temp, JSON.stringify(Object.fromEntries(this.turnStates))); renameSync(temp, this.turnStatesPath)
+  }
+  #turnState(requestId) { return this.turnStates.get(requestId) ?? this.turnState(requestId) }
   #settle(job, state, reason, result = null) {
     job.state = state; job.reason = reason; job.result = result; job.settled_at = this.now(); this.#persist(job)
     this.log(`fallback_job_${state}`, { request_id: job.request_id, reason })
@@ -87,10 +94,7 @@ export class FallbackJobQueue {
   }
   #load() {
     let names = []
-    try { names = readFileSync(join(this.dir, '.index'), 'utf8').split('\n').filter(Boolean) } catch {
-      // The index is advisory; update it as jobs are discovered/submitted.
-      try { names = (awaitImportFsReaddir(this.dir)) } catch { names = [] }
-    }
+    try { names = readdirSync(this.dir) } catch { names = [] }
     for (const name of names) {
       if (!name.endsWith('.json')) continue
       try {
@@ -101,7 +105,3 @@ export class FallbackJobQueue {
     }
   }
 }
-
-// Kept outside the class so tests can use ordinary temporary directories.
-import { readdirSync } from 'node:fs'
-const awaitImportFsReaddir = dir => readdirSync(dir)

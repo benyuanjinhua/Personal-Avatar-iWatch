@@ -3,7 +3,8 @@
 Secure WSS entry that lets iPhone (and, transitively, Watch) speak realtime
 audio directly with the upstream Agent, without routing media through the Mac
 Remote Frontend Bridge. This is the server-side half of the ESS-388 direct
-link: Bridge stays as a feature-flagged fallback but is no longer the default
+link: Bridge persists complete-file fallback jobs and submits them through the
+Gateway's loopback HMAC API; it never opens a second qwen voice owner.
 realtime media plane.
 
 ## Red lines (from ESS-388 v_final / ESS-403)

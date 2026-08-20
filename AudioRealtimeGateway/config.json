@@ -41,5 +41,11 @@
   "agent_max_pending_bytes": 2097152,
   "agent_response_timeout_ms": 8000,
   "agent_takeover_voice": true,
+  "fallback_jobs_enabled": true,
+  "fallback_hmac_secret_env": "FALLBACK_JOB_HMAC_SECRET",
+  "fallback_queue_max_jobs": 64,
+  "fallback_queue_timeout_ms": 30000,
+  "fallback_upstream_timeout_ms": 30000,
+  "fallback_max_audio_bytes": 5242880,
   "provider_key_env": "AUDIO_REALTIME_PROVIDER_KEY"
 }
