@@ -37,6 +37,9 @@ describe('Gateway end-to-end', () => {
     gateway = createGateway({
       port: 0, bind: '127.0.0.1', state_dir: stateDir,
       dev_allow_plain_ws: true,
+      // Keep the Gateway protocol test hermetic. config.json selects the real
+      // agent transport for production, which is not available on hosted CI.
+      agent_transport: 'mock',
       heartbeat_interval_ms: 0, idle_disconnect_ms: 0,
       max_token_ttl_ms: 60_000, default_token_ttl_ms: 30_000,
     })
@@ -94,12 +97,18 @@ describe('Gateway end-to-end', () => {
     assert.equal(mint.body.scope.generation, 1)
 
     const captured = collectLogs()
+    let ws
     try {
       const url = `ws://127.0.0.1:${gateway.server.address().port}/api/realtime`
         + `?device_id=${body.device_id}&session_id=${body.session_id}`
         + `&request_id=${body.request_id}&generation=${body.generation}`
-      const ws = new WebSocket(url, { headers: { authorization: 'Bearer ' + mint.body.token } })
+      ws = new WebSocket(url, { headers: { authorization: 'Bearer ' + mint.body.token } })
       await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject) })
+      // Arm this before session.start. A configured upstream can fail immediately
+      // after ready and close the socket before the await-ready continuation runs.
+      // Registering the listener after sending the client close made hosted CI wait
+      // forever for an event that had already happened (ESS-965).
+      const closed = new Promise(resolve => ws.once('close', resolve))
       const received = []
       ws.on('message', raw => received.push(JSON.parse(raw.toString())))
       ws.send(JSON.stringify({
@@ -117,11 +126,14 @@ describe('Gateway end-to-end', () => {
       })
       assert.equal(ready.type, 'ready')
       assert.equal(ready.request_id, body.request_id)
-      ws.send(JSON.stringify({ type: 'close', reason: 'test_done' }))
-      await new Promise(resolve => ws.once('close', resolve))
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'close', reason: 'test_done' }))
+      }
+      await closed
       // Server-side onSocketClose fires on the next tick — give it a moment.
       await new Promise(resolve => setTimeout(resolve, 50))
     } finally {
+      if (ws && ws.readyState !== WebSocket.CLOSED) ws.terminate()
       captured.restore()
     }
     // Log correlation: ws_upgrade + session_ready + session_ended tagged
