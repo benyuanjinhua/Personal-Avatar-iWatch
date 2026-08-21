@@ -140,14 +140,18 @@ describe('ESS-41 B2: empty/mis-touch audio fails fast before injection', () => {
     assert.equal(ctx.mock.realtimeTurns, 0, 'short audio must never reach realtime injection')
   })
 
-  it('long-enough but pure-silence audio → ERR_AUDIO_TOO_SHORT (energy floor)', async () => {
+  // ESS-959：长度够、但全静音，必须报 ERR_AUDIO_TOO_QUIET 而不是「太短」。
+  // 这一条正是 ESS-959 的立单理由——59.9 秒的静音录音被报成「太短」，
+  // 定位时会往「录音被截断」方向查，而真正的问题是麦克风没采到声音。
+  // 两个错误码指向两条完全不同的排查路径，不能共用一个。
+  it('long-enough but pure-silence audio → ERR_AUDIO_TOO_QUIET (energy floor)', async () => {
     const id = rid()
     await ctx.client.createTurn(id, Buffer.alloc(16000)) // 500ms @16k, RMS=0
     const failed = await waitFor(async () => {
       const r = await ctx.client.getTurn(id)
       return r.json.status === 'failed' ? r.json : null
     })
-    assert.equal(failed.error, 'ERR_AUDIO_TOO_SHORT')
+    assert.equal(failed.error, 'ERR_AUDIO_TOO_QUIET')
     assert.equal(ctx.mock.realtimeTurns, 0)
   })
 

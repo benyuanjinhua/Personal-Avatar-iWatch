@@ -84,8 +84,14 @@ describe('heartbeat + idle timeout', () => {
     assert.ok(pings.length >= 2, `expected ≥2 server_pings, got ${pings.length}`)
   })
 
+  // ESS-959：本例只验「客户端 ping 是否重置空闲窗口」，与提交看门狗无关。
+  // 时间线跨到 40s，会撞上新增的 commitDeadlineMs（默认 30s）并收到
+  // ERR_COMMIT_DEADLINE_TIMEOUT，把这条用例变成两个机制的混合探针。
+  // 显式关掉提交看门狗，让断言仍然只反映空闲窗口这一件事。
   it('client ping resets the idle window', () => {
-    const { session, sent, clock, scope } = harness({ heartbeatIntervalMs: 0 })
+    const { session, sent, clock, scope } = harness({
+      heartbeatIntervalMs: 0, commitDeadlineMs: 0,
+    })
     clock.advance(20_000)
     session.onFrame(JSON.stringify({ type: 'ping', nonce: 'x' }))
     clock.advance(20_000)
