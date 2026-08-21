@@ -8,7 +8,9 @@ const sha256 = value => createHash('sha256').update(value).digest('hex')
 // Durable, single-consumer queue for full-file fallback turns. Records are
 // intentionally one file per job: an atomic rename settles each transition,
 // and a process restart can recover queued/executing work without replaying a
-// terminal job. The upstream request id remains stable across recovery.
+// terminal job. Recovery is at-least-once: an interrupted executing record is
+// requeued with the same request id because the upstream cannot expose whether
+// its result committed before the crash.
 export class FallbackJobQueue {
   constructor({ stateDir, execute, turnState = () => null, maxJobs = 64,
     queueTimeoutMs = 30_000, ownerBusy = () => false, now = () => Date.now(), log = () => {},
@@ -140,12 +142,11 @@ export class FallbackJobQueue {
       if (!name.endsWith('.json')) continue
       try {
         const job = JSON.parse(readFileSync(join(this.dir, name), 'utf8'))
-        // The upstream has no idempotency-result lookup. Replaying an
-        // interrupted execution could duplicate an already-produced side
-        // effect, so fail closed and surface the uncertainty for retry policy
-        // rather than falsely claiming exactly-once.
+        // Architecture decision ESS-949 / plan B: prefer not losing the
+        // answer. The upstream has no result lookup, so this is explicitly
+        // at-least-once and may duplicate a reply in the narrow crash window.
         if (job.state === 'executing') {
-          job.state = 'failed'; job.reason = 'execution_outcome_unknown'; job.settled_at = this.now()
+          job.state = 'queued'; job.reason = 'recovered_after_unknown_outcome'
           this.#persist(job)
         }
         this.jobs.set(job.request_id, job)

@@ -11,7 +11,7 @@ const audio = Buffer.from('safe full-file audio')
 const hash = createHash('sha256').update(audio).digest('hex')
 const dir = () => mkdtempSync(join(tmpdir(), 'ess949-'))
 
-test('active -> queued -> released -> executed exactly once', async () => {
+test('active -> queued -> released -> executes once during normal operation', async () => {
   let state = 'active'; let calls = 0
   const q = new FallbackJobQueue({ stateDir: dir(), turnState: () => state,
     execute: async () => { calls++; return { text: 'ok' } } })
@@ -73,7 +73,7 @@ test('gateway restart autonomously resumes queued work without an external event
   restarted.dispose()
 })
 
-test('gateway restart never replays an execution whose upstream outcome is unknown', async () => {
+test('gateway restart requeues an execution with unknown outcome under at-least-once policy', async () => {
   const stateDir = dir(); let calls = 0
   const first = new FallbackJobQueue({ stateDir, execute: () => new Promise(() => { calls++ }) })
   first.submit({ requestId: 'r-crashed-executing', audio, audioSha256: hash })
@@ -81,8 +81,9 @@ test('gateway restart never replays an execution whose upstream outcome is unkno
   assert.equal(first.get('r-crashed-executing').state, 'executing')
   const restarted = new FallbackJobQueue({ stateDir, execute: async () => { calls++ } })
   await new Promise(resolve => setImmediate(resolve))
-  assert.equal(calls, 1)
-  assert.equal(restarted.get('r-crashed-executing').reason, 'execution_outcome_unknown')
+  assert.equal(calls, 2)
+  assert.equal(restarted.get('r-crashed-executing').state, 'completed')
+  assert.equal(restarted.get('r-crashed-executing').attempts, 2)
   restarted.dispose()
 })
 
