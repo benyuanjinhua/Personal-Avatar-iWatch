@@ -63,6 +63,24 @@ test('agent transport forwards real upstream audio with request-scoped logs', as
   turn.close()
 })
 
+test('sends the Jackson soul instruction in the upstream connect handshake', async () => {
+  const received = []
+  const url = await upstream((ws, message) => {
+    received.push(message)
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+  })
+  const instruction = '你是 Jackson 的数字分身，帮助处理协同事务、学习知识和记录灵感。'
+  const transport = new QwenAgentTransport({ gatewayUrl: url, instruction })
+  const turn = transport.openTurn({
+    requestId: 'soul-r1', sessionId: 'soul-s1', generation: 1,
+    responseId: 'soul-r1:gen1', onEvent: () => {},
+  })
+  await waitFor(() => received.some(event => event.type === 'connect'))
+  const connect = received.find(event => event.type === 'connect')
+  assert.equal(connect.instruction, instruction)
+  turn.close()
+})
+
 // ESS-745: request_id is client-supplied (token-issuer only checks it is a
 // string), and one transport instance serves every connection of the process.
 // Two different devices/sessions may therefore present the SAME request_id.

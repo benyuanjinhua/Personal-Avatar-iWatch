@@ -90,6 +90,7 @@ export class QwenAgentTransport {
     // the client side is mirrored by `AudioRealtimeAgentConfig.responseWaitTimeout`.
     // n=9 is a thin sample (R-04.4), which is why this stays a config knob.
     responseTimeoutMs = 8_000,
+    instruction = '',
     takeover = true,
     log = () => {},
   } = {}) {
@@ -105,6 +106,7 @@ export class QwenAgentTransport {
     this.reorderWaitMs = reorderWaitMs
     this.maxReorderFrames = maxReorderFrames
     this.responseTimeoutMs = responseTimeoutMs
+    this.instruction = String(instruction || '').trim()
     this.takeover = takeover
     this.log = log
     this.turns = new Map()
@@ -414,6 +416,7 @@ export class QwenAgentTransport {
           clientInstanceId: turn.clientInstanceId, voiceEnabled: true,
           manualTurnDetection: true, takeover: this.takeover,
           timeZone: 'Asia/Shanghai', locale: 'zh-CN',
+          ...(this.instruction ? { instruction: this.instruction } : {}),
         }))
       })
       ws.on('message', raw => {

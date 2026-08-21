@@ -26,6 +26,7 @@ import { TokenIssuer, IssuerError } from './token-issuer.mjs'
 import { RealtimeSession } from './realtime-session.mjs'
 import { MockAgentTransport } from './agent-transport.mjs'
 import { QwenAgentTransport } from './qwen-agent-transport.mjs'
+import { loadSoulInstruction } from './soul-instruction.mjs'
 import { FallbackJobQueue } from './fallback-job-queue.mjs'
 import { createFallbackExecutor } from './fallback-executor.mjs'
 import { verifyServiceRequest } from './service-auth.mjs'
@@ -537,6 +538,8 @@ function createAgentTransport(CONFIG, { log }) {
   // Production uses the already deployed qwen-audio-agent as the provider
   // owner instead of duplicating DashScope protocol and credential handling.
   if (kind === 'agent') {
+    const soulPath = resolve(BASE, CONFIG.soul_path ?? '../soul.md')
+    const instruction = loadSoulInstruction(soulPath)
     return new QwenAgentTransport({
       gatewayUrl: CONFIG.agent_gateway_url ?? 'ws://127.0.0.1:3101/api/realtime',
       connectTimeoutMs: CONFIG.agent_connect_timeout_ms ?? 10_000,
@@ -545,6 +548,7 @@ function createAgentTransport(CONFIG, { log }) {
       maxDownlinkFrames: CONFIG.max_downlink_frames ?? 4096,
       maxDownlinkBytes: CONFIG.max_downlink_bytes ?? 32 * 1024 * 1024,
       responseTimeoutMs: CONFIG.agent_response_timeout_ms ?? 8_000,
+      instruction,
       takeover: CONFIG.agent_takeover_voice !== false,
       log: (evt, extra) => log(evt, extra),
     })
