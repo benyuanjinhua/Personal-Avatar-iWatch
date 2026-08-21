@@ -37,6 +37,16 @@ public struct LocalVADConfiguration: Equatable, Sendable {
     /// 救回「一开麦就说话、底噪只能从语音帧里估」那条时序（ESS-865 复审阻断 1）。
     public var preRollMs: Int64
     public var speechStartMs: Int64
+    /// 起判所需的**最少连续帧数**。
+    ///
+    /// ESS-961 第二轮：`speechStartMs = 100ms` 而真机帧长约 97ms——一帧的
+    /// 时长就已经满足时长条件，于是任意一个孤立脉冲（咂嘴、碰撞、环境瞬态）
+    /// 都能开启一轮，700ms 后收口提交，用户来不及说话（2026-08-21 18:14
+    /// 真机：整轮 `speech_frames=1`，rms=0.00670 单帧越过 0.00350 的门）。
+    ///
+    /// 时长条件从原理上挡不住它——一帧就是一个 `speechStartMs`。判据必须
+    /// 显式落在「连续性」上：孤立脉冲只有一帧，真语音跨多帧。
+    public var minimumSpeechFrames: Int
     public var endpointSilenceMs: Int64
     public var playbackGuardMs: Int64
     /// 单轮硬上限。**必须小于 `AudioRecorder.maxDuration`**：AVAudioRecorder
@@ -53,6 +63,7 @@ public struct LocalVADConfiguration: Equatable, Sendable {
         noiseWindowMs: Int64 = 2_000,
         preRollMs: Int64 = 8_000,
         speechStartMs: Int64 = 100,
+        minimumSpeechFrames: Int = 2,
         endpointSilenceMs: Int64 = 700,
         playbackGuardMs: Int64 = 300,
         maximumTurnMs: Int64 = 55_000
@@ -66,6 +77,7 @@ public struct LocalVADConfiguration: Equatable, Sendable {
         precondition(noiseWindowMs > 0)
         precondition(preRollMs > 0)
         precondition(speechStartMs > 0)
+        precondition(minimumSpeechFrames >= 1)
         precondition(endpointSilenceMs > 0)
         precondition(playbackGuardMs >= 0)
         precondition(maximumTurnMs > 0)
@@ -77,6 +89,7 @@ public struct LocalVADConfiguration: Equatable, Sendable {
         self.noiseWindowMs = noiseWindowMs
         self.preRollMs = preRollMs
         self.speechStartMs = speechStartMs
+        self.minimumSpeechFrames = minimumSpeechFrames
         self.endpointSilenceMs = endpointSilenceMs
         self.playbackGuardMs = playbackGuardMs
         self.maximumTurnMs = maximumTurnMs
@@ -127,6 +140,8 @@ public struct LocalVADEndpointer: Sendable {
 
     private var turnStartedAtMs: Int64 = 0
     private var speechCandidateStartedAtMs: Int64?
+    /// ESS-961：当前候选段已连续跨门的帧数。孤立脉冲与真语音的唯一区别。
+    private var candidateSpeechFrames = 0
     private var speechStartedAtMs: Int64?
     private var lastSpeechAtMs: Int64?
     private var guardUntilMs: Int64 = 0
@@ -166,6 +181,7 @@ public struct LocalVADEndpointer: Sendable {
     public mutating func reset(atMs: Int64 = 0) {
         turnStartedAtMs = atMs
         speechCandidateStartedAtMs = nil
+        candidateSpeechFrames = 0
         speechStartedAtMs = nil
         lastSpeechAtMs = nil
         guardUntilMs = atMs
@@ -184,6 +200,7 @@ public struct LocalVADEndpointer: Sendable {
     /// 只可能发生在回答播完之后）。
     public mutating func playbackEnded(atMs: Int64) {
         speechCandidateStartedAtMs = nil
+        candidateSpeechFrames = 0
         lastSpeechAtMs = nil
         guardUntilMs = atMs + configuration.playbackGuardMs
         turnStartedAtMs = guardUntilMs
@@ -261,7 +278,12 @@ public struct LocalVADEndpointer: Sendable {
             if speechStartedAtMs == nil {
                 let candidateStart = speechCandidateStartedAtMs ?? frameStartedAtMs
                 speechCandidateStartedAtMs = candidateStart
-                if frameEndedAtMs - candidateStart >= configuration.speechStartMs {
+                candidateSpeechFrames += 1
+                // ESS-961 第二轮：时长条件挡不住孤立脉冲——真机帧长 ≈97ms，
+                // 一帧就已经满足 `speechStartMs = 100ms`。必须同时要求
+                // **连续帧数**，孤立脉冲只有一帧，真语音跨多帧。
+                if frameEndedAtMs - candidateStart >= configuration.speechStartMs,
+                   candidateSpeechFrames >= configuration.minimumSpeechFrames {
                     speechStartedAtMs = candidateStart
                     events.append(.speechStarted(atMs: candidateStart))
                 }
@@ -274,6 +296,7 @@ public struct LocalVADEndpointer: Sendable {
             appendPreRoll(startedAtMs: frameStartedAtMs, endedAtMs: frameEndedAtMs, rms: rms)
         }
         speechCandidateStartedAtMs = nil
+        candidateSpeechFrames = 0
         guard speechStartedAtMs != nil, let lastSpeechAtMs else { return events }
         if frameEndedAtMs - lastSpeechAtMs >= configuration.endpointSilenceMs {
             isFinal = true
@@ -328,15 +351,18 @@ public struct LocalVADEndpointer: Sendable {
                 runFrames = 0
             }
         }
+        let rescuedFrames = max(bestFrames, runFrames)
         guard let start = runStart, let end = runEnd,
-              end - start >= configuration.speechStartMs else { return nil }
+              end - start >= configuration.speechStartMs,
+              rescuedFrames >= configuration.minimumSpeechFrames else { return nil }
         // ESS-961 取证：救回的帧必须计进 speech_frames，否则真机日志会出现
         // 「speech_started 却 speech_frames=0」这种自相矛盾的记录——本次回归
         // 的第一条线索就是它，但当时无法分辨那是回判救回的还是纯误判。
-        speechFrameCount += max(bestFrames, runFrames)
+        speechFrameCount += rescuedFrames
         speechStartedAtMs = start
         lastSpeechAtMs = end
         speechCandidateStartedAtMs = nil
+        candidateSpeechFrames = 0
         preRoll.removeAll(keepingCapacity: true)
         return .speechStarted(atMs: start)
     }

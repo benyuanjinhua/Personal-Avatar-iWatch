@@ -196,6 +196,46 @@ struct LocalVADEndpointerTests {
                 "speech_started 却 speech_frames=0 是不可解释的取证")
     }
 
+    /// ESS-961 第二轮（2026-08-21 18:14 真机）：**单帧脉冲不得开启一轮**。
+    ///
+    /// 上一版修好了回判误判（这轮 `speech_frames=1` 说明走的是实时路径，
+    /// 回判分支没再触发），但暴露了下一层：
+    ///
+    /// ```
+    /// 18:14:13.309  frames=1   rms=0.00134 noise_floor=0.00134 threshold=0.00401 speech_detected=false
+    /// 18:14:14.964  speech_started frames=18 speech_frames=1 rms=0.00670 noise_floor=0.00069 threshold=0.00350
+    /// 18:14:15.679  speech_final   reason=silence frames=25 speech_frames=1
+    /// ```
+    ///
+    /// 整轮**只有 1 帧**越过门。帧长约 97ms，而 `speechStartMs = 100ms`——
+    /// 一帧的时长就已经满足 `frameEndedAtMs - candidateStart >= speechStartMs`，
+    /// 于是任意一个孤立脉冲（咂嘴、碰撞、环境瞬态）都能开启一轮，700ms 后
+    /// 收口提交，用户来不及说话。
+    ///
+    /// 时长条件挡不住这个：一帧就是 100ms。只能显式要求**连续多帧**。
+    @Test func isolatedLoudFrameDoesNotStartSpeech() {
+        var vad = LocalVADEndpointer()
+        // 真机数值：底噪 0.00069 附近，中间夹一帧 0.00670 的孤立脉冲。
+        var events = feed(&vad, rms: 0.00069, frames: 15, startingAt: 0)
+        events += feed(&vad, rms: 0.00670, frames: 1, startingAt: 1_500)
+        events += feed(&vad, rms: 0.00072, frames: 12, startingAt: 1_600)
+
+        #expect(events.isEmpty)
+        #expect(!vad.metrics.didDetectSpeech)
+    }
+
+    /// 对照：真说话（连续多帧）必须照常起判并断句——不能为了挡脉冲把
+    /// 短促但真实的一句话也挡掉。
+    @Test func shortRealUtteranceStillStartsAndEndpoints() {
+        var vad = LocalVADEndpointer()
+        var events = feed(&vad, rms: 0.00069, frames: 15, startingAt: 0)
+        events += feed(&vad, rms: 0.00670, frames: 4, startingAt: 1_500)
+        events += feed(&vad, rms: 0.00072, frames: 10, startingAt: 1_900)
+
+        #expect(events.contains { if case .speechStarted = $0 { return true }; return false })
+        #expect(events.contains { if case .speechFinal = $0 { return true }; return false })
+    }
+
     /// 单轮上限必须小于 `AudioRecorder.maxDuration`（60s），否则提交发生在
     /// AVAudioRecorder 自停之后，本地 AAC 收尾会走进「从未起录」误判。
     @Test func defaultMaximumTurnLeavesHeadroomBeforeRecorderHardStop() {
