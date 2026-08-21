@@ -313,20 +313,31 @@ final class PhoneRealtimeSession {
 
     private func transition(to newState: State) {
         guard state != newState else { return }
-        // ESS-960：失败即终态。Gateway token 是**单次上行**的（每回合现铸，
-        // 见 `AudioRealtimeAgentSession` "maxReconnectAttempts = 0 — single-use
-        // tokens make reconnect impossible without a fresh token"），所以回合
-        // 中途重开在协议上本来就不可能成功——只有新的 `stream.start` 才带得来
-        // 新 token。把这条契约在这里落成状态，后续上行帧就再也泵不出握手。
+        // ESS-960：把「这一轮还能不能重开」落成状态，后续上行帧就再也泵不出
+        // 无节制的握手。
+        //
+        // 区分两种失败（2026-08-21 18:27 真机教的）：
+        //
+        // - **已经 `.active` 过**：握手成功、token 已被网关消耗。Gateway token
+        //   是单次上行的（见 `AudioRealtimeAgentSession` "maxReconnectAttempts
+        //   = 0 — single-use tokens make reconnect impossible without a fresh
+        //   token"），重开在协议上不可能成功 → 一次即终态。
+        // - **还停在 `.connecting`**：握手压根没成功，token 没进过网关的账，
+        //   重试是合理的。上一版把这种也判终态，结果当晚网关因 ESS-886 复发
+        //   对所有握手回 401，整轮当场判死，用户连说话的机会都没有。
+        //   现在允许有界重试（闸门内计数），超限才封。
         if case .failed(let reason) = newState, let turn = Self.turnIdentity(of: state) {
+            let wasActive: Bool
+            if case .active = state { wasActive = true } else { wasActive = false }
             turnGate.noteFailure(
-                requestId: turn.requestId, sessionId: turn.sessionId, terminal: true
+                requestId: turn.requestId, sessionId: turn.sessionId, wasActive: wasActive
             )
             PhoneAgentClientLog.info(
                 module: "phone_session",
-                event: "realtime_turn_closed",
+                event: "realtime_turn_failed",
                 requestId: turn.requestId, sessionId: turn.sessionId,
-                detail: "reason=\(reason) closed_turns=\(turnGate.closedTurnCount)"
+                detail: "reason=\(reason) was_active=\(wasActive) "
+                    + "closed_turns=\(turnGate.closedTurnCount)"
             )
         }
         state = newState

@@ -33,29 +33,60 @@ struct RealtimeTurnGate: Equatable {
         case suppress(reason: String)
     }
 
-    /// 已判终态、禁止再打开的回合。
+    private struct Entry: Equatable {
+        let turn: Turn
+        var handshakeFailures: Int
+        var closed: Bool
+    }
+
+    /// 最近若干个回合的闸门状态。
     ///
     /// **有界**：只保留最近 `capacity` 个。一个永不清理的集合正是
-    /// ESS-742/743/744 那一类缺陷；这里存的是「最近判死的回合」，
-    /// 超出容量的老回合早就不会再有帧进来，丢掉无损。
-    private var closed: [Turn] = []
+    /// ESS-742/743/744 那一类缺陷；超出容量的老回合早就不会再有帧进来。
+    private var entries: [Entry] = []
     private let capacity: Int
+    /// 握手连续失败多少次后封死该回合。
+    private let maxHandshakeAttempts: Int
 
-    init(capacity: Int = 8) {
+    init(capacity: Int = 8, maxHandshakeAttempts: Int = 3) {
         self.capacity = max(1, capacity)
+        self.maxHandshakeAttempts = max(1, maxHandshakeAttempts)
     }
 
     /// 通道进入失败态时调用。
     ///
-    /// - Parameter terminal: 服务端明确 `retriable: false`，或本地判定不可恢复。
-    ///   只有终态才封死回合——可重试的失败仍允许上层按自己的节奏重开，
-    ///   本类型不替它决定重试策略。
-    mutating func noteFailure(requestId: String, sessionId: String, terminal: Bool) {
-        guard terminal else { return }
+    /// - Parameter wasActive: 失败前这条通道是否**已经握手成功**（`.active`）。
+    ///
+    /// 这个区分是 2026-08-21 18:27 真机事故教的：当时网关因 ESS-886 复发对
+    /// **所有**握手回 401（`missing_bearer`），客户端拿到 `-1011`，而上一版
+    /// 闸门把「第一次握手就被拒」也当成终态，于是整轮当场判死、用户连说话的
+    /// 机会都没有。
+    ///
+    /// 「token 单次使用、重开必然失败」这条理由**只适用于已经握手成功过的
+    /// 通道**——那时 token 确实被消耗了。握手本身被拒时 token 压根没进过
+    /// 网关的账，重试是合理的；但也不能无界重试（那就退回 255 次风暴），
+    /// 所以给一个小的上限。
+    mutating func noteFailure(requestId: String, sessionId: String, wasActive: Bool) {
         let turn = Turn(requestId: requestId, sessionId: sessionId)
-        guard !closed.contains(turn) else { return }
-        closed.append(turn)
-        if closed.count > capacity { closed.removeFirst(closed.count - capacity) }
+        if let index = entries.firstIndex(where: { $0.turn == turn }) {
+            if wasActive {
+                entries[index].closed = true
+            } else {
+                entries[index].handshakeFailures += 1
+                if entries[index].handshakeFailures >= maxHandshakeAttempts {
+                    entries[index].closed = true
+                }
+            }
+            return
+        }
+        entries.append(
+            Entry(
+                turn: turn,
+                handshakeFailures: wasActive ? 0 : 1,
+                closed: wasActive || maxHandshakeAttempts <= 1
+            )
+        )
+        if entries.count > capacity { entries.removeFirst(entries.count - capacity) }
     }
 
     /// 新回合显式开始（`stream.start`）时调用：解除该回合的封印。
@@ -65,7 +96,7 @@ struct RealtimeTurnGate: Equatable {
     /// 会被上一轮的判死结论误伤。
     mutating func noteTurnStart(requestId: String, sessionId: String) {
         let turn = Turn(requestId: requestId, sessionId: sessionId)
-        closed.removeAll { $0 == turn }
+        entries.removeAll { $0.turn == turn }
     }
 
     /// 这个信封能不能打开通道。
@@ -73,12 +104,13 @@ struct RealtimeTurnGate: Equatable {
     /// - Parameter isTurnStart: 该信封是否为 `stream.start`。
     func decide(requestId: String, sessionId: String, isTurnStart: Bool) -> Decision {
         if isTurnStart { return .open }
-        guard closed.contains(Turn(requestId: requestId, sessionId: sessionId)) else {
+        let turn = Turn(requestId: requestId, sessionId: sessionId)
+        guard let entry = entries.first(where: { $0.turn == turn }), entry.closed else {
             return .open
         }
         return .suppress(reason: "turn_closed_terminal")
     }
 
-    /// 取证用：当前封了几个回合。
-    var closedTurnCount: Int { closed.count }
+    /// 取证用：当前封死了几个回合。
+    var closedTurnCount: Int { entries.filter(\.closed).count }
 }
