@@ -61,6 +61,21 @@ const noisePcm = (ms = 400) => {
 }
 const rid = () => 'req_' + crypto.randomUUID().replaceAll('-', '')
 
+// Bridge 结构化日志经 process.stdout 输出；测试里截获它来断言
+// audio_too_short / audio_too_quiet 的实测值与阈值字段。
+function collectLogs() {
+  const lines = []
+  const original = process.stdout.write.bind(process.stdout)
+  process.stdout.write = chunk => {
+    if (typeof chunk === 'string' && chunk.startsWith('{"ts"')) lines.push(JSON.parse(chunk.trim()))
+    return original(chunk)
+  }
+  return {
+    lines,
+    restore() { process.stdout.write = original },
+  }
+}
+
 describe('ESS-41 B1: realtime observability must not feed the taskwatch breaker', () => {
   let ctx
   before(async () => { ctx = await launch({ scenario: 'background', overrides: { max_turn_events: 3 } }) })
@@ -130,14 +145,25 @@ describe('ESS-41 B2: empty/mis-touch audio fails fast before injection', () => {
   it('60ms tail-silence (真机 1920 bytes 取证同款) → ERR_AUDIO_TOO_SHORT within 2s, no injection', async () => {
     const id = rid()
     const t0 = Date.now()
-    await ctx.client.createTurn(id, Buffer.alloc(1920)) // 60ms @16k, 全静音
-    const failed = await waitFor(async () => {
-      const r = await ctx.client.getTurn(id)
-      return r.json.status === 'failed' ? r.json : null
-    })
+    const captured = collectLogs()
+    let failed
+    try {
+      await ctx.client.createTurn(id, Buffer.alloc(1920)) // 60ms @16k, 全静音
+      failed = await waitFor(async () => {
+        const r = await ctx.client.getTurn(id)
+        return r.json.status === 'failed' ? r.json : null
+      })
+    } finally {
+      captured.restore()
+    }
     assert.equal(failed.error, 'ERR_AUDIO_TOO_SHORT')
     assert.ok(Date.now() - t0 < 2000, 'must fail fast, not run the stall machine')
     assert.equal(ctx.mock.realtimeTurns, 0, 'short audio must never reach realtime injection')
+    // ESS-959：过短拒因要带实测时长与阈值，供客户端/定位直接对照。
+    const evt = captured.lines.find(l => l.evt === 'audio_too_short' && l.request_id === id)
+    assert.ok(evt, 'expected an audio_too_short structured log')
+    assert.equal(evt.duration_ms, 60, 'measured duration must be 60ms for 1920 bytes @16k')
+    assert.equal(evt.min_audio_ms, 300, 'threshold must be the configured 300ms')
   })
 
   // ESS-959：长度够、但全静音，必须报 ERR_AUDIO_TOO_QUIET 而不是「太短」。
@@ -146,13 +172,26 @@ describe('ESS-41 B2: empty/mis-touch audio fails fast before injection', () => {
   // 两个错误码指向两条完全不同的排查路径，不能共用一个。
   it('long-enough but pure-silence audio → ERR_AUDIO_TOO_QUIET (energy floor)', async () => {
     const id = rid()
-    await ctx.client.createTurn(id, Buffer.alloc(16000)) // 500ms @16k, RMS=0
-    const failed = await waitFor(async () => {
-      const r = await ctx.client.getTurn(id)
-      return r.json.status === 'failed' ? r.json : null
-    })
+    const captured = collectLogs()
+    let failed
+    try {
+      await ctx.client.createTurn(id, Buffer.alloc(16000)) // 500ms @16k, RMS=0
+      failed = await waitFor(async () => {
+        const r = await ctx.client.getTurn(id)
+        return r.json.status === 'failed' ? r.json : null
+      })
+    } finally {
+      captured.restore()
+    }
     assert.equal(failed.error, 'ERR_AUDIO_TOO_QUIET')
     assert.equal(ctx.mock.realtimeTurns, 0)
+    // ESS-959：过静拒因要带实测能量与阈值——长度够（500ms）但 RMS=0，
+    // 拒因是能量过低，不是时长过短。
+    const evt = captured.lines.find(l => l.evt === 'audio_too_quiet' && l.request_id === id)
+    assert.ok(evt, 'expected an audio_too_quiet structured log')
+    assert.equal(evt.duration_ms, 500, 'measured duration must be 500ms')
+    assert.equal(evt.rms, 0, 'measured rms must be 0 for pure silence')
+    assert.equal(evt.min_audio_rms, 100, 'threshold must be the configured 100')
   })
 
   it('normal-length voiced audio still goes through and completes', async () => {
