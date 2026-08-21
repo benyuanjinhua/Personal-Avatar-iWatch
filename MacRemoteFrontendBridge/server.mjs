@@ -614,8 +614,21 @@ export function createBridge(overrides = {}) {
       // ≈60ms 的尾部静音走完整停摆链后误报 ERR_REALTIME_STALLED）。
       const durationMs = pcm16k.length / 32 // 16kHz mono PCM16 = 32 bytes/ms
       const rms = pcmRms16(pcm16k)
-      if (durationMs < (CONFIG.min_audio_ms ?? 0) || rms < (CONFIG.min_audio_rms ?? 0)) {
-        log({ evt: 'audio_too_short', request_id: requestId, pcm_bytes: pcm16k.length, duration_ms: Math.round(durationMs), rms: Math.round(rms) })
+      const minAudioMs = CONFIG.min_audio_ms ?? 0
+      const minAudioRms = CONFIG.min_audio_rms ?? 0
+      // ESS-959：两个完全不同的拒因共用一个 `audio_too_short` 事件名，把
+      // 59.9s 的静音录音（rms=5，≈-76 dBFS，被能量下限拦下）报成「太短」，
+      // 第一眼会把定位带向「录音被截断」。拆成两个事件，各带触发的阈值与
+      // 实测值，静音与过短在日志里可直接区分。
+      if (durationMs < minAudioMs) {
+        log({ evt: 'audio_too_short', request_id: requestId, pcm_bytes: pcm16k.length,
+          duration_ms: Math.round(durationMs), min_audio_ms: minAudioMs, rms: Math.round(rms) })
+        ledger.fail(requestId, 'ERR_AUDIO_TOO_SHORT')
+        return
+      }
+      if (rms < minAudioRms) {
+        log({ evt: 'audio_too_quiet', request_id: requestId, pcm_bytes: pcm16k.length,
+          duration_ms: Math.round(durationMs), rms: Math.round(rms), min_audio_rms: minAudioRms })
         ledger.fail(requestId, 'ERR_AUDIO_TOO_SHORT')
         return
       }
