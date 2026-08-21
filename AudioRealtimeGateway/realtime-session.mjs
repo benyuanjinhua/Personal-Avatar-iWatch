@@ -44,6 +44,11 @@ export class RealtimeSession {
     heartbeatIntervalMs = 15_000,
     idleDisconnectMs = 60_000,
     doneBarrierGapMs = 30_000,
+    // ESS-959: 「session_ready → uplink_committed」的看门狗时限。上游的
+    // responseTimeoutMs 只在 commit 之后起算，建连了但永远不 commit 的
+    // 会话没有任何服务端时限，只能等上游 socket 自然死亡（真机实测白等
+    // 30s）。超时 fail-closed，不再把兜底寄托在上游 socket 生命周期。
+    commitDeadlineMs = 30_000,
     maxFrameBytes = 64 * 1024,
     maxEventsPerSecond = 200,
     maxUplinkBytesPerSecond = 512 * 1024,
@@ -79,6 +84,7 @@ export class RealtimeSession {
     this.maxUplinkBytesPerSecond = maxUplinkBytesPerSecond
     this.maxDownlinkFrames = maxDownlinkFrames
     this.maxDownlinkBytes = maxDownlinkBytes
+    this.commitDeadlineMs = commitDeadlineMs
     this.now = now
     this.setTimer = setTimer
     this.clearTimer = clearTimer
@@ -89,6 +95,7 @@ export class RealtimeSession {
     this.uplinkCommitted = false
     this.firstUplinkAt = null
     this.firstDownlinkAt = null
+    this._commitDeadlineTimer = null
 
     // Generation-scoped state. On barge-in the WSS is torn down and a new
     // handshake with generation+1 makes a new session, so we only ever have
@@ -187,6 +194,7 @@ export class RealtimeSession {
     if (this._heartbeatTimer) this.clearTimer(this._heartbeatTimer)
     if (this._idleTimer) this.clearTimer(this._idleTimer)
     this._clearBarrierTimer()
+    this._clearCommitDeadline()
     if (this.agentTurn) { try { this.agentTurn.close() } catch { /* ignore */ } }
     this.log('session_ended', {
       request_id: this.scope.request_id, session_id: this.scope.session_id,
@@ -239,6 +247,35 @@ export class RealtimeSession {
       request_id: this.scope.request_id, session_id: this.scope.session_id,
       generation: this.scope.generation, response_id: this.responseId,
     })
+    this._armCommitDeadline()
+  }
+
+  /// ESS-959: arm the「建连后迟迟不 commit」看门狗。session_ready 后起算，
+  /// 超时 fail-closed 并落结构化事件；audio.commit 到达时清除。
+  _armCommitDeadline() {
+    if (this.commitDeadlineMs <= 0 || this._commitDeadlineTimer) return
+    this._commitDeadlineTimer = this.setTimer(() => {
+      this._commitDeadlineTimer = null
+      if (this.state !== OPEN || this.uplinkCommitted || this.cancelled) return
+      this.log('commit_deadline_timeout', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
+        deadline_ms: this.commitDeadlineMs,
+        frames_seen: this.nextUplinkSequence,
+      })
+      this.fail('ERR_COMMIT_DEADLINE_TIMEOUT', {
+        detail: `no audio.commit within ${this.commitDeadlineMs}ms of session.start`,
+        retriable: true,
+      })
+    }, this.commitDeadlineMs)
+    this._commitDeadlineTimer.unref?.()
+  }
+
+  _clearCommitDeadline() {
+    if (this._commitDeadlineTimer) {
+      this.clearTimer(this._commitDeadlineTimer)
+      this._commitDeadlineTimer = null
+    }
   }
 
   _handleAudioAppend(message) {
@@ -246,7 +283,7 @@ export class RealtimeSession {
     if (this.cancelled) return this.fail('ERR_GENERATION_STALE')
     if (message.sequence !== this.nextUplinkSequence) {
       return this.fail('ERR_STREAM_SEQUENCE', {
-        expected: this.nextUplinkSequence, got: message.sequence,
+        expected_sequence: this.nextUplinkSequence, got_sequence: message.sequence,
       })
     }
     const bytes = decodeAudio(message.audio)
@@ -285,6 +322,7 @@ export class RealtimeSession {
       })
     }
     this.uplinkCommitted = true
+    this._clearCommitDeadline()
     try { this.agentTurn.commit() }
     catch (error) { return this.fail('ERR_UPSTREAM_UNAVAILABLE', { detail: String(error?.message ?? error) }) }
     this.log('uplink_committed', {
