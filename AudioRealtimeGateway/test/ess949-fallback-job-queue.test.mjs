@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -38,10 +38,11 @@ test('completed turn is rejected with explicit reason', () => {
     { status: 'rejected', reason: 'turn_already_completed' })
 })
 
-test('completed turn rejection survives a Gateway restart', () => {
+test('completed turn rejection survives a Gateway restart', async () => {
   const stateDir = dir()
   const first = new FallbackJobQueue({ stateDir, execute: async () => {} })
   first.markTurnState('r-complete', 'downlink_done')
+  await first.flushTurnStates()
   const restarted = new FallbackJobQueue({ stateDir, execute: async () => {} })
   assert.equal(restarted.submit({ requestId: 'r-complete', audio, audioSha256: hash }).reason, 'turn_already_completed')
 })
@@ -74,17 +75,49 @@ test('gateway restart autonomously resumes queued work without an external event
 })
 
 test('gateway restart requeues an execution with unknown outcome under at-least-once policy', async () => {
-  const stateDir = dir(); let calls = 0
-  const first = new FallbackJobQueue({ stateDir, execute: () => new Promise(() => { calls++ }) })
+  const stateDir = dir(); let calls = 0; let now = 1_000
+  const first = new FallbackJobQueue({ stateDir, now: () => now, queueTimeoutMs: 30_000,
+    execute: () => new Promise(() => { calls++ }) })
   first.submit({ requestId: 'r-crashed-executing', audio, audioSha256: hash })
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(first.get('r-crashed-executing').state, 'executing')
-  const restarted = new FallbackJobQueue({ stateDir, execute: async () => { calls++ } })
+  now += 40_000
+  const restarted = new FallbackJobQueue({ stateDir, now: () => now, queueTimeoutMs: 30_000,
+    execute: async () => { calls++ } })
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(calls, 2)
   assert.equal(restarted.get('r-crashed-executing').state, 'completed')
   assert.equal(restarted.get('r-crashed-executing').attempts, 2)
   restarted.dispose()
+})
+
+test('same-hash retry after a retryable failure is requeued and eventually completes', async () => {
+  let calls = 0
+  const q = new FallbackJobQueue({ stateDir: dir(), execute: async () => {
+    calls++
+    if (calls === 1) throw Object.assign(new Error('temporary upstream failure'), { code: 'upstream_disconnected' })
+    return { text: 'recovered' }
+  } })
+  q.submit({ requestId: 'r-retry', audio, audioSha256: hash }); await q.drain()
+  assert.equal(q.get('r-retry').state, 'failed')
+  assert.deepEqual(q.submit({ requestId: 'r-retry', audio, audioSha256: hash }),
+    { status: 'accepted', state: 'queued', retried: true })
+  await q.drain()
+  assert.equal(calls, 2); assert.equal(q.get('r-retry').state, 'completed')
+  assert.equal(q.get('r-retry').attempts, 2)
+})
+
+test('turn-state retention is bounded and the bounded snapshot survives restart', async () => {
+  const stateDir = dir()
+  const q = new FallbackJobQueue({ stateDir, turnStateMaxEntries: 3, execute: async () => {} })
+  for (let i = 0; i < 10; i++) q.markTurnState(`turn-${i}`, 'completed')
+  assert.equal(q.turnStateCount(), 3)
+  await q.flushTurnStates()
+  const persisted = JSON.parse(readFileSync(join(stateDir, 'fallback-turn-states.json'), 'utf8'))
+  assert.deepEqual(Object.keys(persisted), ['turn-7', 'turn-8', 'turn-9'])
+  const restarted = new FallbackJobQueue({ stateDir, turnStateMaxEntries: 3, execute: async () => {} })
+  assert.equal(restarted.turnStateCount(), 3)
+  await restarted.dispose()
 })
 
 test('queued job times out autonomously when no owner event arrives', async () => {

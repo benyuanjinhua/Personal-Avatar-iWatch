@@ -48,6 +48,7 @@
   "fallback_port": 8445,
   "fallback_queue_max_jobs": 64,
   "fallback_queue_timeout_ms": 30000,
+  "fallback_turn_state_max_entries": 2048,
   "fallback_upstream_timeout_ms": 30000,
   "fallback_max_audio_bytes": 5242880,
   "provider_key_env": "AUDIO_REALTIME_PROVIDER_KEY"

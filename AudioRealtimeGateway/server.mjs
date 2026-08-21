@@ -72,8 +72,14 @@ export function createGateway(overrides = {}) {
     ownerBusy: () => [...realtimeTurns.values()].some(state => state === 'active'),
     maxJobs: CONFIG.fallback_queue_max_jobs ?? 64,
     queueTimeoutMs: CONFIG.fallback_queue_timeout_ms ?? 30_000,
+    turnStateMaxEntries: CONFIG.fallback_turn_state_max_entries ?? 2048,
     log: (evt, extra) => log(evt, extra),
   })
+  const setRealtimeTurnState = (requestId, state) => {
+    if (state === 'active') realtimeTurns.set(requestId, state)
+    else realtimeTurns.delete(requestId)
+    fallbackQueue.markTurnState(requestId, state)
+  }
 
   const wss = new WebSocketServer({ noServer: true })
 
@@ -137,7 +143,7 @@ export function createGateway(overrides = {}) {
       log('ws_upgrade_rejected', { code: 'ERR_VOICE_BUSY', request_id: scope.request_id })
       return refuseUpgrade(socket, 503, 'ERR_VOICE_BUSY')
     }
-    realtimeTurns.set(scope.request_id, 'active'); fallbackQueue.markTurnState(scope.request_id, 'active')
+    setRealtimeTurnState(scope.request_id, 'active')
     wss.handleUpgrade(req, socket, head, ws => {
       log('ws_upgrade', {
         request_id: scope.request_id, session_id: scope.session_id,
@@ -150,12 +156,14 @@ export function createGateway(overrides = {}) {
         closeGraceMs: CONFIG.downlink_close_grace_ms,
       })
       const send = text => {
+        let stateChanged = false
         try {
           const event = JSON.parse(text)
-          if (event.type === 'audio.done') { realtimeTurns.set(scope.request_id, 'downlink_done'); fallbackQueue.markTurnState(scope.request_id, 'downlink_done') }
-          if (event.type === 'error') { realtimeTurns.set(scope.request_id, 'failed'); fallbackQueue.markTurnState(scope.request_id, 'failed') }
+          if (event.type === 'audio.done') { setRealtimeTurnState(scope.request_id, 'downlink_done'); stateChanged = true }
+          if (event.type === 'error') { setRealtimeTurnState(scope.request_id, 'failed'); stateChanged = true }
         } catch { /* RealtimeSession emits JSON only; guard remains authoritative */ }
-        guarded.send(text); void fallbackQueue.drain()
+        guarded.send(text)
+        if (stateChanged) void fallbackQueue.drain()
       }
       const session = new RealtimeSession({
         scope,
@@ -177,20 +185,20 @@ export function createGateway(overrides = {}) {
         try {
           const event = JSON.parse(raw.toString('utf8'))
           if (event.type === 'playback.ended') {
-            realtimeTurns.set(scope.request_id, 'playback_ended'); fallbackQueue.markTurnState(scope.request_id, 'playback_ended'); void fallbackQueue.drain()
+            setRealtimeTurnState(scope.request_id, 'playback_ended'); void fallbackQueue.drain()
           }
         } catch { /* session validates and reports malformed frames */ }
         session.onFrame(raw.toString('utf8'))
       })
       ws.once('close', (code, reason) => {
         guarded.dispose()
-        if (realtimeTurns.get(scope.request_id) === 'active') { realtimeTurns.set(scope.request_id, 'failed'); fallbackQueue.markTurnState(scope.request_id, 'failed') }
+        if (realtimeTurns.get(scope.request_id) === 'active') setRealtimeTurnState(scope.request_id, 'failed')
         void fallbackQueue.drain()
         session.onSocketClose(code, reason?.toString())
       })
       ws.once('error', error => {
         guarded.dispose()
-        realtimeTurns.set(scope.request_id, 'failed'); fallbackQueue.markTurnState(scope.request_id, 'failed'); void fallbackQueue.drain()
+        setRealtimeTurnState(scope.request_id, 'failed'); void fallbackQueue.drain()
         session.onSocketClose(1006, 'socket_error:' + error.message)
       })
     })
@@ -218,7 +226,7 @@ export function createGateway(overrides = {}) {
   }
   async function stop() {
     issuer.stopSweeper()
-    fallbackQueue.dispose()
+    await fallbackQueue.dispose()
     return new Promise(resolveStop => {
       wss.close(() => server.close(() => {
         if (fallbackServer?.listening) fallbackServer.close(() => resolveStop())

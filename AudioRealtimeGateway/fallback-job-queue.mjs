@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs'
+import { rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 const TERMINAL = new Set(['completed', 'rejected', 'failed', 'timed_out', 'cancelled'])
@@ -14,17 +15,20 @@ const sha256 = value => createHash('sha256').update(value).digest('hex')
 export class FallbackJobQueue {
   constructor({ stateDir, execute, turnState = () => null, maxJobs = 64,
     queueTimeoutMs = 30_000, ownerBusy = () => false, now = () => Date.now(), log = () => {},
-    setTimer = (fn, ms) => setTimeout(fn, ms), clearTimer = timer => clearTimeout(timer) }) {
+    turnStateMaxEntries = 2048, setTimer = (fn, ms) => setTimeout(fn, ms),
+    clearTimer = timer => clearTimeout(timer) }) {
     if (!stateDir || typeof execute !== 'function') throw new Error('stateDir and execute are required')
     this.dir = join(stateDir, 'fallback-jobs')
     this.turnStatesPath = join(stateDir, 'fallback-turn-states.json')
     this.execute = execute; this.turnState = turnState
     this.ownerBusy = ownerBusy; this.setTimer = setTimer; this.clearTimer = clearTimer
-    this.maxJobs = maxJobs; this.queueTimeoutMs = queueTimeoutMs
+    this.maxJobs = maxJobs; this.queueTimeoutMs = queueTimeoutMs; this.turnStateMaxEntries = turnStateMaxEntries
     this.now = now; this.log = log; this.jobs = new Map(); this.turnStates = new Map()
     this.drainPromise = null; this.deadlineTimer = null; this.controllers = new Map()
+    this.turnStatePersistTimer = null; this.turnStatePersistPromise = Promise.resolve()
     mkdirSync(this.dir, { recursive: true })
     try { this.turnStates = new Map(Object.entries(JSON.parse(readFileSync(this.turnStatesPath, 'utf8')))) } catch { /* first boot */ }
+    while (this.turnStates.size > this.turnStateMaxEntries) this.turnStates.delete(this.turnStates.keys().next().value)
     this.#load()
     queueMicrotask(() => { void this.drain() })
   }
@@ -37,8 +41,18 @@ export class FallbackJobQueue {
     const prior = this.jobs.get(requestId)
     if (prior) {
       const same = prior.audio_sha256 === audioSha256
-      return same ? { status: 'duplicate', state: prior.state }
-        : { status: 'rejected', reason: 'idempotency_conflict' }
+      if (!same) return { status: 'rejected', reason: 'idempotency_conflict' }
+      if (prior.state === 'failed' || prior.state === 'timed_out') {
+        if ([...this.jobs.values()].filter(j => !TERMINAL.has(j.state)).length >= this.maxJobs) {
+          return { status: 'rejected', reason: 'queue_full' }
+        }
+        prior.state = 'queued'; prior.reason = 'retry_requested'; prior.result = null
+        prior.accepted_at = this.now(); delete prior.settled_at
+        this.#persist(prior); this.log('fallback_job_requeued', { request_id: requestId, attempt: prior.attempts })
+        void this.drain()
+        return { status: 'accepted', state: 'queued', retried: true }
+      }
+      return { status: 'duplicate', state: prior.state }
     }
     const state = this.#turnState(requestId)
     if (state === 'downlink_done' || state === 'playback_ended' || state === 'completed') {
@@ -100,7 +114,11 @@ export class FallbackJobQueue {
     } finally { /* outer drain installs the next deadline */ }
   }
 
-  dispose() { if (this.deadlineTimer !== null) this.clearTimer(this.deadlineTimer); this.deadlineTimer = null }
+  async dispose() {
+    if (this.deadlineTimer !== null) this.clearTimer(this.deadlineTimer)
+    this.deadlineTimer = null
+    await this.flushTurnStates()
+  }
 
   isExecuting() { return [...this.jobs.values()].some(job => job.state === 'executing') }
   cancel(requestId) {
@@ -114,10 +132,34 @@ export class FallbackJobQueue {
 
   get(requestId) { const job = this.jobs.get(requestId); return job ? { ...job, audio_base64: undefined } : null }
   markTurnState(requestId, state) {
+    this.turnStates.delete(requestId)
     this.turnStates.set(requestId, state)
-    const temp = `${this.turnStatesPath}.tmp`; writeFileSync(temp, JSON.stringify(Object.fromEntries(this.turnStates))); renameSync(temp, this.turnStatesPath)
+    while (this.turnStates.size > this.turnStateMaxEntries) this.turnStates.delete(this.turnStates.keys().next().value)
+    this.#scheduleTurnStatePersist()
+  }
+  turnStateCount() { return this.turnStates.size }
+  async flushTurnStates() {
+    if (this.turnStatePersistTimer !== null) {
+      this.clearTimer(this.turnStatePersistTimer); this.turnStatePersistTimer = null
+      this.#enqueueTurnStatePersist()
+    }
+    await this.turnStatePersistPromise
   }
   #turnState(requestId) { return this.turnStates.get(requestId) ?? this.turnState(requestId) }
+  #scheduleTurnStatePersist() {
+    if (this.turnStatePersistTimer !== null) return
+    this.turnStatePersistTimer = this.setTimer(() => {
+      this.turnStatePersistTimer = null; this.#enqueueTurnStatePersist()
+    }, 0)
+    this.turnStatePersistTimer?.unref?.()
+  }
+  #enqueueTurnStatePersist() {
+    const body = JSON.stringify(Object.fromEntries(this.turnStates))
+    this.turnStatePersistPromise = this.turnStatePersistPromise.then(async () => {
+      const temp = `${this.turnStatesPath}.tmp`
+      await writeFile(temp, body); await rename(temp, this.turnStatesPath)
+    }).catch(error => this.log('fallback_turn_states_persist_failed', { reason: String(error.message).slice(0, 160) }))
+  }
   #scheduleDeadline() {
     if (this.deadlineTimer !== null) this.clearTimer(this.deadlineTimer)
     const deadlines = [...this.jobs.values()].filter(job => job.state === 'queued')
@@ -147,6 +189,7 @@ export class FallbackJobQueue {
         // at-least-once and may duplicate a reply in the narrow crash window.
         if (job.state === 'executing') {
           job.state = 'queued'; job.reason = 'recovered_after_unknown_outcome'
+          job.accepted_at = this.now(); delete job.settled_at
           this.#persist(job)
         }
         this.jobs.set(job.request_id, job)
