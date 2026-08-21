@@ -86,7 +86,10 @@ jobs:
 
       - name: Gateway — npm test
         working-directory: AudioRealtimeGateway
-        run: npm test
+        run: |
+          npm test
+          # ESS-964 temporary negative control; removed after the red run.
+          exit 1
 
       # ESS-964 inventory: VaultSearchMCP is the only other directory with both
       # package.json and an npm test script. It has no dependencies/lockfile, so
