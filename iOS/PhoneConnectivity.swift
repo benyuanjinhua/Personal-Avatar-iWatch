@@ -34,9 +34,23 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         session.onDownlink = { [weak self] envelope in
             self?.forwardRealtimeDownlink(envelope) ?? .deferred
         }
-        session.onStateChange = { [weak self] state in
-            guard case .active(let requestId, let sessionId) = state else { return }
-            self?.sendRealtimeChannelReady(requestId: requestId, sessionId: sessionId)
+        // `session` 弱捕获：强捕获会做出 session → onStateChange → session 的
+        // 保留环；走 `realtimeSession` getter 又会在 storage 尚未赋值时递归。
+        session.onStateChange = { [weak self, weak session] state in
+            guard let self else { return }
+            switch state {
+            case .active(let requestId, let sessionId):
+                self.sendRealtimeChannelReady(requestId: requestId, sessionId: sessionId)
+            case .failed(let reason):
+                // ESS-960 缺陷 4：此前这里只认 `.active`，`.failed` 被整条丢掉，
+                // Watch 永远等不到「通道死了」——用户端的表现就是安静。
+                guard let key = session?.currentTurnKey else { return }
+                self.sendRealtimeChannelFailed(
+                    requestId: key.requestId, sessionId: key.sessionId, reason: reason
+                )
+            case .idle, .connecting, .cancelled:
+                break
+            }
         }
         realtimeSessionStorage = session
         return session
@@ -357,6 +371,45 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         let ready = RealtimeChannelReady(requestId: requestId, sessionId: sessionId)
         pendingRealtimeChannelReady = ready
         deliverRealtimeChannelReady(ready, trigger: "session_active")
+    }
+
+    /// ESS-960：通道终态 → Watch。走 `sendMessage` 单发即可：Watch 不可达时
+    /// 本回合本来就已经没救了，排队重投反而会把一条过期的失败态投到下一轮。
+    /// 不可达时如实落 `channel_failed_undeliverable`，不静默 return。
+    private func sendRealtimeChannelFailed(requestId: String, sessionId: String, reason: String) {
+        guard let data = try? JSONEncoder().encode(
+            RealtimeChannelFailed(requestId: requestId, sessionId: sessionId, reason: reason)
+        ) else { return }
+        // 就绪信号已经不作数了，别让重连回调把它补投出去。
+        pendingRealtimeChannelReady = nil
+        let session = WCSession.default
+        guard session.activationState == .activated, session.isReachable else {
+            PhoneAgentClientLog.error(
+                module: "agent_transport", event: "channel_failed_undeliverable",
+                requestId: requestId, sessionId: sessionId,
+                detail: "reason=\(reason) cause=watch_unreachable",
+                code: "ERR_CHANNEL_FAILED_SEND"
+            )
+            return
+        }
+        PhoneAgentClientLog.info(
+            module: "agent_transport", event: "channel_failed_sent",
+            requestId: requestId, sessionId: sessionId, detail: "reason=\(reason)"
+        )
+        session.sendMessage(
+            [RealtimeMediaMessage.channelFailedEnvelopeKey: data],
+            replyHandler: nil,
+            errorHandler: { error in
+                Task { @MainActor in
+                    PhoneAgentClientLog.error(
+                        module: "agent_transport", event: "channel_failed_send_failed",
+                        requestId: requestId, sessionId: sessionId,
+                        detail: "reason=\(reason) \(error.localizedDescription)",
+                        code: "ERR_CHANNEL_FAILED_SEND"
+                    )
+                }
+            }
+        )
     }
 
     private func replayRealtimeChannelReady(trigger: String) {

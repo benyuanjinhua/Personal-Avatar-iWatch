@@ -194,6 +194,9 @@ final class SessionController: ObservableObject {
     static let readyTimeoutSeconds: TimeInterval = 5.0
     /// 失败文案停留时长。PRD 异常链 A/B：2 秒后自动回待机。
     static let failureNoticeSeconds: TimeInterval = 2.0
+    /// ESS-960：整轮没听到人说话时的一行提示。文案纪律（PRD 异常链）——
+    /// 说清「怎么办」，不出现错误码，不解释内部状态。
+    static let noSpeechNoticeCopy = "没听到你说话，抬手靠近再说一次"
     /// 首次引导停留时长。PRD §3.5.7：3 秒淡出。
     static let firstRunGuideSeconds: TimeInterval = 3.0
     /// 单轮时长上限（PRD F2 异常：单轮 60 秒强制结束）。抢在 AudioRecorder
@@ -397,6 +400,17 @@ final class SessionController: ObservableObject {
     /// 静音送上去，回合随即离开 listening，`armSilenceTimer` 的 75s 提示与 120s
     /// 挂断都以 `turnPhase == .listening` 为前提，从此永远到不了——用户放下手
     /// 走开，会话会一直挂着而不是按策略自己收。静音的归属是静默治理。
+    ///
+    /// ESS-960 缺陷 3：不提交是对的，**什么都不做是错的**。真机 L1
+    /// （`audio_too_short pcm_bytes=1916800 duration_ms=59900 rms=5`）里这一轮
+    /// 录满 59.9 秒、rms=5（≈ -76 dBFS，约为 VAD 门限 int16≈257 的 1/50），
+    /// 永远不可能断句；50s 时本闭包已经**知道**「50 秒没听到人说话」，却只落
+    /// 一条日志就走人——用户在 60s 录音自停 → 整文件回退 → Bridge 判太短 →
+    /// 失败结果回投的整个过程里得不到任何提示。
+    ///
+    /// 现在到点即复用既有 `failureNotice` 一行浮层 + 失败触觉（**不新增常驻
+    /// 文字、不碰 PRD F7**）。回合生命周期一个字不改——不提交、不换相位、
+    /// 不重置静默计时器，ESS-865 的不变量原样保留。
     private func armTurnCap() {
         turnCapToken?.cancel()
         turnCapToken = scheduleDelay(Self.turnCapSeconds) { [weak self] in
@@ -404,7 +418,9 @@ final class SessionController: ObservableObject {
             guard self.didDetectSpeechThisTurn else {
                 WatchLog.info("session", "session_turn_cap_skipped",
                               requestId: self.activeTurnRequestId,
-                              detail: "cap_s=\(Int(Self.turnCapSeconds)) reason=no_speech_detected")
+                              detail: "cap_s=\(Int(Self.turnCapSeconds)) reason=no_speech_detected action=notice")
+                self.playHaptic(.failure)
+                self.presentFailureNotice(Self.noSpeechNoticeCopy)
                 return
             }
             WatchLog.info("session", "session_turn_cap_reached",

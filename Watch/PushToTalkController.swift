@@ -1222,6 +1222,12 @@ final class PushToTalkController: ObservableObject {
         adapter.onUplinkFallback = { [weak self] _ in
             self?.onRealtimeChannelFailed?(.channelEvent)
         }
+        // ESS-960 缺陷 4：iPhone 侧通道终态 → 会话失败链。接在生产接线里
+        // 而不是复制一份到测试，是因为「接线有没有接上」本身就是 ESS-600
+        // 第一次复审被打回的那个缺陷。
+        adapter.onChannelFailed = { [weak self] _, _ in
+            self?.onRealtimeChannelFailed?(.channelEvent)
+        }
         adapter.onAnswerPlaybackStarted = { [weak self] handle in
             self?.onSessionAnswerStarted?(handle.requestId)
         }

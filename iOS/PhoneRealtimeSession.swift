@@ -51,6 +51,12 @@ final class PhoneRealtimeSession {
     /// `Shared/RealtimeDownlinkRelay.swift`，因为 `iOS/` 没有单测 target——
     /// 留在这里这条链路就只能靠人眼复核，正是它两次写错还合入的原因。
     private var pendingDownlink = RealtimeDownlinkRelay()
+    /// ESS-960：已终结的回合不得被上行帧复活。判定本体在
+    /// `Shared/RealtimeReopenPolicy`（`iOS/` 没有单测 target，同 ESS-751 先例）。
+    private var reopenPolicy = RealtimeReopenPolicy()
+    /// 当前（或最近一次尝试建立的）回合身份。`.failed` 不带 id，
+    /// 终态记账要靠它把失败归属到具体回合。
+    private(set) var currentTurnKey: RealtimeReopenPolicy.TurnKey?
     /// ESS-391: Agent transports deliver events via callbacks rather than
     /// the Bridge-style `receive(handler:)` loop. When `true`, `scheduleReceive`
     /// is a no-op — the transport itself wires downlink delivery.
@@ -86,13 +92,17 @@ final class PhoneRealtimeSession {
                     "realtime discarding \(discarded) stale downlink envelopes from previous session"
                 )
             }
-            openIfNeeded(requestId: start.requestId, sessionId: start.sessionId)
+            openIfNeeded(requestId: start.requestId, sessionId: start.sessionId, trigger: .streamStart)
         case .audioAppend:
             guard let append = envelope.append else { return }
-            openIfNeeded(requestId: append.requestId, sessionId: append.streamId)
+            guard openIfNeeded(
+                requestId: append.requestId, sessionId: append.streamId, trigger: .uplinkFrame
+            ) else { completion?(false); return }
         case .audioCommit:
             guard let commit = envelope.commit else { return }
-            openIfNeeded(requestId: commit.requestId, sessionId: commit.sessionId)
+            guard openIfNeeded(
+                requestId: commit.requestId, sessionId: commit.sessionId, trigger: .uplinkFrame
+            ) else { completion?(false); return }
         case .playbackStarted, .playbackEnded:
             guard let receipt = envelope.playback else { return }
             // ESS-525 §1 acceptance: `play_started` / `play_finished`
@@ -105,7 +115,9 @@ final class PhoneRealtimeSession {
                 requestId: receipt.requestId, sessionId: receipt.sessionId,
                 detail: "response_id=\(receipt.responseId)"
             )
-            openIfNeeded(requestId: receipt.requestId, sessionId: receipt.sessionId)
+            guard openIfNeeded(
+                requestId: receipt.requestId, sessionId: receipt.sessionId, trigger: .uplinkFrame
+            ) else { completion?(false); return }
         case .fallback:
             guard let descriptor = envelope.fallback else { return }
             transition(to: .failed(reason: descriptor.reason))
@@ -233,21 +245,39 @@ final class PhoneRealtimeSession {
         deliverDownlink(envelope)
     }
 
-    private func openIfNeeded(requestId: String, sessionId: String) {
-        switch state {
-        case .active(let activeRequest, let activeSession)
-                where activeRequest == requestId && activeSession == sessionId:
-            return
-        case .connecting(let pendingRequest, let pendingSession)
-                where pendingRequest == requestId && pendingSession == sessionId:
-            return
-        default:
+    /// ESS-960：**唯一**的 transport 建立入口，判定全部下放给
+    /// `RealtimeReopenPolicy`（`Shared/`，有单测）。`trigger` 必须如实反映
+    /// 上行来源——把 `audio.append` 当成 `.streamStart` 传，就等于把 255 次
+    /// 握手风暴原样放回来。
+    /// - Returns: `false` 表示该回合已终结、本帧必须就地丢弃——
+    ///   继续往下送等于在一个已死的 socket 上写，还会把 `.failed` 反复重放。
+    @discardableResult
+    private func openIfNeeded(
+        requestId: String,
+        sessionId: String,
+        trigger: RealtimeReopenPolicy.Trigger
+    ) -> Bool {
+        let key = RealtimeReopenPolicy.TurnKey(requestId: requestId, sessionId: sessionId)
+        switch reopenPolicy.decide(state: policyState, key: key, trigger: trigger) {
+        case .reuseExisting:
+            return true
+        case .suppress(let reason):
+            // 取证：这条日志的条数就是「本来会打出去的握手次数」。
+            PhoneAgentClientLog.info(
+                module: "phone_session",
+                event: "realtime_reopen_suppressed",
+                requestId: requestId, sessionId: sessionId,
+                detail: "reason=\(reason) trigger=\(trigger.rawValue) suppressed_total=\(reopenPolicy.suppressedCount)"
+            )
+            return false
+        case .open:
             break
         }
+        currentTurnKey = key
         currentTransport?.close(reason: "supersede")
         guard let transport = transportFactory(requestId, sessionId) else {
             transition(to: .failed(reason: "no_transport"))
-            return
+            return false
         }
         currentTransport = transport
         transition(to: .connecting(requestId: requestId, sessionId: sessionId))
@@ -258,6 +288,7 @@ final class PhoneRealtimeSession {
         if !isAgentTransport {
             transition(to: .active(requestId: requestId, sessionId: sessionId))
         }
+        return true
     }
 
     /// Accept state changes only from the transport serving the current turn.
@@ -287,9 +318,40 @@ final class PhoneRealtimeSession {
         }
     }
 
+    /// `State` → `RealtimeReopenPolicy.SessionState` 的投影。
+    private var policyState: RealtimeReopenPolicy.SessionState {
+        switch state {
+        case .idle:
+            return .idle
+        case .connecting(let requestId, let sessionId):
+            return .connecting(.init(requestId: requestId, sessionId: sessionId))
+        case .active(let requestId, let sessionId):
+            return .active(.init(requestId: requestId, sessionId: sessionId))
+        case .cancelled:
+            return .cancelled
+        case .failed:
+            return .failed
+        }
+    }
+
     private func transition(to newState: State) {
         guard state != newState else { return }
         state = newState
+        // ESS-960 缺陷 1 & 2：任何走到 `.failed` 的路径（通道死亡、
+        // `send_failed`、`recv_failed`、Gateway `retriable:false`、显式 fallback）
+        // 都把这一回合钉成终态。此后只有新的 `stream.start` 能重开——
+        // 上行帧再来多少次都只会落一条 `realtime_reopen_suppressed`。
+        if case .failed(let reason) = newState, let key = currentTurnKey {
+            if reopenPolicy.terminalTurn != key {
+                PhoneAgentClientLog.info(
+                    module: "phone_session",
+                    event: "realtime_turn_terminated",
+                    requestId: key.requestId, sessionId: key.sessionId,
+                    detail: "reason=\(reason)"
+                )
+            }
+            reopenPolicy.markTerminalFailure(key)
+        }
         onStateChange?(newState)
     }
 

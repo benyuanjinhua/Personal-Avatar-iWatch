@@ -13,6 +13,7 @@
 		06514EB08E697AAAEEA6F10A /* ResultNotificationPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13475F099EA8ADC39FB4651D /* ResultNotificationPolicy.swift */; };
 		06E2F65AB24A39F35B1CB39D /* RuntimeSessionPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2B644F4BEAE260E21C555E9E /* RuntimeSessionPolicy.swift */; };
 		070E69DBE697BF3DE0503A23 /* ResultNotifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = 797588258D8FFBB69B05BB71 /* ResultNotifier.swift */; };
+		0A116CF44811586F82257404 /* RealtimeReopenPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 29C387855867013B3155A0F8 /* RealtimeReopenPolicy.swift */; };
 		0B0B586F84AB14F3F9C91F32 /* SessionController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B8DEBE07738843EED2FE5C7 /* SessionController.swift */; };
 		0B14BB8E0DE371AE0274D4F9 /* PhoneConnectivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08AB0CED9CE83E1BB446A82C /* PhoneConnectivity.swift */; };
 		0B21A7424638FD9297A195A5 /* AudioRealtimeAgentTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = F5EC070D0A3D70F7AFB66387 /* AudioRealtimeAgentTransport.swift */; };
@@ -33,6 +34,7 @@
 		1EF1000CCC5EE26560C0A31E /* WatchStreamPlayerStartFailureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C236AB589FD3E3793C2E2958 /* WatchStreamPlayerStartFailureTests.swift */; };
 		1EF906148F17573C9B7D948E /* BuildFingerprint.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32C8DAF30CCFE15F09A5351A /* BuildFingerprint.swift */; };
 		20A0B47A1FB2A2099BE53146 /* VoiceStatusEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0EAD7935F2F128D8408C210F /* VoiceStatusEnvelope.swift */; };
+		228CD27572B736761ABD117C /* Ess960SessionRecoveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E0E2D9C852011658A5EC95F /* Ess960SessionRecoveryTests.swift */; };
 		24ABA6464E98C3CA60DE366E /* WristAgent Watch App.app in Embed Watch Content */ = {isa = PBXBuildFile; fileRef = 2E88D71F4696224E69D652E8 /* WristAgent Watch App.app */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		2531E7416965A3AFE0797407 /* VoiceRequestEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16A065FFB735532D201B2183 /* VoiceRequestEnvelope.swift */; };
 		2600C4D0F1086887A7E1B04A /* ConversationTimelineView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D4D9B7BAB821EF5BEF00394 /* ConversationTimelineView.swift */; };
@@ -110,6 +112,7 @@
 		72AEE3274DC1730DAB22022E /* VoiceTurnJournal.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6F558DCDF4B9CA8F0BA2E2D /* VoiceTurnJournal.swift */; };
 		72E757EA3A1C9DBEF705D3A5 /* VoiceStatusEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0EAD7935F2F128D8408C210F /* VoiceStatusEnvelope.swift */; };
 		74339B1DE6A6C27DBE1885DD /* ClientLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 234EBF336FF2F9724F289524 /* ClientLog.swift */; };
+		74B970CC223A2D27C15FCB0C /* RealtimeReopenPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 29C387855867013B3155A0F8 /* RealtimeReopenPolicy.swift */; };
 		7522A68DCE1692BE3EC03F18 /* PlaybackRecoveryPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 905294A59B10050708A50FBF /* PlaybackRecoveryPolicy.swift */; };
 		770DB683BEC61B9851F2B0D1 /* WatchDownlinkOutbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA60FA5DC7EA82EC5729B54B /* WatchDownlinkOutbox.swift */; };
 		7787B4B28677EFC96B299E8D /* RealtimeMediaFormat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CEDAB5F3CD7B29B993F0FA2 /* RealtimeMediaFormat.swift */; };
@@ -295,6 +298,7 @@
 		234EBF336FF2F9724F289524 /* ClientLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientLog.swift; sourceTree = "<group>"; };
 		24DF76CA9FD4F1F5347735D9 /* AudioRecorderDurationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRecorderDurationTests.swift; sourceTree = "<group>"; };
 		27F5CF3965DA28F8FC440CB9 /* AudioRealtimeAgentFeatureFlag.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRealtimeAgentFeatureFlag.swift; sourceTree = "<group>"; };
+		29C387855867013B3155A0F8 /* RealtimeReopenPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeReopenPolicy.swift; sourceTree = "<group>"; };
 		2B644F4BEAE260E21C555E9E /* RuntimeSessionPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RuntimeSessionPolicy.swift; sourceTree = "<group>"; };
 		2E4C7D8E5213EE0C04CA8BEC /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		2E88D71F4696224E69D652E8 /* WristAgent Watch App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "WristAgent Watch App.app"; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -367,6 +371,7 @@
 		96150E5C8428B98CF5C6765B /* ErrorCue_Retryable.m4a */ = {isa = PBXFileReference; path = ErrorCue_Retryable.m4a; sourceTree = "<group>"; };
 		98840DEEAC5DA7B6F8FCC628 /* AudioRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioRecorder.swift; sourceTree = "<group>"; };
 		9A2CDFE23539DF4DB5ADDAF7 /* CompanionContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionContentView.swift; sourceTree = "<group>"; };
+		9E0E2D9C852011658A5EC95F /* Ess960SessionRecoveryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Ess960SessionRecoveryTests.swift; sourceTree = "<group>"; };
 		9F3363DB5FB9EF9FF44F0744 /* PlaybackEndgamePolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackEndgamePolicy.swift; sourceTree = "<group>"; };
 		9FDE52A8C1B2854E4646A286 /* SpeechPlayerInterruptionEvidenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechPlayerInterruptionEvidenceTests.swift; sourceTree = "<group>"; };
 		A062C41AB26ED23BE9E1A26B /* RealtimeSessionKeepAlive.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeSessionKeepAlive.swift; sourceTree = "<group>"; };
@@ -474,6 +479,7 @@
 				49D1CFEB2C03FAA07DA192C1 /* RealtimeMediaSession.swift */,
 				63B4FAFE429B15682CA5E9F8 /* RealtimeMediaWireFormat.swift */,
 				716B2884D666AEE57BA6AB37 /* RealtimePlaybackReceiptTracker.swift */,
+				29C387855867013B3155A0F8 /* RealtimeReopenPolicy.swift */,
 				73DA7FDE513C75183DABE590 /* RealtimeSessionReducer.swift */,
 				D57D9FD3BB121F4AAB879ACF /* RealtimeUplinkStream.swift */,
 				660A4DC8375BF7F24E66C40F /* RecordingInterruptionPolicy.swift */,
@@ -610,6 +616,7 @@
 				0D9F48A1DBD295B15B067181 /* BackgroundAudioBreatherTests.swift */,
 				FB2E60002E10BE69094D9C53 /* ConversationAudioControllerTests.swift */,
 				1FE6DCDF59808F848A03798D /* DownlinkBacklogHintTests.swift */,
+				9E0E2D9C852011658A5EC95F /* Ess960SessionRecoveryTests.swift */,
 				501DA6C27E71C17FBEE74B79 /* HostedCITestGate.swift */,
 				49FB03B4D918EF4092A7E9FB /* InterruptedRecordingNoticeTests.swift */,
 				7C39EB1E56AB7E26A9E4F72C /* IphoneRelayStuckHintTests.swift */,
@@ -841,6 +848,7 @@
 				87589EC57C16EFE13A79738E /* RealtimeMediaSession.swift in Sources */,
 				ADA9DA139E2F37E309F1C70C /* RealtimeMediaWireFormat.swift in Sources */,
 				AFE89128B354D801AA7BF512 /* RealtimePlaybackReceiptTracker.swift in Sources */,
+				74B970CC223A2D27C15FCB0C /* RealtimeReopenPolicy.swift in Sources */,
 				687F960B1AC7EF8B42C02037 /* RealtimeSessionReducer.swift in Sources */,
 				954F45FCF33EA311254AEDDF /* RealtimeUplinkStream.swift in Sources */,
 				D3C4178F9DE0CC5B10EE75A9 /* RecordingInterruptionPolicy.swift in Sources */,
@@ -925,6 +933,7 @@
 				ECA89E26FFC474C089D1802D /* RealtimeMediaWireFormat.swift in Sources */,
 				2A378D7F61247334FF9CE66A /* RealtimePlaybackEngine.swift in Sources */,
 				9CC8DFCBBBA03E71A76FA9BB /* RealtimePlaybackReceiptTracker.swift in Sources */,
+				0A116CF44811586F82257404 /* RealtimeReopenPolicy.swift in Sources */,
 				6D85A1C0165351F512F9726D /* RealtimeSessionKeepAlive.swift in Sources */,
 				18AF771525FEA7D04A2B155B /* RealtimeSessionReducer.swift in Sources */,
 				B6585933C8D51C2E81B72056 /* RealtimeUplinkStream.swift in Sources */,
@@ -987,6 +996,7 @@
 				9D5E9B2A9E3421DB6ACEC6DD /* BackgroundAudioBreatherTests.swift in Sources */,
 				10CAF781F02E4B9677261541 /* ConversationAudioControllerTests.swift in Sources */,
 				1B71100DEDD4B210D28AE0A1 /* DownlinkBacklogHintTests.swift in Sources */,
+				228CD27572B736761ABD117C /* Ess960SessionRecoveryTests.swift in Sources */,
 				39C8B4C513C81F2A195FEE5D /* HostedCITestGate.swift in Sources */,
 				E2E5A72D5B095D12B991CFDB /* InterruptedRecordingNoticeTests.swift in Sources */,
 				FB1CEDBA1C036BC17C6BEF2C /* IphoneRelayStuckHintTests.swift in Sources */,
