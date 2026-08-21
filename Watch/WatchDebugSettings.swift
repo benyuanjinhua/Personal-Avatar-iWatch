@@ -56,12 +56,28 @@ final class WatchDebugSettings: ObservableObject {
             storedEndpointMs ?? Self.defaultVADEndpointSilenceMs
         )
         // ESS-711：完整能力已存在但旧代码把缺省 key 读成 false，导致生产包
-        // 永远表现为“不支持语音打断”。缺 key 的新安装默认 ON；显式选择仍
-        // 按 UserDefaults 保留，给回声异常设备留有可见的退出开关。
+        // 永远表现为“不支持语音打断”。显式选择仍按 UserDefaults 保留，
+        // 给回声异常设备留有可见的退出开关。
+        //
+        // ESS-891（2026-08-22 改默认为 OFF）：这个开关同时决定音频 mode
+        // （`ConversationAudioController`：ON → `.voiceChat` 取 AEC，
+        // OFF → `.spokenAudio`），而 `.voiceChat` 走的是**通话音量通道**：
+        //
+        // - 真机 7/7 读数（08-20 两轮 + 08-21 五轮，跨两天两个包）
+        //   `output_volume` **精确恒为 0.500**——用户手调的媒体音量不可能
+        //   七次完全相同；
+        // - 白梦林实测**旋转表冠也调不大**，即这条通道用户根本够不着；
+        // - 应用侧无法编程改音量（`outputVolume` 只读），而源峰值只剩
+        //   2~5.6 dB 余量（08-21 实测 `peak_dbfs` -2.05 … -5.63），
+        //   补增益最多找回 2~3 dB，抵不掉 50% 音量约 -6 dB 的损失。
+        //
+        // 取舍：**听得清回答** > **能打断回答**。听不清时打断功能没有意义。
+        // 开关仍在，需要 AEC 打断的用户可以显式打开（打开后音量会回到 50%，
+        // 这是 `.voiceChat` 的既有代价，不是回归）。
         if defaults.object(forKey: Self.voiceBargeInEnabledDefaultsKey) != nil {
             self.voiceBargeInEnabled = defaults.bool(forKey: Self.voiceBargeInEnabledDefaultsKey)
         } else {
-            self.voiceBargeInEnabled = true
+            self.voiceBargeInEnabled = false
         }
     }
 
