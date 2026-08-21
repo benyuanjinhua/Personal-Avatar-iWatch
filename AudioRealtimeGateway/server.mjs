@@ -26,6 +26,9 @@ import { TokenIssuer, IssuerError } from './token-issuer.mjs'
 import { RealtimeSession } from './realtime-session.mjs'
 import { MockAgentTransport } from './agent-transport.mjs'
 import { QwenAgentTransport } from './qwen-agent-transport.mjs'
+import { FallbackJobQueue } from './fallback-job-queue.mjs'
+import { createFallbackExecutor } from './fallback-executor.mjs'
+import { verifyServiceRequest } from './service-auth.mjs'
 
 const BASE = dirname(fileURLToPath(import.meta.url))
 
@@ -59,12 +62,33 @@ export function createGateway(overrides = {}) {
     log: (evt, extra) => log(evt, extra),
   })
   const agentTransport = createAgentTransport(CONFIG, { log, providerKey })
+  const realtimeTurns = new Map()
+  const fallbackSecret = readServiceSecret(CONFIG)
+  const fallbackQueue = new FallbackJobQueue({
+    stateDir, execute: createFallbackExecutor({
+      agentTransport, timeoutMs: CONFIG.fallback_upstream_timeout_ms ?? 30_000,
+    }),
+    turnState: requestId => realtimeTurns.get(requestId) ?? null,
+    ownerBusy: () => [...realtimeTurns.values()].some(state => state === 'active'),
+    maxJobs: CONFIG.fallback_queue_max_jobs ?? 64,
+    queueTimeoutMs: CONFIG.fallback_queue_timeout_ms ?? 30_000,
+    turnStateMaxEntries: CONFIG.fallback_turn_state_max_entries ?? 2048,
+    log: (evt, extra) => log(evt, extra),
+  })
+  const setRealtimeTurnState = (requestId, state) => {
+    if (state === 'active') realtimeTurns.set(requestId, state)
+    else realtimeTurns.delete(requestId)
+    fallbackQueue.markTurnState(requestId, state)
+  }
 
   const wss = new WebSocketServer({ noServer: true })
 
   const server = createHttpListener(CONFIG, {
     devices, issuer, log, protocolVersion: CONFIG.protocol_version,
+    fallbackQueue, fallbackSecret,
   })
+  const fallbackServer = CONFIG.fallback_jobs_enabled === true && CONFIG.dev_allow_plain_ws !== true
+    ? createFallbackListener(CONFIG, { fallbackQueue, fallbackSecret, log }) : null
 
   server.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url, 'https://x')
@@ -112,20 +136,38 @@ export function createGateway(overrides = {}) {
         return refuseUpgrade(socket, error.status ?? 401, error.code ?? 'ERR_TOKEN_INVALID')
       }
     }
+    // Reserve the process-wide voice lease before handing the socket to ws.
+    // A fallback executor already holding it wins; the Watch retries rather
+    // than opening a second upstream owner and forcing takeover.
+    if (fallbackQueue.isExecuting()) {
+      log('ws_upgrade_rejected', { code: 'ERR_VOICE_BUSY', request_id: scope.request_id })
+      return refuseUpgrade(socket, 503, 'ERR_VOICE_BUSY')
+    }
+    setRealtimeTurnState(scope.request_id, 'active')
     wss.handleUpgrade(req, socket, head, ws => {
       log('ws_upgrade', {
         request_id: scope.request_id, session_id: scope.session_id,
         generation: scope.generation, device_id: scope.device_id,
       })
-      const downlink = createDownlinkGuard({
+      const guarded = createDownlinkGuard({
         ws, scope, log: (evt, extra) => log(evt, extra),
         maxBufferedBytes: CONFIG.max_downlink_buffered_bytes,
         warnBufferedBytes: CONFIG.downlink_backpressure_warn_bytes,
         closeGraceMs: CONFIG.downlink_close_grace_ms,
       })
+      const send = text => {
+        let stateChanged = false
+        try {
+          const event = JSON.parse(text)
+          if (event.type === 'audio.done') { setRealtimeTurnState(scope.request_id, 'downlink_done'); stateChanged = true }
+          if (event.type === 'error') { setRealtimeTurnState(scope.request_id, 'failed'); stateChanged = true }
+        } catch { /* RealtimeSession emits JSON only; guard remains authoritative */ }
+        guarded.send(text)
+        if (stateChanged) void fallbackQueue.drain()
+      }
       const session = new RealtimeSession({
         scope,
-        send: downlink.send,
+        send,
         close: (code, reason) => ws.close(code, String(reason).slice(0, 120)),
         agentTransport,
         log: (evt, extra) => log(evt, extra),
@@ -140,20 +182,33 @@ export function createGateway(overrides = {}) {
       })
       ws.on('message', (raw, isBinary) => {
         if (isBinary) return session.onBinary()
+        try {
+          const event = JSON.parse(raw.toString('utf8'))
+          if (event.type === 'playback.ended') {
+            setRealtimeTurnState(scope.request_id, 'playback_ended'); void fallbackQueue.drain()
+          }
+        } catch { /* session validates and reports malformed frames */ }
         session.onFrame(raw.toString('utf8'))
       })
       ws.once('close', (code, reason) => {
-        downlink.dispose()
+        guarded.dispose()
+        if (realtimeTurns.get(scope.request_id) === 'active') setRealtimeTurnState(scope.request_id, 'failed')
+        void fallbackQueue.drain()
         session.onSocketClose(code, reason?.toString())
       })
       ws.once('error', error => {
-        downlink.dispose()
+        guarded.dispose()
+        setRealtimeTurnState(scope.request_id, 'failed'); void fallbackQueue.drain()
         session.onSocketClose(1006, 'socket_error:' + error.message)
       })
     })
   })
 
   async function start() {
+    if (fallbackServer) await new Promise((resolveStart, rejectStart) => {
+      fallbackServer.once('error', rejectStart)
+      fallbackServer.listen({ host: CONFIG.fallback_bind ?? '127.0.0.1', port: CONFIG.fallback_port ?? 8445 }, resolveStart)
+    })
     return new Promise((resolveStart, rejectStart) => {
       server.listen({ host: CONFIG.bind, port: CONFIG.port }, err => {
         if (err) return rejectStart(err)
@@ -171,12 +226,16 @@ export function createGateway(overrides = {}) {
   }
   async function stop() {
     issuer.stopSweeper()
+    await fallbackQueue.dispose()
     return new Promise(resolveStop => {
-      wss.close(() => server.close(() => resolveStop()))
+      wss.close(() => server.close(() => {
+        if (fallbackServer?.listening) fallbackServer.close(() => resolveStop())
+        else resolveStop()
+      }))
     })
   }
 
-  return { server, wss, devices, issuer, agentTransport, config: CONFIG, log, start, stop }
+  return { server, fallbackServer, wss, devices, issuer, agentTransport, fallbackQueue, config: CONFIG, log, start, stop }
 }
 
 // Slow-consumer backpressure (ESS-746). `ws.send` never blocks: on a Watch
@@ -247,7 +306,30 @@ function readConfig(path) {
   try { return JSON.parse(readFileSync(path, 'utf8')) } catch { return {} }
 }
 
-function createHttpListener(CONFIG, { devices, issuer, log, protocolVersion }) {
+function readServiceSecret(CONFIG) {
+  const envValue = process.env[CONFIG.fallback_hmac_secret_env ?? 'FALLBACK_JOB_HMAC_SECRET']
+  if (envValue) return envValue
+  if (!CONFIG.fallback_hmac_secret_file) return ''
+  try { return readFileSync(resolve(BASE, CONFIG.fallback_hmac_secret_file), 'utf8').trim() } catch { return '' }
+}
+
+function createFallbackListener(CONFIG, { fallbackQueue, fallbackSecret, log }) {
+  const bind = CONFIG.fallback_bind ?? '127.0.0.1'
+  if (!['127.0.0.1', '::1', 'localhost'].includes(bind)) throw new Error('fallback_bind must be loopback')
+  return http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://loopback')
+    const match = /^\/v1\/fallback-jobs\/([^/]+)$/.exec(url.pathname)
+    if (!match || !['POST', 'GET', 'DELETE'].includes(req.method)) return writeJson(res, 404, { error: 'ERR_NOT_FOUND' })
+    if (!['127.0.0.1', '::1'].includes(peerIp(req.socket))) return writeJson(res, 403, { error: 'ERR_SOURCE_NOT_ALLOWED' })
+    return handleFallbackJob(req, res, {
+      queue: fallbackQueue, secret: fallbackSecret, log, pathName: url.pathname,
+      requestId: decodeURIComponent(match[1]), method: req.method,
+      maxBytes: CONFIG.fallback_max_audio_bytes ?? 5 * 1024 * 1024,
+    })
+  })
+}
+
+function createHttpListener(CONFIG, { devices, issuer, log, protocolVersion, fallbackQueue, fallbackSecret }) {
   const requestHandler = (req, res) => {
     const ip = peerIp(req.socket)
     if (!sourceAllowed(CONFIG, req.socket)) {
@@ -257,6 +339,18 @@ function createHttpListener(CONFIG, { devices, issuer, log, protocolVersion }) {
     const url = new URL(req.url, 'https://x')
     if (req.method === 'GET' && url.pathname === '/v1/health') {
       return writeJson(res, 200, { ok: true, service: 'audio-realtime-gateway', protocol_version: protocolVersion })
+    }
+    const fallbackMatch = /^\/v1\/fallback-jobs\/([^/]+)$/.exec(url.pathname)
+    // The public TLS listener exposes this route only in loopback dev tests.
+    // Production uses the dedicated loopback listener above, so widening WSS
+    // CIDRs can never widen the fallback control plane by accident.
+    if (CONFIG.dev_allow_plain_ws === true && CONFIG.fallback_jobs_enabled === true &&
+      fallbackMatch && ['POST', 'GET', 'DELETE'].includes(req.method)) {
+      return handleFallbackJob(req, res, {
+        queue: fallbackQueue, secret: fallbackSecret, log, pathName: url.pathname,
+        requestId: decodeURIComponent(fallbackMatch[1]), method: req.method,
+        maxBytes: CONFIG.fallback_max_audio_bytes ?? 5 * 1024 * 1024,
+      })
     }
     if (req.method === 'POST' && url.pathname === '/v1/realtime/session-token') {
       return handleSignedJson(req, res, ({ body, deviceId }) => {
@@ -334,6 +428,53 @@ function handleSignedJson(req, res, act, { devices, log, pathName }) {
       log('http_error', { path: pathName, detail: String(error?.message ?? error).slice(0, 256) })
       return writeJson(res, 500, { error: 'ERR_INTERNAL' })
     }
+  })
+}
+
+function handleFallbackJob(req, res, { queue, secret, log, pathName, requestId, method, maxBytes }) {
+  const chunks = []; let bytes = 0
+  req.on('data', chunk => {
+    bytes += chunk.length
+    if (bytes > Math.ceil(maxBytes * 1.4) + 4096) {
+      writeJson(res, 413, { error: 'ERR_BODY_TOO_LARGE' }); req.destroy(); return
+    }
+    chunks.push(chunk)
+  })
+  req.on('end', () => {
+    const rawBody = Buffer.concat(chunks)
+    if (!verifyServiceRequest({ secret, headers: req.headers, method, path: pathName, body: rawBody })) {
+      log('fallback_job_rejected', { request_id: requestId, reason: 'auth_failed' })
+      return writeJson(res, 401, { status: 'rejected', reason: 'auth_failed' })
+    }
+    if (req.headers['x-request-id'] !== requestId) {
+      return writeJson(res, 400, { status: 'rejected', reason: 'request_id_mismatch' })
+    }
+    if (method === 'GET') {
+      const job = queue.get(requestId)
+      return job ? writeJson(res, 200, job) : writeJson(res, 404, { error: 'ERR_NOT_FOUND' })
+    }
+    if (method === 'DELETE') {
+      const result = queue.cancel(requestId)
+      return result.status === 'not_found' ? writeJson(res, 404, { error: 'ERR_NOT_FOUND' })
+        : writeJson(res, 200, { request_id: requestId, ...result })
+    }
+    let body
+    try { body = JSON.parse(rawBody.toString('utf8')) }
+    catch { return writeJson(res, 400, { status: 'rejected', reason: 'bad_json' }) }
+    if (body.request_id !== requestId || body.codec !== 'pcm_s16le_16k') {
+      return writeJson(res, 400, { status: 'rejected', reason: 'invalid_job' })
+    }
+    let audio
+    try { audio = Buffer.from(body.audio_base64, 'base64') } catch { audio = Buffer.alloc(0) }
+    if (!audio.length || audio.length > maxBytes) return writeJson(res, 413, { status: 'rejected', reason: 'audio_too_large' })
+    const parentRequestId = typeof body.parent_request_id === 'string' && body.parent_request_id.length <= 128
+      ? body.parent_request_id : null
+    const contextSummary = typeof body.context_summary === 'string' && body.context_summary.length <= 4000
+      ? body.context_summary : null
+    const result = queue.submit({ requestId, audio, audioSha256: body.audio_sha256,
+      parentRequestId, contextSummary })
+    const status = result.status === 'accepted' || result.status === 'duplicate' ? 202 : 409
+    writeJson(res, status, { request_id: requestId, ...result })
   })
 }
 
