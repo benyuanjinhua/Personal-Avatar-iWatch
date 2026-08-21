@@ -418,6 +418,16 @@ export class RealtimeSession {
         response_id: this.responseId, code: 'ERR_UPSTREAM_AUDIO_AFTER_DONE',
         sequence: event.sequence, dropped_count: this.postDoneAudioDropped,
       })
+      // ESS-957: 工具调用场景下，第一段回答 done 之后模型还会产出第二段
+      //（真正的答案）。静默丢弃让客户端完全无从知晓，Watch 只能在第一段
+      // 播完后傻等。至少下发一个可观测的 warning 帧，让客户端能提示/降级。
+      this._sendJson({
+        type: 'audio.segment_dropped',
+        session_id: this.scope.session_id, request_id: this.scope.request_id,
+        response_id: this.responseId, generation: this.scope.generation,
+        sequence: event.sequence, dropped_count: this.postDoneAudioDropped,
+        reason: 'post_done',
+      })
       return
     }
     if (!Number.isInteger(event.sequence) || event.sequence < 0) return
