@@ -61,6 +61,21 @@ const noisePcm = (ms = 400) => {
 }
 const rid = () => 'req_' + crypto.randomUUID().replaceAll('-', '')
 
+// bridge.log 即 Bridge 进程 stdout：拦截 stdout 写入以断言落日志的内容。
+// 必须透传原写入，否则 node:test 的 TAP 汇报会被吞掉。
+function captureStdout() {
+  const lines = []
+  const original = process.stdout.write.bind(process.stdout)
+  process.stdout.write = chunk => {
+    for (const line of String(chunk).split('\n')) {
+      if (!line.trim()) continue
+      try { lines.push(JSON.parse(line)) } catch { /* 非 JSON 行忽略 */ }
+    }
+    return original(chunk)
+  }
+  return { lines, restore: () => { process.stdout.write = original } }
+}
+
 describe('ESS-41 B1: realtime observability must not feed the taskwatch breaker', () => {
   let ctx
   before(async () => { ctx = await launch({ scenario: 'background', overrides: { max_turn_events: 3 } }) })
@@ -153,6 +168,41 @@ describe('ESS-41 B2: empty/mis-touch audio fails fast before injection', () => {
     })
     assert.equal(failed.error, 'ERR_AUDIO_TOO_QUIET')
     assert.equal(ctx.mock.realtimeTurns, 0)
+  })
+
+  it('60ms tail-silence logs audio_too_short with the duration threshold (ESS-959)', async () => {
+    const id = rid()
+    const cap = captureStdout()
+    try {
+      await ctx.client.createTurn(id, Buffer.alloc(1920)) // 60ms @16k, 全静音
+      await waitFor(async () => (await ctx.client.getTurn(id)).json.status === 'failed')
+    } finally {
+      cap.restore()
+    }
+    const tooShort = cap.lines.find(l => l.evt === 'audio_too_short' && l.request_id === id)
+    assert.ok(tooShort, 'duration-triggered rejection logs audio_too_short')
+    assert.equal(tooShort.duration_ms, 60, 'measured duration on the too-short line')
+    assert.equal(tooShort.min_audio_ms, 300, 'the triggered threshold on the too-short line')
+    assert.ok(!cap.lines.some(l => l.evt === 'audio_too_quiet' && l.request_id === id),
+      'no audio_too_quiet line for a duration rejection')
+  })
+
+  it('long-but-silent audio logs audio_too_quiet with the rms threshold (ESS-959)', async () => {
+    const id = rid()
+    const cap = captureStdout()
+    try {
+      await ctx.client.createTurn(id, Buffer.alloc(16000)) // 500ms @16k, RMS=0
+      await waitFor(async () => (await ctx.client.getTurn(id)).json.status === 'failed')
+    } finally {
+      cap.restore()
+    }
+    const tooQuiet = cap.lines.find(l => l.evt === 'audio_too_quiet' && l.request_id === id)
+    assert.ok(tooQuiet, 'rms-triggered rejection logs audio_too_quiet')
+    assert.equal(tooQuiet.duration_ms, 500, 'measured duration stays on the too-quiet line')
+    assert.equal(tooQuiet.rms, 0, 'measured rms on the too-quiet line')
+    assert.equal(tooQuiet.min_audio_rms, 100, 'the triggered threshold on the too-quiet line')
+    assert.ok(!cap.lines.some(l => l.evt === 'audio_too_short' && l.request_id === id),
+      'no audio_too_short line for a silence rejection')
   })
 
   it('normal-length voiced audio still goes through and completes', async () => {
