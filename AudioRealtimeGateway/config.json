@@ -40,6 +40,7 @@
   "agent_connect_timeout_ms": 10000,
   "agent_max_pending_bytes": 2097152,
   "agent_response_timeout_ms": 8000,
+  "uplink_commit_timeout_ms": 90000,
   "agent_takeover_voice": true,
   "fallback_jobs_enabled": true,
   "fallback_hmac_secret_env": "FALLBACK_JOB_HMAC_SECRET",

@@ -25,6 +25,7 @@ function harness(overrides = {}) {
     log: (evt, extra) => logs.push({ evt, ...extra }),
     heartbeatIntervalMs: 0,
     idleDisconnectMs: 0,
+    uplinkCommitTimeoutMs: 0,
     ...overrides,
   })
   return { session, sent, logs, closes, agent, scope }
@@ -377,6 +378,94 @@ describe('RealtimeSession — heartbeat', () => {
     session.onFrame(JSON.stringify({ type: 'ping', nonce: 'abc' }))
     const pong = sent.find(e => e.type === 'pong')
     assert.equal(pong?.nonce, 'abc')
+  })
+})
+
+describe('RealtimeSession — pre-commit watchdog (ESS-959)', () => {
+  it('fails closed with a structured event when session_ready never reaches commit', () => {
+    const clock = controlledClock()
+    const { session, sent, closes, logs, scope } = harness({
+      uplinkCommitTimeoutMs: 5_000,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    assert.equal(clock.pendingCount(), 1, 'commit watchdog armed once at session_ready')
+    clock.fireAll()
+    const err = sent.find(e => e.type === 'error')
+    assert.equal(err?.code, 'ERR_UPLINK_COMMIT_TIMEOUT')
+    assert.equal(err?.retriable, true)
+    assert.equal(closes[0]?.code, 1008, 'socket closed once')
+    const log = logs.find(l => l.evt === 'uplink_commit_timeout')
+    assert.ok(log, 'uplink_commit_timeout is a structured, greppable event')
+    assert.equal(log.request_id, 'r-1')
+    assert.equal(log.session_id, 's-1')
+    assert.equal(log.generation, scope.generation)
+    assert.equal(log.timeout_ms, 5_000)
+    assert.equal(log.uplink_frames, 0)
+    assert.equal(typeof log.waited_ms, 'number')
+  })
+
+  it('times out after uplink frames when the client streams but never commits', () => {
+    const clock = controlledClock()
+    const { session, sent, logs, scope } = harness({
+      uplinkCommitTimeoutMs: 5_000,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    session.onFrame(JSON.stringify({
+      type: 'audio.append', session_id: scope.session_id, request_id: scope.request_id,
+      generation: scope.generation, sequence: 0, audio: b64('frame'),
+    }))
+    clock.fireAll()
+    assert.equal(sent.find(e => e.type === 'error')?.code, 'ERR_UPLINK_COMMIT_TIMEOUT')
+    const log = logs.find(l => l.evt === 'uplink_commit_timeout')
+    assert.equal(log.uplink_frames, 1)
+    assert.equal(typeof log.first_uplink_at, 'number')
+  })
+
+  it('audio.commit disarms the watchdog', () => {
+    const clock = controlledClock()
+    const { session, sent, scope } = harness({
+      uplinkCommitTimeoutMs: 5_000,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    session.onFrame(JSON.stringify({
+      type: 'audio.append', session_id: scope.session_id, request_id: scope.request_id,
+      generation: scope.generation, sequence: 0, audio: b64('frame'),
+    }))
+    session.onFrame(JSON.stringify({
+      type: 'audio.commit', session_id: scope.session_id, request_id: scope.request_id,
+      generation: scope.generation, sequence: 0,
+    }))
+    assert.equal(clock.pendingCount(), 0, 'commit disarmed the watchdog')
+    clock.fireAll()
+    assert.equal(sent.filter(e => e.type === 'error').length, 0, 'no fail-closed after commit')
+  })
+
+  it('cancel disarms the watchdog without a fail-closed', () => {
+    const clock = controlledClock()
+    const { session, sent, scope } = harness({
+      uplinkCommitTimeoutMs: 5_000,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    session.onFrame(JSON.stringify({
+      type: 'cancel', session_id: scope.session_id, request_id: scope.request_id, generation: scope.generation,
+    }))
+    assert.equal(clock.pendingCount(), 0, 'cancel disarmed the watchdog')
+    clock.fireAll()
+    assert.equal(sent.filter(e => e.type === 'error').length, 0)
+  })
+
+  it('is disabled when uplinkCommitTimeoutMs is 0', () => {
+    const clock = controlledClock()
+    const { session, scope } = harness({
+      uplinkCommitTimeoutMs: 0,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    assert.equal(clock.pendingCount(), 0, 'watchdog not armed when disabled')
   })
 })
 

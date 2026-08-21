@@ -174,6 +174,7 @@ export function createGateway(overrides = {}) {
         protocolVersion: CONFIG.protocol_version,
         heartbeatIntervalMs: CONFIG.heartbeat_interval_ms,
         idleDisconnectMs: CONFIG.idle_disconnect_ms,
+        uplinkCommitTimeoutMs: CONFIG.uplink_commit_timeout_ms ?? 90_000,
         maxFrameBytes: CONFIG.max_frame_bytes,
         maxEventsPerSecond: CONFIG.max_events_per_second,
         maxUplinkBytesPerSecond: CONFIG.max_uplink_bytes_per_second,

@@ -43,6 +43,7 @@ export class RealtimeSession {
     protocolVersion = 1,
     heartbeatIntervalMs = 15_000,
     idleDisconnectMs = 60_000,
+    uplinkCommitTimeoutMs = 90_000,
     doneBarrierGapMs = 30_000,
     maxFrameBytes = 64 * 1024,
     maxEventsPerSecond = 200,
@@ -73,6 +74,7 @@ export class RealtimeSession {
     this.protocolVersion = protocolVersion
     this.heartbeatIntervalMs = heartbeatIntervalMs
     this.idleDisconnectMs = idleDisconnectMs
+    this.uplinkCommitTimeoutMs = uplinkCommitTimeoutMs
     this.doneBarrierGapMs = doneBarrierGapMs
     this.maxFrameBytes = maxFrameBytes
     this.maxEventsPerSecond = maxEventsPerSecond
@@ -115,6 +117,8 @@ export class RealtimeSession {
     this.staleGenerationDropped = 0
     this.postDoneAudioDropped = 0
     this._barrierTimer = null
+    this._commitTimer = null
+    this._commitArmedAt = null
 
     this.agentTurn = null
 
@@ -187,6 +191,7 @@ export class RealtimeSession {
     if (this._heartbeatTimer) this.clearTimer(this._heartbeatTimer)
     if (this._idleTimer) this.clearTimer(this._idleTimer)
     this._clearBarrierTimer()
+    this._disarmCommitWatchdog()
     if (this.agentTurn) { try { this.agentTurn.close() } catch { /* ignore */ } }
     this.log('session_ended', {
       request_id: this.scope.request_id, session_id: this.scope.session_id,
@@ -239,6 +244,15 @@ export class RealtimeSession {
       request_id: this.scope.request_id, session_id: this.scope.session_id,
       generation: this.scope.generation, response_id: this.responseId,
     })
+    // ESS-959: bound the pre-commit window. A session that connects and
+    // uplinks but never sends `audio.commit` used to wait for the upstream
+    // socket to die on its own (30 s in the incident, non-deterministic).
+    // This watchdog fails the turn closed with a structured event once
+    // `uplinkCommitTimeoutMs` has elapsed since `session_ready`. The value
+    // must stay above the client's VAD hard cap (`LocalVADEndpointer.
+    // maximumTurnMs`, 55 s) so a healthy full-length recording is never
+    // killed.
+    this._armCommitWatchdog()
   }
 
   _handleAudioAppend(message) {
@@ -285,6 +299,7 @@ export class RealtimeSession {
       })
     }
     this.uplinkCommitted = true
+    this._disarmCommitWatchdog()
     try { this.agentTurn.commit() }
     catch (error) { return this.fail('ERR_UPSTREAM_UNAVAILABLE', { detail: String(error?.message ?? error) }) }
     this.log('uplink_committed', {
@@ -306,6 +321,7 @@ export class RealtimeSession {
     // Cancel is authoritative — kill any pending done barrier so the gap
     // timer cannot fire a fail-closed after the client has moved on.
     this._clearBarrierTimer()
+    this._disarmCommitWatchdog()
     this.pendingFinalSequence = null
     try { this.agentTurn?.cancel() } catch { /* best effort */ }
     this.log('cancel_received', {
@@ -592,6 +608,40 @@ export class RealtimeSession {
     if (this._barrierTimer !== null) {
       this.clearTimer(this._barrierTimer)
       this._barrierTimer = null
+    }
+  }
+
+  // ESS-959 pre-commit watchdog. Armed at `session_ready`, disarmed by
+  // `audio.commit` (or cancel / socket close). On expiry the turn fails
+  // closed with a typed, retriable error instead of waiting for the upstream
+  // socket to die on its own — the incident's only exit was a 30 s upstream
+  // `ERR_UPSTREAM_UNAVAILABLE`, which is upstream behaviour, not a bound.
+  _armCommitWatchdog() {
+    if (this.uplinkCommitTimeoutMs <= 0) return
+    if (this._commitTimer !== null) return
+    this._commitArmedAt = this.now()
+    this._commitTimer = this.setTimer(() => {
+      this._commitTimer = null
+      if (this.state !== OPEN || this.uplinkCommitted || this.cancelled) return
+      this.log('uplink_commit_timeout', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
+        waited_ms: this.now() - this._commitArmedAt,
+        timeout_ms: this.uplinkCommitTimeoutMs,
+        uplink_frames: this.nextUplinkSequence,
+        first_uplink_at: this.firstUplinkAt,
+      })
+      this.fail('ERR_UPLINK_COMMIT_TIMEOUT', {
+        detail: `no audio.commit within ${this.uplinkCommitTimeoutMs}ms of session_ready`,
+        retriable: true,
+      })
+    }, this.uplinkCommitTimeoutMs)
+  }
+
+  _disarmCommitWatchdog() {
+    if (this._commitTimer !== null) {
+      this.clearTimer(this._commitTimer)
+      this._commitTimer = null
     }
   }
 

@@ -52,6 +52,7 @@ function harness(overrides = {}) {
     log: (evt, extra) => logs.push({ evt, ...extra }),
     heartbeatIntervalMs: 5_000,
     idleDisconnectMs: 30_000,
+    uplinkCommitTimeoutMs: 0,
     maxEventsPerSecond: 5,
     maxUplinkBytesPerSecond: 512,
     maxFrameBytes: 128,

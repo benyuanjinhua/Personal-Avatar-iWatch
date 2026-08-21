@@ -69,6 +69,7 @@ describe('turn reconstruction', () => {
       log,
       heartbeatIntervalMs: 0,
       idleDisconnectMs: 0,
+      uplinkCommitTimeoutMs: 0,
     })
     session.onFrame(JSON.stringify({
       type: 'session.start', session_id: 's-1', request_id: 'r-1', generation: 1, protocol_version: 1,

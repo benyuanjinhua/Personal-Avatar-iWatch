@@ -35,6 +35,7 @@ function harness(overrides = {}) {
     log: (evt, extra) => logs.push({ evt, ...extra }),
     heartbeatIntervalMs: 0,
     idleDisconnectMs: 0,
+    uplinkCommitTimeoutMs: 0,
     setTimer: (fn, ms) => { const t = { fn, ms }; timers.push(t); return t },
     clearTimer: t => { const i = timers.indexOf(t); if (i >= 0) timers.splice(i, 1) },
     ...overrides,

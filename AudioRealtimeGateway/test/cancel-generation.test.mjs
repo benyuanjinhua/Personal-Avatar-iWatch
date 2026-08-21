@@ -25,6 +25,7 @@ function harness() {
     log: (evt, extra) => logs.push({ evt, ...extra }),
     heartbeatIntervalMs: 0,
     idleDisconnectMs: 0,
+    uplinkCommitTimeoutMs: 0,
   })
   session.onFrame(JSON.stringify({
     type: 'session.start', session_id: scope.session_id,
