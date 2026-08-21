@@ -1222,6 +1222,12 @@ final class PushToTalkController: ObservableObject {
         adapter.onUplinkFallback = { [weak self] _ in
             self?.onRealtimeChannelFailed?(.channelEvent)
         }
+        // ESS-960 缺陷 4：iPhone 侧通道终态 → 会话失败链。接在生产接线里
+        // 而不是复制一份到测试，是因为「接线有没有接上」本身就是 ESS-600
+        // 第一次复审被打回的那个缺陷。
+        adapter.onChannelFailed = { [weak self] _, _ in
+            self?.onRealtimeChannelFailed?(.channelEvent)
+        }
         adapter.onAnswerPlaybackStarted = { [weak self] handle in
             self?.onSessionAnswerStarted?(handle.requestId)
         }
@@ -1606,6 +1612,25 @@ final class PushToTalkController: ObservableObject {
         // ESS-554：按压被取消 = 本轮不会发起，会话随之显式收口（PD-2）。
         endConversationAudio(reason: .userExit)
         flushPendingAutoPlay()
+    }
+
+    /// ESS-960 / ESS-962 阻断 3：**丢弃当前这一轮采集，但不动会话**。
+    ///
+    /// 与 `pressCancelled()` 的区别只有一条，也是关键的一条：不调
+    /// `endConversationAudio(reason:)`。PD-2 的口径是「只有点 X 才真
+    /// deactivate」，会话模式里回收一轮死采集不该把会话级 `.playAndRecord`
+    /// 持有一起释放——那会让紧接着的重开采集撞上一次多余的会话重建。
+    ///
+    /// 与 `endSessionTurn()` 的区别：那条走 `finishRecording()` 会**提交**，
+    /// 而本路径的前提正是「整轮没听到人说话」，提交等于送一段静音上去。
+    func discardSessionTurn() {
+        guard state == .recording else { return }
+        recorder.cancel()
+        releaseRequestedWhileStarting = false
+        state = .idle
+        onLocalCaptureChanged?(false)
+        // 与 pressCancelled 同一清理口径：不让 PCM tap 挂到下次按压才停。
+        abortUnsubmittedRealtimeTurn()
     }
 
     /// ESS-573 / PRD F1：会话模式点 X / 下滑退出的统一拆链入口——

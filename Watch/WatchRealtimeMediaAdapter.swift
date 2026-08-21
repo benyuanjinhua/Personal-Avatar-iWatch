@@ -123,6 +123,9 @@ final class WatchRealtimeMediaAdapter {
     /// ESS-573 复审硬性要求：会话 UI 的 connecting → listening 只能由
     /// 这个真实事件驱动，不得在发起录音后同步宣告 ready。
     var onChannelReady: (@MainActor (_ requestId: String) -> Void)?
+    /// ESS-960：通道终态（iPhone → Watch）。接线在 `attachSessionEvents`，
+    /// 终点是 `SessionController.markChannelFailed(.channelEvent)`。
+    var onChannelFailed: (@MainActor (_ requestId: String, _ reason: String) -> Void)?
 
     /// ESS-573: 快速上行通道死亡事件（传输失败 / 缓冲溢出 / 采集 tap
     /// 失败等，经 RealtimeMediaSession 单发兜底）。会话模式据此刻意
@@ -561,6 +564,28 @@ final class WatchRealtimeMediaAdapter {
             detail: "session_id=\(ready.sessionId) source=transport_connected"
         )
         onChannelReady?(ready.requestId)
+    }
+
+    /// ESS-960 缺陷 4：iPhone 侧实时通道走到终态（Gateway `retriable:false`、
+    /// 通道死亡、显式回退）。与 `markDownlinkBridgeFallback` 分开：那条是
+    /// 「下行快通道死了，降级到整文件，用户还能拿到结果」，这条是
+    /// 「本回合的通道彻底没了」，必须让用户看见。
+    func receiveChannelFailed(_ failed: RealtimeChannelFailed) {
+        guard let turn = currentTurn,
+              turn.requestId == failed.requestId,
+              turn.sessionId == failed.sessionId else {
+            WatchLog.info(
+                "realtime", "stale_channel_failed_dropped", requestId: failed.requestId,
+                detail: "session_id=\(failed.sessionId) reason=\(failed.reason)"
+            )
+            return
+        }
+        WatchLog.error(
+            "realtime", "channel_failed_received", requestId: failed.requestId,
+            detail: "session_id=\(failed.sessionId) reason=\(failed.reason)",
+            code: "ERR_REALTIME_CHANNEL_FAILED"
+        )
+        onChannelFailed?(failed.requestId, failed.reason)
     }
 
     /// Called when the user starts speaking again mid-response.

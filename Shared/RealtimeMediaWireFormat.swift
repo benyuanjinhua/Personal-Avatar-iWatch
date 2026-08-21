@@ -519,6 +519,10 @@ enum RealtimeMediaMessage {
     static let uplinkEnvelopeKey = "wristagent_realtime_uplink"
     static let uplinkAckEnvelopeKey = "wristagent_realtime_uplink_ack"
     static let channelReadyEnvelopeKey = "wristagent_realtime_channel_ready"
+    /// ESS-960 缺陷 4：通道终态的显式信号。此前 `.failed` 在
+    /// `PhoneConnectivity` 的 `onStateChange` 里被整条丢掉（那个闭包只认
+    /// `.active`），Watch 侧因此永远等不到「通道死了」，用户看到的就是安静。
+    static let channelFailedEnvelopeKey = "wristagent_realtime_channel_failed"
     static let downlinkEnvelopeKey = "wristagent_realtime_downlink"
 }
 
@@ -529,4 +533,17 @@ enum RealtimeMediaMessage {
 struct RealtimeChannelReady: Codable, Equatable, Sendable {
     let requestId: String
     let sessionId: String
+}
+
+/// ESS-960：`RealtimeChannelReady` 的对称面——iPhone 侧实时通道走到终态。
+///
+/// 与 `stream.fallback`（下行快通道死掉、降级到整文件回放，用户仍能拿到结果）
+/// **不是**一回事：这条说的是本回合的通道彻底没了，Watch 必须收口到 P6
+/// 失败态并给用户一行可行动文案，而不是继续假装在听。
+struct RealtimeChannelFailed: Codable, Equatable, Sendable {
+    let requestId: String
+    let sessionId: String
+    /// 机器可读的失败原因（如 `gateway_error_ERR_STREAM_SEQUENCE`），
+    /// 只进日志取证，不进用户文案（PRD 文案纪律：不出现错误码）。
+    let reason: String
 }

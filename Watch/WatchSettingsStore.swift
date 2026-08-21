@@ -170,6 +170,12 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
            let ready = try? JSONDecoder().decode(RealtimeChannelReady.self, from: data) {
             Task { @MainActor in self.realtimeAdapter?.receiveChannelReady(ready) }
         }
+        // ESS-960 缺陷 4：通道终态。收到即收口到失败链（一行可行动文案 +
+        // 失败触觉），不再让用户对着一个已经死掉的通道继续说话。
+        if let data = message[RealtimeMediaMessage.channelFailedEnvelopeKey] as? Data,
+           let failed = try? JSONDecoder().decode(RealtimeChannelFailed.self, from: data) {
+            Task { @MainActor in self.realtimeAdapter?.receiveChannelFailed(failed) }
+        }
         guard let data = message[VoiceStatusMessage.envelopeKey] as? Data else { return }
         Task { @MainActor in self.applyVoiceStatus(data) }
     }
