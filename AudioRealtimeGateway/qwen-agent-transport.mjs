@@ -91,6 +91,7 @@ export class QwenAgentTransport {
     // n=9 is a thin sample (R-04.4), which is why this stays a config knob.
     responseTimeoutMs = 8_000,
     takeover = true,
+    soulInstruction = null,
     log = () => {},
   } = {}) {
     this.gatewayUrl = gatewayUrl
@@ -106,6 +107,7 @@ export class QwenAgentTransport {
     this.maxReorderFrames = maxReorderFrames
     this.responseTimeoutMs = responseTimeoutMs
     this.takeover = takeover
+    this.soulInstruction = soulInstruction
     this.log = log
     this.turns = new Map()
   }
@@ -414,6 +416,7 @@ export class QwenAgentTransport {
           clientInstanceId: turn.clientInstanceId, voiceEnabled: true,
           manualTurnDetection: true, takeover: this.takeover,
           timeZone: 'Asia/Shanghai', locale: 'zh-CN',
+          ...(this.soulInstruction ? { instruction: this.soulInstruction } : {}),
         }))
       })
       ws.on('message', raw => {

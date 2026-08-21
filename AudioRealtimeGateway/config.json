@@ -36,6 +36,7 @@
 
   "agent_transport": "agent",
   "agent_gateway_url": "ws://127.0.0.1:3101/api/realtime",
+  "soul_path": "../soul.md",
   "dev_universal_token": "rtk_dev_universal",
   "agent_connect_timeout_ms": 10000,
   "agent_max_pending_bytes": 2097152,
