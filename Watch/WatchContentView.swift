@@ -304,7 +304,9 @@ struct WatchContentView: View {
                         .transition(.opacity)
                 }
 
-                // 异常一行文案（全 PRD 唯一允许状态文字的地方）
+                // 异常一行文案（全 PRD 唯一允许状态文字的地方）。
+                // ESS-891 复审阻断 1：三条同落点的提示用 else-if 串成单通道，
+                // 互斥关系由代码保证，不靠运行期状态互斥的概率。
                 if let notice = session.failureNotice {
                     Text(notice)
                         .font(.caption)
@@ -317,10 +319,8 @@ struct WatchContentView: View {
                             y: proxy.size.height * 0.5 + orbSize / 2 + 20
                         )
                         .transition(.opacity)
-                }
-
-                // 首次引导（PRD §3.5.7）：只出现一次，3 秒淡出。
-                if session.showFirstRunGuide {
+                } else if session.showFirstRunGuide {
+                    // 首次引导（PRD §3.5.7）：只出现一次，3 秒淡出。
                     Text("说话就行，说完停一下")
                         .font(.caption)
                         .foregroundStyle(.cyan)
@@ -331,10 +331,9 @@ struct WatchContentView: View {
                             y: proxy.size.height * 0.5 + orbSize / 2 + 20
                         )
                         .transition(.opacity)
-                }
-
-                // ESS-891：回答播放中系统音量过低 → 一行可行动提示。
-                if session.lowVolumeHint {
+                } else if session.lowVolumeHint {
+                    // ESS-891：回答播放中系统音量过低 → 一行可行动提示。
+                    // 落点下移一档，与失败/引导文案在视觉上区分。
                     Text("音量较低，旋转表冠调高")
                         .font(.caption)
                         .foregroundStyle(.cyan)
@@ -342,7 +341,7 @@ struct WatchContentView: View {
                         .padding(.horizontal, 12)
                         .position(
                             x: proxy.size.width / 2,
-                            y: proxy.size.height * 0.5 + orbSize / 2 + 20
+                            y: proxy.size.height * 0.5 + orbSize / 2 + 34
                         )
                         .transition(.opacity)
                 }
