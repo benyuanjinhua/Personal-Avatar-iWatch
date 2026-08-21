@@ -196,6 +196,57 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertEqual(teardownCount, 0)
     }
 
+    // MARK: - ESS-891 低音量提示
+
+    private func enterListeningAndSpeaking() {
+        controller.enterSession()
+        controller.markChannelReady()
+        let requestId = controller.activeTurnRequestId!
+        controller.markTurnCommitted(requestId: requestId)
+        controller.markAnswerStarted(requestId: requestId)
+    }
+
+    /// 阈值钉住：低于 0.6 提示，等于/高于 0.6 不提示。
+    func testLowVolumeHintPolicyThreshold() {
+        XCTAssertTrue(SessionController.shouldSurfaceLowVolumeHint(outputVolume: 0.0))
+        XCTAssertTrue(SessionController.shouldSurfaceLowVolumeHint(outputVolume: 0.5))
+        XCTAssertTrue(SessionController.shouldSurfaceLowVolumeHint(outputVolume: 0.599))
+        XCTAssertFalse(SessionController.shouldSurfaceLowVolumeHint(outputVolume: 0.6))
+        XCTAssertFalse(SessionController.shouldSurfaceLowVolumeHint(outputVolume: 1.0))
+    }
+
+    /// 真机取证口径：`output_volume=0.500` 时应提示调高音量。
+    func testAnswerStartedAtLowVolumeRaisesHint() {
+        controller.readOutputVolume = { 0.5 }
+        enterListeningAndSpeaking()
+        XCTAssertTrue(controller.lowVolumeHint)
+    }
+
+    /// 音量满格时不打扰。
+    func testAnswerStartedAtFullVolumeDoesNotRaiseHint() {
+        controller.readOutputVolume = { 1.0 }
+        enterListeningAndSpeaking()
+        XCTAssertFalse(controller.lowVolumeHint)
+    }
+
+    /// 提示只在 speaking 期间有效，回答播完即清除。
+    func testLowVolumeHintClearsWhenAnswerFinishes() {
+        controller.readOutputVolume = { 0.5 }
+        enterListeningAndSpeaking()
+        XCTAssertTrue(controller.lowVolumeHint)
+        controller.markAnswerFinished(requestId: controller.activeTurnRequestId!, success: true)
+        XCTAssertFalse(controller.lowVolumeHint)
+    }
+
+    /// 会话退出（点 X）后提示不得残留。
+    func testLowVolumeHintClearsOnSessionExit() {
+        controller.readOutputVolume = { 0.5 }
+        enterListeningAndSpeaking()
+        XCTAssertTrue(controller.lowVolumeHint)
+        controller.exitSession()
+        XCTAssertFalse(controller.lowVolumeHint)
+    }
+
     // MARK: - 失败路径
 
     /// 就绪超时：5s 无真实 ack → 进入 P6 failed 态（不退回 idle）。
