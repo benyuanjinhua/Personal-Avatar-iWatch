@@ -342,15 +342,17 @@ final class PhoneRealtimeSession {
         // 都把这一回合钉成终态。此后只有新的 `stream.start` 能重开——
         // 上行帧再来多少次都只会落一条 `realtime_reopen_suppressed`。
         if case .failed(let reason) = newState, let key = currentTurnKey {
-            if reopenPolicy.terminalTurn != key {
+            if !reopenPolicy.isTerminated(key) {
+                reopenPolicy.markTerminalFailure(key)
+                // ESS-962：终态集合有界（`terminalHistoryLimit`）。淘汰数一并
+                // 落日志——被淘汰的回合就不再受保护，这个口径不许静默。
                 PhoneAgentClientLog.info(
                     module: "phone_session",
                     event: "realtime_turn_terminated",
                     requestId: key.requestId, sessionId: key.sessionId,
-                    detail: "reason=\(reason)"
+                    detail: "reason=\(reason) terminal_tracked=\(reopenPolicy.terminalTurns.count) terminal_evicted=\(reopenPolicy.evictedTerminalCount)"
                 )
             }
-            reopenPolicy.markTerminalFailure(key)
         }
         onStateChange?(newState)
     }

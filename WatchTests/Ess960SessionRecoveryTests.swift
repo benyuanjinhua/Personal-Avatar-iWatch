@@ -19,6 +19,7 @@ final class Ess960SessionRecoveryTests: XCTestCase {
     private var scheduled: [(delay: TimeInterval, fire: @MainActor () -> Void)]!
     private var commitCount = 0
     private var teardownCount = 0
+    private var discardCount = 0
     private var defaults: UserDefaults!
 
     override func setUp() {
@@ -29,6 +30,7 @@ final class Ess960SessionRecoveryTests: XCTestCase {
         scheduled = []
         commitCount = 0
         teardownCount = 0
+        discardCount = 0
         controller.playHaptic = { [weak self] in self?.haptics.append($0) }
         controller.scheduleDelay = { [weak self] delay, fire in
             self?.scheduled.append((delay, fire))
@@ -38,6 +40,9 @@ final class Ess960SessionRecoveryTests: XCTestCase {
         controller.onBeginChannel = { began += 1; return "req-\(began)" }
         controller.onCommitTurn = { [weak self] in self?.commitCount += 1 }
         controller.onTeardownChannel = { [weak self] in self?.teardownCount += 1 }
+        controller.onDiscardTurn = { [weak self] in self?.discardCount += 1 }
+        var turns = 0
+        controller.onStartTurn = { turns += 1; return "turn-\(turns)" }
     }
 
     override func tearDown() {
@@ -48,21 +53,86 @@ final class Ess960SessionRecoveryTests: XCTestCase {
 
     // MARK: - 缺陷 3
 
-    /// 到达单轮上限、整轮没听到人说话：**必须**给出一行可行动提示 + 失败触觉，
-    /// 而且**不得**提交这段静音（ESS-865 的不变量）。修复前这里 notice 为 nil。
-    func testTurnCapWithoutSpeechSurfacesActionableNotice() {
+    /// 到达单轮上限、整轮没听到人说话：**回合必须真正终结**——丢弃这轮死采集、
+    /// 相位回 `.idle`，并给出一行可行动提示 + 失败触觉。修复前这里只落一条
+    /// 日志就 return，notice 为 nil、相位不动、采集不收。
+    func testTurnCapWithoutSpeechTerminatesTurnAndNotifiesUser() {
         controller.enterSession()
         controller.markChannelReady()
         XCTAssertEqual(controller.turnPhase, .listening)
 
         fireDelay(matching: SessionController.turnCapSeconds)
 
+        // 用户可见：一行可行动文案 + 失败触觉。
         XCTAssertEqual(controller.failureNotice, SessionController.noSpeechNoticeCopy)
         XCTAssertTrue(haptics.contains(.failure))
-        // ESS-865：静音一律不提交，回合仍留在聆听相位交给静默治理收口。
+        // 回合真正收口：死采集被丢弃（不是被提交，也不是被放着继续录）。
+        XCTAssertEqual(discardCount, 1)
+        // ESS-865 的不变量：静音一律**不提交**。
         XCTAssertEqual(commitCount, 0)
+        // 会话本身还活着，用户随时可以继续说。
         XCTAssertEqual(controller.state, .listening)
+    }
+
+    /// 收口之后当场回到可用态：新一轮采集起来了，麦克风不留死态。
+    ///
+    /// 刻意**同一个 tick 内**完成，不借 `markTurnAborted` 的 1.5s 退避——
+    /// 相位只要在退避窗里落到 `.idle`，`armSilenceTimer` 三级治理的
+    /// `turnPhase == .listening` 前置就会被打断（ESS-865 复审阻断 2）。
+    func testSilentTurnRecycleImmediatelyRestartsCapture() {
+        controller.enterSession()
+        controller.markChannelReady()
+        let firstTurnIndex = controller.turnIndex
+        let firstRequestId = controller.activeTurnRequestId
+
+        fireDelay(matching: SessionController.turnCapSeconds)
+
         XCTAssertEqual(controller.turnPhase, .listening)
+        XCTAssertEqual(controller.turnIndex, firstTurnIndex + 1)
+        XCTAssertNotNil(controller.activeTurnRequestId)
+        XCTAssertNotEqual(controller.activeTurnRequestId, firstRequestId)
+        XCTAssertFalse(controller.didDetectSpeechThisTurn)
+    }
+
+    /// ESS-865 复审阻断 2 的回归护栏：静音回收**不得**重置静默治理。
+    ///
+    /// 重开一轮时若走默认的 `armSilenceTimer()`，30/75/120s 三级治理会被每轮
+    /// 刷新，用户放下手走开后会话永远不自收——正是 ESS-865 拦下的那个回归。
+    /// 判据：回收+重开之后，新排的延迟里不得出现 30s 这一档（静默治理的
+    /// 第一级），只应有单轮上限 50s。
+    func testSilentTurnRecycleDoesNotRearmSilenceGovernance() {
+        controller.enterSession()
+        controller.markChannelReady()
+
+        let scheduledBeforeRecycle = scheduled.count
+        fireDelay(matching: SessionController.turnCapSeconds)
+
+        let afterRelisten = scheduled[scheduledBeforeRecycle...].map(\.delay)
+        XCTAssertFalse(
+            afterRelisten.contains { abs($0 - SessionController.silenceHint1Seconds) < 0.001 },
+            "静音回收重开不得重新起算静默治理（ESS-865）"
+        )
+        XCTAssertTrue(
+            afterRelisten.contains { abs($0 - SessionController.turnCapSeconds) < 0.001 },
+            "新一轮仍须有单轮上限兜底"
+        )
+    }
+
+    /// 说过话的正常换轮**必须**重置静默治理——本修复只收窄静音那一条路径。
+    func testNormalRelistenStillRearmsSilenceGovernance() {
+        controller.enterSession()
+        controller.markChannelReady()
+        controller.markSpeechDetected(requestId: "req-1")
+        controller.markTurnCommitted(requestId: "req-1")
+        controller.markAnswerStarted(requestId: "req-1")
+        let before = scheduled.count
+        controller.markAnswerFinished(requestId: "req-1")
+
+        let afterFinish = scheduled[before...].map(\.delay)
+        XCTAssertTrue(
+            afterFinish.contains { abs($0 - SessionController.silenceHint1Seconds) < 0.001 },
+            "正常换轮仍须重新起算静默治理（ESS-652）"
+        )
     }
 
     /// 提示文案是「怎么办」，不含错误码、不解释内部状态（PRD 异常链文案纪律）。

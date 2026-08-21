@@ -183,6 +183,10 @@ final class SessionController: ObservableObject {
     /// （完整文件 / WCSession transferFile）提交，而不是连人带话一起丢。
     /// 生产接 `PushToTalkController.endSessionTurn()`。
     var onSalvageTurn: (() -> Void)?
+    /// ESS-960 / ESS-962 阻断 3：**丢弃**当前这一轮采集（不提交、不动会话）。
+    /// 生产接 `PushToTalkController.discardSessionTurn()`。与 `onSalvageTurn`
+    /// 互补：那条是「录到了，救出去」，这条是「整轮没人说话，扔掉」。
+    var onDiscardTurn: (() -> Void)?
 
     // MARK: - 参数（PRD 数值，【待调】项需真机体感定稿）
 
@@ -408,19 +412,13 @@ final class SessionController: ObservableObject {
     /// 一条日志就走人——用户在 60s 录音自停 → 整文件回退 → Bridge 判太短 →
     /// 失败结果回投的整个过程里得不到任何提示。
     ///
-    /// 现在到点即复用既有 `failureNotice` 一行浮层 + 失败触觉（**不新增常驻
-    /// 文字、不碰 PRD F7**）。回合生命周期一个字不改——不提交、不换相位、
-    /// 不重置静默计时器，ESS-865 的不变量原样保留。
+    /// 收口走 `recycleSilentTurn()`，见那里的注释。
     private func armTurnCap() {
         turnCapToken?.cancel()
         turnCapToken = scheduleDelay(Self.turnCapSeconds) { [weak self] in
             guard let self, self.state == .listening, self.turnPhase == .listening else { return }
             guard self.didDetectSpeechThisTurn else {
-                WatchLog.info("session", "session_turn_cap_skipped",
-                              requestId: self.activeTurnRequestId,
-                              detail: "cap_s=\(Int(Self.turnCapSeconds)) reason=no_speech_detected action=notice")
-                self.playHaptic(.failure)
-                self.presentFailureNotice(Self.noSpeechNoticeCopy)
+                self.recycleSilentTurn()
                 return
             }
             WatchLog.info("session", "session_turn_cap_reached",
@@ -428,6 +426,44 @@ final class SessionController: ObservableObject {
                           detail: "cap_s=\(Int(Self.turnCapSeconds))")
             self.onCommitTurn?()
         }
+    }
+
+    /// ESS-960 缺陷 3 / ESS-962 阻断 3：整轮没听到人说话，到达单轮上限。
+    ///
+    /// **真正收口**：丢弃这轮死采集（`onDiscardTurn` → `discardSessionTurn()`，
+    /// 不提交静音），当场重开一轮新采集，回到可用态。麦克风不留死态，
+    /// 会话相位一刻也不离开 `.listening`。
+    ///
+    /// 三条刻意保留的不变量：
+    ///
+    /// 1. **不提交**——提交等于把一段静音送上去（ESS-865 复审阻断 2）。
+    /// 2. **不重置静默治理**——`startNextTurn` 默认会重新 `armSilenceTimer`，
+    ///    那正是 ESS-865 拦下的回归：用户放下手走开，30/75/120s 三级治理被
+    ///    每轮刷新，会话永远不自收。这里显式传 `resetSilenceGovernance: false`，
+    ///    120s 挂断仍按**最初那次** arm 落地。
+    /// 3. **先丢弃再重开**——`pressBegan` 有 `guard state == .idle`，不先把在录
+    ///    的那一轮收掉，`onStartTurn` 只会把在飞的旧 request_id 原样返回，
+    ///    什么也不会发生（这是初版方案的实际死点）。
+    ///
+    /// 用户侧复用既有 `failureNotice` 一行浮层 + 失败触觉，**不新增常驻文字、
+    /// 不碰 PRD F7**。
+    private func recycleSilentTurn() {
+        WatchLog.info(
+            "session", "session_turn_cap_skipped",
+            requestId: activeTurnRequestId,
+            detail: "cap_s=\(Int(Self.turnCapSeconds)) reason=no_speech_detected action=recycle turn_index=\(turnIndex)"
+        )
+        playHaptic(.failure)
+        presentFailureNotice(Self.noSpeechNoticeCopy)
+        // 先丢弃再重开，**同一个 tick 内完成**。
+        //
+        // 不走 `markTurnAborted` 的 1.5s 退避：那段退避是为「错误提示音正在
+        // 外放、立刻开麦会被自己的声音再次触发 VAD」准备的，本路径只有触觉
+        // 没有提示音，不需要它；而只要相位在退避窗里落到 `.idle`，
+        // `armSilenceTimer` 三级治理的 `turnPhase == .listening` 前置就会被
+        // 打断——那正是 ESS-865 复审阻断 2 钉死的东西。
+        onDiscardTurn?()
+        startNextTurn(reason: "turn_cap_no_speech", resetSilenceGovernance: false)
     }
 
     // MARK: - ESS-600 回合状态机（listening → thinking → speaking → listening）
@@ -743,7 +779,11 @@ final class SessionController: ObservableObject {
 
     /// 开启下一轮采集。`onStartTurn` 返回新一轮的 request_id——从这一刻起
     /// 旧 id 的任何事件都会被 `acceptsTurnEvent` 挡在门外。
-    private func startNextTurn(reason: String) {
+    /// - Parameter resetSilenceGovernance: 是否重新起算静默治理（30/75/120s）。
+    ///   默认 `true`（正常换轮：用户刚说完话，治理理应重新起算）。
+    ///   ESS-962 阻断 3 的静音回收路径传 `false`——那一轮**没有**人说话，
+    ///   重置等于把 ESS-865 拦下的「走开后永不自收」原样放回来。
+    private func startNextTurn(reason: String, resetSilenceGovernance: Bool = true) {
         guard state == .listening else { return }
         relistenToken?.cancel(); relistenToken = nil
         thinkingToken?.cancel(); thinkingToken = nil
@@ -771,7 +811,7 @@ final class SessionController: ObservableObject {
         if Self.hapticOnAutoRelisten { playHaptic(.ready) }
         armTurnCap()
         // ESS-652: arm silence governance timer for the new turn.
-        armSilenceTimer()
+        if resetSilenceGovernance { armSilenceTimer() }
     }
 
     /// 通道失败（建立期或会话期），全部来自真实事件：
@@ -1159,6 +1199,10 @@ enum SessionTurnWiring {
         }
         session.onSalvageTurn = { [weak pushToTalk] in
             pushToTalk?.endSessionTurn()
+        }
+        // ESS-962 阻断 3：静音回收——丢弃这轮采集，不提交、不动会话。
+        session.onDiscardTurn = { [weak pushToTalk] in
+            pushToTalk?.discardSessionTurn()
         }
         // ESS-573：通道就绪 / 通道失败（唯一的 connecting → listening / idle 驱动源）。
         pushToTalk.onRealtimeChannelReady = { [weak session] in

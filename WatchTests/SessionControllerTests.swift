@@ -23,6 +23,7 @@ final class SessionControllerTests: XCTestCase {
     private var beginCount = 0
     private var teardownCount = 0
     private var commitCount = 0
+    private var startTurnCount = 0
     private var defaults: UserDefaults!
 
     override func setUp() {
@@ -35,6 +36,7 @@ final class SessionControllerTests: XCTestCase {
         beginCount = 0
         teardownCount = 0
         commitCount = 0
+        startTurnCount = 0
 
         controller.playHaptic = { [weak self] in self?.haptics.append($0) }
         controller.scheduleDelay = { [weak self] delay, fire in
@@ -49,6 +51,13 @@ final class SessionControllerTests: XCTestCase {
         }
         controller.onTeardownChannel = { [weak self] in self?.teardownCount += 1 }
         controller.onCommitTurn = { [weak self] in self?.commitCount += 1 }
+        // ESS-962：换轮接缝此前没接（`startNextTurn` 拿不到 request_id 就会
+        // 走 `ERR_SESSION_TURN_START` 失败路径）。静音回收要经过它，缺这一行
+        // 测的就不是生产行为。
+        controller.onStartTurn = { [weak self] in
+            self?.startTurnCount += 1
+            return "turn-\(self?.startTurnCount ?? 0)"
+        }
     }
 
     override func tearDown() {

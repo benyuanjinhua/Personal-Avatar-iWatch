@@ -1614,6 +1614,25 @@ final class PushToTalkController: ObservableObject {
         flushPendingAutoPlay()
     }
 
+    /// ESS-960 / ESS-962 阻断 3：**丢弃当前这一轮采集，但不动会话**。
+    ///
+    /// 与 `pressCancelled()` 的区别只有一条，也是关键的一条：不调
+    /// `endConversationAudio(reason:)`。PD-2 的口径是「只有点 X 才真
+    /// deactivate」，会话模式里回收一轮死采集不该把会话级 `.playAndRecord`
+    /// 持有一起释放——那会让紧接着的重开采集撞上一次多余的会话重建。
+    ///
+    /// 与 `endSessionTurn()` 的区别：那条走 `finishRecording()` 会**提交**，
+    /// 而本路径的前提正是「整轮没听到人说话」，提交等于送一段静音上去。
+    func discardSessionTurn() {
+        guard state == .recording else { return }
+        recorder.cancel()
+        releaseRequestedWhileStarting = false
+        state = .idle
+        onLocalCaptureChanged?(false)
+        // 与 pressCancelled 同一清理口径：不让 PCM tap 挂到下次按压才停。
+        abortUnsubmittedRealtimeTurn()
+    }
+
     /// ESS-573 / PRD F1：会话模式点 X / 下滑退出的统一拆链入口——
     /// 「点 X 必须真正释放麦克风」：
     /// - 录音中 → pressCancelled（不提交、停采集、取消实时回合、deactivate）

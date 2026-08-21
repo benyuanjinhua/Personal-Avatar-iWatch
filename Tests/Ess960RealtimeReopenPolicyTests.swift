@@ -32,7 +32,7 @@ final class Ess960RealtimeReopenPolicyTests: XCTestCase {
 
         XCTAssertEqual(decisions.filter { $0 == .open }.count, 0)
         XCTAssertEqual(
-            decisions.filter { $0 == .suppress(reason: "turn_terminated") }.count, 20
+            decisions.filter { $0 == .suppress(reason: RealtimeReopenPolicy.SuppressReason.turnTerminated) }.count, 20
         )
         XCTAssertEqual(policy.suppressedCount, 20)
     }
@@ -45,7 +45,7 @@ final class Ess960RealtimeReopenPolicyTests: XCTestCase {
         for _ in 0..<3 {
             XCTAssertEqual(
                 policy.decide(state: .failed, key: turn, trigger: .uplinkFrame),
-                .suppress(reason: "turn_terminated")
+                .suppress(reason: RealtimeReopenPolicy.SuppressReason.turnTerminated)
             )
         }
         XCTAssertEqual(policy.suppressedCount, 3)
@@ -61,7 +61,7 @@ final class Ess960RealtimeReopenPolicyTests: XCTestCase {
 
         XCTAssertEqual(
             policy.decide(state: .failed, key: turn, trigger: .uplinkFrame),
-            .suppress(reason: "turn_terminated")
+            .suppress(reason: RealtimeReopenPolicy.SuppressReason.turnTerminated)
         )
 
         let nextTurn = RealtimeReopenPolicy.TurnKey(
@@ -70,34 +70,121 @@ final class Ess960RealtimeReopenPolicyTests: XCTestCase {
         XCTAssertEqual(
             policy.decide(state: .failed, key: nextTurn, trigger: .streamStart), .open
         )
-        XCTAssertNil(policy.terminalTurn)
-        XCTAssertEqual(policy.suppressedCount, 0)
+        // ESS-962 阻断 2：新回合开始**不得**清掉旧回合的终态记账。
+        XCTAssertTrue(policy.isTerminated(turn))
     }
 
-    /// 同一个回合被新的 `stream.start` 显式重启也放行——它每回合恰好一次，
-    /// 做不出帧节奏的风暴，且这是失败之后唯一的复原路径。
-    func testStreamStartIsTheOnlyReopenRoute() {
+    // MARK: - ESS-962 阻断 1
+
+    /// **终态就是终态**：同一个 TurnKey 的 `.streamStart` 也一样 suppress。
+    ///
+    /// 初版对任何 `.streamStart` 都先清空终态再放行，等于「终态不是终态」，
+    /// 与验收标准「`retriable:false` 之后同 requestId 不再重开」直接冲突。
+    /// 生产上 Watch 每轮 `pressBegan` 都新铸 `UUIDv7`，同 requestId 的
+    /// `stream.start` 只可能是重放/重试。
+    func testTerminatedTurnIsNotReopenedEvenByStreamStart() {
         var policy = RealtimeReopenPolicy()
         policy.markTerminalFailure(turn)
         XCTAssertEqual(
-            policy.decide(state: .failed, key: turn, trigger: .streamStart), .open
+            policy.decide(state: .failed, key: turn, trigger: .streamStart),
+            .suppress(reason: RealtimeReopenPolicy.SuppressReason.turnTerminated)
         )
-        XCTAssertNil(policy.terminalTurn)
+        XCTAssertTrue(policy.isTerminated(turn))
     }
 
-    /// 被新回合顶掉之后，**旧**回合的迟到帧仍然不得复活：
-    /// `terminalTurn` 只由 `stream.start` 清，不由「别的 key 开了」清。
-    func testLateFramesFromSupersededTurnStaySuppressed() {
+    /// 验收标准 1 的完整口径：同一终态回合的 `.streamStart` **加**连续 20 个
+    /// 上行帧，合计 0 次 `.open`；随后新 requestId 仍能正常开。
+    func testTerminatedTurnOpensZeroTimesAcrossAllTriggers() {
         var policy = RealtimeReopenPolicy()
         policy.markTerminalFailure(turn)
-        let other = RealtimeReopenPolicy.TurnKey(requestId: "other", sessionId: "sess-b")
-        XCTAssertEqual(
-            policy.decide(state: .failed, key: other, trigger: .uplinkFrame), .open
+
+        var decisions: [RealtimeReopenPolicy.Decision] = []
+        decisions.append(policy.decide(state: .failed, key: turn, trigger: .streamStart))
+        for _ in 0..<20 {
+            decisions.append(policy.decide(state: .failed, key: turn, trigger: .uplinkFrame))
+        }
+        XCTAssertEqual(decisions.filter { $0 == .open }.count, 0)
+        XCTAssertEqual(decisions.count, 21)
+
+        let fresh = RealtimeReopenPolicy.TurnKey(
+            requestId: "01a017b2-0000-7000-8000-000000000002", sessionId: "sess-c"
         )
         XCTAssertEqual(
-            policy.decide(state: .failed, key: turn, trigger: .uplinkFrame),
-            .suppress(reason: "turn_terminated")
+            policy.decide(state: .failed, key: fresh, trigger: .streamStart), .open
         )
+    }
+
+    // MARK: - ESS-962 阻断 2
+
+    /// **生产顺序**的迟到帧回归：新回合 `.streamStart` → 状态 `.active(new)`
+    /// → 旧回合的 `.uplinkFrame`。
+    ///
+    /// 初版只存一个 `terminalTurn` 且被新回合的 `.streamStart` 清成 nil，
+    /// 此后旧 key 的帧既不命中 reuse、也无终态可命中，最终走 `.open`；
+    /// 生产路径随即关掉**正在服务新回合**的 transport 去建旧回合的。
+    /// 初版那条同名测试用的是 `state: .failed`，根本没走到这个顺序。
+    func testLateFrameFromTerminatedTurnCannotSupersedeLiveTurn() {
+        var policy = RealtimeReopenPolicy()
+        policy.markTerminalFailure(turn)
+
+        let next = RealtimeReopenPolicy.TurnKey(
+            requestId: "01a017b2-0000-7000-8000-000000000001", sessionId: "sess-b"
+        )
+        XCTAssertEqual(
+            policy.decide(state: .failed, key: next, trigger: .streamStart), .open
+        )
+        // 新回合已在服务，终态记账不得因此失忆。
+        XCTAssertTrue(policy.isTerminated(turn))
+
+        var lateDecisions: [RealtimeReopenPolicy.Decision] = []
+        for _ in 0..<20 {
+            lateDecisions.append(
+                policy.decide(state: .active(next), key: turn, trigger: .uplinkFrame)
+            )
+        }
+        XCTAssertEqual(lateDecisions.filter { $0 == .open }.count, 0)
+        // 新回合自己的帧不受影响，仍然复用同一个 transport。
+        XCTAssertEqual(
+            policy.decide(state: .active(next), key: next, trigger: .uplinkFrame),
+            .reuseExisting
+        )
+    }
+
+    /// 从未失败过、但也不是当前回合的外来帧，同样不得顶掉正在服务的 transport
+    /// （迟到帧 / WCSession 重排都能造出这个顺序）。
+    func testForeignFrameCannotSupersedeLiveTurnEvenWithoutTerminalRecord() {
+        var policy = RealtimeReopenPolicy()
+        let live = RealtimeReopenPolicy.TurnKey(requestId: "live", sessionId: "sess-live")
+        let foreign = RealtimeReopenPolicy.TurnKey(requestId: "old", sessionId: "sess-old")
+
+        XCTAssertEqual(
+            policy.decide(state: .active(live), key: foreign, trigger: .uplinkFrame),
+            .suppress(reason: RealtimeReopenPolicy.SuppressReason.foreignTurnLive)
+        )
+        XCTAssertEqual(
+            policy.decide(state: .connecting(live), key: foreign, trigger: .uplinkFrame),
+            .suppress(reason: RealtimeReopenPolicy.SuppressReason.foreignTurnLive)
+        )
+        // 真正的新回合带着自己的 stream.start 来，照常放行。
+        XCTAssertEqual(
+            policy.decide(state: .active(live), key: foreign, trigger: .streamStart), .open
+        )
+    }
+
+    /// 终态集合有界，且淘汰不是静默的——超出上限时 `evictedTerminalCount`
+    /// 必须记账，好让日志里能看出「更早的回合已不受保护」。
+    func testTerminalHistoryIsBoundedAndEvictionIsCounted() {
+        var policy = RealtimeReopenPolicy()
+        let limit = RealtimeReopenPolicy.terminalHistoryLimit
+        let keys = (0..<(limit + 2)).map {
+            RealtimeReopenPolicy.TurnKey(requestId: "req-\($0)", sessionId: "sess-\($0)")
+        }
+        keys.forEach { policy.markTerminalFailure($0) }
+
+        XCTAssertEqual(policy.terminalTurns.count, limit)
+        XCTAssertEqual(policy.evictedTerminalCount, 2)
+        XCTAssertFalse(policy.isTerminated(keys[0]))
+        XCTAssertTrue(policy.isTerminated(keys[limit + 1]))
     }
 
     // MARK: - 原有行为不得回归
