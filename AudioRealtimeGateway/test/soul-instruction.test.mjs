@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -21,4 +22,12 @@ test('fails explicitly when soul.md is missing or empty', () => {
   const empty = join(dir, 'empty.md')
   writeFileSync(empty, ' \n')
   assert.throws(() => loadSoulInstruction(empty), /soul_instruction_empty/)
+})
+
+test('canonical soul names the twin Mübai and defines its invocation phrase', () => {
+  const soulPath = fileURLToPath(new URL('../../soul.md', import.meta.url))
+  const instruction = loadSoulInstruction(soulPath)
+  assert.match(instruction, /你的名字是慕白/)
+  assert.match(instruction, /你好，慕白/)
+  assert.match(instruction, /明确唤起你/)
 })
