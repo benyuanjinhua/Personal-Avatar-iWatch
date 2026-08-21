@@ -63,6 +63,15 @@ export function createGateway(overrides = {}) {
   })
   const agentTransport = createAgentTransport(CONFIG, { log, providerKey })
   const realtimeTurns = new Map()
+  // ESS-958: 同 scope（device/session/request/generation）只允许一个活跃
+  // 会话。重复 upgrade 会导致新会话 nextUplinkSequence 归零，而客户端续发
+  // sequence 必然 ERR_STREAM_SEQUENCE，形成重连风暴。value 为 ws 句柄，
+  // close 时删除。
+  const activeScopes = new Map()
+  // ESS-958: 同 device_id + request_id 的握手限速。单个客户端 bug 不应
+  // 能把上游连接打 256 次。key=device:request，value=最近一次握手时间。
+  const handshakeTimes = new Map()
+  const HANDSHAKE_MIN_INTERVAL_MS = CONFIG.handshake_min_interval_ms ?? 1_000
   const fallbackSecret = readServiceSecret(CONFIG)
   const fallbackQueue = new FallbackJobQueue({
     stateDir, execute: createFallbackExecutor({
@@ -143,7 +152,39 @@ export function createGateway(overrides = {}) {
       log('ws_upgrade_rejected', { code: 'ERR_VOICE_BUSY', request_id: scope.request_id })
       return refuseUpgrade(socket, 503, 'ERR_VOICE_BUSY')
     }
+    // ESS-958: 同 scope 的重复 upgrade 拒绝。一个 request_id 只有一个合法
+    // 会话；重复 upgrade 会新建 nextUplinkSequence=0 的会话，客户端续发
+    // sequence 必然 ERR_STREAM_SEQUENCE。给可区分的错误码，不「建了就死」。
+    const scopeKey = [scope.device_id, scope.session_id, scope.request_id, scope.generation].join(':')
+    if (activeScopes.has(scopeKey)) {
+      log('ws_upgrade_rejected', {
+        code: 'ERR_SCOPE_ALREADY_ACTIVE',
+        request_id: scope.request_id, session_id: scope.session_id,
+        generation: scope.generation, device_id: scope.device_id,
+      })
+      return refuseUpgrade(socket, 409, 'ERR_SCOPE_ALREADY_ACTIVE')
+    }
+    // ESS-958: 同 device+request 的握手限速。单个客户端 bug 不应能把上游
+    // 连接打 256 次（真机实测 47s 内 256 次重连）。
+    const handshakeKey = `${scope.device_id}:${scope.request_id}`
+    const now = Date.now()
+    const lastHandshake = handshakeTimes.get(handshakeKey)
+    if (lastHandshake !== undefined && now - lastHandshake < HANDSHAKE_MIN_INTERVAL_MS) {
+      log('ws_upgrade_rejected', {
+        code: 'ERR_HANDSHAKE_RATE_LIMITED',
+        request_id: scope.request_id, session_id: scope.session_id,
+        retry_after_ms: HANDSHAKE_MIN_INTERVAL_MS - (now - lastHandshake),
+      })
+      return refuseUpgrade(socket, 429, 'ERR_HANDSHAKE_RATE_LIMITED')
+    }
+    handshakeTimes.set(handshakeKey, now)
+    // 限速表本身要有界：定期清理超过 1 分钟的条目，避免无界增长。
+    if (handshakeTimes.size > 4096) {
+      const cutoff = now - 60_000
+      for (const [k, t] of handshakeTimes) if (t < cutoff) handshakeTimes.delete(k)
+    }
     setRealtimeTurnState(scope.request_id, 'active')
+    activeScopes.set(scopeKey, socket)
     wss.handleUpgrade(req, socket, head, ws => {
       log('ws_upgrade', {
         request_id: scope.request_id, session_id: scope.session_id,
@@ -192,12 +233,14 @@ export function createGateway(overrides = {}) {
       })
       ws.once('close', (code, reason) => {
         guarded.dispose()
+        activeScopes.delete(scopeKey)
         if (realtimeTurns.get(scope.request_id) === 'active') setRealtimeTurnState(scope.request_id, 'failed')
         void fallbackQueue.drain()
         session.onSocketClose(code, reason?.toString())
       })
       ws.once('error', error => {
         guarded.dispose()
+        activeScopes.delete(scopeKey)
         setRealtimeTurnState(scope.request_id, 'failed'); void fallbackQueue.drain()
         session.onSocketClose(1006, 'socket_error:' + error.message)
       })
