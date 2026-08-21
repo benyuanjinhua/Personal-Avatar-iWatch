@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
-const TERMINAL = new Set(['completed', 'rejected', 'failed', 'timed_out'])
+const TERMINAL = new Set(['completed', 'rejected', 'failed', 'timed_out', 'cancelled'])
 const sha256 = value => createHash('sha256').update(value).digest('hex')
 
 // Durable, single-consumer queue for full-file fallback turns. Records are
@@ -11,19 +11,23 @@ const sha256 = value => createHash('sha256').update(value).digest('hex')
 // terminal job. The upstream request id remains stable across recovery.
 export class FallbackJobQueue {
   constructor({ stateDir, execute, turnState = () => null, maxJobs = 64,
-    queueTimeoutMs = 30_000, now = () => Date.now(), log = () => {} }) {
+    queueTimeoutMs = 30_000, ownerBusy = () => false, now = () => Date.now(), log = () => {},
+    setTimer = (fn, ms) => setTimeout(fn, ms), clearTimer = timer => clearTimeout(timer) }) {
     if (!stateDir || typeof execute !== 'function') throw new Error('stateDir and execute are required')
     this.dir = join(stateDir, 'fallback-jobs')
     this.turnStatesPath = join(stateDir, 'fallback-turn-states.json')
     this.execute = execute; this.turnState = turnState
+    this.ownerBusy = ownerBusy; this.setTimer = setTimer; this.clearTimer = clearTimer
     this.maxJobs = maxJobs; this.queueTimeoutMs = queueTimeoutMs
-    this.now = now; this.log = log; this.jobs = new Map(); this.turnStates = new Map(); this.draining = false
+    this.now = now; this.log = log; this.jobs = new Map(); this.turnStates = new Map()
+    this.drainPromise = null; this.deadlineTimer = null; this.controllers = new Map()
     mkdirSync(this.dir, { recursive: true })
     try { this.turnStates = new Map(Object.entries(JSON.parse(readFileSync(this.turnStatesPath, 'utf8')))) } catch { /* first boot */ }
     this.#load()
+    queueMicrotask(() => { void this.drain() })
   }
 
-  submit({ requestId, audio, audioSha256 }) {
+  submit({ requestId, audio, audioSha256, parentRequestId = null, contextSummary = null }) {
     if (!requestId || !Buffer.isBuffer(audio) || !/^[a-f0-9]{64}$/.test(audioSha256 ?? '')) {
       return { status: 'rejected', reason: 'invalid_job' }
     }
@@ -44,7 +48,8 @@ export class FallbackJobQueue {
       return { status: 'rejected', reason: 'queue_full' }
     }
     const job = { request_id: requestId, audio_sha256: audioSha256,
-      audio_base64: audio.toString('base64'), state: 'queued', accepted_at: this.now(), attempts: 0 }
+      audio_base64: audio.toString('base64'), parent_request_id: parentRequestId,
+      context_summary: contextSummary, state: 'queued', accepted_at: this.now(), attempts: 0 }
     this.jobs.set(requestId, job); this.#persist(job)
     this.log('fallback_job_accepted', { request_id: requestId, audio_sha256: audioSha256 })
     void this.drain()
@@ -52,8 +57,19 @@ export class FallbackJobQueue {
   }
 
   async drain() {
-    if (this.draining) return
-    this.draining = true
+    // A caller that arrives while a drain is active must observe a fresh pass,
+    // not merely wait for the pass that may already have inspected the queue.
+    // This matters when an owner-release event races the startup/submit kick.
+    if (this.drainPromise) {
+      await this.drainPromise
+      return this.drain()
+    }
+    this.drainPromise = this.#drainOnce()
+    try { await this.drainPromise } finally { this.drainPromise = null; this.#scheduleDeadline() }
+  }
+
+  async #drainOnce() {
+    if (this.deadlineTimer !== null) { this.clearTimer(this.deadlineTimer); this.deadlineTimer = null }
     try {
       for (const job of this.jobs.values()) {
         if (job.state !== 'queued') continue
@@ -61,21 +77,37 @@ export class FallbackJobQueue {
           this.#settle(job, 'timed_out', 'queue_timeout'); continue
         }
         const state = this.#turnState(job.request_id)
-        if (state === 'active' || state === 'owner_busy') continue
+        if (state === 'active' || state === 'owner_busy' || this.ownerBusy()) continue
         if (state === 'downlink_done' || state === 'playback_ended' || state === 'completed') {
           this.#settle(job, 'rejected', 'turn_already_completed'); continue
         }
         job.state = 'executing'; job.attempts += 1; this.#persist(job)
         this.log('fallback_job_executing', { request_id: job.request_id, attempt: job.attempts })
+        const controller = new AbortController(); this.controllers.set(job.request_id, controller)
         try {
           const result = await this.execute({ requestId: job.request_id,
-            audio: Buffer.from(job.audio_base64, 'base64'), audioSha256: job.audio_sha256 })
-          this.#settle(job, 'completed', null, result)
+            audio: Buffer.from(job.audio_base64, 'base64'), audioSha256: job.audio_sha256,
+            parentRequestId: job.parent_request_id, contextSummary: job.context_summary,
+            signal: controller.signal })
+          if (!controller.signal.aborted) this.#settle(job, 'completed', null, result)
         } catch (error) {
-          this.#settle(job, 'failed', error.code ?? 'upstream_failed')
-        }
+          this.#settle(job, controller.signal.aborted ? 'cancelled' : 'failed',
+            controller.signal.aborted ? 'cancelled' : (error.code ?? 'upstream_failed'))
+        } finally { this.controllers.delete(job.request_id) }
       }
-    } finally { this.draining = false }
+    } finally { /* outer drain installs the next deadline */ }
+  }
+
+  dispose() { if (this.deadlineTimer !== null) this.clearTimer(this.deadlineTimer); this.deadlineTimer = null }
+
+  isExecuting() { return [...this.jobs.values()].some(job => job.state === 'executing') }
+  cancel(requestId) {
+    const job = this.jobs.get(requestId)
+    if (!job) return { status: 'not_found' }
+    if (TERMINAL.has(job.state)) return { status: 'duplicate', state: job.state }
+    if (job.state === 'executing') this.controllers.get(requestId)?.abort()
+    else this.#settle(job, 'cancelled', 'cancelled')
+    return { status: 'cancelled', state: 'cancelled' }
   }
 
   get(requestId) { const job = this.jobs.get(requestId); return job ? { ...job, audio_base64: undefined } : null }
@@ -84,6 +116,15 @@ export class FallbackJobQueue {
     const temp = `${this.turnStatesPath}.tmp`; writeFileSync(temp, JSON.stringify(Object.fromEntries(this.turnStates))); renameSync(temp, this.turnStatesPath)
   }
   #turnState(requestId) { return this.turnStates.get(requestId) ?? this.turnState(requestId) }
+  #scheduleDeadline() {
+    if (this.deadlineTimer !== null) this.clearTimer(this.deadlineTimer)
+    const deadlines = [...this.jobs.values()].filter(job => job.state === 'queued')
+      .map(job => job.accepted_at + this.queueTimeoutMs)
+    if (!deadlines.length) { this.deadlineTimer = null; return }
+    const delay = Math.max(0, Math.min(...deadlines) - this.now())
+    this.deadlineTimer = this.setTimer(() => { this.deadlineTimer = null; void this.drain() }, delay)
+    this.deadlineTimer?.unref?.()
+  }
   #settle(job, state, reason, result = null) {
     job.state = state; job.reason = reason; job.result = result; job.settled_at = this.now(); this.#persist(job)
     this.log(`fallback_job_${state}`, { request_id: job.request_id, reason })
@@ -99,7 +140,14 @@ export class FallbackJobQueue {
       if (!name.endsWith('.json')) continue
       try {
         const job = JSON.parse(readFileSync(join(this.dir, name), 'utf8'))
-        if (job.state === 'executing') job.state = 'queued'
+        // The upstream has no idempotency-result lookup. Replaying an
+        // interrupted execution could duplicate an already-produced side
+        // effect, so fail closed and surface the uncertainty for retry policy
+        // rather than falsely claiming exactly-once.
+        if (job.state === 'executing') {
+          job.state = 'failed'; job.reason = 'execution_outcome_unknown'; job.settled_at = this.now()
+          this.#persist(job)
+        }
         this.jobs.set(job.request_id, job)
       } catch { /* malformed records fail closed and are not executed */ }
     }

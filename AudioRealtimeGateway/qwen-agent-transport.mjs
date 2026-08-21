@@ -587,8 +587,10 @@ export class QwenAgentTransport {
     }
 
     return {
-      appendAudio: ({ bytes }) => sendOrQueue({
+      appendAudio: ({ bytes, parentRequestId = null, contextSummary = null }) => sendOrQueue({
         type: 'audio.append', audio: bytes.toString('base64'),
+        ...(parentRequestId ? { parent_request_id: parentRequestId } : {}),
+        ...(contextSummary ? { context_summary: contextSummary } : {}),
       }, bytes.length),
       commit: () => {
         if (turn.committed || turn.terminal) return

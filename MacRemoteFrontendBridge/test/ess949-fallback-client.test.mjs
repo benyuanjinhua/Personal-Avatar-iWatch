@@ -18,6 +18,15 @@ test('Bridge outbox durably recovers a pending full file and settles it', () => 
   restarted.settle('r1', 'completed'); assert.equal(restarted.pending().length, 0)
 })
 
+test('Bridge outbox persists the ledger seed needed to close the accept/create crash window', () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'ess949-outbox-seed-')); const audio = Buffer.from('full file')
+  const meta = { sha256: createHash('sha256').update(audio).digest('hex'), codec: 'm4a' }
+  const ledgerSeed = { deviceId: 'watch-1', bodySha256: 'body-hash', sessionId: 'session-1', watchCreatedAt: 42 }
+  new FallbackJobOutbox({ stateDir }).accept({ requestId: 'crash-window', audio, meta, context: {}, ledgerSeed })
+  const recovered = new FallbackJobOutbox({ stateDir }).pending()[0]
+  assert.deepEqual(recovered.ledger_seed, ledgerSeed)
+})
+
 test('Bridge client signs POST/GET and observes a terminal result', async () => {
   const secret = 'bridge-client-test-secret-32-bytes-minimum'; let gets = 0
   const server = http.createServer((req, res) => {

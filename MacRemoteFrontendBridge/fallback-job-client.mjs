@@ -28,12 +28,17 @@ export class FallbackJobClient {
     while (Date.now() < deadline) {
       const job = await this.#request('GET', path, requestId, Buffer.alloc(0))
       if (job.state === 'completed') return job.result
-      if (['failed', 'rejected', 'timed_out'].includes(job.state)) {
+      if (['failed', 'rejected', 'timed_out', 'cancelled'].includes(job.state)) {
         throw Object.assign(new Error(job.reason ?? job.state), { code: job.reason ?? job.state })
       }
       await new Promise(resolve => setTimeout(resolve, this.pollMs))
     }
+    await this.cancel(requestId).catch(() => {})
     throw Object.assign(new Error('fallback job wait timeout'), { code: 'queue_timeout' })
+  }
+  cancel(requestId) {
+    const path = `/v1/fallback-jobs/${encodeURIComponent(requestId)}`
+    return this.#request('DELETE', path, requestId, Buffer.alloc(0))
   }
   #request(method, path, requestId, body) {
     const timestamp = String(Date.now())

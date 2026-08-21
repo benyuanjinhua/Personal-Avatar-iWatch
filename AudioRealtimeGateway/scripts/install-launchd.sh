@@ -23,6 +23,15 @@ if [ ! -f "${DEST}/certs/gateway.crt" ] || [ ! -f "${DEST}/certs/gateway.key" ];
   exit 1
 fi
 
+# Gateway and Bridge share this loopback-only service credential through a
+# mode-0600 file. Keep an existing value so restarts/deploys remain compatible.
+install -d -m 700 "${DEST}/state"
+if [ ! -s "${DEST}/state/fallback-hmac-secret" ]; then
+  umask 077
+  /usr/bin/openssl rand -hex 32 > "${DEST}/state/fallback-hmac-secret"
+fi
+chmod 600 "${DEST}/state/fallback-hmac-secret"
+
 install -d "${AGENTS_DIR}"
 install -m 644 "${SCRIPT_DIR}/launchd/${GATEWAY_LABEL}.plist" "${AGENTS_DIR}/"
 install -m 644 "${SCRIPT_DIR}/launchd/${ROTATOR_LABEL}.plist" "${AGENTS_DIR}/"

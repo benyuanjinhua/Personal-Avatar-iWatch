@@ -2,7 +2,7 @@
 // QwenAgentTransport. This is the only process that opens an upstream voice
 // connection; Bridge calls the HTTP job API and never instantiates a voice owner.
 export function createFallbackExecutor({ agentTransport, timeoutMs = 30_000, chunkBytes = 32_000 }) {
-  return ({ requestId, audio }) => new Promise((resolve, reject) => {
+  return ({ requestId, audio, parentRequestId = null, contextSummary = null, signal = null }) => new Promise((resolve, reject) => {
     const chunks = []; let settled = false; let handle; let assistantTranscript = null; let userTranscript = null
     const result = extra => ({ audio24k_base64: chunks.length ? Buffer.concat(chunks.filter(Boolean)).toString('base64') : null,
       assistant_transcript: assistantTranscript, user_transcript: userTranscript, ...extra })
@@ -12,6 +12,10 @@ export function createFallbackExecutor({ agentTransport, timeoutMs = 30_000, chu
       try { handle?.close() } catch { /* already closed */ }
       error ? reject(error) : resolve(result)
     }
+    signal?.addEventListener('abort', () => {
+      try { handle?.cancel?.() } catch { /* best effort */ }
+      finish(Object.assign(new Error('cancelled'), { code: 'cancelled' }))
+    }, { once: true })
     const timer = setTimeout(() => finish(Object.assign(new Error('fallback upstream timeout'), {
       code: 'upstream_timeout',
     })), timeoutMs)
@@ -40,7 +44,9 @@ export function createFallbackExecutor({ agentTransport, timeoutMs = 30_000, chu
     let sequence = 0
     for (let offset = 0; offset < audio.length; offset += chunkBytes) {
       const bytes = audio.subarray(offset, Math.min(offset + chunkBytes, audio.length))
-      handle.appendAudio({ sequence: sequence++, bytes })
+      const first = sequence === 0
+      handle.appendAudio({ sequence: sequence++, bytes,
+        ...(first ? { parentRequestId, contextSummary } : {}) })
     }
     handle.commit()
   })

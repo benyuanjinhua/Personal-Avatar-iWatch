@@ -22,6 +22,16 @@ test('active -> queued -> released -> executed exactly once', async () => {
   await q.drain(); assert.equal(calls, 1)
 })
 
+test('global owner lease blocks a different fallback request until release', async () => {
+  let ownerBusy = true; let calls = 0
+  const q = new FallbackJobQueue({ stateDir: dir(), turnState: () => 'failed',
+    ownerBusy: () => ownerBusy, execute: async () => { calls++; return { text: 'ok' } } })
+  q.submit({ requestId: 'fallback-B', audio, audioSha256: hash })
+  await q.drain(); assert.equal(calls, 0)
+  ownerBusy = false; await q.drain()
+  assert.equal(calls, 1); assert.equal(q.get('fallback-B').state, 'completed')
+})
+
 test('completed turn is rejected with explicit reason', () => {
   const q = new FallbackJobQueue({ stateDir: dir(), turnState: () => 'playback_ended', execute: async () => {} })
   assert.deepEqual(q.submit({ requestId: 'r2', audio, audioSha256: hash }),
@@ -53,6 +63,39 @@ test('gateway restart recovers queued job without duplicate execution', async ()
   assert.equal(calls, 1); assert.equal(second.get('r4').state, 'completed')
 })
 
+test('gateway restart autonomously resumes queued work without an external event', async () => {
+  const stateDir = dir(); let calls = 0
+  const first = new FallbackJobQueue({ stateDir, turnState: () => 'active', execute: async () => { calls++ } })
+  first.submit({ requestId: 'r-autokick', audio, audioSha256: hash }); await first.drain(); first.dispose()
+  const restarted = new FallbackJobQueue({ stateDir, turnState: () => 'failed', execute: async () => { calls++ } })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(calls, 1); assert.equal(restarted.get('r-autokick').state, 'completed')
+  restarted.dispose()
+})
+
+test('gateway restart never replays an execution whose upstream outcome is unknown', async () => {
+  const stateDir = dir(); let calls = 0
+  const first = new FallbackJobQueue({ stateDir, execute: () => new Promise(() => { calls++ }) })
+  first.submit({ requestId: 'r-crashed-executing', audio, audioSha256: hash })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(first.get('r-crashed-executing').state, 'executing')
+  const restarted = new FallbackJobQueue({ stateDir, execute: async () => { calls++ } })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(calls, 1)
+  assert.equal(restarted.get('r-crashed-executing').reason, 'execution_outcome_unknown')
+  restarted.dispose()
+})
+
+test('queued job times out autonomously when no owner event arrives', async () => {
+  let calls = 0
+  const q = new FallbackJobQueue({ stateDir: dir(), queueTimeoutMs: 15,
+    ownerBusy: () => true, execute: async () => { calls++ } })
+  q.submit({ requestId: 'r-autotimeout', audio, audioSha256: hash })
+  await new Promise(resolve => setTimeout(resolve, 30))
+  assert.equal(calls, 0); assert.equal(q.get('r-autotimeout').state, 'timed_out')
+  q.dispose()
+})
+
 test('queue timeout settles explicitly without upstream execution', async () => {
   let now = 1_000; let calls = 0
   const q = new FallbackJobQueue({ stateDir: dir(), now: () => now, queueTimeoutMs: 50,
@@ -71,16 +114,32 @@ test('upstream disconnect settles failed and never silently retries', async () =
   assert.equal(calls, 1); assert.equal(q.get('r6').reason, 'gateway_disconnected')
 })
 
+test('cancel aborts an executing upstream job and records a terminal state', async () => {
+  let release
+  const q = new FallbackJobQueue({ stateDir: dir(), execute: ({ signal }) => new Promise((resolve, reject) => {
+    release = () => resolve({ text: 'too late' })
+    signal.addEventListener('abort', () => reject(Object.assign(new Error('cancelled'), { code: 'cancelled' })))
+  }) })
+  q.submit({ requestId: 'r-cancel', audio, audioSha256: hash })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(q.cancel('r-cancel').status, 'cancelled')
+  await q.drain(); release?.()
+  assert.equal(q.get('r-cancel').state, 'cancelled')
+})
+
 test('executor preserves transcript and background task identity', async () => {
+  let firstAppend
   const transport = { openTurn: ({ responseId, onEvent }) => ({
-    appendAudio() {}, commit() {
+    appendAudio(frame) { firstAppend ??= frame }, commit() {
       onEvent({ type: 'agent.transcript.final', response_id: responseId, role: 'user', content: '问题' })
       onEvent({ type: 'agent.audio.delta', response_id: responseId, sequence: 0, audio: Buffer.from('ack').toString('base64') })
       onEvent({ type: 'agent.transcript.final', response_id: responseId, role: 'assistant', content: '处理中' })
       onEvent({ type: 'agent.task', response_id: responseId, task: { id: 'task-1' } })
     }, close() {},
   }) }
-  const result = await createFallbackExecutor({ agentTransport: transport })({ requestId: 'r-task', audio })
+  const result = await createFallbackExecutor({ agentTransport: transport })({ requestId: 'r-task', audio,
+    parentRequestId: 'parent-1', contextSummary: 'prior context' })
   assert.equal(result.task_id, 'task-1'); assert.equal(result.assistant_transcript, '处理中')
   assert.equal(result.user_transcript, '问题'); assert.equal(Buffer.from(result.audio24k_base64, 'base64').toString(), 'ack')
+  assert.equal(firstAppend.parentRequestId, 'parent-1'); assert.equal(firstAppend.contextSummary, 'prior context')
 })

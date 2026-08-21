@@ -62,6 +62,13 @@ function optionalBoundedString(value, field, maxLength) {
   return value
 }
 
+function readFallbackSecret(config) {
+  const envValue = process.env[config.fallback_hmac_secret_env ?? 'FALLBACK_JOB_HMAC_SECRET']
+  if (envValue) return envValue
+  if (!config.fallback_hmac_secret_file) return ''
+  try { return readFileSync(resolve(BASE, config.fallback_hmac_secret_file), 'utf8').trim() } catch { return '' }
+}
+
 export function createBridge(overrides = {}) {
   const CONFIG = { ...JSON.parse(readFileSync(join(BASE, 'config.json'), 'utf8')), ...overrides }
   const log = obj => process.stdout.write(JSON.stringify({ ts: new Date().toISOString(), ...obj }) + '\n')
@@ -135,7 +142,7 @@ export function createBridge(overrides = {}) {
     },
   } : new FallbackJobClient({
     baseUrl: CONFIG.audio_realtime_gateway_url ?? 'http://127.0.0.1:8444',
-    secret: process.env[CONFIG.fallback_hmac_secret_env ?? 'FALLBACK_JOB_HMAC_SECRET'] ?? '',
+    secret: readFallbackSecret(CONFIG),
     pollMs: CONFIG.fallback_job_poll_ms ?? 100,
     timeoutMs: CONFIG.fallback_job_wait_ms ?? 35_000,
     log,
@@ -581,6 +588,7 @@ export function createBridge(overrides = {}) {
       if (!turn || ['completed', 'failed', 'cancelled'].includes(turn.state)) return
       if (turn.task_id) return // background phase: TaskWatcher owns the deadline
       log({ evt: 'work_timeout_realtime', request_id: requestId })
+      await fallbackJobs.cancel?.(requestId).catch(() => {})
       if (supervisor.currentTurn?.label === requestId) supervisor.abortCurrentTurn('work timeout')
       ledger.fail(requestId, 'ERR_WORK_TIMEOUT')
     }, CONFIG.max_work_ms)
@@ -799,6 +807,10 @@ export function createBridge(overrides = {}) {
 
     const persisted = fallbackOutbox.accept({
       requestId, audio: audioBuf, meta, context: { parentRequestId, contextSummary },
+      ledgerSeed: {
+        deviceId: authInfo.deviceId, bodySha256: bodySha,
+        sessionId: supervisor.sessionId, watchCreatedAt: body.created_at,
+      },
     })
     if (persisted.status === 'conflict') throw new ApiError(ERR.IDEMPOTENCY_CONFLICT)
     const { turn } = ledger.create({
@@ -908,6 +920,7 @@ export function createBridge(overrides = {}) {
       const ok = await watcher.cancel(requestId).catch(() => false)
       if (!ok) ledger.update(requestId, { state: 'cancelled' })
     } else {
+      await fallbackJobs.cancel?.(requestId).catch(() => {})
       if (supervisor.currentTurn?.label === requestId) supervisor.abortCurrentTurn('cancelled')
       ledger.update(requestId, { state: 'cancelled' })
     }
@@ -1434,7 +1447,12 @@ export function createBridge(overrides = {}) {
       if (!sourceAllowed(ip)) return refuse(403, 'ERR_SOURCE_NOT_ALLOWED')
       const isMedia = pathName === '/v1/voice/realtime'
       if (pathName !== '/v1/voice/events' && !isMedia) return refuse(404, 'ERR_NOT_FOUND')
-      if (isMedia && CONFIG.realtime_media_v1 !== true) return refuse(404, 'ERR_NOT_FOUND')
+      // Legacy Bridge-owned realtime media is test-only. Production Watch
+      // realtime traffic terminates at AudioRealtimeGateway so there is one
+      // process-wide upstream voice owner.
+      if (isMedia && (CONFIG.realtime_media_v1 !== true || CONFIG.legacy_bridge_media_owner_enabled !== true)) {
+        return refuse(404, 'ERR_NOT_FOUND')
+      }
       const { deviceId, requestId } = auth.verify({ headers: req.headers, method: 'GET', pathName, rawBody: Buffer.alloc(0) })
       if (isMedia) {
         const url = new URL(req.url, 'https://x')
@@ -1744,7 +1762,11 @@ export function createBridge(overrides = {}) {
   function start() {
     recover()
     for (const record of fallbackOutbox.pending()) {
-      const turn = ledger.get(record.request_id)
+      let turn = ledger.get(record.request_id)
+      if (!turn && record.ledger_seed) {
+        turn = ledger.create({ requestId: record.request_id, ...record.ledger_seed }).turn
+        log({ evt: 'fallback_ledger_recovered', request_id: record.request_id })
+      }
       if (turn && !turn.task_id && !['completed', 'failed', 'cancelled'].includes(turn.state)) {
         processTurn(record.request_id, fallbackOutbox.readAudio(record), record.meta, record.context).catch(error =>
           log({ evt: 'fallback_recovery_failed', request_id: record.request_id, reason: String(error.message) }))

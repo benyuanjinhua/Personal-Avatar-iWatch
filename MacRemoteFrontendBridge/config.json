@@ -18,11 +18,12 @@
   "pairing_code_ttl_ms": 600000,
 
   "gateway_url": "http://127.0.0.1:3101",
-  "audio_realtime_gateway_url": "https://127.0.0.1:8444",
+  "audio_realtime_gateway_url": "http://127.0.0.1:8445",
   "fallback_jobs_enabled": true,
   "fallback_hmac_secret_env": "FALLBACK_JOB_HMAC_SECRET",
+  "fallback_hmac_secret_file": "../AudioRealtimeGateway/state/fallback-hmac-secret",
   "fallback_job_poll_ms": 100,
-  "fallback_job_wait_ms": 35000,
+  "fallback_job_wait_ms": 70000,
   "device_id": "jackson-iphone",
   "idle_disconnect_ms": 900000,
   "turn_timeout_ms": 120000,
@@ -54,6 +55,7 @@
   "allow_test_pcm": false,
   "voice_streaming_v2": false,
   "realtime_media_v1": false,
+  "legacy_bridge_media_owner_enabled": false,
   "realtime_media_max_frame_bytes": 65536,
   "realtime_media_max_buffered_bytes": 262144,
 

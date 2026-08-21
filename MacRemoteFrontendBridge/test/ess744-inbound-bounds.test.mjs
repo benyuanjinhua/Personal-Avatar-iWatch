@@ -170,6 +170,7 @@ describe('ESS-744 WSS inbound frame and queue bounds', () => {
     bridge = createBridge({
       port: 0, bind_tailscale_ip: 'none', tls_cert: CERT, tls_key: KEY,
       state_dir: stateDir, gateway_url: gatewayUrl, realtime_media_v1: true,
+      legacy_bridge_media_owner_enabled: true,
       probe_timeout_ms: 500, events_heartbeat_ms: 60_000,
       realtime_media_max_queued_messages: MAX_QUEUED,
     })
