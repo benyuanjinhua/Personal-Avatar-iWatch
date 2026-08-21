@@ -216,8 +216,10 @@ final class SessionController: ObservableObject {
     /// 声音再次触发 VAD，形成「太短 → 报错 → 又太短」的自激循环。
     /// 1.5s【待调】≈ 一句错误提示语音的长度。
     static let abortedTurnRelistenDelaySeconds: TimeInterval = 1.5
-    /// ESS-891：系统输出音量（0.0–1.0）低于此值时提示调高音量。真机取证
-    /// `output_volume=0.500` 已不可听，取 0.6 留出余量，覆盖 50% 及以下。
+    /// ESS-891：系统输出音量（0.0–1.0）低于此值时提示调高音量。
+    /// 【暂定阈值 · 单点外推】依据仅一次真机观测 `output_volume=0.500` 不可听，
+    /// 取 0.6 留余量；未做 50%/100% 同场对照与多设备采样（R-04.4），0.55 等
+    /// 临界用户可能听得清却被反复提示——待真机对照校准后再定稿。
     static let lowVolumeHintThreshold: Float = 0.6
     // MARK: ESS-652 超时与静默治理
     /// 思考慢提示：提交后无回答 > 此值显示慢提示。
