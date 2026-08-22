@@ -81,24 +81,24 @@ function scriptToolCallTurn({ toolDelayMs = 500, nestedShape = false } = {}) {
       // 与 origin=announcement 的过期后台播报不同，后者由 ESS-849 隔离。
       send(ws, { type: 'response.started', responseId: 'up-prompt', origin: 'model' })
       audioDelta(ws, 0, 'current-turn-prompt')
-      send(ws, { type: 'audio.done' })
       send(ws, { type: 'response.done', responseId: 'up-prompt', origin: 'model', hasFunctionCall: false, status: 'completed' })
+      send(ws, { type: 'audio.done' })
       // 段 1：model 决定调用工具（无音频）
       setTimeout(() => {
         send(ws, { type: 'response.started', responseId: 'up-model', origin: 'model' })
-        send(ws, { type: 'audio.done' })
         const done = nestedShape
           ? { type: 'response.done', response: { id: 'up-model', hasFunctionCall: true } }
           : { type: 'response.done', responseId: 'up-model', origin: 'model', hasFunctionCall: true, status: 'completed' }
         send(ws, done)
+        send(ws, { type: 'audio.done' })
       }, 200)
       // 段 2：agent 工具结果（真正的答案），在工具执行之后到达
       setTimeout(() => {
         send(ws, { type: 'response.started', responseId: 'up-agent', origin: 'agent' })
         audioDelta(ws, 1, 'real-answer-a')
         audioDelta(ws, 2, 'real-answer-b')
-        send(ws, { type: 'audio.done' })
         send(ws, { type: 'response.done', responseId: 'up-agent', origin: 'agent', hasFunctionCall: false, status: 'completed' })
+        send(ws, { type: 'audio.done' })
       }, 200 + toolDelayMs)
     }
   }
@@ -165,9 +165,9 @@ test('ESS-1052 · pending 期间夹入 announcement/缺字段 done 不得冒充�
     if (message.type === 'audio.commit') {
       send(ws, { type: 'response.started', responseId: 'up-model', origin: 'model' })
       audioDelta(ws, 0, 'prompt')
-      send(ws, { type: 'audio.done' })
       send(ws, { type: 'response.done', responseId: 'up-model', origin: 'model',
         hasFunctionCall: true, status: 'completed' })
+      send(ws, { type: 'audio.done' })
 
       // 同一 WSS 的无关完成事件：显式 false 的后台播报，以及缺字段的未知响应。
       send(ws, { type: 'response.done', responseId: 'up-ann', origin: 'announcement',
@@ -178,9 +178,9 @@ test('ESS-1052 · pending 期间夹入 announcement/缺字段 done 不得冒充�
       setTimeout(() => {
         send(ws, { type: 'response.started', responseId: 'up-agent', origin: 'agent' })
         audioDelta(ws, 1, 'real-answer')
-        send(ws, { type: 'audio.done' })
         send(ws, { type: 'response.done', responseId: 'up-agent', origin: 'agent',
           hasFunctionCall: false, status: 'completed' })
+        send(ws, { type: 'audio.done' })
       }, 250)
     }
   })
@@ -196,7 +196,8 @@ test('ESS-1052 · pending 期间夹入 announcement/缺字段 done 不得冒充�
   const terminals = logs.filter(l => l.evt === 'upstream_turn_terminal')
   assert.equal(terminals.length, 1)
   assert.equal(terminals[0].reason, 'tool_result_done')
-  assert.equal(logs.filter(l => l.evt === 'upstream_tool_call_resolution_ignored').length, 2)
+  assert.equal(logs.filter(l => l.evt === 'upstream_tool_call_resolution_ignored').length, 1)
+  assert.equal(logs.filter(l => l.evt === 'upstream_announcement_response_done_dropped').length, 1)
   assert.equal(logs.filter(l => l.evt === 'upstream_tool_call_resolved').length, 1)
   turn.close()
 })

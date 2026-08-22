@@ -210,6 +210,8 @@ test('ESS-849 · 只有播报音频时，应答死线照常到期（播报不算
     if (message.type === 'audio.commit') {
       send(ws, { type: 'response.started', responseId: 'ann-1', origin: 'announcement' })
       audioDelta(ws, 0, '只有播报', 'ann-1')
+      send(ws, { type: 'response.done', responseId: 'ann-1', origin: 'announcement',
+        hasFunctionCall: false, status: 'completed' })
       send(ws, { type: 'audio.done', responseId: 'ann-1' })
     }
   })
@@ -228,6 +230,7 @@ test('ESS-849 · 只有播报音频时，应答死线照常到期（播报不算
   assert.equal(events.at(-1).code, 'ERR_UPSTREAM_NO_RESPONSE')
   assert.equal(events.filter(event => event.type === 'agent.audio.delta').length, 0)
   assert.ok(logs.some(l => l.evt === 'upstream_response_timeout'))
+  assert.ok(logs.some(l => l.evt === 'upstream_announcement_response_done_dropped'))
 })
 
 test('ESS-849 · 映射缺失默认放行：先 delta 后 started 的乱序漏网，但留证', async () => {

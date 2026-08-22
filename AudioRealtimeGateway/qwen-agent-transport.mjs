@@ -1140,7 +1140,6 @@ export class QwenAgentTransport {
         // `response.hasFunctionCall` and snake_case accepted too so a shape
         // change cannot silently drop the signal.
         if (event.type === 'response.done') {
-          noteResponseProgress()
           const rawHasFunctionCall = typeof event.hasFunctionCall === 'boolean'
             ? event.hasFunctionCall
             : typeof event.response?.hasFunctionCall === 'boolean'
@@ -1151,12 +1150,28 @@ export class QwenAgentTransport {
           const hasFunctionCall = rawHasFunctionCall === true
           const upstreamResponseId = event.responseId ?? event.response?.id ?? null
           const responseOrigin = event.origin ?? event.response?.origin ?? null
+          const responseAnnouncementId = responseOrigin === 'announcement'
+            ? String(upstreamResponseId ?? '') || null
+            : announcementResponseIdOf({ responseId: upstreamResponseId })
           this.log('upstream_response_done', {
             ...scopeLog, upstream_response_id: upstreamResponseId,
             origin: responseOrigin,
             status: event.status ?? event.response?.status ?? null,
             has_function_call: rawHasFunctionCall,
           })
+          // ESS-849/1052: response.done shares the same responseId→origin
+          // ownership table as audio/transcript. A stale background completion
+          // proves nothing about this turn and must neither cancel its response
+          // deadline nor mutate the pending-tool latch.
+          if (responseAnnouncementId !== null) {
+            this.log('upstream_announcement_response_done_dropped', {
+              ...scopeLog,
+              upstream_response_id: responseAnnouncementId,
+              has_function_call: rawHasFunctionCall,
+            })
+            return
+          }
+          noteResponseProgress()
           if (hasFunctionCall) {
             if (!turn.pendingToolCall) {
               turn.pendingToolCall = true
@@ -1176,7 +1191,10 @@ export class QwenAgentTransport {
             // the pending `flushDone` otherwise.
             if (turn.closedSegment) {
               endTurn('tool_result_done', turn.closedSegment.finalSequence)
-            } else if (turn.pendingDone) {
+            } else {
+              // The upstream gateway emits response.done before audio.done.
+              // Remember the final response now; flushDone consumes this latch
+              // once its audio barrier settles.
               turn.endAfterDone = true
             }
           } else if (turn.pendingToolCall) {
