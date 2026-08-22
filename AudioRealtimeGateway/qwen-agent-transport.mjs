@@ -1049,7 +1049,11 @@ export class QwenAgentTransport {
             // the pending `flushDone` otherwise.
             if (turn.closedSegment) {
               endTurn('tool_result_done', turn.closedSegment.finalSequence)
-            } else if (turn.pendingDone) {
+            } else {
+              // 上游在同一 handler 里先发 `response.done` 后发 `audio.done`，
+              // 所以最终段的音频此刻尚未 settle。标记 `endAfterDone`，由
+              // `flushDone` 在音频 settle 时收口——两种事件顺序都能正确
+              // 触发 tool_result_done（ESS-1053 复审 B3）。
               turn.endAfterDone = true
             }
           } else if (turn.pendingToolCall) {

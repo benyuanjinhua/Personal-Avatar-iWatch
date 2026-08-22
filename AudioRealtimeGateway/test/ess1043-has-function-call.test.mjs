@@ -137,6 +137,62 @@ test('ESS-1043 · hasFunctionCall=true 时回合跨过工具延迟保持打开�
   turn.close()
 })
 
+// ESS-1053 复审 B3：上游在同一 handler 里先发 `response.done` 后发 `audio.done`。
+// 这里按真实顺序注入，且工具执行期间再插入一条过期播报（ESS-849 场景），
+// 断言回合仍只由 agent 工具结果收口、终态唯一。
+test('ESS-1043 · 上游真实顺序（response.done 先于 audio.done）+ 工具期间插入过期播报仍只在最终段收口', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') {
+      send(ws, { type: 'voice.ready' })
+      send(ws, { type: 'voice.state', state: 'listening', origin: 'model' })
+    }
+    if (message.type === 'audio.commit') {
+      // 段 0：announcement「我正在查询」——response.done 先于 audio.done
+      send(ws, { type: 'response.started', responseId: 'up-ann', origin: 'announcement' })
+      audioDelta(ws, 0, 'announcement')
+      send(ws, { type: 'response.done', responseId: 'up-ann', origin: 'announcement', hasFunctionCall: false, status: 'completed' })
+      send(ws, { type: 'audio.done' })
+      // 段 1：model 决定调用工具（无音频）
+      setTimeout(() => {
+        send(ws, { type: 'response.started', responseId: 'up-model', origin: 'model' })
+        send(ws, { type: 'response.done', responseId: 'up-model', origin: 'model', hasFunctionCall: true, status: 'completed' })
+        send(ws, { type: 'audio.done' })
+        // 工具执行期间插入一条过期播报的 response.done（hasFunctionCall=false）
+        setTimeout(() => {
+          send(ws, { type: 'response.done', responseId: 'up-stale', origin: 'announcement', hasFunctionCall: false, status: 'completed' })
+        }, 150)
+      }, 200)
+      // 段 2：agent 工具结果
+      setTimeout(() => {
+        send(ws, { type: 'response.started', responseId: 'up-agent', origin: 'agent' })
+        audioDelta(ws, 1, 'real-answer-a')
+        audioDelta(ws, 2, 'real-answer-b')
+        send(ws, { type: 'response.done', responseId: 'up-agent', origin: 'agent', hasFunctionCall: false, status: 'completed' })
+        send(ws, { type: 'audio.done' })
+      }, 700)
+    }
+  })
+  const events = []; const logs = []
+  const transport = transportFor(url, {
+    logs, segmentGapMs: 100, segmentGapBusyMs: 200, toolCallWindowMs: 2_000,
+  })
+  const turn = openTurn(transport, { requestId: 'r-order', events })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'), 4_000)
+
+  // 两段答案音频都到。
+  assert.deepEqual(events.filter(e => e.type === 'agent.audio.delta').map(e => e.sequence), [0, 1, 2])
+  const terminals = logs.filter(l => l.evt === 'upstream_turn_terminal')
+  assert.equal(terminals.length, 1, '唯一终态')
+  assert.equal(terminals[0].reason, 'tool_result_done')
+  assert.equal(terminals[0].final_sequence, 2)
+  // 过期播报的 done 被忽略，不得冒充工具结果。
+  assert.ok(logs.some(l => l.evt === 'upstream_response_done_ignored'
+    && l.upstream_response_id === 'up-stale' && l.reason === 'announcement'))
+  turn.close()
+})
+
 test('ESS-1043 · 嵌套 response.hasFunctionCall 形状同样被识别', async () => {
   const url = await upstream(scriptToolCallTurn({ nestedShape: true }))
   const events = []; const logs = []
