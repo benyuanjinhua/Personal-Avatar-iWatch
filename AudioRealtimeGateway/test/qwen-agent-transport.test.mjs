@@ -644,3 +644,94 @@ test('ESS-842: cancel and close disarm the committed-turn deadline', async () =>
     assert.deepEqual(events, [], `${teardown} 之后不得再有 deadline 事件`)
   }
 })
+
+// ESS-842 取证：验收标准 1 点名要 `speech_final` 与 `response.started`，
+// 而本适配器此前**只**转发 audio.delta / audio.done，其余上游帧一律无声丢弃。
+// 2026-08-14 对真实上游实测：一次普通回合会发 voice.state x4、
+// response.started x4、transcript.final x1、task.progress x35 —— 全部不可见。
+// 所以事故里那句「上游什么都没发」从来就没有被证明过，它只是我们没记。
+test('ESS-842: unhandled upstream frames are logged once per type', async () => {
+  let socket
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') { socket = ws; ws.send(JSON.stringify({ type: 'voice.ready' })) }
+  })
+  const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, responseTimeoutMs: 0, log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  const turn = transport.openTurn({
+    requestId: 'rObs', sessionId: 'sObs', generation: 1, responseId: 'rObs:gen1',
+    onEvent: () => {},
+  })
+  await waitFor(() => logs.some(item => item.evt === 'upstream_ready'))
+  socket.send(JSON.stringify({ type: 'voice.state', state: 'thinking' }))
+  for (let i = 0; i < 5; i += 1) socket.send(JSON.stringify({ type: 'task.progress', step: i }))
+  await waitFor(() => logs.filter(item => item.evt === 'upstream_event_ignored').length === 2)
+
+  const ignored = logs.filter(item => item.evt === 'upstream_event_ignored')
+  assert.deepEqual(ignored.map(item => item.upstream_event_type).sort(), ['task.progress', 'voice.state'])
+  // 每类每回合只记一次——35 条 task.progress 不能把日志淹掉。
+  assert.equal(ignored.filter(item => item.upstream_event_type === 'task.progress').length, 1)
+  assert.equal(ignored.find(item => item.upstream_event_type === 'voice.state').state, 'thinking')
+  assert.ok(ignored.every(item => item.request_id === 'rObs'))
+  turn.close()
+})
+
+// `transcript.final` (role=user) 就是验收标准要的 ASR final。
+// **内容是用户语音，绝不入日志**；只留「到了没有」所需的元数据。
+test('ESS-842: the ASR final is logged without logging what the user said', async () => {
+  let socket
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') { socket = ws; ws.send(JSON.stringify({ type: 'voice.ready' })) }
+  })
+  const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, responseTimeoutMs: 0, log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  const turn = transport.openTurn({
+    requestId: 'rAsr', sessionId: 'sAsr', generation: 1, responseId: 'rAsr:gen1',
+    onEvent: () => {},
+  })
+  await waitFor(() => logs.some(item => item.evt === 'upstream_ready'))
+  const secret = '我的身份证号是不能出现在日志里的'
+  socket.send(JSON.stringify({
+    type: 'transcript.final', role: 'user', content: secret, turnId: 'ut-1',
+  }))
+  await waitFor(() => logs.some(item => item.evt === 'upstream_speech_final'))
+
+  const speechFinal = logs.find(item => item.evt === 'upstream_speech_final')
+  assert.equal(speechFinal.content_length, secret.length)
+  assert.equal(speechFinal.upstream_turn_id, 'ut-1')
+  // 红线：整份日志里不得出现用户说的话。
+  assert.equal(JSON.stringify(logs).includes(secret), false, '用户语音内容不得进日志')
+  turn.close()
+})
+
+// `response.started` 带 origin。实测上游会以 origin="announcement" 起一个与
+// 用户这一轮无关的响应，其音频会被当成本轮回答转给手表。记下 origin 是让这件事
+// **可判定**的前提；改不改转发行为是另一个决定，不在本次范围。
+test('ESS-842: response.started is promoted with its origin', async () => {
+  let socket
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') { socket = ws; ws.send(JSON.stringify({ type: 'voice.ready' })) }
+  })
+  const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, responseTimeoutMs: 0, log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  const turn = transport.openTurn({
+    requestId: 'rOrig', sessionId: 'sOrig', generation: 1, responseId: 'rOrig:gen1',
+    onEvent: () => {},
+  })
+  await waitFor(() => logs.some(item => item.evt === 'upstream_ready'))
+  socket.send(JSON.stringify({ type: 'response.started', origin: 'announcement', responseId: 'resp_x' }))
+  socket.send(JSON.stringify({ type: 'response.started', origin: 'model', responseId: 'resp_y' }))
+  await waitFor(() => logs.filter(item => item.evt === 'upstream_response_started').length === 2)
+
+  const started = logs.filter(item => item.evt === 'upstream_response_started')
+  assert.deepEqual(started.map(item => item.origin), ['announcement', 'model'])
+  assert.deepEqual(started.map(item => item.upstream_response_id), ['resp_x', 'resp_y'])
+  // 这两条不走「每类一次」的收敛——每一次响应起头都要留痕。
+  assert.equal(logs.filter(item => item.evt === 'upstream_event_ignored').length, 0)
+  turn.close()
+})
