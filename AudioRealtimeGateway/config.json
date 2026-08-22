@@ -44,6 +44,7 @@
   "agent_multi_segment_mode": "auto",
   "agent_segment_gap_ms": 2500,
   "agent_segment_gap_busy_ms": 12000,
+  "agent_tool_call_window_ms": 30000,
   "fallback_jobs_enabled": false,
   "fallback_hmac_secret_env": "FALLBACK_JOB_HMAC_SECRET",
   "fallback_hmac_secret_file": "./state/fallback-hmac-secret",

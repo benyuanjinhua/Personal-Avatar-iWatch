@@ -213,6 +213,14 @@ inspect control frames.
   因此本窗口天然早于客户端，12 s 距客户端预算仍有充足余量。
   旧的 `agent_turn_idle_backstop_ms = 45000` 是 ESS-969 的未标定占位值，
   已由上面两个标定值替换（删除的理由是「没标定 + 判据换了」，不是时序竞争）。
+- `agent_tool_call_window_ms`（默认 30000，ESS-1043）：工具调用窗口。上游 qwen
+  `response.done` 携带 `hasFunctionCall`；为 true 时模型已决定调用工具，真正的
+  答案段要在工具执行（实测 8–16 s，远超上面两档）之后才到。此时挂起的段落改用
+  本窗口，而不是用普通空闲窗口把回合提前收口。工具结果段的 `response.done`
+  （`hasFunctionCall=false`）一到，回合在其音频 settle 后立即收口
+  （`upstream_turn_terminal reason=tool_result_done`）。30 s ≈ 1.9x 实测上限，
+  仍早于 Watch 的 45 s 硬思考超时，工具结果丢失时也有界兜底（按 segment_gap
+  收口），不会把回合永远挂住。
 - **task 生命周期只延长窗口，不否决收口**：`task.accepted` 实测比第一段
   `audio.done` 晚 795–8689 ms（n=10），护不住第一段；而 task 常比回合多活
   30–70 s，「有未终结 task 就不收口」会把每个工具回合挂到客户端硬超时。
