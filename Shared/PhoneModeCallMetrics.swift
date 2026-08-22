@@ -80,6 +80,8 @@ enum PhoneModeCallTrace {
         "session_turn_aborted": 3,
         "session_speaking_interrupted": 3,
         "session_thinking_timeout": 3,
+        // ESS-1044：服务端判本轮终态失败，与上面几条同为回合终局。
+        "session_turn_failed": 3,
     ]
 
     private static let terminalTurnEvents: Set<String> = [
@@ -88,6 +90,7 @@ enum PhoneModeCallTrace {
         "session_turn_aborted",
         "session_speaking_interrupted",
         "session_thinking_timeout",
+        "session_turn_failed",
     ]
 
     /// 逼出额外按键的事件（进入 / 挂断 / 打断都不算——设计稿「打断除外」）。

@@ -102,6 +102,14 @@ final class PushToTalkController: ObservableObject {
     var onSessionAnswerInterim: ((_ requestId: String) -> Void)?
     /// 本轮**零提交**收场（太短 / 收尾抛错）——没有回答可等，会话需重开采集。
     var onSessionTurnAborted: ((_ requestId: String, _ reason: String) -> Void)?
+    /// ESS-1044：本轮被服务端判**终态失败**（relay `phase=failed` /
+    /// Bridge `state=failed`）。已提交、正在等回答的那一轮再也不会有回答，
+    /// 会话层必须就地收口，不能干等到 45s 硬超时。
+    ///
+    /// 与 `onStateApplied(.failed)` 的分工：那条驱动 PTT 自身的错误卡片链
+    /// （且只在状态机接受转移时触发）；本条**无论转移是否被接受都触发**，
+    /// 因为「服务端说这一轮失败了」对会话层是同一个事实。幂等归会话层。
+    var onSessionTurnFailed: ((_ requestId: String, _ errorCode: String?) -> Void)?
     /// 本地采集起停（与网络 ready 独立呈现）。
     var onLocalCaptureChanged: ((_ active: Bool) -> Void)?
     /// ESS-865 复审整改：本轮**本地 VAD 真的听到人说话了**。
@@ -335,6 +343,20 @@ final class PushToTalkController: ObservableObject {
                     self.releaseMainScreenBlock(requestId: requestId)
                 }
             }
+        }
+
+        // ESS-1044：终态失败 → 会话层收口。挂在 journal 上而不是 transport 上，
+        // 是因为两条失败来源（iPhone 回执 `WatchVoiceTransport.handleRelayStatus`
+        // 与 Bridge WSS `WatchSettingsStore.applyVoiceStatus`）都收敛到
+        // `journal.apply(_:)` 这一个入口——挂在这里两条都覆盖，且不必给
+        // transport / settings store 各拉一条到 SessionController 的新引用。
+        journal.onTerminalFailure = { [weak self] requestId, errorCode, applied in
+            guard let self else { return }
+            WatchLog.info(
+                "turn", "turn_terminal_failure_signal", requestId: requestId,
+                detail: "applied=\(applied) error_code=\(errorCode ?? "nil")"
+            )
+            self.onSessionTurnFailed?(requestId, errorCode)
         }
 
         // 结果入账（含摘要，ESS-55 通知链路）：够格就发本地通知（自带震动），
