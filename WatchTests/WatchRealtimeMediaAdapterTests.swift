@@ -1504,6 +1504,128 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         XCTAssertEqual(segmentFinished, 0)
     }
 
+    /// ESS-1070 验收 2 的**运行时实测**：播放中打断 → 旧 generation 在 300 ms 内
+    /// 停止出声，且此后旧代帧零播放。
+    ///
+    /// 与前两条控制面用例不同，本用例用**真实** `RealtimePlaybackEngine` +
+    /// `AVAudioPlayerNode`（watchOS 模拟器进程内），并用单调时钟
+    /// （`DispatchTime.uptimeNanoseconds`）量「打断触发 → 播放器确认不再出声」。
+    /// 先等到真实 `.started` 回执（`.dataPlayedBack`，即首个 buffer 已经出声）
+    /// 才打断，量的才是「播放中打断」。
+    ///
+    /// 覆盖边界（诚实声明）：这是模拟器音频栈的实测，不是配对真机的端到端；
+    /// 真机三态证据仍是 ESS-1070 验收 3 的独立前置。
+    func testEss1070_RealPlayerStopsOldGenerationWithin300msOfBargeIn() throws {
+        try HostedCITestGate.skipIfHostedCI("real AVAudioEngine playback in ESS-1070 barge-in latency measurement")
+        let controller = ConversationAudioController()
+        let engine = RealtimePlaybackEngine(
+            audioEngine: controller.playbackEngine,
+            lifecycleOwner: { .conversation }
+        )
+        do {
+            try controller.beginConversation(conversationId: "ess1070-bargein")
+        } catch {
+            throw XCTSkip("模拟器会话不可用：\(error.localizedDescription)")
+        }
+        defer { controller.endConversation(reason: .userExit) }
+
+        var receipts: [String] = []
+        engine.onPlaybackEvent = { event in
+            switch event {
+            case .started: receipts.append("started")
+            case .ended: receipts.append("ended")
+            case .bargedIn: receipts.append("bargedIn")
+            case .failed: receipts.append("failed")
+            }
+        }
+
+        let session = RealtimeMediaSession()
+        var drops: [RealtimeDownlinkPlayback.DropReason] = []
+        var readyCount = 0
+        session.onEvent = { event in
+            switch event {
+            case .playbackReady(let playables):
+                readyCount += playables.count
+                engine.enqueue(playables: playables)
+            case .playbackCleared(let bytes):
+                engine.bargeIn(clearedBytes: bytes)
+            case .downlinkDropped(let reason):
+                drops.append(reason)
+            default:
+                break
+            }
+        }
+        let handle = session.beginTurn(requestId: "10701070-0000-4000-8000-000000000001")
+        session.openGeneration(1)
+        try engine.prepare(for: handle)
+
+        func oldChunk(_ seq: Int) -> VoiceStreamChunk {
+            VoiceStreamChunk(
+                requestId: handle.requestId, streamId: handle.sessionId,
+                direction: .downlink, sequence: seq,
+                capturedAtMs: 1_800_000_000_000 + Int64(seq),
+                codec: "pcm_s16le", sampleRate: 24_000,
+                // 24 kHz / 16-bit：4800 字节 ≈ 100 ms 音频。
+                payload: Data(repeating: 0, count: 4_800)
+            )
+        }
+
+        // 旧 generation 的答案正在播：灌 ~2 s，足够在打断前真的出声。
+        for seq in 0..<20 {
+            session.receiveDownlink(oldChunk(seq), responseId: "r-old", generation: 1)
+        }
+
+        XCTAssertEqual(readyCount, 20, "20 帧旧代音频必须全部进入播放器，否则量的不是「播放中打断」")
+        XCTAssertTrue(engine.hasAudioInRenderPipeline)
+
+        // 等到首个 buffer **真的播完**（`.dataPlayedBack` 回执）才打断。
+        let speaking = XCTestExpectation(description: "first buffer really rendered")
+        Task { @MainActor in
+            for _ in 0..<120 {
+                if receipts.contains("started") { speaking.fulfill(); return }
+                try? await Task.sleep(for: .milliseconds(25))
+            }
+        }
+        wait(for: [speaking], timeout: 8)
+        XCTAssertTrue(engine.isRenderingDownlink, "打断前必须确实在出声")
+
+        // —— 实测：用户新输入触发打断 ——
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        session.bargeInDownlink()
+        let stopMs = Double(DispatchTime.now().uptimeNanoseconds - startedAt) / 1_000_000
+
+        XCTAssertFalse(engine.isRenderingDownlink, "打断后播放器仍在出声")
+        XCTAssertFalse(engine.hasAudioInRenderPipeline, "打断后渲染链路必须当场清空")
+        XCTAssertLessThanOrEqual(
+            stopMs, 300,
+            "ESS-1070 验收 2：打断后 300ms 内停止旧 generation 播放；实测 \(stopMs) ms"
+        )
+        // 实测值进测试日志，供复审复核（本机 watchOS 26.5 模拟器：41.43 ms）。
+        print("ESS-1070 evidence barge_in_stop_ms=\(stopMs) receipts=\(receipts)")
+        XCTAssertTrue(
+            receipts.contains("started"), "必须有真实渲染回执才谈得上「播放中」"
+        )
+        XCTAssertTrue(receipts.contains("bargedIn"), "打断必须产生 barge-in 回执")
+
+        // 打断后旧代在途帧：一帧都不得进入渲染链路（零补播）。
+        for seq in 20..<26 {
+            session.receiveDownlink(oldChunk(seq), responseId: "r-old", generation: 1)
+        }
+        XCTAssertFalse(
+            engine.hasAudioInRenderPipeline,
+            "旧 generation 的在途帧进了渲染链路 —— 越代补播"
+        )
+        XCTAssertFalse(engine.isRenderingDownlink)
+        XCTAssertEqual(
+            drops.count, 6,
+            "打断后旧代帧必须全部被门禁丢弃并留证，实际=\(drops)"
+        )
+        XCTAssertTrue(
+            drops.allSatisfy { $0 == .pendingGeneration(incoming: 1) },
+            "丢弃原因必须是换代 pending 窗口，实际=\(drops)"
+        )
+    }
+
     // MARK: - ESS-527 outer timer regressions
 
     /// ESS-527 acceptance 1: barrier armed + missing tail + timeout → exactly
