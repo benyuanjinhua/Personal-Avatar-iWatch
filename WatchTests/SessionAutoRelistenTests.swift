@@ -420,6 +420,31 @@ final class SessionAutoRelistenTests: XCTestCase {
         XCTAssertEqual(h.session.state, .failed)
     }
 
+    /// ESS-1008 B2: control-plane transport failure is a deterministic turn
+    /// terminal. It must return to listening, and a previously scheduled 45 s
+    /// closure must be harmless rather than producing "回答超时" / hangup.
+    func testTransportFailureCancelsThinkingTimeoutAndRelistens() {
+        let h = makeHarness()
+        defer { h.tearDown() }
+        h.startFirstTurn()
+        h.commitCurrentTurn()
+        let failedRequestId = h.currentRequestId
+        XCTAssertEqual(h.session.turnPhase, .thinking)
+
+        h.adapter.markTransportFailed(reason: "recv_error")
+
+        XCTAssertEqual(h.session.state, .listening)
+        XCTAssertEqual(h.session.turnPhase, .listening)
+        XCTAssertNotEqual(h.currentRequestId, failedRequestId)
+        XCTAssertEqual(h.log.count(of: "session_answer_failed"), 1)
+
+        // The test scheduler deliberately cannot cancel queued closures, so
+        // firing the stale closure proves the production guard is sufficient.
+        h.fireScheduled(withDelay: SessionController.thinkingHardTimeoutSeconds)
+        XCTAssertEqual(h.log.count(of: "session_thinking_hard_timeout"), 0)
+        XCTAssertEqual(h.session.state, .listening)
+    }
+
     // MARK: - 阻断 3：连续五轮的运行时关联证据
 
     /// R-02.1 运行时证据：watchOS 模拟器进程内连续跑满五轮，抓真实

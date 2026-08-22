@@ -60,6 +60,61 @@ final class VoiceBargeInEvidenceTests: XCTestCase {
         XCTAssertEqual(session.modes, [.spokenAudio, .voiceChat])
     }
 
+    // MARK: - ESS-1023：AEC 可用性必须读「已配置的 mode」，不是「期望开关」
+
+    /// 毕玄复审阻断（PR #384）：把 `aecAvailable` 接到实时开关是错的。
+    ///
+    /// `ConversationAudioController:283-285` 明写 mode 只在**下一次**
+    /// `beginConversation` 生效、通话中不重配。所以：会话以 OFF 启动
+    /// （实际 `.spokenAudio`、无 AEC）→ 播放中用户翻到 ON → 若判据读的是开关，
+    /// 抑制会立刻停止，**而会话仍然没有 AEC** → 自激当场复发。
+    ///
+    /// 判据只认**已经配置成功的 mode**。
+    func testConfiguredModeNotDesiredSwitchDecidesAECAvailability() throws {
+        let session = FakeAudioSession()
+        var gate = false                       // 语音打断 OFF 启动
+        let controller = ConversationAudioController(
+            session: session, captureControl: FakeEngine(), playbackControl: FakeEngine()
+        )
+        controller.voiceBargeInEnabled = { gate }
+
+        try controller.beginConversation(conversationId: "c-off")
+        XCTAssertEqual(controller.lastConfiguredMode, .spokenAudio, "OFF 启动应配 .spokenAudio")
+        XCTAssertNotEqual(controller.lastConfiguredMode, .voiceChat, "此刻没有 AEC")
+
+        // 播放进行中用户把开关翻到 ON —— 期望变了，**当前会话没变**。
+        gate = true
+        XCTAssertEqual(
+            controller.lastConfiguredMode, .spokenAudio,
+            "翻开关不重配当前会话：AEC 判据必须仍然是「无」，否则自激复发"
+        )
+
+        // 只有下一次 beginConversation 才真的配成 .voiceChat。
+        controller.endConversation(reason: .userExit)
+        try controller.beginConversation(conversationId: "c-on")
+        XCTAssertEqual(controller.lastConfiguredMode, .voiceChat, "下一轮才有 AEC")
+    }
+
+    /// 回落到 `.default` 档（`ConversationAudioController:316`）同样没有 AEC，
+    /// 判据不得把它当成可用。
+    func testFallbackDefaultModeIsNotTreatedAsAECAvailable() throws {
+        let session = FakeAudioSession()
+        // 让 .voiceChat 与 .spokenAudio 都失败，逼到 .default 回落档。
+        session.rejectModes = [.voiceChat, .spokenAudio]
+        let controller = ConversationAudioController(
+            session: session, captureControl: FakeEngine(), playbackControl: FakeEngine()
+        )
+        controller.voiceBargeInEnabled = { true }
+
+        try controller.beginConversation(conversationId: "c-fallback")
+
+        XCTAssertEqual(controller.lastConfiguredMode, .default)
+        XCTAssertNotEqual(
+            controller.lastConfiguredMode, .voiceChat,
+            ".default 回落档没有 AEC，不得被判为可用"
+        )
+    }
+
     // MARK: - F2-4：gate 的默认值、持久化与契约事件
 
     /// ESS-891（2026-08-22）：默认从 ON 改为 OFF。

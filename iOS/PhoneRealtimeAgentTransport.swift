@@ -46,6 +46,7 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
     /// advancement via `bargein.request`.
     private var gate: BargeInGenerationCoordinator
     private var cancelTimeout: Task<Void, Never>?
+    private var didEmitTransportFailure = false
 
     /// Pending completion for the latest `send` call — the Agent transport
     /// is asynchronous (WSS), so `send` reports completion via this pending
@@ -311,6 +312,22 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
                 Self.logger.error(
                     "agent failed sid=\(sid.prefix(8), privacy: .public) reason=\(reason, privacy: .public)"
                 )
+                if !self.didEmitTransportFailure {
+                    self.didEmitTransportFailure = true
+                    PhoneAgentClientLog.error(
+                        module: Self.logModule,
+                        event: "transport_failure_enqueued",
+                        requestId: self.requestId, sessionId: self.sessionId,
+                        detail: "reason=\(reason) gen=\(self.gate.generation)",
+                        code: "ERR_REALTIME_TRANSPORT_FAILED"
+                    )
+                    self.onDownlink?(.transportFailed(
+                        requestId: self.requestId,
+                        sessionId: self.sessionId,
+                        generation: self.gate.generation,
+                        reason: reason
+                    ))
+                }
                 self.onStateChange?(.failed(reason: reason))
             case .connecting:
                 self.onStateChange?(.connecting(requestId: self.requestId, sessionId: self.sessionId))
