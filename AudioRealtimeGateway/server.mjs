@@ -598,7 +598,7 @@ function createAgentTransport(CONFIG, { log }) {
       // multi-segment path for a turn whose upstream proved it emits
       // `voice.state`; anything else keeps the pre-ESS-969 behaviour.
       multiSegmentMode: CONFIG.agent_multi_segment_mode ?? 'auto',
-      turnIdleBackstopMs: CONFIG.agent_turn_idle_backstop_ms ?? 45_000,
+      turnIdleBackstopMs: CONFIG.agent_turn_idle_backstop_ms ?? 32_000,
       takeover: CONFIG.agent_takeover_voice !== false,
       log: (evt, extra) => log(evt, extra),
     })

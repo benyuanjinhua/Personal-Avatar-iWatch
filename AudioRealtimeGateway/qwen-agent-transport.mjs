@@ -116,16 +116,35 @@ export class QwenAgentTransport {
     // pre-ESS-969 behaviour, so an upstream without the signal cannot regress
     // into waiting on a backstop. `'always'` / `'off'` force either side.
     multiSegmentMode = 'auto',
-    // ESS-969 BACKSTOP ONLY — 待标定 (R-04.4). Bounds a turn whose upstream
-    // announced `voice.state` but never sent `idle`. It is NOT the mechanism
-    // that ends a healthy turn, and it must stay well above tool latency:
-    // shrinking it would truncate exactly the turns this issue exists to fix.
-    // No real-device sample of「段落 audio.done → 下一段 response.started」or
-    // 「末段 audio.done → voice.state idle」exists yet; 45 s is a placeholder
-    // chosen only to sit above the Watch-visible turn budget. Calibrate from
-    // `upstream_segment_closed` → `upstream_turn_terminal` deltas once real
-    // tool-calling turns are in gateway.log (n ≥ 20).
-    turnIdleBackstopMs = 45_000,
+    // ESS-969 backstop, recalibrated by ESS-1004 from real-device data.
+    //
+    // ESS-1004 L2: `voice.state {state:'idle'}` is NOT reachable for this
+    // client shape. For an audio-bearing response the upstream only emits it
+    // from `finishPlayback()` (qwen-audio-agent
+    // `server/src/voice/realtime-gateway.mjs:738-763`), which is reached only
+    // by a client `playback.ended` receipt (`:1998-2009`); at `response.done`
+    // it is emitted only when `!hasAudio` (`:1213-1221`). This gateway never
+    // relays the Watch's receipts upstream (`realtime-session.mjs`
+    // `_handlePlayback` logs and drops them; nothing here sends `playback.*`),
+    // so `voice_state_idle` cannot fire. Until a turn-terminal fact exists on
+    // the wire, THIS timer is the only terminal a multi-segment turn has —
+    // treat it as load-bearing, not as a backstop.
+    //
+    // Both bounds are measured (R-04.4) and pinned by
+    // `test/ess1004-turn-terminal-budget.test.mjs`.
+    //
+    // LOWER bound — must not truncate a turn that is still producing. Window:
+    // `logs/gateway.log` 2026-08-22; sample = every multi-segment turn in it
+    // (n=4); metric = `upstream_segment_closed` → next `upstream_response_started`:
+    //   15.054 / 15.157 / 14.954 / 0.363 s. Slowest 15.157 s, so the timer
+    //   must sit at >= 2x that. n=4 is thin, which is why this stays a knob.
+    //
+    // UPPER bound — the `audio.done` it produces has to reach a client that is
+    // still waiting. The Watch re-arms `SessionController.thinkingHardTimeoutSeconds`
+    // (45 s) when a segment finishes playing; at the ESS-969 value of 45 s the
+    // two deadlines were IDENTICAL and which one fired first was pure
+    // scheduling order. The client must lose that race by a wide margin.
+    turnIdleBackstopMs = 32_000,
     takeover = true,
     // ESS-978: our own identity on the upstream. The label embeds the pid so
     // two copies of this gateway on one machine are distinguishable, and the
@@ -436,8 +455,9 @@ export class QwenAgentTransport {
       })
     }
 
-    // BACKSTOP, not the mechanism (see `turnIdleBackstopMs`). Only armed while
-    // a closed segment is parked and the upstream has said nothing since.
+    // ESS-1004: with `voice_state_idle` unreachable (see `turnIdleBackstopMs`)
+    // this is currently the ONLY terminal a multi-segment turn gets. Only armed
+    // while a closed segment is parked and the upstream has said nothing since.
     const armTurnIdleBackstop = () => {
       if (this.turnIdleBackstopMs <= 0 || turn.turnIdleTimer) return
       turn.turnIdleTimer = setTimeout(() => {
