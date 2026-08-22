@@ -332,9 +332,23 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         }
     }
 
+    /// ESS-1002：`downlink_drop reason=…` 只经由适配器的 `logger` 闭包落地
+    /// （`WatchLog` 那条只覆盖 generation 类丢弃），所以要断言 `sessionEnded`
+    /// 有没有发生，必须能接住这条线。
+    private final class LoggerSink: @unchecked Sendable {
+        private let lock = NSLock()
+        private var lines: [String] = []
+        func append(_ line: String) { lock.lock(); defer { lock.unlock() }; lines.append(line) }
+        var all: [String] { lock.lock(); defer { lock.unlock() }; return lines }
+        func count(containing fragment: String) -> Int {
+            all.filter { $0.contains(fragment) }.count
+        }
+    }
+
     private func makeAdapter(
         sessionIds: [String],
-        barrierTimer: WatchRealtimeMediaAdapter.BarrierTimer = TaskBasedBarrierTimer()
+        barrierTimer: WatchRealtimeMediaAdapter.BarrierTimer = TaskBasedBarrierTimer(),
+        loggerSink: LoggerSink? = nil
     ) -> (
         WatchRealtimeMediaAdapter, MockRecorder, MockPlayer, MockTransport, FallbackCounter
     ) {
@@ -359,6 +373,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         let adapter = WatchRealtimeMediaAdapter(
             session: session, recorder: recorder, player: player, transport: transport,
             fullFileFallback: { handle, reason in counter.record(handle, reason) },
+            logger: { line in loggerSink?.append(line) },
             barrierTimer: barrierTimer
         )
         return (adapter, recorder, player, transport, counter)
@@ -868,6 +883,64 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
             detail.contains("final_seq=2"),
             "the unique done_barrier_released line must carry final_seq=2; got detail=\(detail)"
         )
+    }
+
+    // MARK: - ESS-1002 异步段落屏障
+
+    /// ESS-1002：`audio.segment_done` 先到、尾帧后到时，屏障走**异步**释放路径
+    /// （`receiveDownlink` 尾部的 `checkBarrierRelease()`）。整改前该路径无条件
+    /// `downlink.endSession()`，于是第二段每一帧都被判 `.sessionEnded`——
+    /// 2026-08-22 真机 `request_id=01a027f8-fcc3` 上 10 帧整段消失就是这条。
+    ///
+    /// 本用例是 watchOS 模拟器进程内的运行时证据（R-02.1）：断言第二段既没有
+    /// `downlink_drop reason=sessionEnded`，也真的进了播放器队列。
+    func testEss1002_AsyncSegmentBarrierKeepsNextSegmentPlayable() {
+        let requestId = "44444444-4444-4444-4444-444444441002"
+        let sessionId = "55555555-5555-5555-5555-555555551002"
+        let sink = LoggerSink()
+        let (adapter, _, player, _, _) = makeAdapter(
+            sessionIds: [sessionId], loggerSink: sink
+        )
+        adapter.onAnswerPlaybackSegmentFinished = { _, _ in }
+        let handle = adapter.beginTurn(requestId: requestId)
+        adapter.openGeneration(1)
+
+        func delta(_ seq: Int) -> VoiceStreamChunk {
+            VoiceStreamChunk(
+                requestId: handle.requestId, streamId: handle.sessionId,
+                direction: .downlink, sequence: seq,
+                capturedAtMs: 1_800_000_000_000 + Int64(seq),
+                codec: "pcm_s16le", sampleRate: 24_000,
+                payload: Data(repeating: UInt8(seq), count: 64)
+            )
+        }
+
+        // 第一段：只到了 seq 0，控制帧先于尾帧到达 → 屏障 waiting。
+        adapter.ingestDownlink(delta(0), responseId: "r-1002", generation: 1)
+        adapter.markDownlinkSegmentComplete(
+            responseId: "r-1002", generation: 1, finalSequence: 2, segmentIndex: 0
+        )
+        XCTAssertEqual(player.finishCount, 0, "屏障还在等，不得提前 drain")
+
+        // 尾帧补齐 → 异步释放本段。
+        adapter.ingestDownlink(delta(1), responseId: "r-1002", generation: 1)
+        adapter.ingestDownlink(delta(2), responseId: "r-1002", generation: 1)
+        XCTAssertEqual(player.finishCount, 1, "补齐后本段必须收口播完")
+
+        // 工具跑完，第二段到达。
+        let enqueuedBefore = player.enqueuedChunks.count
+        adapter.ingestDownlink(delta(3), responseId: "r-1002", generation: 1)
+        adapter.ingestDownlink(delta(4), responseId: "r-1002", generation: 1)
+
+        XCTAssertEqual(
+            sink.count(containing: "downlink_drop reason=sessionEnded"), 0,
+            "第二段被判 sessionEnded —— 真机整段消失的复现条件，实际日志=\(sink.all)"
+        )
+        XCTAssertEqual(
+            player.enqueuedChunks.count, enqueuedBefore + 2,
+            "第二段的 delta 必须进播放队列才可能出声"
+        )
+        XCTAssertEqual(player.enqueuedChunks.suffix(2).map(\.sequence), [3, 4])
     }
 
     // MARK: - ESS-527 outer timer regressions

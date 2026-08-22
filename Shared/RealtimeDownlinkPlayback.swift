@@ -147,6 +147,13 @@ struct RealtimeDownlinkPlayback: Sendable {
     /// The `response_id` supplied with `audio.done`, held so barrier release
     /// can hand it back to the caller for `player.finish(responseId:)`.
     private(set) var pendingDoneResponseId: String?
+    /// ESS-1002: 边界类型必须**跟着屏障一起等**。`markDone` 返回 `.waiting`
+    /// 时，释放发生在后续 `checkBarrierRelease()` 里，那时调用方手上已经没有
+    /// `isSegmentBoundary` 这个入参了；不在这里存住，异步释放路径就只能按回合
+    /// 终态处理，把 session 关掉，下一段 delta 全被判 `.sessionEnded`
+    /// （这正是 ESS-971 在同步路径修掉、却在异步路径漏掉的那半边）。
+    /// 只在屏障真正 armed 且 waiting 时置位；同步释放不需要它。
+    private(set) var pendingDoneIsSegmentBoundary = false
     /// Highest seq released so far, retained for the missing-final-sequence
     /// degradation path where Gateway omits the barrier value entirely.
     private var maxEmittedSequence: Int = -1
@@ -257,6 +264,7 @@ struct RealtimeDownlinkPlayback: Sendable {
         generationState = .open(generation)
         pendingFinalSequence = nil
         pendingDoneResponseId = nil
+        pendingDoneIsSegmentBoundary = false
         didSessionEnd = false
         return .buffered
     }
@@ -358,10 +366,15 @@ struct RealtimeDownlinkPlayback: Sendable {
     /// mismatched generations here just like `ingest`, so a stale `audio.done`
     /// can no longer close the current-generation session (that is the G4
     /// core-regression U8 covers).
+    /// - Parameter isSegmentBoundary: ESS-1002。`true` 表示这次 done 是
+    ///   `audio.segment_done`（段落边界）而不是回合终态。仅当屏障进入
+    ///   `.waiting` 时被记住，供异步释放路径读取；见
+    ///   `consumePendingDoneIsSegmentBoundary()`。
     mutating func markDone(
         finalSequence: Int?,
         responseId: String? = nil,
-        generation: Int? = nil
+        generation: Int? = nil,
+        isSegmentBoundary: Bool = false
     ) -> DoneOutcome {
         if let drop = generationDropReason(incoming: generation) {
             switch drop {
@@ -381,6 +394,9 @@ struct RealtimeDownlinkPlayback: Sendable {
             }
         }
         pendingDoneResponseId = responseId
+        // 每次 done 先归零：只有走到 `.waiting` 分支才需要跨调用记住边界类型，
+        // 其余分支都是同步收口，调用方手上还有入参。
+        pendingDoneIsSegmentBoundary = false
         guard let target = finalSequence else {
             // Contract violation: Gateway omitted `final_sequence`. Degrade
             // to "n = max emitted seq" per §3.2 row 3 and let the caller
@@ -407,6 +423,7 @@ struct RealtimeDownlinkPlayback: Sendable {
             pendingFinalSequence = nil
             return .barrierReleased(finalSequence: target, responseId: responseId)
         }
+        pendingDoneIsSegmentBoundary = isSegmentBoundary
         return .waiting(missing: missingSequences(upTo: target), responseId: responseId)
     }
 
@@ -419,6 +436,16 @@ struct RealtimeDownlinkPlayback: Sendable {
         let responseId = pendingDoneResponseId
         pendingFinalSequence = nil
         return .barrierReleased(finalSequence: target, responseId: responseId)
+    }
+
+    /// ESS-1002: 读走并清掉「上一次 armed 的屏障是不是段落边界」。
+    /// 与 `checkBarrierRelease()` 配对使用：先释放屏障，再据此决定要不要
+    /// `endSession()`。一次性语义——重复调用返回 `false`，避免一个陈旧的
+    /// `true` 让后续的**回合终态** done 忘记关闭 session。
+    mutating func consumePendingDoneIsSegmentBoundary() -> Bool {
+        let value = pendingDoneIsSegmentBoundary
+        pendingDoneIsSegmentBoundary = false
+        return value
     }
 
     /// Snapshot of the current barrier state for observability / test asserts.
@@ -448,6 +475,7 @@ struct RealtimeDownlinkPlayback: Sendable {
         maxEmittedSequence = -1
         pendingFinalSequence = nil
         pendingDoneResponseId = nil
+        pendingDoneIsSegmentBoundary = false
     }
 
     private func generationDropReason(incoming: Int?) -> DropReason? {

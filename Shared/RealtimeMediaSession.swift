@@ -287,9 +287,17 @@ final class RealtimeMediaSession {
         // trigger release right here — otherwise the coordinator would sit
         // on `pendingFinalSequence` until the next barrier tick and delay
         // `player.finish(...)` past the point of the last render.
+        //
+        // ESS-1002：这条**异步**释放路径必须与 `receiveDone` 的同步分支同口径。
+        // `audio.segment_done` 先到、尾帧后到时，`markDone` 返回 `.waiting`，
+        // 释放就发生在这里；此处若无条件 `endSession()`，下一段的 delta 照样
+        // 被判 `.sessionEnded`——ESS-971 只修了同步那一半。边界类型由屏障自己
+        // 带过来（`consumePendingDoneIsSegmentBoundary`），不靠调用方重传。
         if let release = downlink.checkBarrierRelease() {
             if case .barrierReleased(let final, let responseId) = release {
-                _ = downlink.endSession()
+                if !downlink.consumePendingDoneIsSegmentBoundary() {
+                    _ = downlink.endSession()
+                }
                 onEvent?(.doneBarrierReleased(handle, finalSequence: final, responseId: responseId))
             }
         }
@@ -313,7 +321,8 @@ final class RealtimeMediaSession {
     ) {
         guard let handle = currentTurn else { return }
         let outcome = downlink.markDone(
-            finalSequence: finalSequence, responseId: responseId, generation: generation
+            finalSequence: finalSequence, responseId: responseId, generation: generation,
+            isSegmentBoundary: isSegmentBoundary
         )
         onEvent?(.doneArrived(handle, outcome))
         switch outcome {
@@ -340,6 +349,8 @@ final class RealtimeMediaSession {
             // visible so the Gateway side gets fixed.
             break
         case .waiting,
+             // ESS-1002：屏障 armed 但未收齐。边界类型已由 `markDone` 存进
+             // buffer，异步释放（`receiveDownlink` 尾部）据此决定是否 endSession。
              .droppedStaleGeneration,
              .droppedFutureGeneration,
              .droppedPendingGeneration:
