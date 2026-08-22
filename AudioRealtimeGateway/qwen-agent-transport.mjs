@@ -158,6 +158,15 @@ export class QwenAgentTransport {
     // 才起表，因此本窗口天然早于客户端。12 s 距客户端预算仍有充足余量。
     segmentGapMs = 2_500,
     segmentGapBusyMs = 12_000,
+    // ESS-1043 tool-call window. qwen `response.done` carries `hasFunctionCall`:
+    // when true, the model has decided to call a tool and the real answer
+    // segment only arrives after the tool runs (measured 8–16 s — well past
+    // both segment-gap windows above). A pending tool call therefore arms this
+    // dedicated window instead of letting the ordinary idle window close the
+    // turn while the tool is still in flight. 30 s ≈ 1.9x the 16 s maximum,
+    // and still ends before the Watch's own 45 s hard thinking timeout, so a
+    // lost tool result cannot hold the turn open past the client budget.
+    toolCallWindowMs = 30_000,
     takeover = true,
     // ESS-978: our own identity on the upstream. The label embeds the pid so
     // two copies of this gateway on one machine are distinguishable, and the
@@ -180,6 +189,7 @@ export class QwenAgentTransport {
     this.multiSegmentMode = multiSegmentMode
     this.segmentGapMs = segmentGapMs
     this.segmentGapBusyMs = segmentGapBusyMs
+    this.toolCallWindowMs = toolCallWindowMs
     this.takeover = takeover
     this.clientLabel = clientLabel
     this.log = log
@@ -289,6 +299,14 @@ export class QwenAgentTransport {
       // own (see `noteTurnBusy`), they only widen the window.
       outstandingTasks: new Set(), announcementResponseIds: new Set(),
       turnBusy: false,
+      // ESS-1043: qwen `response.done` carries `hasFunctionCall`. When true,
+      // the model has decided to call a tool and at least one more response
+      // segment (the tool result) is coming — the ordinary segment-gap window
+      // must not end the turn while the tool runs. When the final segment's
+      // `response.done` (hasFunctionCall=false) lands after a pending tool
+      // call, `endAfterDone` marks it so `flushDone` ends the turn as soon as
+      // that segment's audio settles instead of waiting out the idle window.
+      pendingToolCall: false, endAfterDone: false,
     }
     const scopeLog = { request_id: requestId, session_id: sessionId, device_id: deviceId, generation }
     turn.supersede = nextRequestId => {
@@ -418,6 +436,15 @@ export class QwenAgentTransport {
         })
       }
       if (!turn.multiSegment) return endTurn('legacy_first_done', finalSequence)
+      // ESS-1043: the final segment of a tool-call turn (`response.done`
+      // hasFunctionCall=false after a pending tool call) ends the turn the
+      // moment its audio settles. The settled segment below is the endpoint,
+      // not another segment boundary to park and idle-window.
+      if (turn.endAfterDone) {
+        turn.endAfterDone = false
+        turn.segmentsClosed += 1
+        return endTurn('tool_result_done', finalSequence)
+      }
       turn.closedSegment = { segmentIndex: turn.segmentIndex, finalSequence }
       turn.segmentsClosed += 1
       this.log('upstream_segment_closed', {
@@ -484,7 +511,9 @@ export class QwenAgentTransport {
     // the window later never restarts the clock.
     const armSegmentGap = cause => {
       if (turn.terminal || turn.turnEnded || !turn.closedSegment) return
-      const window = turn.turnBusy ? this.segmentGapBusyMs : this.segmentGapMs
+      const window = turn.pendingToolCall ? this.toolCallWindowMs
+        : turn.turnBusy ? this.segmentGapBusyMs
+        : this.segmentGapMs
       if (window <= 0) return endTurn('segment_gap_disabled', turn.closedSegment.finalSequence)
       if (turn.segmentGapWindowMs >= window) return
       clearTimeout(turn.segmentGapTimer)
@@ -970,6 +999,49 @@ export class QwenAgentTransport {
             outstanding: turn.outstandingTasks.size,
           })
           onEvent({ type: 'agent.task', response_id: responseId, task: { id, status } })
+          return
+        }
+        // ESS-1043: qwen `response.done` is the response-level metadata that
+        // carries `hasFunctionCall` — the signal the model is about to run a
+        // tool and produce at least one more segment. The upstream only knows
+        // this when the response completes, so this is the earliest reliable
+        // place to learn「the turn is not over yet」. `hasFunctionCall` is read
+        // from the qwen dialect's top-level field, with the OpenAI-style nested
+        // `response.hasFunctionCall` and snake_case accepted too so a shape
+        // change cannot silently drop the signal.
+        if (event.type === 'response.done') {
+          noteResponseProgress()
+          const hasFunctionCall = event.hasFunctionCall === true
+            || event.response?.hasFunctionCall === true
+            || event.has_function_call === true
+          const upstreamResponseId = event.responseId ?? event.response?.id ?? null
+          this.log('upstream_response_done', {
+            ...scopeLog, upstream_response_id: upstreamResponseId,
+            origin: event.origin ?? event.response?.origin ?? null,
+            status: event.status ?? event.response?.status ?? null,
+            has_function_call: hasFunctionCall,
+          })
+          if (hasFunctionCall) {
+            if (!turn.pendingToolCall) {
+              turn.pendingToolCall = true
+              this.log('upstream_tool_call_pending', { ...scopeLog, upstream_response_id: upstreamResponseId })
+            }
+            // A parked segment must not close the turn while the tool runs:
+            // re-arm its window with the dedicated tool-call window (the
+            // re-arm only ever widens — see `armSegmentGap`).
+            if (turn.closedSegment) armSegmentGap('tool_call_pending')
+          } else if (turn.pendingToolCall) {
+            turn.pendingToolCall = false
+            this.log('upstream_tool_call_resolved', { ...scopeLog, upstream_response_id: upstreamResponseId })
+            // The tool result is the final segment. End the turn as soon as its
+            // audio settles — immediately if the segment already closed, or on
+            // the pending `flushDone` otherwise.
+            if (turn.closedSegment) {
+              endTurn('tool_result_done', turn.closedSegment.finalSequence)
+            } else if (turn.pendingDone) {
+              turn.endAfterDone = true
+            }
+          }
           return
         }
         if (event.type === 'error' || event.type === 'session.error' || event.type === 'voice.error') {
