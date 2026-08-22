@@ -506,7 +506,14 @@ export class QwenAgentTransport {
         if (event.type === 'voice.ownership' || event.type === 'voice.deactivated') {
           const holder = event.holder ?? null
           const holderIsSelf = holder?.instanceId === turn.clientInstanceId
-          if (holder?.instanceId
+          // ESS-974 fence, scoped to a turn that is already live (ESS-986).
+          // A delayed broadcast naming one of OUR retired instances must not
+          // kill the replacement — but the same guard must NOT swallow a
+          // connect-time `busy` naming that retired instance: before
+          // `voice.ready` that frame is what drives the ESS-978 two-step
+          // takeover retry, and dropping it would strand the handshake until
+          // `agent_connect_timeout_ms`.
+          if (turn.ready && holder?.instanceId
             && this.retiredClientInstanceIds.has(holder.instanceId)) {
             this.log('upstream_ownership_ignored', {
               ...scopeLog, event_type: event.type,

@@ -783,6 +783,60 @@ test('our own prior connection is reclaimed with takeover (ESS-978)', async () =
   turn.close()
 })
 
+// ESS-986：ESS-974 的「退役实例 fence」与 ESS-978 的「两步 takeover」落在同一个
+// ownership 分支上。fence 只能挡住**已 ready 的回合**被迟到广播打死；握手期的
+// busy 即使指名一个退役实例，也必须继续走 takeover 重试——否则新一轮会一直挂到
+// agent_connect_timeout_ms 才失败。
+test('a connect-time busy naming our retired instance still reclaims the slot (ESS-986)', async () => {
+  const connects = []
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') {
+      connects.push(message)
+      if (connects.length === 1) {
+        ws.send(JSON.stringify({ type: 'voice.ready' }))
+        return
+      }
+      if (message.takeover === false) {
+        ws.send(JSON.stringify({
+          type: 'voice.ownership', state: 'busy',
+          holder: {
+            type: 'cli', label: 'watch-direct-gateway:2222',
+            instanceId: connects[0].clientInstanceId,
+          },
+        }))
+      } else {
+        ws.send(JSON.stringify({ type: 'voice.ready' }))
+      }
+    }
+    if (message.type === 'audio.commit') {
+      ws.send(JSON.stringify({ type: 'audio.delta', sequence: 0, audio: 'AAAA' }))
+      ws.send(JSON.stringify({ type: 'audio.done' }))
+    }
+  })
+  const events = []; const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, clientLabel: 'watch-direct-gateway:2222',
+    responseTimeoutMs: 5_000, doneSettleMs: 10, log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  transport.openTurn({
+    requestId: 'r986a', sessionId: 's986', deviceId: 'd986', generation: 1,
+    responseId: 'r986a:gen1', onEvent: () => {},
+  })
+  await waitFor(() => connects.length === 1)
+  // 同一会话的下一轮 supersede 上一轮 —— 上一轮的 clientInstanceId 就此退役。
+  const replacement = transport.openTurn({
+    requestId: 'r986b', sessionId: 's986', deviceId: 'd986', generation: 2,
+    responseId: 'r986b:gen2', onEvent: event => events.push(event),
+  })
+  replacement.appendAudio({ bytes: Buffer.from('audio') })
+  replacement.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  assert.ok(!events.some(event => event.type === 'agent.error'))
+  assert.deepEqual(connects.slice(1).map(c => c.takeover), [false, true])
+  assert.ok(logs.some(item => item.evt === 'upstream_takeover_retry'))
+  replacement.close()
+})
+
 // ESS-978 反向保证：持有者是一个非网关前台（例如 Bridge），且配置允许抢占时，
 // 仍然走 takeover 拿回语音槽——不能让新防护误伤原本的「Watch 显式说话抢占」语义。
 test('an allowed frontend holder is still taken over (ESS-978)', async () => {
