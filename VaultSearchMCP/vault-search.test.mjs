@@ -238,6 +238,10 @@ test("MCP stdio 端到端：initialize / tools/list / tools/call", async () => {
     send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
     const list = await waitFor(2);
     assert.deepEqual(list.result.tools.map(t => t.name), ["vault_search", "vault_read", "vault_capture_idea"]);
+    const captureTool = list.result.tools.find(tool => tool.name === "vault_capture_idea");
+    for (const voiceCommand of ["我有个方法", "帮我记录", "我有个观点"]) {
+      assert.ok(captureTool.description.includes(voiceCommand), `工具契约必须覆盖语音指令：${voiceCommand}`);
+    }
 
     send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "vault.search", arguments: { query: "WatchConnectivity" } } });
     const call = await waitFor(3);
