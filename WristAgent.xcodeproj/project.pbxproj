@@ -95,6 +95,7 @@
 		5FDDCA93B9385470FA7D76DE /* ConversationHandle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B040C1E0BEEDB84847B5572 /* ConversationHandle.swift */; };
 		6367A07D0292627141725AB1 /* VoiceTurnState.swift in Sources */ = {isa = PBXBuildFile; fileRef = F928ACBF6FA59402D5EB1275 /* VoiceTurnState.swift */; };
 		6430DBD9D8E4A5E8D6567B0D /* PushToTalkDeferredFallbackTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F07106FBFCBFC4FE539B6E5 /* PushToTalkDeferredFallbackTests.swift */; };
+		647C2F5BB0E4187ED20FF9DA /* Ess1047CompletedWinsLateFailureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF302A8674E14F6579A01FF3 /* Ess1047CompletedWinsLateFailureTests.swift */; };
 		68781D48489578E0762AA9F7 /* PhoneClientLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA723C972910467E39E5B5DE /* PhoneClientLog.swift */; };
 		687F960B1AC7EF8B42C02037 /* RealtimeSessionReducer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73DA7FDE513C75183DABE590 /* RealtimeSessionReducer.swift */; };
 		68EF687B6F0F17A356355833 /* SpeechPlayerReleaseTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAD9BD4DBA7700C65F134EF3 /* SpeechPlayerReleaseTests.swift */; };
@@ -378,6 +379,7 @@
 		A062C41AB26ED23BE9E1A26B /* RealtimeSessionKeepAlive.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeSessionKeepAlive.swift; sourceTree = "<group>"; };
 		A5752A6573A7A674BF8880E4 /* BargeInGenerationCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BargeInGenerationCoordinator.swift; sourceTree = "<group>"; };
 		AAD9BD4DBA7700C65F134EF3 /* SpeechPlayerReleaseTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechPlayerReleaseTests.swift; sourceTree = "<group>"; };
+		AF302A8674E14F6579A01FF3 /* Ess1047CompletedWinsLateFailureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Ess1047CompletedWinsLateFailureTests.swift; sourceTree = "<group>"; };
 		AFF7358416B9853C70000E04 /* Ess1044RelayFailureClosureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Ess1044RelayFailureClosureTests.swift; sourceTree = "<group>"; };
 		B059A6F3DD6B2B19D18CFB5E /* PCM16LevelMeter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PCM16LevelMeter.swift; sourceTree = "<group>"; };
 		B1CE1503A0D6F97C52A835D5 /* WatchAppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchAppDelegate.swift; sourceTree = "<group>"; };
@@ -621,6 +623,7 @@
 				FB2E60002E10BE69094D9C53 /* ConversationAudioControllerTests.swift */,
 				1FE6DCDF59808F848A03798D /* DownlinkBacklogHintTests.swift */,
 				AFF7358416B9853C70000E04 /* Ess1044RelayFailureClosureTests.swift */,
+				AF302A8674E14F6579A01FF3 /* Ess1047CompletedWinsLateFailureTests.swift */,
 				501DA6C27E71C17FBEE74B79 /* HostedCITestGate.swift */,
 				49FB03B4D918EF4092A7E9FB /* InterruptedRecordingNoticeTests.swift */,
 				7C39EB1E56AB7E26A9E4F72C /* IphoneRelayStuckHintTests.swift */,
@@ -1003,6 +1006,7 @@
 				10CAF781F02E4B9677261541 /* ConversationAudioControllerTests.swift in Sources */,
 				1B71100DEDD4B210D28AE0A1 /* DownlinkBacklogHintTests.swift in Sources */,
 				579408CC2CCD844B548861E9 /* Ess1044RelayFailureClosureTests.swift in Sources */,
+				647C2F5BB0E4187ED20FF9DA /* Ess1047CompletedWinsLateFailureTests.swift in Sources */,
 				39C8B4C513C81F2A195FEE5D /* HostedCITestGate.swift in Sources */,
 				E2E5A72D5B095D12B991CFDB /* InterruptedRecordingNoticeTests.swift in Sources */,
 				FB1CEDBA1C036BC17C6BEF2C /* IphoneRelayStuckHintTests.swift in Sources */,

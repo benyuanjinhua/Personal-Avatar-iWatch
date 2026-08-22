@@ -35,8 +35,10 @@ final class Ess1044TerminalFailureSignalTests: XCTestCase {
     func testAppliedFailureFiresSignal() {
         let journal = makeJournal()
         journal.begin(requestId: requestId)
-        var observed: [(String, String?, Bool)] = []
-        journal.onTerminalFailure = { rid, code, applied in observed.append((rid, code, applied)) }
+        var observed: [(String, String?, Bool, VoiceTurnState)] = []
+        journal.onTerminalFailure = { rid, code, applied, state in
+            observed.append((rid, code, applied, state))
+        }
 
         XCTAssertTrue(journal.apply(failedEnvelope()))
 
@@ -44,6 +46,7 @@ final class Ess1044TerminalFailureSignalTests: XCTestCase {
         XCTAssertEqual(observed.first?.0, requestId)
         XCTAssertEqual(observed.first?.1, "ERR_VOICE_BUSY")
         XCTAssertEqual(observed.first?.2, true)
+        XCTAssertEqual(observed.first?.3, .failed, "applied=true 时当前态就是 failed")
     }
 
     /// 本单核心回归：回合已终态 → `apply` 返回 false、`onStateApplied` 不触发，
@@ -55,9 +58,11 @@ final class Ess1044TerminalFailureSignalTests: XCTestCase {
         XCTAssertTrue(journal.apply(.status(requestId: requestId, state: .cancelled)))
 
         var stateApplied: [VoiceTurnState] = []
-        var observed: [(String, String?, Bool)] = []
+        var observed: [(String, String?, Bool, VoiceTurnState)] = []
         journal.onStateApplied = { _, state in stateApplied.append(state) }
-        journal.onTerminalFailure = { rid, code, applied in observed.append((rid, code, applied)) }
+        journal.onTerminalFailure = { rid, code, applied, state in
+            observed.append((rid, code, applied, state))
+        }
 
         XCTAssertFalse(journal.apply(failedEnvelope()), "终态吸收，转移仍应被拒")
 
@@ -66,6 +71,8 @@ final class Ess1044TerminalFailureSignalTests: XCTestCase {
         XCTAssertEqual(observed.first?.0, requestId)
         XCTAssertEqual(observed.first?.1, "ERR_VOICE_BUSY", "被拒路径回滚了 errorCode，只能取信封上的码")
         XCTAssertEqual(observed.first?.2, false)
+        XCTAssertEqual(observed.first?.3, .cancelled,
+                       "ESS-1047：必须带出吸收方终态，订阅方据此分类")
     }
 
     /// 非失败终态（completed）不得误发失败信号。
@@ -73,7 +80,7 @@ final class Ess1044TerminalFailureSignalTests: XCTestCase {
         let journal = makeJournal()
         journal.begin(requestId: requestId)
         var fired = 0
-        journal.onTerminalFailure = { _, _, _ in fired += 1 }
+        journal.onTerminalFailure = { _, _, _, _ in fired += 1 }
 
         XCTAssertTrue(journal.apply(.status(requestId: requestId, state: .completed)))
         // 重复 completed 被拒，同样不发。
@@ -87,7 +94,7 @@ final class Ess1044TerminalFailureSignalTests: XCTestCase {
         let journal = makeJournal()
         journal.begin(requestId: requestId)
         var fired = 0
-        journal.onTerminalFailure = { _, _, _ in fired += 1 }
+        journal.onTerminalFailure = { _, _, _, _ in fired += 1 }
 
         let broken = VoiceStatusEnvelope.status(requestId: "", state: .failed)
         XCTAssertNotNil(broken.validate(), "空 request_id 必须校验不过")

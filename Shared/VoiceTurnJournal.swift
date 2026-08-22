@@ -208,8 +208,13 @@ final class VoiceTurnJournal: ObservableObject {
             turns[index].errorCode = priorErrorCode
             // ESS-1044：转移被拒不代表「这一轮没失败」——会话层仍须收口，
             // 否则 turnPhase 卡在 thinking 直到 45s 硬超时。
+            // ESS-1047：但「被谁吸收的」决定了收口是否成立——回滚后的
+            // currentState 就是吸收方（completed / failed / cancelled），
+            // 一并交给订阅方分类，不能让它再回查一次 journal。
             if envelope.state == .failed {
-                onTerminalFailure?(envelope.requestId, envelope.errorCode, false)
+                onTerminalFailure?(
+                    envelope.requestId, envelope.errorCode, false, turns[index].currentState
+                )
             }
             return false
         }
@@ -218,7 +223,7 @@ final class VoiceTurnJournal: ObservableObject {
             // `index` 在 append 之后可能已失效（onStateApplied 是同步回调，
             // 订阅方有可能反过来动 turns），按 requestId 重查。
             let lockedCode = turns.first { $0.requestId == envelope.requestId }?.errorCode
-            onTerminalFailure?(envelope.requestId, lockedCode ?? envelope.errorCode, true)
+            onTerminalFailure?(envelope.requestId, lockedCode ?? envelope.errorCode, true, .failed)
         }
         // 纯文本降级（ESS-48）：结果没有配套语音（speech_sha256 为空），不会有
         // transferFile / attachSpeech 后续，在这里按 request_id 通知展示全文。
@@ -268,7 +273,13 @@ final class VoiceTurnJournal: ObservableObject {
     ///   - requestId: 失败回合。
     ///   - errorCode: 稳定短码（可能为空）。
     ///   - applied: 状态机是否真的接受了这次 `.failed` 转移。
-    var onTerminalFailure: ((_ requestId: String, _ errorCode: String?, _ applied: Bool) -> Void)?
+    ///   - currentState: 信号发出时该回合在 journal 里的状态。`applied=true`
+    ///     恒为 `.failed`；`applied=false` 时它是**吸收掉这次转移的那个终态**
+    ///     ——ESS-1047 的分类依据：`.completed` 表示这一轮其实成功了，迟到的
+    ///     failed 只是陈旧/竞态事件，订阅方不得据此判会话失败。
+    var onTerminalFailure: ((
+        _ requestId: String, _ errorCode: String?, _ applied: Bool, _ currentState: VoiceTurnState
+    ) -> Void)?
 
     /// completed 且结果载荷已挂上后的回调（ESS-55 通知链路）。重复/乱序的
     /// completed 信封被状态机拒绝时不会触发（幂等第一层；通知记账是第二层）。

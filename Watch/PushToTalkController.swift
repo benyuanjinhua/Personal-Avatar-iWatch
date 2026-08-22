@@ -350,12 +350,21 @@ final class PushToTalkController: ObservableObject {
         // 与 Bridge WSS `WatchSettingsStore.applyVoiceStatus`）都收敛到
         // `journal.apply(_:)` 这一个入口——挂在这里两条都覆盖，且不必给
         // transport / settings store 各拉一条到 SessionController 的新引用。
-        journal.onTerminalFailure = { [weak self] requestId, errorCode, applied in
+        //
+        // ESS-1047：转发前按 journal 当前终态分类。同一 request_id 已 `completed`
+        // 之后到达的 failed（applied=false，被终态吸收）说明这一轮**其实成功了**，
+        // 它是陈旧/竞态事件；照转会让 SessionController 在 `turnPhase == .thinking`
+        // （答案还没起播）时把成功回合打进 P6。success-wins：只留日志不转发。
+        // `.cancelled` / `.failed` 吸收的那两支仍按 ESS-1044 立即收口。
+        journal.onTerminalFailure = { [weak self] requestId, errorCode, applied, currentState in
             guard let self else { return }
+            let forwarded = applied || currentState != .completed
             WatchLog.info(
                 "turn", "turn_terminal_failure_signal", requestId: requestId,
-                detail: "applied=\(applied) error_code=\(errorCode ?? "nil")"
+                detail: "applied=\(applied) current_state=\(currentState.rawValue) "
+                    + "forwarded=\(forwarded) error_code=\(errorCode ?? "nil")"
             )
+            guard forwarded else { return }
             self.onSessionTurnFailed?(requestId, errorCode)
         }
 
