@@ -1404,6 +1404,106 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         XCTAssertEqual(player.enqueuedChunks.suffix(2).map(\.sequence), [3, 4])
     }
 
+    // MARK: - ESS-1070 增量语音：段落边界与回合终态的分流
+
+    /// ESS-1070 B1：被 generation 门禁**丢弃**的 `audio.segment_done` 不得置位
+    /// 段落边界标志。
+    ///
+    /// 复现时序（打断后的 pending 窗口，iPhone 换代要等 `cancel.ack`，
+    /// 期间仍在转发旧代下行）：
+    /// 1. 用户打断 → Watch 门禁进入 `.pending`；
+    /// 2. 旧代在途的 `audio.segment_done` 到达 → 被判 `droppedPendingGeneration`；
+    /// 3. 新一代答案播完 → 那唯一一次 `.ended` 被当成**段落**边界，
+    ///    `onAnswerPlaybackFinished` 永不触发，回合只能等 45s 硬超时。
+    func testEss1070_DroppedSegmentDoneDoesNotSwallowTurnCompletion() {
+        let requestId = "44444444-4444-4444-4444-444444441070"
+        let sessionId = "55555555-5555-5555-5555-555555551070"
+        let (adapter, _, player, _, _) = makeAdapter(sessionIds: [sessionId])
+        let handle = adapter.beginTurn(requestId: requestId)
+        adapter.openGeneration(1)
+        var segmentFinished = 0
+        var answerFinished = 0
+        adapter.onAnswerPlaybackSegmentFinished = { _, _ in segmentFinished += 1 }
+        adapter.onAnswerPlaybackFinished = { _, _ in answerFinished += 1 }
+
+        // 打断：门禁进入 pending，旧代下行全部丢弃。
+        adapter.bargeIn()
+        adapter.markDownlinkSegmentComplete(
+            responseId: "r-old", generation: 1, finalSequence: 0, segmentIndex: 0
+        )
+
+        // iPhone 换代成功，新一代的答案边收边播、正常收口。
+        adapter.openGeneration(2)
+        adapter.ingestDownlink(
+            VoiceStreamChunk(
+                requestId: handle.requestId, streamId: handle.sessionId,
+                direction: .downlink, sequence: 0, capturedAtMs: 1_800_000_000_000,
+                codec: "pcm_s16le", sampleRate: 24_000,
+                payload: Data(repeating: 7, count: 64)
+            ),
+            responseId: "r-new", generation: 2
+        )
+        adapter.markDownlinkComplete(responseId: "r-new", generation: 2, finalSequence: 0)
+        player.completeBuffer(.ended(
+            requestId: handle.requestId, sessionId: handle.sessionId,
+            responseId: "r-new", bytesPlayed: 64
+        ))
+
+        XCTAssertEqual(
+            answerFinished, 1,
+            "回合终态被旧代的段落屏障吞掉——用户要等 45s 硬超时才看到结束"
+        )
+        XCTAssertEqual(segmentFinished, 0, "被门禁丢弃的 done 不是本回合的段落边界")
+    }
+
+    /// ESS-1070 B2：回合终态 `audio.done` 必须**清掉**上一段留下的边界标志。
+    ///
+    /// 增量语音里段与段几乎背靠背（ADR ESS-1060 的分句窗口 350 ms），段落屏障
+    /// 释放时本段音频往往还在渲染。若终态 done 到达时标志仍为 true，之后那次
+    /// `.ended` 又会被判成段落边界，回合同样收不了口。
+    func testEss1070_TurnTerminalDoneClearsPendingSegmentBoundary() {
+        let requestId = "44444444-4444-4444-4444-444444441071"
+        let sessionId = "55555555-5555-5555-5555-555555551071"
+        let (adapter, _, player, _, _) = makeAdapter(sessionIds: [sessionId])
+        let handle = adapter.beginTurn(requestId: requestId)
+        adapter.openGeneration(1)
+        var segmentFinished = 0
+        var answerFinished = 0
+        adapter.onAnswerPlaybackSegmentFinished = { _, _ in segmentFinished += 1 }
+        adapter.onAnswerPlaybackFinished = { _, _ in answerFinished += 1 }
+
+        func delta(_ seq: Int) -> VoiceStreamChunk {
+            VoiceStreamChunk(
+                requestId: handle.requestId, streamId: handle.sessionId,
+                direction: .downlink, sequence: seq,
+                capturedAtMs: 1_800_000_000_000 + Int64(seq),
+                codec: "pcm_s16le", sampleRate: 24_000,
+                payload: Data(repeating: UInt8(seq), count: 64)
+            )
+        }
+
+        // 段 0：「正在查询…」→ 段落屏障释放（音频还在渲染，.ended 未到）。
+        adapter.ingestDownlink(delta(0), responseId: "r-1070", generation: 1)
+        adapter.markDownlinkSegmentComplete(
+            responseId: "r-1070", generation: 1, finalSequence: 0, segmentIndex: 0
+        )
+        // 段 1：真答案 + 回合终态。
+        adapter.ingestDownlink(delta(1), responseId: "r-1070", generation: 1)
+        adapter.markDownlinkComplete(responseId: "r-1070", generation: 1, finalSequence: 1)
+
+        // 终态之后的渲染完成必须收口**回合**。
+        player.completeBuffer(.ended(
+            requestId: handle.requestId, sessionId: handle.sessionId,
+            responseId: "r-1070", bytesPlayed: 128
+        ))
+
+        XCTAssertEqual(
+            answerFinished, 1,
+            "终态 done 之后的 .ended 被判成段落边界——回合永不收口"
+        )
+        XCTAssertEqual(segmentFinished, 0)
+    }
+
     // MARK: - ESS-527 outer timer regressions
 
     /// ESS-527 acceptance 1: barrier armed + missing tail + timeout → exactly

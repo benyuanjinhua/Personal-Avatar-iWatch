@@ -241,18 +241,16 @@ struct RealtimeDownlinkPlayback: Sendable {
     /// `.pending → .open` already routes through `bargeIn()`, which reset
     /// the buffer state; the reset is only missing on `.open(g) → .open(g+1)`.
     ///
-    /// **Reachability today (main, verified by Jackson Bai in ESS-442
-    /// thread 6ab9c363)**: unreachable, but only because the SENDER of
-    /// `generation.open` is not yet implemented. The receive-side is
-    /// fully wired (`Shared/RealtimeMediaWireFormat.swift:210` enum,
-    /// `Shared/RealtimeBridgeWireCodec.swift:252-254` decoder,
-    /// `Watch/WatchSettingsStore.swift:340-343` unguarded route to
-    /// `adapter.openGeneration(_)`), and NO iPhone-side sender wires it
-    /// yet — `iOS/PhoneRealtimeSession.swift:87` notes ESS-402 is the
-    /// ticket that will land it. So this reset is a proactively-planted
-    /// guard, NOT a "contract forbids iPhone from self-advancing" —
-    /// current status is defensive; auto-upgrades to P0 the moment ESS-402
-    /// (or any other work) wires a `generation.open` sender.
+    /// **Reachability (ESS-1070 复核，2026-08-23)**：这条重置**已经是活路径**。
+    /// ESS-442 当时记的「没有 iPhone 侧发送方」已过时——`generation.open` 的
+    /// 发送方现在实装于 `iOS/PhoneRealtimeAgentTransport.swift`：换代后的新
+    /// 会话连上时 `gate.ready(generation:)` 返回 `.open(g)`，随即下发
+    /// `.generationOpen` 给 Watch。接收侧一直是通的
+    /// （`Shared/RealtimeMediaWireFormat.swift` 枚举、
+    /// `Shared/RealtimeBridgeWireCodec.swift` 解码、
+    /// `Watch/WatchSettingsStore.swift` 路由到 `adapter.openGeneration(_)`）。
+    /// 因此 `.open(g) → .open(g+1)` 的记账重置是打断路径的正确性依赖，
+    /// 不再是「预置的防御」。
     @discardableResult
     mutating func openGeneration(_ generation: Int) -> Outcome {
         if case .open(let existing) = generationState, existing == generation {
