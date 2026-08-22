@@ -1235,7 +1235,7 @@ final class PushToTalkController: ObservableObject {
         //
         // `.default` 回落档（`:316`）同样没有 AEC，因此判据只认 `.voiceChat`。
         adapter.aecAvailable = { [weak self] in
-            self?.conversationAudioController?.lastConfiguredMode == .voiceChat
+            self?.conversationAudioController?.isEchoCancellationActive ?? false
         }
         // ESS-971：段落播完 → interim（回合保持打开，等下一段）。
         adapter.onAnswerPlaybackSegmentFinished = { [weak self] handle, bytes in

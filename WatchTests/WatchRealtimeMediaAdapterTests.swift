@@ -1,3 +1,4 @@
+import AVFoundation
 import XCTest
 @testable import WristAgent_Watch_App
 
@@ -127,45 +128,43 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         }
     }
 
-    // MARK: - ESS-1013 播放期自激：无 AEC 时麦克风不得喂给 VAD
+    // MARK: - ESS-1023 播放期自激：无 AEC 时麦克风不得喂给 VAD
 
-    /// 2026-08-22 真机（`request_id` 见 ESS-1013）：用户**一句话都没说**，
-    /// 系统却提交了 14.7 秒「语音」。
+    /// 2026-08-22 真机（包 `b409fdf`）：用户**一句话都没说**，系统却提交了
+    /// 14.7 秒「语音」。
     ///
     /// ```
     /// 12:15:54.991  play_started                     ← 排队播报开始出声
     /// 12:15:55.289  speech_started  rms=0.01574      ← 0.298 秒后 VAD 起判
     ///               speech_frames 8→27→58→93→121     ← 跟着播报一路涨
     /// 12:16:09.988  speech_final  frames=183 speech_frames=121
+    /// 12:16:10.481  → thinking                       ← 从此卡住，无法输入
     /// ```
     ///
     /// 根因：ESS-891 把语音打断默认关掉换音量，`.voiceChat` 的 AEC 一并消失。
-    /// 没有 AEC 时扬声器输出会被麦克风拾取，VAD 把系统自己的播报判成用户提问，
-    /// 整轮被垃圾音频占掉，用户从此卡在「思考中」无法输入。
-    ///
+    /// 没有 AEC 时扬声器输出会被麦克风拾取，VAD 把系统自己的播报判成用户提问。
     /// 既有的 `playbackEndedForVADGuard` 只覆盖**播完之后**的 300ms，
     /// 缺的正是**播放进行中**这一段。
     func testPlaybackAudioDoesNotFeedVADWithoutAEC() {
-        let recorder = MockRecorder()
-        let player = MockPlayer()
-        let transport = MockTransport()
-        let adapter = WatchRealtimeMediaAdapter(
-            recorder: recorder,
-            player: player,
-            transport: transport,
-            vadConfiguration: LocalVADConfiguration(),
-            automaticallyCommitOnSpeechFinal: true
-        )
+        let events = EventLog()
+        WatchLog.setObserver { module, event, _, detail, code in
+            events.record(module: module, event: event, detail: detail, code: code)
+        }
+        defer { WatchLog.setObserver(nil) }
+
+        let (adapter, recorder, player, transport) = makeVADAdapter()
         adapter.aecAvailable = { false }   // 语音打断关闭 → .spokenAudio → 无 AEC
         var vadEvents: [LocalVADEvent] = []
         adapter.onVADEvent = { vadEvents.append($0) }
 
-        adapter.beginTurn(requestId: "57557557-5575-4575-8575-575575575575")
+        let handle = adapter.beginTurn(requestId: "10231023-0000-4000-8000-000000000001")
         for _ in 0..<3 { recorder.feed(Self.pcmFrame(rms: 0)) }
 
-        // 播报开始出声。
-        player.enqueue(playables: [Self.playable()])
-        XCTAssertTrue(player.isRenderingDownlink, "前提：播放器确实在出声")
+        // 播报**真的出声**（首个 buffer 已渲染），不是「入队了」。
+        player.onPlaybackEvent?(.started(
+            requestId: handle.requestId, sessionId: handle.sessionId, responseId: "resp-1"
+        ))
+        XCTAssertTrue(adapter.isDownlinkAudible, "前提：回执已确认在出声")
 
         // 麦克风拾到的正是扬声器放出来的播报（真机 rms 0.015~0.033 量级）。
         for _ in 0..<20 { recorder.feed(Self.pcmFrame(rms: 0.02)) }
@@ -174,42 +173,138 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
             vadEvents.isEmpty,
             "播放期间无 AEC，麦克风帧必须不喂 VAD —— 否则系统把自己的播报当成用户提问"
         )
+        XCTAssertEqual(transport.commitEvents.count, 0, "更不得把自己的播报提交上行")
         XCTAssertEqual(
-            transport.commitEvents.count, 0,
-            "更不得把自己的播报提交上行"
+            events.count(module: "vad", event: "vad_input_suppressed_during_playback",
+                         detailContains: "reason=no_aec"),
+            1,
+            "整段压制落且只落一条进入取证"
         )
     }
 
     /// 对照：**有** AEC 时（语音打断开启，`.voiceChat`）不得改变行为——
     /// 那正是 ESS-650 语音打断赖以成立的路径，本修复不许把它一起关掉。
     func testPlaybackAudioStillFeedsVADWhenAECAvailable() {
-        let recorder = MockRecorder()
-        let player = MockPlayer()
-        let transport = MockTransport()
-        let adapter = WatchRealtimeMediaAdapter(
-            recorder: recorder,
-            player: player,
-            transport: transport,
-            vadConfiguration: LocalVADConfiguration(),
-            automaticallyCommitOnSpeechFinal: true
-        )
+        let (adapter, recorder, player, transport) = makeVADAdapter()
         adapter.aecAvailable = { true }
         var vadEvents: [LocalVADEvent] = []
         adapter.onVADEvent = { vadEvents.append($0) }
 
-        adapter.beginTurn(requestId: "57557557-5575-4575-8575-575575575575")
+        let handle = adapter.beginTurn(requestId: "10231023-0000-4000-8000-000000000002")
+        player.onPlaybackEvent?(.started(
+            requestId: handle.requestId, sessionId: handle.sessionId, responseId: "resp-1"
+        ))
         for _ in 0..<3 { recorder.feed(Self.pcmFrame(rms: 0)) }
-        player.enqueue(playables: [Self.playable()])
-        for _ in 0..<3 { recorder.feed(Self.pcmFrame(rms: 0.08)) }
+        for _ in 0..<2 { recorder.feed(Self.pcmFrame(rms: 0.08)) }
+        for _ in 0..<7 { recorder.feed(Self.pcmFrame(rms: 0)) }
 
-        XCTAssertFalse(
-            vadEvents.isEmpty,
-            "有 AEC 时播放期仍应正常喂 VAD —— ESS-650 语音打断依赖它"
+        XCTAssertEqual(vadEvents.count, 2, "有 AEC 时播放期行为不得改变：\(vadEvents)")
+        XCTAssertEqual(transport.commitEvents.count, 1)
+    }
+
+    /// 播放结束后必须恢复喂帧，否则用户永远说不了话。
+    func testVADResumesAfterPlaybackEnds() {
+        let events = EventLog()
+        WatchLog.setObserver { module, event, _, detail, code in
+            events.record(module: module, event: event, detail: detail, code: code)
+        }
+        defer { WatchLog.setObserver(nil) }
+
+        let (adapter, recorder, player, transport) = makeVADAdapter()
+        adapter.aecAvailable = { false }
+        var vadEvents: [LocalVADEvent] = []
+        adapter.onVADEvent = { vadEvents.append($0) }
+
+        let handle = adapter.beginTurn(requestId: "10231023-0000-4000-8000-000000000003")
+        player.onPlaybackEvent?(.started(
+            requestId: handle.requestId, sessionId: handle.sessionId, responseId: "resp-1"
+        ))
+        for _ in 0..<20 { recorder.feed(Self.pcmFrame(rms: 0.02)) }
+        XCTAssertTrue(vadEvents.isEmpty)
+
+        player.onPlaybackEvent?(.ended(
+            requestId: handle.requestId, sessionId: handle.sessionId,
+            responseId: "resp-1", bytesPlayed: 2_672_820
+        ))
+        // 头 3 帧落在既有的 `playbackGuardMs = 300ms` 守卫窗内（扬声器余音），
+        // 之后 3 帧是底噪预热，与生产时序一致。
+        for _ in 0..<6 { recorder.feed(Self.pcmFrame(rms: 0)) }
+        for _ in 0..<2 { recorder.feed(Self.pcmFrame(rms: 0.08)) }
+        for _ in 0..<7 { recorder.feed(Self.pcmFrame(rms: 0)) }
+
+        XCTAssertEqual(vadEvents.count, 2, "播报结束后用户说话必须能起判并断句：\(vadEvents)")
+        guard case .speechFinal(_, .silence) = vadEvents.last else {
+            return XCTFail("期望 silence 断句，实际 \(String(describing: vadEvents.last))")
+        }
+        XCTAssertEqual(transport.commitEvents.count, 1, "真正的用户语音必须提交且只提交一次")
+        XCTAssertEqual(
+            events.count(module: "vad", event: "vad_input_resumed_after_playback",
+                         detailContains: "suppressed_frames=20"),
+            1,
+            "恢复喂帧同样要有取证，否则「永远说不了话」在日志上不可区分"
         )
     }
 
-    /// 播放停止后必须恢复喂帧，否则用户永远说不了话。
-    func testVADResumesAfterPlaybackStops() {
+    /// **压制的判据不能是 `player.isRenderingDownlink`。**
+    ///
+    /// 它读 `AVAudioPlayerNode.isPlaying`，而 `prepare(for:)` 末尾就
+    /// `playerNode.play()`、适配器又在 `beginTurn` 里调 `prepare`——于是它整轮
+    /// 恒为 true（运行时取证见
+    /// `testRealPlayerReportsRenderingRightAfterPrepareWithNothingEnqueued`）。
+    /// 拿它当门，**无 AEC 是生产默认**，用户从此一句话也说不了：比本单要修的
+    /// 自激更坏。判据只能是播放器回执（`.started` / `.ended`）。
+    func testMicrophoneStaysLiveWhilePlayerNodeIsStartedButSilent() {
+        let (adapter, recorder, player, transport) = makeVADAdapter()
+        adapter.aecAvailable = { false }
+        // 与真实引擎同语义：`prepare` 之后 `isRenderingDownlink` 即为 true。
+        player.reportsRenderingFromPrepare = true
+        var vadEvents: [LocalVADEvent] = []
+        adapter.onVADEvent = { vadEvents.append($0) }
+
+        adapter.beginTurn(requestId: "10231023-0000-4000-8000-000000000004")
+        XCTAssertTrue(player.isRenderingDownlink, "前提：节点已启动（没有任何音频在放）")
+        XCTAssertFalse(adapter.isDownlinkAudible, "没有 `.started` 回执就不算在出声")
+
+        for _ in 0..<3 { recorder.feed(Self.pcmFrame(rms: 0)) }
+        for _ in 0..<2 { recorder.feed(Self.pcmFrame(rms: 0.08)) }
+        for _ in 0..<7 { recorder.feed(Self.pcmFrame(rms: 0)) }
+
+        XCTAssertEqual(vadEvents.count, 2, "没在出声时必须照常听用户说话：\(vadEvents)")
+        XCTAssertEqual(transport.commitEvents.count, 1)
+    }
+
+    /// 停播路径（打断 / 取消 / 回退）把排队 buffer 直接丢掉，**不保证**还会有
+    /// `.ended` 回执。压制若挂在这里，用户就再也说不了话。
+    func testSuppressionLiftsWhenPlaybackStopsWithoutEndedReceipt() {
+        let (adapter, recorder, player, transport) = makeVADAdapter()
+        adapter.aecAvailable = { false }
+        var vadEvents: [LocalVADEvent] = []
+        adapter.onVADEvent = { vadEvents.append($0) }
+
+        let handle = adapter.beginTurn(requestId: "10231023-0000-4000-8000-000000000005")
+        player.onPlaybackEvent?(.started(
+            requestId: handle.requestId, sessionId: handle.sessionId, responseId: "resp-1"
+        ))
+        XCTAssertTrue(adapter.isDownlinkAudible)
+
+        adapter.cancel(reason: .interrupted)
+
+        XCTAssertFalse(adapter.isDownlinkAudible, "停播即解除压制，不等 `.ended`")
+        XCTAssertTrue(player.stopped)
+
+        // 下一轮照常起判（`beginTurn` 的重置也在这条路径上被覆盖）。
+        adapter.beginTurn(requestId: "10231023-0000-4000-8000-000000000006")
+        for _ in 0..<3 { recorder.feed(Self.pcmFrame(rms: 0)) }
+        for _ in 0..<2 { recorder.feed(Self.pcmFrame(rms: 0.08)) }
+        for _ in 0..<7 { recorder.feed(Self.pcmFrame(rms: 0)) }
+
+        XCTAssertEqual(vadEvents.count, 2, "取消后的新回合必须能正常起判断句：\(vadEvents)")
+        XCTAssertEqual(transport.commitEvents.count, 1)
+    }
+
+    private func makeVADAdapter() -> (
+        WatchRealtimeMediaAdapter, MockRecorder, MockPlayer, MockTransport
+    ) {
         let recorder = MockRecorder()
         let player = MockPlayer()
         let transport = MockTransport()
@@ -220,22 +315,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
             vadConfiguration: LocalVADConfiguration(),
             automaticallyCommitOnSpeechFinal: true
         )
-        adapter.aecAvailable = { false }
-        var vadEvents: [LocalVADEvent] = []
-        adapter.onVADEvent = { vadEvents.append($0) }
-
-        adapter.beginTurn(requestId: "57557557-5575-4575-8575-575575575575")
-        for _ in 0..<3 { recorder.feed(Self.pcmFrame(rms: 0)) }
-        player.enqueue(playables: [Self.playable()])
-        for _ in 0..<10 { recorder.feed(Self.pcmFrame(rms: 0.02)) }
-        XCTAssertTrue(vadEvents.isEmpty)
-
-        player.stop(barge: false)
-        adapter.playbackEndedForVADGuard()
-        for _ in 0..<4 { recorder.feed(Self.pcmFrame(rms: 0)) }
-        for _ in 0..<3 { recorder.feed(Self.pcmFrame(rms: 0.08)) }
-
-        XCTAssertFalse(vadEvents.isEmpty, "播放结束后必须恢复听用户说话")
+        return (adapter, recorder, player, transport)
     }
 
     // MARK: - ESS-865
@@ -327,17 +407,34 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         }
     }
 
-    /// ESS-1013：一段可播放的下行块，用来让 MockPlayer 进入「正在出声」。
-    private static func playable() -> RealtimeDownlinkPlayback.PlayableChunk {
-        RealtimeDownlinkPlayback.PlayableChunk(
-            chunk: VoiceStreamChunk(
-                requestId: "57557557-5575-4575-8575-575575575575",
-                streamId: "11111111-0000-0000-0000-000000000001",
-                direction: .downlink, sequence: 0, capturedAtMs: 1,
-                codec: "pcm_s16le", sampleRate: 24_000,
-                payload: Data(repeating: 1, count: 64), endOfStream: false
-            ),
-            responseId: "resp-1"
+    /// ESS-1023 取证：**真实**播放器的 `isRenderingDownlink` 在 `prepare(for:)`
+    /// 之后就为 true，哪怕一个 buffer 都没入队。
+    ///
+    /// `RealtimePlaybackEngine.swift:128` 读的是 `AVAudioPlayerNode.isPlaying`，
+    /// 而 `prepare(for:)` 末尾调用 `playerNode.play()`；适配器又在 `beginTurn`
+    /// 里调 `prepare`。所以它的语义是「节点已启动」，**不是**「此刻在出声」——
+    /// 拿它当「播放中」的判据，会在整轮聆听期一直成立。
+    func testRealPlayerReportsRenderingRightAfterPrepareWithNothingEnqueued() throws {
+        try HostedCITestGate.skipIfHostedCI("real AVAudioEngine start in ESS-1023 evidence pin")
+        let controller = ConversationAudioController()
+        let engine = RealtimePlaybackEngine(
+            audioEngine: controller.playbackEngine,
+            lifecycleOwner: { .conversation }
+        )
+        do {
+            try controller.beginConversation(conversationId: "ess1023-evidence")
+        } catch {
+            throw XCTSkip("模拟器会话不可用：\(error.localizedDescription)")
+        }
+        defer { controller.endConversation(reason: .userExit) }
+
+        let session = RealtimeMediaSession()
+        let handle = session.beginTurn(requestId: "10231023-0000-4000-8000-0000000000ff")
+        try engine.prepare(for: handle)
+
+        XCTAssertTrue(
+            engine.isRenderingDownlink,
+            "证据：一个 buffer 都没入队，isRenderingDownlink 已为 true"
         )
     }
 
@@ -446,7 +543,14 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
 
         var enqueuedChunks: [VoiceStreamChunk] { enqueuedPlayables.map(\.chunk) }
 
-        func prepare(for turn: RealtimeMediaSession.TurnHandle) throws { preparedFor = turn }
+        /// ESS-1023：真实引擎的 `isRenderingDownlink` 读 `playerNode.isPlaying`，
+        /// `prepare(for:)` 末尾就 `play()` 了——置真即复现该语义。
+        var reportsRenderingFromPrepare = false
+
+        func prepare(for turn: RealtimeMediaSession.TurnHandle) throws {
+            preparedFor = turn
+            if reportsRenderingFromPrepare { isRenderingDownlink = true }
+        }
         func enqueue(playables: [RealtimeDownlinkPlayback.PlayableChunk]) {
             enqueuedPlayables.append(contentsOf: playables)
             if !playables.isEmpty { isRenderingDownlink = true }
