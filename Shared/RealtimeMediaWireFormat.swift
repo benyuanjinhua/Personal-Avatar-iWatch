@@ -285,6 +285,23 @@ enum RealtimeDownlinkKind: String, Codable, Sendable {
     /// not send `cancel` on the WSS, so the pending window must collapse.
     case generationOpen = "generation.open"
     case bargeInFailed = "bargein.failed"
+    /// ESS-969 / ESS-971：**本段结束，回合未结束**。屏障语义与 `audioDone`
+    /// 一致，但客户端必须保持本轮打开（`markAnswerInterim`），不开下一轮。
+    case audioSegmentDone = "audio.segment_done"
+
+    /// 未知 kind 不得让**整个信封**解码失败。
+    ///
+    /// ESS-971：本枚举原先是裸 `String, Codable`，新增任何取值都会让尚未升级的
+    /// 一侧在 `RealtimeDownlinkEnvelope` 解码时整帧抛错——不是忽略一个字段，
+    /// 是**丢掉整条下行**。Watch 与 iPhone 虽然同包发布，但 WCSession 的队列
+    /// 里可能残留上一版进程投递的信封，滚动升级窗口内真实存在混版。
+    /// 未知取值降级为 `.unrecognised`，由分发层按「不认识就跳过」处理。
+    case unrecognised = "__unrecognised__"
+
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = RealtimeDownlinkKind(rawValue: raw) ?? .unrecognised
+    }
 }
 
 /// ESS-541: a downlink may only enter the playback pipeline for the exact
@@ -448,6 +465,25 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
             protocolVersion: RealtimeWireVersion.downlink,
             kind: .audioDone, requestId: requestId, sessionId: sessionId,
             sequence: nil, audio: nil, transcript: nil, reason: nil,
+            responseId: responseId, generation: generation, finalSequence: finalSequence
+        )
+    }
+
+    /// ESS-969 / ESS-971：段落屏障。`sequence` 复用 `finalSequence` 承载屏障值，
+    /// `segmentIndex` 借 `sequence` 字段传递（信封无专用字段，避免为一个取证字段
+    /// 改动全链路 Codable 契约）。
+    static func audioSegmentDone(
+        requestId: String,
+        sessionId: String,
+        responseId: String? = nil,
+        generation: Int? = nil,
+        segmentIndex: Int,
+        finalSequence: Int
+    ) -> Self {
+        RealtimeDownlinkEnvelope(
+            protocolVersion: RealtimeWireVersion.downlink,
+            kind: .audioSegmentDone, requestId: requestId, sessionId: sessionId,
+            sequence: segmentIndex, audio: nil, transcript: nil, reason: nil,
             responseId: responseId, generation: generation, finalSequence: finalSequence
         )
     }

@@ -328,6 +328,71 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertEqual(commitCount, commitsBefore + 1, "听到过说话就该按 60s 上限提交")
     }
 
+    // MARK: - ESS-971 段落屏障：本段完了，回合没完
+
+    /// 2026-08-22 真机（`request_id=01a02783-7e78`）：网关侧 ESS-969 已经在发
+    /// `audio.segment_done`，Watch 只落了一条 `downlink_decode_unrecognised`——
+    /// 协议上线、客户端没接，于是回合既收不到「这段完了」也收不到「这轮完了」，
+    /// 一直挂到用户关掉 App。
+    ///
+    /// 这条钉住接线后的行为：退回 `.thinking` 等下一段，**绝不开下一轮**。
+    /// 开下一轮的话，第二段（真正的答案）会落进下一轮——正是 ESS-600 复审
+    /// 阻断 B 钉住的跨轮错乱。
+    func testSegmentDoneReturnsToThinkingWithoutStartingNextTurn() {
+        controller.enterSession()
+        controller.markChannelReady()
+        let requestId = controller.activeTurnRequestId!
+        var startTurnCount = 0
+        controller.onStartTurn = { startTurnCount += 1; return "req-next" }
+        controller.markTurnCommitted(requestId: requestId)
+        controller.markAnswerStarted(requestId: requestId)
+        XCTAssertEqual(controller.turnPhase, .speaking)
+        let turnIndexBefore = controller.turnIndex
+
+        // 段落屏障：本段播完，但回合没完。
+        controller.markAnswerInterim(requestId: requestId)
+
+        XCTAssertEqual(controller.turnPhase, .thinking, "必须退回等待态")
+        XCTAssertEqual(startTurnCount, 0, "绝不能开下一轮——第二段会落进下一轮")
+        XCTAssertEqual(controller.turnIndex, turnIndexBefore, "回合序号不变")
+        XCTAssertEqual(controller.activeTurnRequestId, requestId, "仍是同一轮")
+    }
+
+    /// 第二段到达后正常起播，且**仍是同一轮**。
+    func testSecondSegmentPlaysBackInSameTurn() {
+        controller.enterSession()
+        controller.markChannelReady()
+        let requestId = controller.activeTurnRequestId!
+        var startTurnCount = 0
+        controller.onStartTurn = { startTurnCount += 1; return "req-next" }
+        controller.markTurnCommitted(requestId: requestId)
+        controller.markAnswerStarted(requestId: requestId)
+        controller.markAnswerInterim(requestId: requestId)
+
+        // 工具跑完，第二段来了。
+        controller.markAnswerStarted(requestId: requestId)
+
+        XCTAssertEqual(controller.turnPhase, .speaking, "第二段应正常起播")
+        XCTAssertEqual(controller.activeTurnRequestId, requestId)
+        XCTAssertEqual(startTurnCount, 0)
+    }
+
+    /// 段落屏障后必须**重新武装**思考超时：第二段若永不到达，
+    /// 会话要能被超时捞回，而不是永久挂死（真机上就是挂到用户关 App）。
+    func testSegmentDoneRearmsThinkingTimeout() {
+        controller.enterSession()
+        controller.markChannelReady()
+        let requestId = controller.activeTurnRequestId!
+        controller.onStartTurn = { "req-next" }
+        controller.markTurnCommitted(requestId: requestId)
+        controller.markAnswerStarted(requestId: requestId)
+        controller.markAnswerInterim(requestId: requestId)
+
+        fireDelay(SessionController.thinkingHardTimeoutSeconds)
+
+        XCTAssertEqual(controller.state, .failed, "第二段不来时必须被超时捞回")
+    }
+
     // MARK: - 失败路径
 
     /// 就绪超时：5s 无真实 ack → 进入 P6 failed 态（不退回 idle）。
