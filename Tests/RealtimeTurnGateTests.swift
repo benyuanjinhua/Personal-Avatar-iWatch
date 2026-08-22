@@ -11,7 +11,7 @@ final class RealtimeTurnGateTests: XCTestCase {
 
     /// 未失败时一律放行——不能因为加了闸门就把正常链路拦住。
     func testOpensWhenNothingFailed() {
-        let gate = RealtimeTurnGate()
+        var gate = RealtimeTurnGate()
         XCTAssertEqual(gate.decide(requestId: rid, sessionId: sid, isTurnStart: false), .open)
         XCTAssertEqual(gate.decide(requestId: rid, sessionId: sid, isTurnStart: true), .open)
     }

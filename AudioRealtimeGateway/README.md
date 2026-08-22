@@ -145,7 +145,8 @@ verifiable).
 |---|---|---|
 | `ready` | echoes scope, adds `heartbeat_interval_ms` | Sent once after `session.start` is accepted. |
 | `audio.delta` | `sequence`, `sample_rate`, `codec`, `audio` (base64 PCM16LE 24 kHz) | Sequences are monotone and dense per `response_id`. |
-| `audio.done` | `final_sequence` | Barrier — client waits until it has seen every `0..final_sequence` before signalling playback complete. |
+| `audio.segment_done` | `segment_index`, `final_sequence` | **本段结束，回合未结束**（ESS-969）。同一屏障语义，但客户端应保持本轮打开、退回等待态（Watch：`SessionController.markAnswerInterim`），不得开下一轮。未实现的老客户端忽略该帧即可——后续 `audio.delta` 与最终的 `audio.done` 不受影响。 |
+| `audio.done` | `final_sequence` | Barrier — client waits until it has seen every `0..final_sequence` before signalling playback complete. **回合终态**：一个回合有且只有一帧。 |
 | `cancel.ack` | echoes scope + `cancelled_response_id?` | Response to a `cancel` message. |
 | `error` | `code`, `retriable`, `detail?` | Structured failure; connection is closed with WebSocket code 1008 unless `retriable: true`. |
 | `pong` | echoes `nonce` | Heartbeat reply. |
@@ -173,6 +174,25 @@ inspect control frames.
   `done_barrier_clamped` with `reason` in {`gap_before_final_sequence`,
   `final_sequence_not_yet_emitted`}. A response that produced zero
   contiguous deltas ends with `final_sequence == -1`.
+
+#### 多段回合（ESS-969）
+
+一个回合可以承载多段回答：工具调用回合先说「我正在查询…」，跑工具，再说
+真正的答案。上游的 `audio.done` 是**段落**边界，不是回合终态。
+
+- 回合终态取自上游信号 `voice.state {state:'idle'}`——与部署中的 Bridge 对同一
+  端点（`ws://127.0.0.1:3101/api/realtime`）的读法一致，见
+  `MacRemoteFrontendBridge/supervisor.mjs` 的 `TurnCapture.onEvent`。不是超时。
+- 下游序号在整个回合内单调稠密，跨段连续，所以稠密前缀屏障对段落边界与
+  回合终态同样成立。
+- `agent_multi_segment_mode`：`auto`（默认）只对**已证明上游会发 `voice.state`**
+  的回合启用新语义；没有该信号的回合逐字节保持 ESS-969 之前的行为。
+  `always` / `off` 强制两侧。每个回合落一条 `upstream_turn_terminal_mode`
+  日志，直接说明本次走了哪条分支。
+- `agent_turn_idle_backstop_ms`（默认 45000）是**兜底**，不是收口机制：只在
+  上游宣告了 `voice.state` 却始终不 `idle` 时触发。**该值待标定**（R-04.4）：
+  目前没有任何真机采样，标定依据是 `upstream_segment_closed` →
+  `upstream_turn_terminal` 的时间差，需要 n ≥ 20 个真实工具调用回合。
 
 #### Barge-in
 
@@ -241,7 +261,8 @@ upstream nor a Watch that stopped draining can grow the process without limit.
 | `ERR_UPSTREAM_BUDGET_EXCEEDED` | — / 1008 | Upstream exceeded the per-turn downlink frame/byte budget. |
 | `ERR_DOWNLINK_BUDGET` | — / 1008 | Session downlink budget or sequence window exhausted (not retriable). |
 | `ERR_UPSTREAM_NO_RESPONSE` | — / 1008 | ESS-842: no upstream response frame within `agent_response_timeout_ms` of `audio.commit` (retriable). |
-| `ERR_VOICE_OWNERSHIP_LOST` | — / 1008 | ESS-842: upstream voice ownership was taken by another client mid-turn, so our audio is being discarded (retriable). |
+| `ERR_VOICE_OWNERSHIP_LOST` | — / 1008 | ESS-842: upstream voice ownership was taken by another client mid-turn, so our audio is being discarded (retriable). The `upstream_ownership` log now carries the thief's `holder_label` and `holder_instance_id` (ESS-978). |
+| `ERR_VOICE_BUSY` | — / 1008 | ESS-978: the upstream single voice slot is held by another client at connect time and the holder is not eligible for takeover — a foreign gateway instance, or a frontend while `agent_takeover_voice` is off (retriable). |
 | `ERR_SLOW_CONSUMER` | — / 1013 | Client stopped draining; `bufferedAmount` passed `max_downlink_buffered_bytes`. Close reason only — no `error` frame, the socket is already backlogged. |
 
 ## Auth
@@ -324,11 +345,11 @@ ceilings do evict, because a dropped token entry can only cause a rejection.
 | `downlink_backpressure_warn_bytes` | `1048576` | `bufferedAmount` that logs one `downlink_backpressure_warning` |
 | `downlink_close_grace_ms` | `5000` | Grace before `terminate()` when `close()` cannot drain |
 | `agent_transport` | `agent` | `agent` connects the production qwen-audio-agent loopback WSS; `mock` is test-only. |
-| `agent_gateway_url` | `ws://127.0.0.1:3101/api/realtime` | Existing qwen-audio-agent endpoint. Keep loopback-only. |
+| `agent_gateway_url` | `ws://127.0.0.1:3101/api/realtime` | Existing qwen-audio-agent endpoint. Keep loopback-only. **Never run a second copy of this gateway against this default — it will silently take over the real-device voice channel (see the deployment warning below).** |
 | `agent_connect_timeout_ms` | `10000` | Fail the northbound turn with a structured upstream timeout. |
 | `agent_max_pending_bytes` | `2097152` | Hard cap while waiting for upstream `voice.ready`. |
 | `agent_response_timeout_ms` | `8000` | ESS-842: how long a committed turn waits for the first upstream response frame before failing closed with `ERR_UPSTREAM_NO_RESPONSE`. Must stay below the client's post-commit wait budget (`AudioRealtimeAgentConfig.responseWaitTimeout`, 15 s) and inside the incident's measured 10.153 s client window — pinned by `test/ess842-response-deadline.test.mjs`. `0` disables the deadline. |
-| `agent_takeover_voice` | `true` | Explicit Watch speech takes ownership from a stale/local frontend. |
+| `agent_takeover_voice` | `true` | Explicit Watch speech takes ownership from a stale/local frontend. ESS-978: takeover is two-step — the gateway first connects **without** takeover and only steals the voice slot when the current holder is its own prior connection (same process, same `clientLabel`) or an allowed frontend; a second gateway instance on the same machine is never stolen from and fails with `ERR_VOICE_BUSY`. |
 | `fallback_bind` / `fallback_port` | `127.0.0.1` / `8445` | Dedicated loopback-only HTTP listener for Bridge fallback jobs; never exposed on the public TLS listener. |
 | `fallback_hmac_secret_file` | `./state/fallback-hmac-secret` | Mode-0600 service credential generated by `scripts/install-launchd.sh`; the configured environment variable takes precedence. |
 | `fallback_turn_state_max_entries` | `2048` | Maximum durable realtime completion tombstones retained. Persistence is asynchronously serialized and atomically renamed, rather than synchronously rewriting the table on each realtime frame. |
@@ -342,6 +363,19 @@ under launchd / systemd / a deploy script — behaves identically to `npm start`
 (ESS-428). Absolute paths in `config.json` are honored as-is.
 
 ## Deployment (quickstart)
+
+> **ESS-978 — single-gateway-per-machine rule.** The default `agent_gateway_url`
+> is `ws://127.0.0.1:3101/api/realtime`. Anyone who starts an *unchanged*
+> copy of this module on the production Mac mini — a fresh `npm test`, a
+> scratch checkout, a stray dev process — used to connect with `takeover:
+> true` and silently steal the real-device voice channel mid-sentence.
+> Since ESS-978 the gateway only takes over a holder it can prove is its own
+> prior connection (same process) or an allowed frontend, and it identifies
+> itself as `watch-direct-gateway:<pid>`, so a second copy now fails with
+> `ERR_VOICE_BUSY` instead of killing the live turn. Still: keep exactly one
+> gateway process per machine, and when triaging `ERR_VOICE_BUSY` /
+> `ERR_VOICE_OWNERSHIP_LOST`, read `holder_label` + `holder_instance_id` in
+> `upstream_ownership` to name the offending process.
 
 Target host for ESS-447 dev cluster:
 **`jackson-macmac-mini.magic.workspace.beer:8444`** — Jackson's Mac mini,
