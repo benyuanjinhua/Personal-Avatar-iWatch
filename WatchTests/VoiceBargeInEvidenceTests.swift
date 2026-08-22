@@ -320,6 +320,8 @@ final class VoiceBargeInEvidenceTests: XCTestCase {
         private(set) var modes: [AVAudioSession.Mode] = []
         var rejectModes: Set<AVAudioSession.Mode> = []
 
+        var currentRouteDescription: String { "Speaker(BuiltInSpeaker)" }
+
         func setCategory(
             _ category: AVAudioSession.Category,
             mode: AVAudioSession.Mode,
