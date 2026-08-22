@@ -3,6 +3,11 @@
 //   • strict client→server frame schema + monotone uplink sequence check
 //   • generation-aware server→client emission (dedup by sequence, drop
 //     stale generations, `audio.done` barrier with `final_sequence`)
+//   • ESS-969 multi-segment turns: `audio.segment_done` marks the end of ONE
+//     answer segment while the turn continues (a tool-calling turn speaks
+//     「我正在查询…」, runs the tool, then speaks the real answer); `audio.done`
+//     stays the single turn terminal. Both ride the same dense-prefix barrier
+//     and the same monotone downlink sequence space.
 //   • server-authoritative cancel (stop emission + acknowledge)
 //   • per-connection rate limits and frame-size cap
 //   • structured logging keyed on request_id / session_id
@@ -113,6 +118,15 @@ export class RealtimeSession {
     // is dense in `seenDownlinkSequences`, then release ONE downstream
     // `audio.done(final_sequence=pendingFinalSequence)`. Never rewritten.
     this.pendingFinalSequence = null
+    // ESS-969: segment boundaries WITHIN one turn. `audio.done` remains the
+    // single turn terminal (`doneEmitted` is still set exactly once and is
+    // never reset — the reset problem disappears because a segment boundary
+    // no longer masquerades as a turn end). A segment done is held on the
+    // same dense-prefix rule as the turn barrier, but it needs its own slot:
+    // it must NOT become `pendingFinalSequence`, or `_emitDelta` would start
+    // dropping the next segment's frames as "past the promised barrier".
+    this.pendingSegmentDone = null
+    this.segmentsEmitted = 0
     // `done(-1)` is ambiguous until a short bounded window elapses: it can
     // mean a genuinely empty response, or (as observed in ESS-526) an
     // upstream marker that races ahead of the first delta.  Do not commit it
@@ -203,6 +217,7 @@ export class RealtimeSession {
       close_code: typeof code === 'number' ? code : null,
       stale_generation_dropped: this.staleGenerationDropped,
       post_done_audio_dropped: this.postDoneAudioDropped,
+      segments_emitted: this.segmentsEmitted,
       final_sequence: this.finalSequence,
       done_emitted: this.doneEmitted,
       cancelled: this.cancelled,
@@ -399,6 +414,7 @@ export class RealtimeSession {
       return
     }
     if (event.type === 'agent.audio.delta') return this._emitDelta(event)
+    if (event.type === 'agent.audio.segment_done') return this._emitSegmentDone(event)
     if (event.type === 'agent.audio.done') return this._emitDone(event)
     if (event.type === 'agent.error') return this.fail(event.code ?? 'ERR_UPSTREAM_UNAVAILABLE',
       { detail: event.detail ?? null, retriable: Boolean(event.retriable) })
@@ -515,7 +531,74 @@ export class RealtimeSession {
     })
     // A backfilled hole may have completed the dense prefix; check whether
     // an upstream `audio.done` we've been holding can now be released.
+    this._maybeReleaseSegmentDone()
     this._maybeReleaseDone()
+  }
+
+  // ESS-969: one segment of a multi-segment turn ended. This is NOT the turn
+  // terminal — `doneEmitted` stays false and the next segment's deltas keep
+  // flowing, which is precisely the drop this issue exists to remove. The
+  // client reads it as「这一段完了，回合没完」and can hold its turn open
+  // (Watch: `SessionController.markAnswerInterim`) instead of guessing.
+  _emitSegmentDone(event) {
+    if (this.doneEmitted) {
+      // The turn already ended downstream; a segment boundary after it is the
+      // upstream contradicting its own terminal. Counted, not forwarded.
+      this.log('segment_done_after_turn_done', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        response_id: this.responseId, segment_index: event.segment_index ?? null,
+      })
+      return
+    }
+    const claimed = Number.isInteger(event.final_sequence)
+      ? event.final_sequence
+      : this.downlinkHighWatermark
+    // An empty segment carries no barrier to wait for and nothing for the
+    // client to have played; forwarding it would only produce a boundary
+    // around silence.
+    if (claimed < 0) return
+    if (claimed >= this.maxDownlinkFrames) {
+      return this._failDownlinkBudget('segment_final_sequence_out_of_window', {
+        claimed_final_sequence: claimed, frames_cap: this.maxDownlinkFrames,
+      })
+    }
+    this.pendingSegmentDone = {
+      segment_index: Number.isInteger(event.segment_index) ? event.segment_index : this.segmentsEmitted,
+      final_sequence: claimed,
+    }
+    this.log('segment_done_pending', {
+      request_id: this.scope.request_id, session_id: this.scope.session_id,
+      response_id: this.responseId,
+      segment_index: this.pendingSegmentDone.segment_index,
+      segment_final_sequence: claimed,
+      dense_prefix: this._highestDensePrefix(),
+    })
+    this._maybeReleaseSegmentDone()
+  }
+
+  // Release a held segment boundary once every 0..final_sequence delta has
+  // gone downstream. No timer of its own: a segment whose prefix never
+  // completes is a hole in the turn, and the turn barrier's existing gap
+  // timer is the thing that fails it closed.
+  _maybeReleaseSegmentDone() {
+    const pending = this.pendingSegmentDone
+    if (!pending || this.doneEmitted) return
+    if (this._highestDensePrefix() < pending.final_sequence) return
+    this.pendingSegmentDone = null
+    this.segmentsEmitted += 1
+    this._sendJson({
+      type: 'audio.segment_done',
+      session_id: this.scope.session_id, request_id: this.scope.request_id,
+      response_id: this.responseId, generation: this.scope.generation,
+      segment_index: pending.segment_index,
+      final_sequence: pending.final_sequence,
+    })
+    this.log('downlink_segment_done', {
+      request_id: this.scope.request_id, session_id: this.scope.session_id,
+      response_id: this.responseId,
+      segment_index: pending.segment_index,
+      segment_final_sequence: pending.final_sequence,
+    })
   }
 
   _emitDone(event) {
@@ -574,6 +657,11 @@ export class RealtimeSession {
       this._clearBarrierTimer()
       this.finalSequence = target
       this.doneEmitted = true
+      // ESS-969: a boundary that only becomes releasable at the same instant
+      // as the turn terminal carries no information — the turn end already
+      // says everything it would have said. Drop it rather than make the
+      // client flip to「等下一段」and back within one frame.
+      this.pendingSegmentDone = null
       this._sendJson({
         type: 'audio.done',
         session_id: this.scope.session_id, request_id: this.scope.request_id,

@@ -90,6 +90,36 @@ export class QwenAgentTransport {
     // the client side is mirrored by `AudioRealtimeAgentConfig.responseWaitTimeout`.
     // n=9 is a thin sample (R-04.4), which is why this stays a config knob.
     responseTimeoutMs = 8_000,
+    // ESS-969 multi-segment turns. Upstream `audio.done` is a SEGMENT
+    // boundary, not the end of the turn: in a tool-calling turn the model
+    // says 「我正在查询…」, closes that response, runs the tool, then opens a
+    // second response with the real answer. Treating the first `audio.done`
+    // as terminal is what made the second segment unreachable.
+    //
+    // The turn terminal is an upstream signal, not a timeout: the SAME
+    // upstream endpoint (`ws://127.0.0.1:3101/api/realtime`, identical
+    // `connect` handshake) emits `voice.state {state:'idle'}`, and that is
+    // exactly what the deployed Bridge uses to finish a turn
+    // (`MacRemoteFrontendBridge/supervisor.mjs` `TurnCapture.onEvent`
+    // case `voice.state`). Segment starts are witnessed by `response.started`
+    // (same file, `beginAnnouncement`).
+    //
+    // `'auto'` only enables the new terminal rule for a turn that has PROVEN
+    // the upstream speaks that dialect (a `voice.state` frame was seen before
+    // the first segment settles). A turn that never sees one keeps the exact
+    // pre-ESS-969 behaviour, so an upstream without the signal cannot regress
+    // into waiting on a backstop. `'always'` / `'off'` force either side.
+    multiSegmentMode = 'auto',
+    // ESS-969 BACKSTOP ONLY — 待标定 (R-04.4). Bounds a turn whose upstream
+    // announced `voice.state` but never sent `idle`. It is NOT the mechanism
+    // that ends a healthy turn, and it must stay well above tool latency:
+    // shrinking it would truncate exactly the turns this issue exists to fix.
+    // No real-device sample of「段落 audio.done → 下一段 response.started」or
+    // 「末段 audio.done → voice.state idle」exists yet; 45 s is a placeholder
+    // chosen only to sit above the Watch-visible turn budget. Calibrate from
+    // `upstream_segment_closed` → `upstream_turn_terminal` deltas once real
+    // tool-calling turns are in gateway.log (n ≥ 20).
+    turnIdleBackstopMs = 45_000,
     takeover = true,
     log = () => {},
   } = {}) {
@@ -105,6 +135,8 @@ export class QwenAgentTransport {
     this.reorderWaitMs = reorderWaitMs
     this.maxReorderFrames = maxReorderFrames
     this.responseTimeoutMs = responseTimeoutMs
+    this.multiSegmentMode = multiSegmentMode
+    this.turnIdleBackstopMs = turnIdleBackstopMs
     this.takeover = takeover
     this.log = log
     this.turns = new Map()
@@ -162,6 +194,14 @@ export class QwenAgentTransport {
       expectedUpstream: 0, anchored: false, reorderBuffer: new Map(), gapTimer: null,
       clientInstanceId, ownershipState: null, ownershipHolderLabel: null,
       responseTimer: null, responded: false, commitSentAt: null,
+      // ESS-969 segment book-keeping. `closedSegment` holds a segment whose
+      // `audio.done` has settled but whose meaning is not decided yet: it is
+      // a SEGMENT boundary if the turn goes on to produce more, and the TURN
+      // boundary if the upstream goes idle. Deferring the choice is what
+      // keeps a plain one-segment turn from emitting a spurious interim.
+      segmentIndex: 0, closedSegment: null, segmentsClosed: 0,
+      sawVoiceState: false, multiSegment: null,
+      turnIdleTimer: null, turnEnded: false,
     }
     const scopeLog = { request_id: requestId, session_id: sessionId, device_id: deviceId, generation }
     turn.supersede = nextRequestId => {
@@ -171,6 +211,7 @@ export class QwenAgentTransport {
       clearTimeout(turn.doneTimer)
       clearTimeout(turn.gapTimer)
       clearTimeout(turn.responseTimer)
+      clearTimeout(turn.turnIdleTimer)
       this.log('upstream_turn_superseded', {
         ...scopeLog, superseded_by_request_id: nextRequestId,
       })
@@ -190,6 +231,7 @@ export class QwenAgentTransport {
       clearTimeout(turn.doneTimer)
       clearTimeout(turn.gapTimer)
       clearTimeout(turn.responseTimer)
+      clearTimeout(turn.turnIdleTimer)
       this.log('upstream_error', { ...scopeLog, code })
       onEvent({ type: 'agent.error', response_id: responseId, code, detail, retriable: true })
       try { turn.ws?.close() } catch { /* best effort */ }
@@ -249,6 +291,16 @@ export class QwenAgentTransport {
     // always covers the frames that were actually forwarded. Anything that ends
     // the upstream socket while the window is open flushes it rather than
     // dropping it — a completed response must not surface as a disconnect.
+    //
+    // ESS-969 makes the *meaning* of that settled done conditional. An
+    // upstream `audio.done` closes one RESPONSE; whether that is also the end
+    // of the turn is decided by the upstream, not by this adapter:
+    //   • `voice.state {state:'idle'}`  → turn over        → `agent.audio.done`
+    //   • more output (`response.started` / a new delta)   → `agent.audio.segment_done`
+    //     for the segment that just closed, and the turn continues
+    // so the closed segment is PARKED in `turn.closedSegment` until one of
+    // those arrives (or the bounded backstop fires). Parking is what stops a
+    // plain one-segment turn from ever emitting a spurious segment boundary.
     const flushDone = () => {
       if (!turn.pendingDone) return
       // A hole is still outstanding: the run is not complete, so it is not done.
@@ -259,9 +311,82 @@ export class QwenAgentTransport {
       turn.doneTimer = null
       const finalSequence = turn.nextOutputSequence - 1
       this.log('upstream_audio_done', { ...scopeLog, final_sequence: finalSequence })
+      if (turn.multiSegment === null) {
+        turn.multiSegment = this.multiSegmentMode === 'always' ? true
+          : this.multiSegmentMode === 'off' ? false
+          : turn.sawVoiceState
+        // The single line that tells a real-device log which branch this
+        // build actually took. `legacy` means the upstream never announced
+        // `voice.state`, so the multi-segment path was NOT exercised — read
+        // it before concluding anything about the fix.
+        this.log('upstream_turn_terminal_mode', {
+          ...scopeLog,
+          mode: turn.multiSegment ? 'multi_segment' : 'legacy',
+          configured: this.multiSegmentMode,
+          saw_voice_state: turn.sawVoiceState,
+        })
+      }
+      if (!turn.multiSegment) return endTurn('legacy_first_done', finalSequence)
+      turn.closedSegment = { segmentIndex: turn.segmentIndex, finalSequence }
+      turn.segmentsClosed += 1
+      this.log('upstream_segment_closed', {
+        ...scopeLog, segment_index: turn.segmentIndex, final_sequence: finalSequence,
+      })
+      armTurnIdleBackstop()
+    }
+
+    // The turn produced more output after a segment closed: that closed
+    // segment was a boundary, not the end. Release it downstream before the
+    // new segment's frames so the client sees them in order.
+    const releaseClosedSegment = cause => {
+      const closed = turn.closedSegment
+      if (!closed) return
+      turn.closedSegment = null
+      turn.segmentIndex += 1
+      clearTimeout(turn.turnIdleTimer)
+      turn.turnIdleTimer = null
+      this.log('upstream_segment_done', {
+        ...scopeLog, segment_index: closed.segmentIndex,
+        final_sequence: closed.finalSequence, cause,
+      })
+      onEvent({
+        type: 'agent.audio.segment_done', response_id: responseId,
+        segment_index: closed.segmentIndex, final_sequence: closed.finalSequence,
+      })
+    }
+
+    // The one place a turn ends. `finalSequence` defaults to everything
+    // forwarded so far, which is exactly the last segment's endpoint.
+    const endTurn = (reason, finalSequence = turn.nextOutputSequence - 1) => {
+      if (turn.turnEnded) return
+      turn.turnEnded = true
+      turn.closedSegment = null
+      clearTimeout(turn.turnIdleTimer)
+      turn.turnIdleTimer = null
+      this.log('upstream_turn_terminal', {
+        ...scopeLog, reason, final_sequence: finalSequence,
+        segments: turn.segmentsClosed || 1,
+      })
       onEvent({
         type: 'agent.audio.done', response_id: responseId, final_sequence: finalSequence,
+        segments: turn.segmentsClosed || 1,
       })
+    }
+
+    // BACKSTOP, not the mechanism (see `turnIdleBackstopMs`). Only armed while
+    // a closed segment is parked and the upstream has said nothing since.
+    const armTurnIdleBackstop = () => {
+      if (this.turnIdleBackstopMs <= 0 || turn.turnIdleTimer) return
+      turn.turnIdleTimer = setTimeout(() => {
+        turn.turnIdleTimer = null
+        if (turn.terminal || turn.turnEnded || !turn.closedSegment) return
+        this.log('upstream_turn_idle_backstop', {
+          ...scopeLog, backstop_ms: this.turnIdleBackstopMs,
+          segment_index: turn.closedSegment.segmentIndex,
+        })
+        endTurn('idle_backstop', turn.closedSegment.finalSequence)
+      }, this.turnIdleBackstopMs)
+      turn.turnIdleTimer.unref?.()
     }
 
     const scheduleDone = () => {
@@ -277,6 +402,10 @@ export class QwenAgentTransport {
     // Forward one accepted frame and stamp it with the downstream contract's
     // sequence. Ordering has already been settled by `enqueueOrdered`.
     const emitDelta = frame => {
+      // ESS-969: audio after a closed segment proves the turn went on. The
+      // boundary must reach the client BEFORE the new segment's first frame,
+      // otherwise the client attributes this audio to the previous segment.
+      releaseClosedSegment('audio.delta')
       const sequence = turn.nextOutputSequence++
       if (turn.pendingDone) {
         clearTimeout(turn.doneTimer)
@@ -468,6 +597,43 @@ export class QwenAgentTransport {
           }
           return
         }
+        // ESS-969 turn structure. `response.started` opens a response segment
+        // and `voice.state {state:'idle'}` ends the turn — both are upstream
+        // facts, mirrored from the deployed Bridge's reading of this same
+        // endpoint (`MacRemoteFrontendBridge/supervisor.mjs`). `origin` is
+        // `model` | `agent` | `announcement`; only `announcement` is an
+        // unrelated background broadcast and must not steer this turn (ESS-36).
+        if (event.type === 'response.started' && event.origin !== 'announcement') {
+          this.log('upstream_response_started', {
+            ...scopeLog, upstream_response_id: event.responseId ?? null,
+            origin: event.origin ?? null, segment_index: turn.segmentIndex,
+          })
+          releaseClosedSegment('response.started')
+          return
+        }
+        if (event.type === 'voice.state' && event.origin !== 'announcement') {
+          turn.sawVoiceState = true
+          if (event.state === 'idle') {
+            // Settle first: idle normally lands right behind the last
+            // `audio.done`, inside its settle window.
+            if (turn.pendingDone) flushDone()
+            // Only a PARKED closed segment may be converted into the turn
+            // endpoint. Ending on anything else would cut a response that is
+            // still streaming (or one whose tail is still held by the reorder
+            // barrier) and present the truncation to the Watch as success.
+            // If idle ever lands elsewhere, this line is the evidence — and
+            // the bounded backstop still closes the turn.
+            if (turn.closedSegment) endTurn('voice_state_idle', turn.closedSegment.finalSequence)
+            else if (turn.responded && !turn.turnEnded) {
+              this.log('upstream_voice_state_idle_ignored', {
+                ...scopeLog, pending_done: turn.pendingDone,
+                reorder_pending: turn.reorderBuffer.size,
+                segments_closed: turn.segmentsClosed,
+              })
+            }
+          }
+          return
+        }
         if (event.type === 'audio.delta' && event.audio) {
           noteResponseProgress()
           const audio = event.audio
@@ -572,11 +738,17 @@ export class QwenAgentTransport {
         // complete, so release the barrier instead of reporting a disconnect —
         // but only if nothing is still missing; a close over an open hole is a
         // disconnect, not a completion.
-        if (turn.pendingDone && turn.reorderBuffer.size === 0) {
+        // ESS-969: a close is an unambiguous turn terminal, so a segment that
+        // `flushDone` parked here becomes the turn endpoint rather than
+        // waiting on the backstop. `endTurn` is idempotent, so the legacy
+        // branch (which ends inside `flushDone`) is unaffected.
+        if ((turn.pendingDone || turn.closedSegment) && turn.reorderBuffer.size === 0) {
           flushDone()
+          if (turn.closedSegment) endTurn('upstream_closed', turn.closedSegment.finalSequence)
           turn.terminal = true
           clearTimeout(turn.connectTimer)
           clearTimeout(turn.responseTimer)
+          clearTimeout(turn.turnIdleTimer)
           this.#release(turn)
           return
         }
@@ -607,6 +779,7 @@ export class QwenAgentTransport {
         clearTimeout(turn.doneTimer)
         clearTimeout(turn.gapTimer)
         clearTimeout(turn.responseTimer)
+        clearTimeout(turn.turnIdleTimer)
         turn.ws?.close()
         this.#release(turn)
       },
@@ -617,6 +790,7 @@ export class QwenAgentTransport {
         clearTimeout(turn.doneTimer)
         clearTimeout(turn.gapTimer)
         clearTimeout(turn.responseTimer)
+        clearTimeout(turn.turnIdleTimer)
         if (turn.ws?.readyState === WebSocket.OPEN) {
           turn.ws.send(JSON.stringify({ type: 'mute' }))
         }
