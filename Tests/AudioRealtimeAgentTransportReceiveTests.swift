@@ -146,4 +146,26 @@ final class AudioRealtimeAgentTransportReceiveTests: XCTestCase {
         XCTAssertNotNil(transport)
         transport?.close(reason: "test_cleanup")
     }
+
+    /// ESS-1008: a dead Agent WSS must have a control-plane terminal event
+    /// that survives JSON encoding and can be delivered over WCSession.
+    func testTransportFailureEnvelopeRoundTripsWithTurnIdentity() throws {
+        let envelope = RealtimeDownlinkEnvelope.transportFailed(
+            requestId: requestId,
+            sessionId: sessionId,
+            generation: 3,
+            reason: "recv_error"
+        )
+
+        let decoded = try JSONDecoder().decode(
+            RealtimeDownlinkEnvelope.self,
+            from: JSONEncoder().encode(envelope)
+        )
+
+        XCTAssertEqual(decoded.kind, .transportFailed)
+        XCTAssertEqual(decoded.requestId, requestId)
+        XCTAssertEqual(decoded.sessionId, sessionId)
+        XCTAssertEqual(decoded.generation, 3)
+        XCTAssertEqual(decoded.reason, "recv_error")
+    }
 }

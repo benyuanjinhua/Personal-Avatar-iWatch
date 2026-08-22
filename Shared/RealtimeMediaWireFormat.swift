@@ -285,6 +285,11 @@ enum RealtimeDownlinkKind: String, Codable, Sendable {
     /// not send `cancel` on the WSS, so the pending window must collapse.
     case generationOpen = "generation.open"
     case bargeInFailed = "bargein.failed"
+    /// ESS-1008: the iPhone-owned Agent WSS died after the turn had become
+    /// active. This control event travels over WCSession (not the dead WSS)
+    /// so Watch can leave `.thinking` deterministically instead of arming a
+    /// fresh 45 s timeout and reporting a misleading "answer timeout".
+    case transportFailed = "transport.failed"
     /// ESS-969 / ESS-971：**本段结束，回合未结束**。屏障语义与 `audioDone`
     /// 一致，但客户端必须保持本轮打开（`markAnswerInterim`），不开下一轮。
     case audioSegmentDone = "audio.segment_done"
@@ -542,6 +547,20 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
             kind: .bargeInFailed, requestId: requestId, sessionId: sessionId,
             sequence: nil, audio: nil, transcript: nil, reason: reason,
             responseId: nil, generation: fromGeneration
+        )
+    }
+
+    static func transportFailed(
+        requestId: String,
+        sessionId: String,
+        generation: Int,
+        reason: String
+    ) -> Self {
+        RealtimeDownlinkEnvelope(
+            protocolVersion: RealtimeWireVersion.downlink,
+            kind: .transportFailed, requestId: requestId, sessionId: sessionId,
+            sequence: nil, audio: nil, transcript: nil, reason: reason,
+            responseId: nil, generation: generation
         )
     }
 }

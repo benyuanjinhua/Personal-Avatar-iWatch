@@ -346,6 +346,7 @@ final class CloseObserver: NSObject, URLSessionWebSocketDelegate, @unchecked Sen
     private let identifier: String
     private let lock = NSLock()
     private var callback: Callback?
+    private var didReportTerminalEvent = false
 
     init(requestId: String, sessionId: String, generation: Int) {
         self.identifier = "rid=\(requestId.prefix(8)) sid=\(sessionId.prefix(8)) gen=\(generation)"
@@ -364,6 +365,8 @@ final class CloseObserver: NSObject, URLSessionWebSocketDelegate, @unchecked Sen
     ) {
         let reasonString = reason.flatMap { String(data: $0, encoding: .utf8) }
         lock.lock()
+        guard !didReportTerminalEvent else { lock.unlock(); return }
+        didReportTerminalEvent = true
         let cb = callback
         lock.unlock()
         cb?(closeCode.rawValue, reasonString)
@@ -379,9 +382,17 @@ final class CloseObserver: NSObject, URLSessionWebSocketDelegate, @unchecked Sen
         // sees a `wss_closed` event either way.
         guard let error else { return }
         let ns = error as NSError
+        let urlError = error as? URLError
+        let detail = [
+            "transport_error:\(ns.domain)#\(ns.code)",
+            "url_error=\(urlError?.code.rawValue.description ?? "nil")",
+            "network_unavailable=\(urlError?.networkUnavailableReason?.rawValue.description ?? "nil")"
+        ].joined(separator: " ")
         lock.lock()
+        guard !didReportTerminalEvent else { lock.unlock(); return }
+        didReportTerminalEvent = true
         let cb = callback
         lock.unlock()
-        cb?(0, "transport_error:\(ns.domain)#\(ns.code)")
+        cb?(0, detail)
     }
 }

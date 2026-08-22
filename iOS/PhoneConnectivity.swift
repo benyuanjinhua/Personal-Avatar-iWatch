@@ -144,6 +144,19 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         flushDownlink(trigger: "activate")
     }
 
+    /// ESS-1008: correlate iPhone scene changes with the Agent WSS turn.
+    /// This is evidence only; entering background does not proactively close
+    /// the socket and therefore cannot manufacture the failure it observes.
+    func recordLifecycle(_ phase: String) {
+        let identity = realtimeSessionStorage?.currentTurnIdentity
+        PhoneAgentClientLog.info(
+            module: "phone_lifecycle", event: "scene_phase",
+            requestId: identity?.requestId,
+            sessionId: identity?.sessionId,
+            detail: "phase=\(phase) has_active_turn=\(identity != nil)"
+        )
+    }
+
     func send(_ configuration: AgentConfiguration) {
         let watchConfiguration = configuration.watchSafe
         pendingConfiguration = watchConfiguration
