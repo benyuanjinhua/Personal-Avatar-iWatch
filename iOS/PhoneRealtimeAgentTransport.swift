@@ -209,7 +209,7 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
     private func wireAgentSession() {
         agentSession.onAudioDelta = { [weak self] chunk, responseId, gen in
             guard let self else { return }
-            guard gen == self.gate.generation else {
+            guard self.gate.shouldForwardDownlink(generation: gen) else {
                 PhoneAgentClientLog.info(
                     module: Self.logModule,
                     event: "downlink_audio_delta_stale_generation",
@@ -231,7 +231,7 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
         }
         agentSession.onAudioDone = { [weak self] rid, responseId, gen, finalSeq in
             guard let self else { return }
-            guard gen == self.gate.generation else {
+            guard self.gate.shouldForwardDownlink(generation: gen) else {
                 PhoneAgentClientLog.info(
                     module: Self.logModule,
                     event: "downlink_audio_done_stale_generation",
@@ -258,7 +258,7 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
         // 但**不**触发任何回合终态——它只是「这一段完了」。
         agentSession.onAudioSegmentDone = { [weak self] rid, responseId, gen, segIdx, finalSeq in
             guard let self else { return }
-            guard gen == self.gate.generation else {
+            guard self.gate.shouldForwardDownlink(generation: gen) else {
                 PhoneAgentClientLog.info(
                     module: Self.logModule,
                     event: "downlink_audio_segment_done_stale_generation",
