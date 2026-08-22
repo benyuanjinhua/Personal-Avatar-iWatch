@@ -102,6 +102,10 @@ final class AudioRealtimeAgentTransport {
         requestId: String,
         generation: Int
     ) -> AudioRealtimeAgentTransport? {
+        // ESS-885: fail closed when the bearer is missing. A handshake that
+        // sends `Authorization: Bearer ` (empty) is a protocol violation —
+        // refuse to build the transport instead of emitting a broken upgrade.
+        guard !config.authToken.isEmpty else { return nil }
         guard var components = URLComponents(
             url: config.gatewayURL, resolvingAgainstBaseURL: false
         ) else { return nil }

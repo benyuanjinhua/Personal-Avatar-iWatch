@@ -37,6 +37,7 @@ describe('Gateway end-to-end', () => {
     gateway = createGateway({
       port: 0, bind: '127.0.0.1', state_dir: stateDir,
       dev_allow_plain_ws: true,
+      dev_universal_token: 'rtk_dev_universal',
       heartbeat_interval_ms: 0, idle_disconnect_ms: 0,
       max_token_ttl_ms: 60_000, default_token_ttl_ms: 30_000,
     })
@@ -131,6 +132,32 @@ describe('Gateway end-to-end', () => {
     for (const expected of ['ws_upgrade', 'session_ready', 'session_ended']) {
       assert.ok(names.includes(expected), `expected event ${expected} for req ${body.request_id}, saw: ${names.join(', ')}`)
     }
+  })
+
+  it('admits the development universal token (Bearer with underscores) without minting', async () => {
+    const body = scopeBody()
+    const captured = collectLogs()
+    try {
+      const url = `ws://127.0.0.1:${gateway.server.address().port}/api/realtime`
+        + `?device_id=${body.device_id}&session_id=${body.session_id}`
+        + `&request_id=${body.request_id}&generation=${body.generation}`
+      const ws = new WebSocket(url, {
+        headers: { authorization: 'Bearer ' + gateway.config.dev_universal_token },
+      })
+      await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject) })
+      ws.close()
+      await new Promise(resolve => ws.once('close', resolve))
+      await new Promise(resolve => setTimeout(resolve, 50))
+    } finally {
+      captured.restore()
+    }
+    const upgrades = captured.lines.filter(
+      line => line.evt === 'ws_upgrade' && line.request_id === body.request_id,
+    )
+    assert.equal(upgrades.length, 1)
+    assert.equal(upgrades[0].token_mode, 'universal')
+    assert.equal(captured.lines.some(line => line.evt === 'token_consumed'
+      && line.request_id === body.request_id), false)
   })
 
   it('rejects a WSS upgrade without a bearer token (401 ERR_TOKEN_INVALID)', async () => {
