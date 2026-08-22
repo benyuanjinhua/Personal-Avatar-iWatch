@@ -629,6 +629,7 @@ function createAgentTransport(CONFIG, { log }) {
       // above the Watch's own 45 s hard thinking timeout.
       segmentGapMs: CONFIG.agent_segment_gap_ms ?? 2_500,
       segmentGapBusyMs: CONFIG.agent_segment_gap_busy_ms ?? 12_000,
+      toolCallWindowMs: CONFIG.agent_tool_call_window_ms ?? 30_000,
       takeover: CONFIG.agent_takeover_voice !== false,
       log: (evt, extra) => log(evt, extra),
     })
