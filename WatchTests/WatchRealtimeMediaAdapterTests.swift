@@ -11,9 +11,10 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
     /// ESS-1008 B1: a dead WSS must not truncate PCM already owned by the
     /// Watch player. Failure is held until the real renderer emits `.ended`.
     func testTransportFailureDrainsBufferedAudioBeforeTerminal() {
+        let drainTimer = ManualBarrierTimer()
         let (adapter, _, player, _, _) = makeAdapter(sessionIds: [
             "10081008-0000-4000-8000-000000000001"
-        ])
+        ], transportFailureDrainTimer: drainTimer)
         let handle = adapter.beginTurn(requestId: "10081008-0000-4000-8000-000000000002")
         var failures: [String] = []
         adapter.onAnswerPlaybackFailed = { _, code in failures.append(code) }
@@ -29,6 +30,10 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         XCTAssertTrue(player.isRenderingDownlink)
         XCTAssertFalse(player.stopped, "WSS failure must not truncate buffered PCM")
         XCTAssertTrue(failures.isEmpty)
+        XCTAssertEqual(
+            drainTimer.lastRequestedInterval,
+            WatchRealtimeMediaAdapter.transportFailureDrainDeadlineSeconds
+        )
 
         player.onPlaybackEvent?(.ended(
             requestId: handle.requestId, sessionId: handle.sessionId,
@@ -37,6 +42,41 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
 
         XCTAssertEqual(failures, ["transport_failed:recv_error"])
         XCTAssertTrue(player.stopped, "fallback cleanup runs only after renderer drained")
+        XCTAssertFalse(drainTimer.isArmed, "normal drain must cancel the deadline")
+    }
+
+    /// ESS-1019: without an audio.done barrier the player cannot emit
+    /// `.ended`; the bounded drain deadline must terminate before the
+    /// SessionController's 45-second hard timeout instead of hanging forever.
+    func testTransportFailureWithoutBarrierTerminatesAtDrainDeadline() {
+        let drainTimer = ManualBarrierTimer()
+        let (adapter, _, player, _, _) = makeAdapter(
+            sessionIds: ["10191019-0000-4000-8000-000000000001"],
+            transportFailureDrainTimer: drainTimer
+        )
+        let handle = adapter.beginTurn(requestId: "10191019-0000-4000-8000-000000000002")
+        var failures: [String] = []
+        adapter.onAnswerPlaybackFailed = { _, code in failures.append(code) }
+        adapter.ingestDownlink(VoiceStreamChunk(
+            requestId: handle.requestId, streamId: handle.sessionId,
+            direction: .downlink, sequence: 0, capturedAtMs: 1,
+            codec: "pcm_s16le", sampleRate: 24_000,
+            payload: Data(repeating: 1, count: 96)
+        ))
+
+        adapter.markTransportFailed(reason: "recv_error_before_barrier")
+
+        XCTAssertTrue(failures.isEmpty)
+        XCTAssertTrue(drainTimer.isArmed)
+        XCTAssertLessThan(
+            WatchRealtimeMediaAdapter.transportFailureDrainDeadlineSeconds,
+            SessionController.thinkingHardTimeoutSeconds
+        )
+
+        XCTAssertTrue(drainTimer.fire())
+        XCTAssertEqual(failures, ["transport_failed:recv_error_before_barrier"])
+        XCTAssertTrue(player.stopped, "deadline terminal must collapse realtime playback")
+        XCTAssertFalse(drainTimer.isArmed)
     }
 
     /// ESS-1008 B1: when no PCM is queued, there is nothing to preserve and
@@ -85,6 +125,117 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         guard case .speechFinal(_, .silence) = vadEvents.last else {
             return XCTFail("expected silence speech.final")
         }
+    }
+
+    // MARK: - ESS-1013 播放期自激：无 AEC 时麦克风不得喂给 VAD
+
+    /// 2026-08-22 真机（`request_id` 见 ESS-1013）：用户**一句话都没说**，
+    /// 系统却提交了 14.7 秒「语音」。
+    ///
+    /// ```
+    /// 12:15:54.991  play_started                     ← 排队播报开始出声
+    /// 12:15:55.289  speech_started  rms=0.01574      ← 0.298 秒后 VAD 起判
+    ///               speech_frames 8→27→58→93→121     ← 跟着播报一路涨
+    /// 12:16:09.988  speech_final  frames=183 speech_frames=121
+    /// ```
+    ///
+    /// 根因：ESS-891 把语音打断默认关掉换音量，`.voiceChat` 的 AEC 一并消失。
+    /// 没有 AEC 时扬声器输出会被麦克风拾取，VAD 把系统自己的播报判成用户提问，
+    /// 整轮被垃圾音频占掉，用户从此卡在「思考中」无法输入。
+    ///
+    /// 既有的 `playbackEndedForVADGuard` 只覆盖**播完之后**的 300ms，
+    /// 缺的正是**播放进行中**这一段。
+    func testPlaybackAudioDoesNotFeedVADWithoutAEC() {
+        let recorder = MockRecorder()
+        let player = MockPlayer()
+        let transport = MockTransport()
+        let adapter = WatchRealtimeMediaAdapter(
+            recorder: recorder,
+            player: player,
+            transport: transport,
+            vadConfiguration: LocalVADConfiguration(),
+            automaticallyCommitOnSpeechFinal: true
+        )
+        adapter.aecAvailable = { false }   // 语音打断关闭 → .spokenAudio → 无 AEC
+        var vadEvents: [LocalVADEvent] = []
+        adapter.onVADEvent = { vadEvents.append($0) }
+
+        adapter.beginTurn(requestId: "57557557-5575-4575-8575-575575575575")
+        for _ in 0..<3 { recorder.feed(Self.pcmFrame(rms: 0)) }
+
+        // 播报开始出声。
+        player.enqueue(playables: [Self.playable()])
+        XCTAssertTrue(player.isRenderingDownlink, "前提：播放器确实在出声")
+
+        // 麦克风拾到的正是扬声器放出来的播报（真机 rms 0.015~0.033 量级）。
+        for _ in 0..<20 { recorder.feed(Self.pcmFrame(rms: 0.02)) }
+
+        XCTAssertTrue(
+            vadEvents.isEmpty,
+            "播放期间无 AEC，麦克风帧必须不喂 VAD —— 否则系统把自己的播报当成用户提问"
+        )
+        XCTAssertEqual(
+            transport.commitEvents.count, 0,
+            "更不得把自己的播报提交上行"
+        )
+    }
+
+    /// 对照：**有** AEC 时（语音打断开启，`.voiceChat`）不得改变行为——
+    /// 那正是 ESS-650 语音打断赖以成立的路径，本修复不许把它一起关掉。
+    func testPlaybackAudioStillFeedsVADWhenAECAvailable() {
+        let recorder = MockRecorder()
+        let player = MockPlayer()
+        let transport = MockTransport()
+        let adapter = WatchRealtimeMediaAdapter(
+            recorder: recorder,
+            player: player,
+            transport: transport,
+            vadConfiguration: LocalVADConfiguration(),
+            automaticallyCommitOnSpeechFinal: true
+        )
+        adapter.aecAvailable = { true }
+        var vadEvents: [LocalVADEvent] = []
+        adapter.onVADEvent = { vadEvents.append($0) }
+
+        adapter.beginTurn(requestId: "57557557-5575-4575-8575-575575575575")
+        for _ in 0..<3 { recorder.feed(Self.pcmFrame(rms: 0)) }
+        player.enqueue(playables: [Self.playable()])
+        for _ in 0..<3 { recorder.feed(Self.pcmFrame(rms: 0.08)) }
+
+        XCTAssertFalse(
+            vadEvents.isEmpty,
+            "有 AEC 时播放期仍应正常喂 VAD —— ESS-650 语音打断依赖它"
+        )
+    }
+
+    /// 播放停止后必须恢复喂帧，否则用户永远说不了话。
+    func testVADResumesAfterPlaybackStops() {
+        let recorder = MockRecorder()
+        let player = MockPlayer()
+        let transport = MockTransport()
+        let adapter = WatchRealtimeMediaAdapter(
+            recorder: recorder,
+            player: player,
+            transport: transport,
+            vadConfiguration: LocalVADConfiguration(),
+            automaticallyCommitOnSpeechFinal: true
+        )
+        adapter.aecAvailable = { false }
+        var vadEvents: [LocalVADEvent] = []
+        adapter.onVADEvent = { vadEvents.append($0) }
+
+        adapter.beginTurn(requestId: "57557557-5575-4575-8575-575575575575")
+        for _ in 0..<3 { recorder.feed(Self.pcmFrame(rms: 0)) }
+        player.enqueue(playables: [Self.playable()])
+        for _ in 0..<10 { recorder.feed(Self.pcmFrame(rms: 0.02)) }
+        XCTAssertTrue(vadEvents.isEmpty)
+
+        player.stop(barge: false)
+        adapter.playbackEndedForVADGuard()
+        for _ in 0..<4 { recorder.feed(Self.pcmFrame(rms: 0)) }
+        for _ in 0..<3 { recorder.feed(Self.pcmFrame(rms: 0.08)) }
+
+        XCTAssertFalse(vadEvents.isEmpty, "播放结束后必须恢复听用户说话")
     }
 
     // MARK: - ESS-865
@@ -174,6 +325,20 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
                     && (fragment == nil || $0.detail?.contains(fragment!) == true)
             }.count
         }
+    }
+
+    /// ESS-1013：一段可播放的下行块，用来让 MockPlayer 进入「正在出声」。
+    private static func playable() -> RealtimeDownlinkPlayback.PlayableChunk {
+        RealtimeDownlinkPlayback.PlayableChunk(
+            chunk: VoiceStreamChunk(
+                requestId: "57557557-5575-4575-8575-575575575575",
+                streamId: "11111111-0000-0000-0000-000000000001",
+                direction: .downlink, sequence: 0, capturedAtMs: 1,
+                codec: "pcm_s16le", sampleRate: 24_000,
+                payload: Data(repeating: 1, count: 64), endOfStream: false
+            ),
+            responseId: "resp-1"
+        )
     }
 
     private static func pcmFrame(rms: Double) -> Data {
@@ -395,6 +560,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
     private func makeAdapter(
         sessionIds: [String],
         barrierTimer: WatchRealtimeMediaAdapter.BarrierTimer = TaskBasedBarrierTimer(),
+        transportFailureDrainTimer: WatchRealtimeMediaAdapter.BarrierTimer = TaskBasedBarrierTimer(),
         loggerSink: LoggerSink? = nil
     ) -> (
         WatchRealtimeMediaAdapter, MockRecorder, MockPlayer, MockTransport, FallbackCounter
@@ -421,7 +587,8 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
             session: session, recorder: recorder, player: player, transport: transport,
             fullFileFallback: { handle, reason in counter.record(handle, reason) },
             logger: { line in loggerSink?.append(line) },
-            barrierTimer: barrierTimer
+            barrierTimer: barrierTimer,
+            transportFailureDrainTimer: transportFailureDrainTimer
         )
         return (adapter, recorder, player, transport, counter)
     }
