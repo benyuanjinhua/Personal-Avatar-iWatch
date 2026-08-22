@@ -39,6 +39,7 @@
 		26780BEBF601751525AE9BDD /* SubtitleScript.swift in Sources */ = {isa = PBXBuildFile; fileRef = C426A9FB7C2456FD57F1BA1E /* SubtitleScript.swift */; };
 		27A31EA8FB0837912F05A208 /* AudioRealtimeAgentSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 089122E724A393364FA3F2CA /* AudioRealtimeAgentSession.swift */; };
 		28EA2E815D8252770E3221F1 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 67C6A03628F073DFB7BD92CF /* Assets.xcassets */; };
+		29007E35A3FD3E245AACDF91 /* MonotonicDuration.swift in Sources */ = {isa = PBXBuildFile; fileRef = E707C807988AE07F37CB0C77 /* MonotonicDuration.swift */; };
 		293E9641FC4B28984DCC0CF9 /* AudioSessionPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC3ECBAA9A62DE9AED7C9C34 /* AudioSessionPolicy.swift */; };
 		2A378D7F61247334FF9CE66A /* RealtimePlaybackEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C77CA501A013873CA471BBC /* RealtimePlaybackEngine.swift */; };
 		2A6D5FCC43F0BC317088A28B /* WatchRealtimeMediaAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = D270E5D7D1369F80F38C115A /* WatchRealtimeMediaAdapter.swift */; };
@@ -121,6 +122,7 @@
 		7D85664D09122BF9A31C2ED4 /* ErrorCue_MicPermission.m4a in Resources */ = {isa = PBXBuildFile; fileRef = E50FB76863F935EDDBC6FAF9 /* ErrorCue_MicPermission.m4a */; };
 		7E75E969A72336DBE618BEBE /* VoiceInteractionCue.swift in Sources */ = {isa = PBXBuildFile; fileRef = D70795CA9CC1B496467FE2B8 /* VoiceInteractionCue.swift */; };
 		7F172712436C104970B3035C /* VoiceRelayWire.swift in Sources */ = {isa = PBXBuildFile; fileRef = 035DF4EEFBF9F540A0B791F7 /* VoiceRelayWire.swift */; };
+		811B0B7A509DC8110EE89F6C /* MonotonicDuration.swift in Sources */ = {isa = PBXBuildFile; fileRef = E707C807988AE07F37CB0C77 /* MonotonicDuration.swift */; };
 		82B50E90942BDC1117375BB7 /* MainStatusCopy.swift in Sources */ = {isa = PBXBuildFile; fileRef = C608A2AC1FA2B2981F7EB790 /* MainStatusCopy.swift */; };
 		87589EC57C16EFE13A79738E /* RealtimeMediaSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49D1CFEB2C03FAA07DA192C1 /* RealtimeMediaSession.swift */; };
 		88162BC2A9F5ADF2F56E6246 /* PlaybackEndgamePolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F3363DB5FB9EF9FF44F0744 /* PlaybackEndgamePolicy.swift */; };
@@ -415,6 +417,7 @@
 		E50FB76863F935EDDBC6FAF9 /* ErrorCue_MicPermission.m4a */ = {isa = PBXFileReference; path = ErrorCue_MicPermission.m4a; sourceTree = "<group>"; };
 		E614C9408E9F36CF691B9605 /* AgentEnvelopeBuffer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentEnvelopeBuffer.swift; sourceTree = "<group>"; };
 		E6CD1D5526BE7E406BD8FFAC /* ConversationAudioController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationAudioController.swift; sourceTree = "<group>"; };
+		E707C807988AE07F37CB0C77 /* MonotonicDuration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MonotonicDuration.swift; sourceTree = "<group>"; };
 		E86C631B9730FD0A3CB91448 /* VoiceStreamProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceStreamProtocol.swift; sourceTree = "<group>"; };
 		E92A4F28175D63C6FBD62D7E /* ConversationHistory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationHistory.swift; sourceTree = "<group>"; };
 		EA8DE58E8A52B108D31F1450 /* ConfirmFallback.m4a */ = {isa = PBXFileReference; path = ConfirmFallback.m4a; sourceTree = "<group>"; };
@@ -461,6 +464,7 @@
 				3A74603EEEBF6327940BB0BE /* ErrorCueCatalog.swift */,
 				EEE83E69A84D0788F31329E4 /* LocalVADEndpointer.swift */,
 				C608A2AC1FA2B2981F7EB790 /* MainStatusCopy.swift */,
+				E707C807988AE07F37CB0C77 /* MonotonicDuration.swift */,
 				B059A6F3DD6B2B19D18CFB5E /* PCM16LevelMeter.swift */,
 				6B4F63CDFB83979811AE2689 /* PendingDownlinkBuffer.swift */,
 				827B4FDF631BEBEFA13118A9 /* PersistHelper.swift */,
@@ -823,6 +827,7 @@
 				FFC6B09DA5B4296BAC67C690 /* ErrorCueCatalog.swift in Sources */,
 				6F68B5E709EADBD0A814A163 /* LocalVADEndpointer.swift in Sources */,
 				B8341DE12C11F07793D54054 /* MainStatusCopy.swift in Sources */,
+				811B0B7A509DC8110EE89F6C /* MonotonicDuration.swift in Sources */,
 				9FF42138AD106C5690A32C89 /* PCM16LevelMeter.swift in Sources */,
 				D3AF454484C6920CDFE52A19 /* PendingDownlinkBuffer.swift in Sources */,
 				5FC7E0538B77B76B1A1E55BE /* PersistHelper.swift in Sources */,
@@ -909,6 +914,7 @@
 				1B82F586343739AA4F419D21 /* ErrorCueCatalog.swift in Sources */,
 				9A6B27223193C90C2117EB80 /* LocalVADEndpointer.swift in Sources */,
 				82B50E90942BDC1117375BB7 /* MainStatusCopy.swift in Sources */,
+				29007E35A3FD3E245AACDF91 /* MonotonicDuration.swift in Sources */,
 				C3D8984AB14E3ECEB93542E0 /* OpenWristAgentIntent.swift in Sources */,
 				5143077337720B489BB983CC /* PCM16LevelMeter.swift in Sources */,
 				A7E57A17426B0BB822699784 /* PCMFrameRecorder.swift in Sources */,
