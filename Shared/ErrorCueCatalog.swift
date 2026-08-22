@@ -204,6 +204,15 @@ enum ErrorCueCatalog {
                 clip: "ErrorCue_Retryable",
                 recoveryFamily: .retry
             )
+        // ESS-983：全文件降级路径确定性不可用（HMAC 密钥缺失 / fallback 关闭）。
+        // 重试必然再次失败，族 C（稍后再叫）——不出「重试」按钮，避免白等。
+        case "ERR_FALLBACK_NOT_CONFIGURED":
+            return ErrorCueEntry(
+                code: code,
+                text: "助手这边还没准备好，这次没接上，稍后再试。",
+                clip: nil,
+                recoveryFamily: .waitAndRetry
+            )
         // ESS-257 · D2 E-26：Mac 找不到这次任务（gateway/taskwatch 均可能抛）。
         // 缓存录音可重投；文案强调「重新交一次」区别于普通重试。
         // ESS-262：与 E-11 / E-18 共享 `ErrorCue_Retryable` 语音资产。

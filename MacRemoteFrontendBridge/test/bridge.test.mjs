@@ -585,3 +585,64 @@ describe('D1 read-only switch (write_actions_enabled=false, the default)', () =>
     }
   })
 })
+
+describe('deterministic fallback failure (ESS-983)', () => {
+  let ctx
+  let submits
+  before(async () => {
+    submits = new Map()
+    ctx = await launch({
+      overrides: {
+        result_delivery_backoff_base_ms: 25,
+        fallbackJobClient: {
+          async submitAndWait({ requestId }) {
+            submits.set(requestId, (submits.get(requestId) || 0) + 1)
+            throw Object.assign(new Error('fallback HMAC secret unavailable'), { code: 'fallback_hmac_secret_missing' })
+          },
+        },
+      },
+    })
+  })
+  after(async () => { await ctx.bridge.stop(); await ctx.mock.stop() })
+
+  const submitCount = id => submits.get(id) || 0
+
+  it('fails deterministically, submits once, and stays deliverable until Watch ACK', async () => {
+    const id = rid()
+    await ctx.client.createTurn(id, pcm(300))
+
+    const failed = await waitFor(async () => {
+      const r = await ctx.client.getTurn(id)
+      return r.json.status === 'failed' ? r.json : null
+    })
+    assert.equal(failed.error, 'ERR_FALLBACK_NOT_CONFIGURED')
+    assert.equal(submitCount(id), 1)
+
+    // 未 ACK 前，HTTP 补投仍能拿到同一失败终态（不可永久丢终态）。
+    const delivered = await ctx.client.deliverTurn(id)
+    assert.equal(delivered.status, 200)
+    assert.equal(delivered.json.turn.status, 'failed')
+    assert.equal(delivered.json.turn.error, 'ERR_FALLBACK_NOT_CONFIGURED')
+    assert.equal(submitCount(id), 1)
+
+    // Watch 真实 ACK 后才收口，且 fallback job 始终只提交一次。
+    assert.equal((await ctx.client.ackTurn(id)).status, 200)
+    assert.equal(submitCount(id), 1)
+    assert.equal((await ctx.client.deliverTurn(id)).status, 204)
+  })
+
+  it('replays an unacknowledged deterministic failure after disconnect-before-ACK', async () => {
+    const id = rid()
+    await ctx.client.createTurn(id, pcm(300))
+    await waitFor(async () => (await ctx.client.getTurn(id)).json.status === 'failed')
+
+    // 断线前未 ACK：重连 snapshot 必须仍回放同一失败终态。
+    const replay = ctx.client.events()
+    const snapshot = await waitFor(() => replay.received.find(e =>
+      e.type === 'snapshot' && e.turns.some(turn => turn.request_id === id && turn.status === 'failed')))
+    const replayedTurn = snapshot.turns.find(turn => turn.request_id === id)
+    assert.equal(replayedTurn.error, 'ERR_FALLBACK_NOT_CONFIGURED')
+    assert.equal(submitCount(id), 1)
+    replay.ws.close()
+  })
+})

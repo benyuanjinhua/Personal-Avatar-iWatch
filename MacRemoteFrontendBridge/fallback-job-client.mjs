@@ -13,7 +13,10 @@ export class FallbackJobClient {
     this.baseUrl = baseUrl; this.secret = secret; this.pollMs = pollMs; this.timeoutMs = timeoutMs; this.log = log
   }
   async submitAndWait({ requestId, audio, audioSha256, context = {} }) {
-    if (!this.secret || this.secret.length < 32) throw Object.assign(new Error('fallback HMAC secret unavailable'), { code: 'gateway_unavailable' })
+    // ESS-983: 三个拒因拆成三个可区分的错误码，不再共享误导性的
+    // `gateway_unavailable`——密钥缺失是确定性配置失败，网关不可达是
+    // 网络问题，网关拒绝是服务端主动拒收。
+    if (!this.secret || this.secret.length < 32) throw Object.assign(new Error('fallback HMAC secret unavailable'), { code: 'fallback_hmac_secret_missing' })
     const path = `/v1/fallback-jobs/${encodeURIComponent(requestId)}`
     const body = Buffer.from(JSON.stringify({ request_id: requestId, codec: 'pcm_s16le_16k',
       audio_sha256: audioSha256, audio_base64: audio.toString('base64'),
@@ -52,13 +55,13 @@ export class FallbackJobClient {
       } }, res => {
         const chunks = []; res.on('data', c => chunks.push(c)); res.on('end', () => {
           let parsed = {}; try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')) } catch { /* typed below */ }
-          if ((res.statusCode ?? 500) >= 400) return reject(Object.assign(new Error(parsed.reason ?? parsed.error ?? 'gateway unavailable'), {
-            code: parsed.reason ?? parsed.error ?? 'gateway_unavailable', status: res.statusCode,
+          if ((res.statusCode ?? 500) >= 400) return reject(Object.assign(new Error(parsed.reason ?? parsed.error ?? 'gateway refused'), {
+            code: parsed.reason ?? parsed.error ?? 'gateway_refused', status: res.statusCode,
           }))
           resolve(parsed)
         })
       })
-      req.on('error', error => reject(Object.assign(error, { code: 'gateway_unavailable' })))
+      req.on('error', error => reject(Object.assign(error, { code: 'gateway_unreachable' })))
       req.end(body)
     })
   }
