@@ -1,8 +1,9 @@
-# VaultSearchMCP — Obsidian Vault 只读 MCP Search
+# VaultSearchMCP — Obsidian Vault MCP
 
 实现 TECHNICAL_DESIGN_V2_1 §4.4 / §9(`VaultSearchMCP`) / §10 P2（ESS-31）：
-把本地 Obsidian Vault 以标准 MCP（stdio, JSON-RPC 2.0）暴露为两个**只读**工具，
-仅在 Codex 判断需要本地知识时调用，不是默认上下文。
+把本地 Obsidian Vault 以标准 MCP（stdio, JSON-RPC 2.0）暴露为检索、读取与
+显式灵感记录工具。读取仅在 Codex 判断需要本地知识时调用，不是默认上下文；
+写入只允许用户明确要求记录 idea 的场景。
 
 ## 工具
 
@@ -10,6 +11,7 @@
 |---|---|---|
 | `vault_search` | `query`（必填）、`limit?`、`path_prefix?` | 全文检索，返回 `note_id`、标题、截断摘要 |
 | `vault_read` | `note_id`（必填）、`offset?` | 读取单篇笔记，超过字符上限截断并返回 `next_offset` |
+| `vault_capture_idea` | `intent=record_idea`、`content`、`context?` | 排他创建 Markdown 到固定的 `Jackson/Idea/` |
 
 设计文档中的写法是 `vault.search` / `vault.read`。正式注册名使用下划线，
 因为部分模型侧工具协议对工具名有 `^[a-zA-Z0-9_-]+$` 约束；`tools/call`
@@ -17,7 +19,10 @@
 
 ## 安全边界（MVP）
 
-- **单根只读**：根目录固定为一个 Vault（`VAULT_MCP_ROOT` 或 `config.json` 的 `vaultRoot`）；`note_id` 是 Vault 内相对路径，真实绝对路径不返回前端。
+- **单根最小写权限**：根目录固定为一个 Vault（`VAULT_MCP_ROOT` 或 `config.json` 的 `vaultRoot`）；搜索和读取只读，唯一写操作固定到 `Jackson/Idea/`，调用方不能指定路径。
+- **显式意图门禁**：`vault_capture_idea` 必须收到固定的 `intent=record_idea` 和非空原文；工具描述要求普通问答、含糊暗示不得调用。
+- **语音表达**：明确覆盖“我有个方法”“帮我记录”“我有个观点”，并提取其后用户指定的方法、观点或想法作为原文。
+- **不覆盖**：文件名由 UTC 时间与 UUID 组成，并用 `wx` 排他创建；成功返回可追溯 `note_id`，失败返回 `WRITE_FAILED`，模型不得假报成功。
 - **路径防穿越**：拒绝绝对路径、`..`、反斜杠、控制字符；对解析结果做 `realpath` 包含性检查，阻断符号链接逃逸。
 - **文件准入**：默认只允许 `.md`（`allowedExtensions` 可显式追加附件类型）；`.obsidian/`、`.trash/`、一切点号开头的隐藏目录/文件一律忽略；`.pem`/`.key`/`id_rsa*` 等密钥类文件被硬编码拒绝，配置不可放宽。
 - **结果限额**：条数上限（默认 10，硬上限 20）、摘要与正文字符上限；超限截断并显式标记 `truncated`。
@@ -59,6 +64,6 @@ env = { VAULT_MCP_ROOT = "/path/to/YourVault" }
 cd VaultSearchMCP && npm test   # 等价于 node --test vault-search.test.mjs
 ```
 
-覆盖：中英文检索命中、`path_prefix` 与 limit 上限、隐藏目录/回收站/密钥文件不进索引、
+覆盖：灵感写入成功、连续记录不覆盖、空/非法内容、工具失败、非记录意图，中英文检索命中、`path_prefix` 与 limit 上限、隐藏目录/回收站/密钥文件不进索引、
 路径穿越与符号链接逃逸拒绝、读取截断与 `offset` 续读、Vault 不可用显式降级、
 审计日志不含正文、MCP stdio 端到端（initialize → tools/list → tools/call）。

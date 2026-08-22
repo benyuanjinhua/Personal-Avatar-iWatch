@@ -11,6 +11,7 @@ import { VaultIndex } from "./indexer.mjs";
 import {
   ERROR_CODES,
   VaultError,
+  captureIdea,
   loadConfig,
   resolveNotePath,
   resolveVaultRoot
@@ -48,6 +49,28 @@ const TOOLS = [
         offset: { type: "integer", minimum: 0, description: "可选，从第几个字符开始读，用于续读被截断的长笔记" }
       },
       required: ["note_id"]
+    }
+  },
+  {
+    name: "vault_capture_idea",
+    description:
+      "仅当用户明确说“我有个方法”“帮我记录”“我有个观点”“记录灵感”“记下这个想法”" +
+      "或“记录一个想法”等记录指令时调用；把指令后用户要保存的方法、观点或想法提取为 content。" +
+      "将用户指定的想法写入 Obsidian Jackson/Idea/。普通问答、含糊暗示或助手自行推断时严禁调用。" +
+      "成功结果可据此向用户确认；工具报错时必须明确告知失败，绝不能声称已记录。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        intent: {
+          type: "string",
+          enum: ["record_idea"],
+          description: "仅在用户明确要求记录时传固定值 record_idea"
+        },
+        content: { type: "string", minLength: 1, description: "用户要记录的原始 idea 正文，不要扩写" },
+        context: { type: "string", description: "可选，仅保留理解该 idea 必需的简短对话上下文" }
+      },
+      required: ["intent", "content"],
+      additionalProperties: false
     }
   }
 ];
@@ -98,7 +121,18 @@ export function createHandlers(config) {
     }
   }
 
-  return { index, audit, toolSearch, toolRead };
+  function toolCaptureIdea(args) {
+    try {
+      const result = captureIdea(config, args);
+      audit.captureIdea({ noteId: result.note_id });
+      return result;
+    } catch (error) {
+      audit.captureIdea({ errorCode: error.code ?? "INTERNAL" });
+      throw error;
+    }
+  }
+
+  return { index, audit, toolSearch, toolRead, toolCaptureIdea };
 }
 
 function toolResultText(payload) {
@@ -145,6 +179,9 @@ export function handleRequest(handlers, request) {
         }
         if (name === "vault_read" || name === "vault.read") {
           return respond(toolResultText(handlers.toolRead(args)));
+        }
+        if (name === "vault_capture_idea" || name === "vault.capture_idea") {
+          return respond(toolResultText(handlers.toolCaptureIdea(args)));
         }
         return fail(-32602, `未知工具: ${name}`);
       } catch (error) {
