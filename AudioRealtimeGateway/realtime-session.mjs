@@ -107,6 +107,10 @@ export class RealtimeSession {
     this.downlinkHighWatermark = -1
     this.downlinkBytes = 0
     this.doneEmitted = false
+    // ESS-969：一个回合可以有多段回答。`segmentIndex` 是段号，
+    // `_pendingSegmentFinal` 由上游 `agent.audio.done` 的 `final` 字段带来。
+    this.segmentIndex = 0
+    this._pendingSegmentFinal = true
     this.cancelled = false
     // `pendingFinalSequence` is the raw `final_sequence` the upstream sent on
     // `agent.audio.done`; we hold it verbatim until `0..pendingFinalSequence`
@@ -399,7 +403,14 @@ export class RealtimeSession {
       return
     }
     if (event.type === 'agent.audio.delta') return this._emitDelta(event)
-    if (event.type === 'agent.audio.done') return this._emitDone(event)
+    if (event.type === 'agent.audio.done') {
+      // ESS-969：段落是否为回合最终段由上游 task 生命周期判定（见
+      // qwen-agent-transport `noteTaskLifecycle`）。缺字段时按 true，
+      // 保持既有单段行为不变。
+      this._pendingSegmentFinal = event.final !== false
+      return this._emitDone(event)
+    }
+    if (event.type === 'agent.turn.done') return this._emitTurnDone(event)
     if (event.type === 'agent.error') return this.fail(event.code ?? 'ERR_UPSTREAM_UNAVAILABLE',
       { detail: event.detail ?? null, retriable: Boolean(event.retriable) })
   }
@@ -559,6 +570,47 @@ export class RealtimeSession {
     this._maybeReleaseDone()
   }
 
+  // ESS-969：开启下一段。段落收口后必须把「这一段」的状态复位，否则
+  // `doneEmitted` 永久锁死、`pendingFinalSequence` 残留，第二段的每一帧都会
+  // 走 post-done 丢弃分支（这正是 ESS-957 复现里 `post_done_audio_dropped=3`
+  // 的来源）。
+  //
+  // **序号刻意不复位**：`sequence` 在整个回合内连续递增，客户端的重排缓冲
+  // 才能保持单调。复位会让第二段的 seq 0 撞上第一段的 seq 0，被去重丢掉。
+  _beginNextSegment() {
+    this.segmentIndex += 1
+    this.doneEmitted = false
+    this.pendingFinalSequence = null
+    this._pendingSegmentFinal = true
+    this._emptyDoneWindowElapsed = false
+    this._clearBarrierTimer()
+    this.log('downlink_segment_boundary', {
+      request_id: this.scope.request_id, session_id: this.scope.session_id,
+      response_id: this.responseId, segment_index: this.segmentIndex,
+      resumes_from_sequence: this.downlinkHighWatermark + 1,
+    })
+  }
+
+  // ESS-969：上游最后一个 task 终结、但已经发过非最终段落 done —— 回合到此
+  // 为止。补一个终态帧，否则客户端会停在 thinking 等一段永远不来的回答。
+  _emitTurnDone(event) {
+    if (this.state !== OPEN || this.cancelled || this.doneEmitted) return
+    this.doneEmitted = true
+    this._clearBarrierTimer()
+    this._sendJson({
+      type: 'audio.done',
+      session_id: this.scope.session_id, request_id: this.scope.request_id,
+      response_id: this.responseId, generation: this.scope.generation,
+      final_sequence: this.downlinkHighWatermark,
+      segment_index: this.segmentIndex, final: true,
+    })
+    this.log('downlink_turn_done', {
+      request_id: this.scope.request_id, session_id: this.scope.session_id,
+      response_id: this.responseId, segments: event?.segments ?? this.segmentIndex + 1,
+      final_sequence: this.downlinkHighWatermark,
+    })
+  }
+
   // Release the held `audio.done` if the dense prefix has caught up to the
   // upstream-claimed `pendingFinalSequence`. Idempotent: only fires once,
   // always with the original `pendingFinalSequence`.
@@ -573,17 +625,25 @@ export class RealtimeSession {
       || (target >= 0 && this._highestDensePrefix() >= target)) {
       this._clearBarrierTimer()
       this.finalSequence = target
-      this.doneEmitted = true
+      // ESS-969：`final: false` 表示「这一段完了，回合没完」。老客户端读不到
+      // 这个字段，会把它当成普通 audio.done 收口——即今天的行为，第一段照常
+      // 播完、不卡死，向后兼容成立。新客户端据此走 markAnswerInterim 回
+      // thinking 等下一段，而不是开下一轮。
+      const isFinal = this._pendingSegmentFinal !== false
+      this.doneEmitted = isFinal
       this._sendJson({
         type: 'audio.done',
         session_id: this.scope.session_id, request_id: this.scope.request_id,
         response_id: this.responseId, generation: this.scope.generation,
         final_sequence: this.finalSequence,
+        segment_index: this.segmentIndex, final: isFinal,
       })
       this.log('downlink_done', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
         response_id: this.responseId, final_sequence: this.finalSequence,
+        segment_index: this.segmentIndex, final: isFinal,
       })
+      if (!isFinal) this._beginNextSegment()
       return
     }
     // Still waiting for holes to be backfilled — arm the gap timer once.

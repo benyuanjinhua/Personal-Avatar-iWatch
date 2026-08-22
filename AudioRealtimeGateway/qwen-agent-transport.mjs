@@ -159,6 +159,17 @@ export class QwenAgentTransport {
       downlinkFrames: 0, downlinkBytes: 0,
       connectTimer: null,
       doneTimer: null, pendingDone: false, recentUpstreamFrames: new Map(),
+      // ESS-969: 一个回合可以有多段回答（工具调用：先「我去查」，再给答案）。
+      // 段落边界由上游的 `audio.done` 给出；**回合是否结束**由「还有没有未
+      // 终结的 task」决定——这是上游的显式信号，不是我们发明的超时。
+      // 实测（2026-08-22 对真实上游，问「杭州今天天气怎么样」）：
+      //   response.started origin=model taskId=null → audio.done      ← 第 1 段
+      //   task.accepted    work_b5f2…                                  ← 回合未完
+      //   response.started origin=agent taskId=work_b5f2… → audio.done ← 第 2 段
+      // 上游的 task 终态事件是 task.completed / task.failed / task.cancelled
+      // （`shared/realtime-events.mjs` GatewayTaskEvent），所以「回合结束」
+      // 可判定，无需启发式窗口。
+      outstandingTasks: new Set(), segmentIndex: 0,
       expectedUpstream: 0, anchored: false, reorderBuffer: new Map(), gapTimer: null,
       clientInstanceId, ownershipState: null, ownershipHolderLabel: null,
       responseTimer: null, responded: false, commitSentAt: null,
@@ -249,6 +260,47 @@ export class QwenAgentTransport {
     // always covers the frames that were actually forwarded. Anything that ends
     // the upstream socket while the window is open flushes it rather than
     // dropping it — a completed response must not surface as a disconnect.
+    // ESS-969 回合终态判定。一段回答结束（`audio.done`）不等于回合结束——
+    // 工具调用会先回一段「我去查」，等 task 出结果再回第二段。
+    //
+    // 未终结 task 的集合就是「回合还欠一段」的显式证据：
+    //   进行中：task.accepted / .scheduled / .scheduled.fired / .running /
+    //           .delegated / .finalizing
+    //   终  态：task.completed / .failed / .cancelled
+    // 取值来自上游 `shared/realtime-events.mjs` 的 GatewayTaskEvent，
+    // 外加实测会发但不在枚举里的 `task.accepted`——**不是我们猜的**。
+    //
+    // 刻意不叠超时兜底：上游既然给了显式终态，再加一层启发式窗口只会把
+    // 「工具跑得慢」误判成「回合结束」，那正是 ESS-969 要修的病。
+    const TASK_INFLIGHT = new Set([
+      'task.accepted', 'task.scheduled', 'task.scheduled.fired',
+      'task.running', 'task.delegated', 'task.finalizing',
+    ])
+    const TASK_TERMINAL = new Set(['task.completed', 'task.failed', 'task.cancelled'])
+
+    const noteTaskLifecycle = event => {
+      const taskId = event.task?.id ?? event.taskId ?? event.task?.workId ?? null
+      if (!taskId) return
+      const before = turn.outstandingTasks.size
+      if (TASK_INFLIGHT.has(event.type)) turn.outstandingTasks.add(String(taskId))
+      else if (TASK_TERMINAL.has(event.type)) turn.outstandingTasks.delete(String(taskId))
+      else return
+      if (turn.outstandingTasks.size === before) return
+      this.log('upstream_task_lifecycle', {
+        ...scopeLog, upstream_event_type: event.type, task_id: String(taskId),
+        outstanding_tasks: turn.outstandingTasks.size,
+      })
+      // 最后一个 task 终结，而已经发过「非最终」的段落 done ⇒ 回合到此为止。
+      // 不补这一帧，客户端会永远停在 thinking 等一段永远不来的回答。
+      if (turn.outstandingTasks.size === 0 && turn.segmentIndex > 0
+        && !turn.pendingDone && !turn.terminal) {
+        this.log('upstream_turn_done', { ...scopeLog, segments: turn.segmentIndex })
+        onEvent({
+          type: 'agent.turn.done', response_id: responseId, segments: turn.segmentIndex,
+        })
+      }
+    }
+
     const flushDone = () => {
       if (!turn.pendingDone) return
       // A hole is still outstanding: the run is not complete, so it is not done.
@@ -258,9 +310,18 @@ export class QwenAgentTransport {
       clearTimeout(turn.doneTimer)
       turn.doneTimer = null
       const finalSequence = turn.nextOutputSequence - 1
-      this.log('upstream_audio_done', { ...scopeLog, final_sequence: finalSequence })
+      // 还有未终结的 task ⇒ 这只是段落结束，回合还会有下一段。
+      const isFinal = turn.outstandingTasks.size === 0
+      const segmentIndex = turn.segmentIndex
+      turn.segmentIndex += 1
+      this.log('upstream_audio_done', {
+        ...scopeLog, final_sequence: finalSequence,
+        segment_index: segmentIndex, final: isFinal,
+        outstanding_tasks: turn.outstandingTasks.size,
+      })
       onEvent({
         type: 'agent.audio.done', response_id: responseId, final_sequence: finalSequence,
+        segment_index: segmentIndex, final: isFinal,
       })
     }
 
@@ -556,6 +617,7 @@ export class QwenAgentTransport {
         }
         if (event.type.startsWith('task.') && event.task?.id) {
           noteResponseProgress()
+          noteTaskLifecycle(event)   // ESS-969：决定回合是否还欠一段
           onEvent({ type: 'agent.task', response_id: responseId,
             task: { id: String(event.task.id), status: event.task.status ?? event.type.slice(5) } })
           return
