@@ -437,8 +437,36 @@ export class QwenAgentTransport {
 
     // The one place a turn ends. `finalSequence` defaults to everything
     // forwarded so far, which is exactly the last segment's endpoint.
+    // ESS-990：哪些终态原因是**投机的**（推断出来的，不是上游说的）。
+    // 只有这两个会被未终结 task 否决——`legacy_first_done` 是无多段能力时的
+    // 既有行为，`upstream_closed` 是连接已经没了，两者都不该被 task 拦住。
+    const SPECULATIVE_TERMINALS = new Set(['idle_backstop', 'voice_state_idle'])
+
     const endTurn = (reason, finalSequence = turn.nextOutputSequence - 1) => {
       if (turn.turnEnded) return
+      // ESS-990：**存在未终结 task ⇒ 一律不得收口回合。**
+      //
+      // 依据（2026-08-22 对真实上游实测，200 秒观察窗）：末段 `audio.done` 之后
+      // 190 秒内没有任何 `voice.state`，更没有 `idle`；全程 idle 只在连接初始态
+      // 出现一次。所以 `voice_state_idle` 这条终态在真实上游上**根本不会到**，
+      // 而 `idle_backstop` 是纯计时器——两者都是推断，不是事实。
+      //
+      // 未终结 task 是**事实**：上游明确发过 in-flight 事件且没发终态。
+      // 用它否决收口，比用一个不会到的信号或一个计时器可靠。
+      //
+      // 只否决、不判定（本单原文的约束）：`task.accepted` 实测可能比第 1 段
+      // `audio.done` 晚约 800 ms，远超 `doneSettleMs=120`，所以 done 时刻的
+      // task 集合是不完整的，不能拿它在那一刻直接判 `final`。
+      if (SPECULATIVE_TERMINALS.has(reason) && turn.outstandingTasks.size > 0) {
+        this.log('upstream_turn_terminal_vetoed', {
+          ...scopeLog, reason,
+          outstanding_tasks: turn.outstandingTasks.size,
+          task_ids: [...turn.outstandingTasks].slice(0, 8),
+        })
+        // 段落仍然 park 着，重新武装兜底：等 task 终结或上游再出声。
+        armTurnIdleBackstop()
+        return
+      }
       turn.turnEnded = true
       turn.closedSegment = null
       clearTimeout(turn.turnIdleTimer)
@@ -920,6 +948,13 @@ export class QwenAgentTransport {
             ...scopeLog, task_id: taskId, status: taskStatus,
             outstanding: turn.outstandingTasks.size,
           })
+          // ESS-990：最后一件后台工作终结，且还有段落 park 着 ⇒ 回合真的完了。
+          // 这是本单能拿到的**唯一由上游事实驱动**的回合终点：
+          // `voice.state idle` 实测不会到，backstop 只是计时器。
+          if (settled && turn.outstandingTasks.size === 0 && turn.closedSegment
+            && !turn.turnEnded && !turn.terminal) {
+            endTurn('tasks_settled', turn.closedSegment.finalSequence)
+          }
           onEvent({ type: 'agent.task', response_id: responseId,
             task: { id: String(event.task.id), status: event.task.status ?? event.type.slice(5) } })
           return
