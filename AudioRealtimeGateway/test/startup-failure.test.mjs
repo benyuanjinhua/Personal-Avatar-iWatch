@@ -100,3 +100,45 @@ test('dev_allow_plain_ws with non-loopback bind → structured startup_failed', 
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('missing soul instruction → structured startup_failed instead of wrong identity', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gw-startup-'))
+  try {
+    const base = JSON.parse(readFileSync(join(HERE, '..', 'config.json'), 'utf8'))
+    const config = {
+      ...base,
+      dev_allow_plain_ws: true,
+      bind: '127.0.0.1',
+      soul_path: join(dir, 'missing-soul.md'),
+    }
+    const configPath = join(dir, 'config.json')
+    writeFileSync(configPath, JSON.stringify(config))
+
+    const result = runServer({ GATEWAY_CONFIG_PATH: configPath })
+    assertStructuredStartupFailure(result, { expectDetail: /soul instruction unavailable/ })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('empty soul instruction → structured startup_failed instead of wrong identity', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gw-startup-'))
+  try {
+    const soulPath = join(dir, 'empty-soul.md')
+    writeFileSync(soulPath, ' \n')
+    const base = JSON.parse(readFileSync(join(HERE, '..', 'config.json'), 'utf8'))
+    const config = {
+      ...base,
+      dev_allow_plain_ws: true,
+      bind: '127.0.0.1',
+      soul_path: soulPath,
+    }
+    const configPath = join(dir, 'config.json')
+    writeFileSync(configPath, JSON.stringify(config))
+
+    const result = runServer({ GATEWAY_CONFIG_PATH: configPath })
+    assertStructuredStartupFailure(result, { expectDetail: /soul instruction is empty/ })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

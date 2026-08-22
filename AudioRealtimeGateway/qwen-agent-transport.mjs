@@ -142,6 +142,7 @@ export class QwenAgentTransport {
     // n≥20 的 `upstream_segment_closed` → `upstream_turn_terminal` 实测分布。
     turnIdleBackstopMs = 45_000,
     takeover = true,
+    soulInstruction = null,
     // ESS-978: our own identity on the upstream. The label embeds the pid so
     // two copies of this gateway on one machine are distinguishable, and the
     // takeover guard treats "same label" as "same process, our own residual".
@@ -163,6 +164,7 @@ export class QwenAgentTransport {
     this.multiSegmentMode = multiSegmentMode
     this.turnIdleBackstopMs = turnIdleBackstopMs
     this.takeover = takeover
+    this.soulInstruction = soulInstruction
     this.clientLabel = clientLabel
     this.log = log
     this.turns = new Map()
@@ -646,6 +648,7 @@ export class QwenAgentTransport {
           clientInstanceId: turn.clientInstanceId, voiceEnabled: true,
           manualTurnDetection: true, takeover,
           timeZone: 'Asia/Shanghai', locale: 'zh-CN',
+          ...(this.soulInstruction ? { instruction: this.soulInstruction } : {}),
         }))
       })
       ws.on('message', raw => {

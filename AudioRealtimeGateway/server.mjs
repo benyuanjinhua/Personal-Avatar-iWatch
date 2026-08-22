@@ -16,6 +16,7 @@
 import http from 'node:http'
 import https from 'node:https'
 import { readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { execSync } from 'node:child_process'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -69,6 +70,7 @@ export function createGateway(overrides = {}) {
   const providerKey = process.env[providerKeyEnv] ?? null
 
   const log = createLogger()
+  const soulInstruction = loadSoulInstruction(CONFIG.soul_path ?? '../soul.md')
   const stateDir = resolve(BASE, CONFIG.state_dir)
   const devices = new DeviceStore({
     stateDir, timestampSkewMs: CONFIG.timestamp_skew_ms, log: r => log.raw(r),
@@ -86,7 +88,7 @@ export function createGateway(overrides = {}) {
     sweepIntervalMs: CONFIG.token_sweep_interval_ms,
     log: (evt, extra) => log(evt, extra),
   })
-  const agentTransport = createAgentTransport(CONFIG, { log, providerKey })
+  const agentTransport = createAgentTransport(CONFIG, { log, providerKey, soulInstruction })
   const realtimeTurns = new Map()
   // ESS-958: 同 scope（device/session/request/generation）只允许一个活跃
   // 会话。重复 upgrade 会导致新会话 nextUplinkSequence 归零，而客户端续发
@@ -120,6 +122,13 @@ export function createGateway(overrides = {}) {
   const server = createHttpListener(CONFIG, {
     devices, issuer, log, protocolVersion: CONFIG.protocol_version,
     fallbackQueue, fallbackSecret,
+  })
+  // Emit success only after every synchronous startup validation above has
+  // passed. Startup failures intentionally produce exactly one JSONL record.
+  log('soul_instruction_loaded', {
+    path: CONFIG.soul_path ?? '../soul.md',
+    sha256: createHash('sha256').update(soulInstruction).digest('hex'),
+    characters: soulInstruction.length,
   })
   const fallbackServer = CONFIG.fallback_jobs_enabled === true && CONFIG.dev_allow_plain_ws !== true
     ? createFallbackListener(CONFIG, { fallbackQueue, fallbackSecret, log }) : null
@@ -606,7 +615,19 @@ function refuseUpgrade(socket, status, code) {
   socket.destroy()
 }
 
-function createAgentTransport(CONFIG, { log }) {
+function loadSoulInstruction(path) {
+  const resolved = resolve(BASE, path)
+  let instruction
+  try {
+    instruction = readFileSync(resolved, 'utf8').trim()
+  } catch (error) {
+    throw new Error(`soul instruction unavailable at ${resolved}: ${error.message}`)
+  }
+  if (!instruction) throw new Error(`soul instruction is empty at ${resolved}`)
+  return instruction
+}
+
+function createAgentTransport(CONFIG, { log, soulInstruction }) {
   const kind = CONFIG.agent_transport ?? 'mock'
   if (kind === 'mock') return new MockAgentTransport({ log: (...args) => log('mock_agent', { detail: args.map(String).join(' ') }) })
   // Production uses the already deployed qwen-audio-agent as the provider
@@ -626,6 +647,7 @@ function createAgentTransport(CONFIG, { log }) {
       multiSegmentMode: CONFIG.agent_multi_segment_mode ?? 'auto',
       turnIdleBackstopMs: CONFIG.agent_turn_idle_backstop_ms ?? 45_000,
       takeover: CONFIG.agent_takeover_voice !== false,
+      soulInstruction,
       log: (evt, extra) => log(evt, extra),
     })
   }
