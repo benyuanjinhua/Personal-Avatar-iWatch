@@ -5,6 +5,8 @@
 // 仅在 Codex 判断需要本地知识时挂载调用，不是默认上下文。
 
 import fs from "node:fs";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
 import readline from "node:readline";
 import { AuditLog } from "./audit.mjs";
 import { VaultIndex } from "./indexer.mjs";
@@ -49,12 +51,78 @@ const TOOLS = [
       },
       required: ["note_id"]
     }
+  },
+  {
+    name: "vault_capture_idea",
+    description:
+      "仅当 Jackson 明确要求‘记录灵感/记下想法/保存 idea’时调用。" +
+      "把用户确认要保存的原始想法写入 Obsidian 的 Jackson/Idea/，成功后返回 note_id；" +
+      "普通对话、推测内容或空内容不得调用。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        content: { type: "string", description: "Jackson 明确要求保存的 idea 正文，保留原意，不自动扩写" },
+        title: { type: "string", description: "可选短标题；不传时使用‘语音灵感’" }
+      },
+      required: ["content"]
+    }
   }
 ];
 
-export function createHandlers(config) {
+const IDEA_DIRECTORY = ["Jackson", "Idea"];
+const MAX_IDEA_CHARS = 10000;
+const MAX_TITLE_CHARS = 80;
+
+function ensureSafeDirectory(root, segments) {
+  let current = root;
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    if (!fs.existsSync(current)) {
+      fs.mkdirSync(current);
+    }
+    const stat = fs.lstatSync(current);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new VaultError(ERROR_CODES.PATH_DENIED, "Idea 目录不是安全的普通目录");
+    }
+  }
+  return current;
+}
+
+function normalizeIdeaInput(args) {
+  const content = typeof args?.content === "string" ? args.content.trim() : "";
+  if (content.length === 0) {
+    throw new VaultError(ERROR_CODES.INVALID_ARGUMENT, "idea content 必须是非空字符串");
+  }
+  if (content.length > MAX_IDEA_CHARS) {
+    throw new VaultError(ERROR_CODES.INVALID_ARGUMENT, `idea content 超过 ${MAX_IDEA_CHARS} 字符`);
+  }
+  const rawTitle = args?.title === undefined ? "语音灵感" : args.title;
+  if (typeof rawTitle !== "string" || rawTitle.trim().length === 0 || rawTitle.trim().length > MAX_TITLE_CHARS) {
+    throw new VaultError(ERROR_CODES.INVALID_ARGUMENT, `title 必须是 1-${MAX_TITLE_CHARS} 字符`);
+  }
+  const title = rawTitle.trim().replace(/[\r\n]+/g, " ");
+  return { content, title };
+}
+
+function filenameSlug(title) {
+  const slug = title.normalize("NFKC")
+    .replace(/[\\/:*?"<>|#^[\]]/g, "-")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 40);
+  return slug || "idea";
+}
+
+function compactTimestamp(date) {
+  return date.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+}
+
+export function createHandlers(config, dependencies = {}) {
   const index = new VaultIndex(config);
   const audit = new AuditLog(config.auditLogPath);
+  const now = dependencies.now ?? (() => new Date());
+  const uuid = dependencies.uuid ?? randomUUID;
 
   function toolSearch(args) {
     const { query, limit, path_prefix: pathPrefix } = args ?? {};
@@ -98,7 +166,43 @@ export function createHandlers(config) {
     }
   }
 
-  return { index, audit, toolSearch, toolRead };
+  function toolCaptureIdea(args) {
+    let noteId = null;
+    let contentChars = null;
+    try {
+      const { content, title } = normalizeIdeaInput(args);
+      contentChars = content.length;
+      const capturedAt = now();
+      if (!(capturedAt instanceof Date) || Number.isNaN(capturedAt.getTime())) {
+        throw new VaultError(ERROR_CODES.INVALID_ARGUMENT, "记录时间无效");
+      }
+      const root = resolveVaultRoot(config);
+      const directory = ensureSafeDirectory(root, IDEA_DIRECTORY);
+      const filename = `${compactTimestamp(capturedAt)}-${uuid().slice(0, 8)}-${filenameSlug(title)}.md`;
+      noteId = `${IDEA_DIRECTORY.join("/")}/${filename}`;
+      const absolute = path.join(directory, filename);
+      const body = [
+        "---",
+        `captured_at: ${capturedAt.toISOString()}`,
+        "source: voice-dialogue",
+        "type: idea",
+        "---",
+        "",
+        `# ${title}`,
+        "",
+        content,
+        ""
+      ].join("\n");
+      fs.writeFileSync(absolute, body, { encoding: "utf8", flag: "wx", mode: 0o600 });
+      audit.captureIdea({ noteId, contentChars });
+      return { saved: true, note_id: noteId, captured_at: capturedAt.toISOString() };
+    } catch (error) {
+      audit.captureIdea({ noteId, contentChars, errorCode: error.code ?? "INTERNAL" });
+      throw error;
+    }
+  }
+
+  return { index, audit, toolSearch, toolRead, toolCaptureIdea };
 }
 
 function toolResultText(payload) {
@@ -145,6 +249,9 @@ export function handleRequest(handlers, request) {
         }
         if (name === "vault_read" || name === "vault.read") {
           return respond(toolResultText(handlers.toolRead(args)));
+        }
+        if (name === "vault_capture_idea" || name === "vault.capture_idea") {
+          return respond(toolResultText(handlers.toolCaptureIdea(args)));
         }
         return fail(-32602, `未知工具: ${name}`);
       } catch (error) {

@@ -116,6 +116,37 @@ test("vault_read 返回内容并按字符上限截断，支持 offset 续读", (
   assert.ok(whole.content.includes("SQLite FTS5"));
 });
 
+test("vault_capture_idea 固定写入 Jackson/Idea 且连续记录不覆盖", () => {
+  let sequence = 0;
+  const fixed = createHandlers(config, {
+    now: () => new Date("2026-08-22T11:30:00.000Z"),
+    uuid: () => `0000000${++sequence}-0000-4000-8000-000000000000`
+  });
+  const first = fixed.toolCaptureIdea({ content: "把实时对话中的零碎想法沉淀下来", title: "语音 Idea" });
+  const second = fixed.toolCaptureIdea({ content: "第二条想法", title: "语音 Idea" });
+
+  assert.equal(first.saved, true);
+  assert.equal(second.saved, true);
+  assert.notEqual(first.note_id, second.note_id);
+  assert.match(first.note_id, /^Jackson\/Idea\//);
+  const body = fs.readFileSync(path.join(vaultRoot, ...first.note_id.split("/")), "utf8");
+  assert.match(body, /source: voice-dialogue/);
+  assert.match(body, /# 语音 Idea/);
+  assert.match(body, /零碎想法/);
+});
+
+test("vault_capture_idea 拒绝空内容、超长内容与危险 Idea 目录", () => {
+  assert.throws(() => handlers.toolCaptureIdea({ content: "   " }), /非空字符串/);
+  assert.throws(() => handlers.toolCaptureIdea({ content: "甲".repeat(10001) }), /超过 10000/);
+
+  const unsafeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "vault-mcp-unsafe-"));
+  fs.mkdirSync(path.join(unsafeRoot, "Jackson"));
+  fs.symlinkSync(outsideDir, path.join(unsafeRoot, "Jackson", "Idea"));
+  const unsafe = createHandlers({ ...config, vaultRoot: unsafeRoot });
+  assert.throws(() => unsafe.toolCaptureIdea({ content: "不能逃逸" }), error => error.code === "PATH_DENIED");
+  fs.rmSync(unsafeRoot, { recursive: true, force: true });
+});
+
 test("Vault 不可用时明确报错，不伪造结果", () => {
   const broken = createHandlers({ ...makeConfig(), vaultRoot: path.join(outsideDir, "does-not-exist") });
   assert.throws(() => broken.toolSearch({ query: "anything" }), /VAULT_UNAVAILABLE|不可访问/);
@@ -132,6 +163,7 @@ test("Vault 不可用时明确报错，不伪造结果", () => {
 test("审计日志记录查询词/命中 ID/读取范围，但不含笔记正文", () => {
   handlers.toolSearch({ query: "WatchConnectivity" });
   handlers.toolRead({ note_id: "Projects/watch-plan.md" });
+  handlers.toolCaptureIdea({ content: "审计日志里不能出现这段灵感正文", title: "审计测试" });
   const lines = fs.readFileSync(auditPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
 
   const searchEntry = lines.findLast(entry => entry.tool === "vault_search" && !entry.error);
@@ -144,6 +176,10 @@ test("审计日志记录查询词/命中 ID/读取范围，但不含笔记正文
 
   const raw = fs.readFileSync(auditPath, "utf8");
   assert.ok(!raw.includes("tangerine-42"), "审计日志不得包含笔记正文");
+  assert.ok(!raw.includes("审计日志里不能出现这段灵感正文"), "Idea 审计不得包含正文");
+  const ideaEntry = lines.findLast(entry => entry.tool === "vault_capture_idea" && !entry.error);
+  assert.match(ideaEntry.note_id, /^Jackson\/Idea\//);
+  assert.equal(typeof ideaEntry.content_chars, "number");
 });
 
 test("MCP stdio 端到端：initialize / tools/list / tools/call", async () => {
@@ -179,13 +215,18 @@ test("MCP stdio 端到端：initialize / tools/list / tools/call", async () => {
 
     send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
     const list = await waitFor(2);
-    assert.deepEqual(list.result.tools.map(t => t.name), ["vault_search", "vault_read"]);
+    assert.deepEqual(list.result.tools.map(t => t.name), ["vault_search", "vault_read", "vault_capture_idea"]);
 
     send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "vault.search", arguments: { query: "WatchConnectivity" } } });
     const call = await waitFor(3);
     const text = call.result.content[0].text;
     assert.ok(text.includes("UNTRUSTED_VAULT_CONTENT"), "内容必须带不可信标记");
     assert.ok(text.includes("Projects/watch-plan.md"));
+
+    send({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "vault_capture_idea", arguments: { content: "从语音保存的灵感", title: "端到端" } } });
+    const write = await waitFor(4);
+    assert.equal(write.result.isError, undefined);
+    assert.ok(write.result.content[0].text.includes("Jackson/Idea/"));
   } finally {
     child.kill();
   }
