@@ -207,9 +207,12 @@ final class VoiceTurnJournal: ObservableObject {
             turns[index].firstResultAt = priorFirstResultAt
             turns[index].errorCode = priorErrorCode
             // ESS-1044：转移被拒不代表「这一轮没失败」——会话层仍须收口，
-            // 否则 turnPhase 卡在 thinking 直到 45s 硬超时。
+            // 否则 turnPhase 卡在 thinking 直到 45s 硬超时。带出**吸收方**，
+            // 订阅方据此区分「早先已判失败」与「已经成功/已取消」。
             if envelope.state == .failed {
-                onTerminalFailure?(envelope.requestId, envelope.errorCode, false)
+                onTerminalFailure?(
+                    envelope.requestId, envelope.errorCode, false, turns[index].currentState
+                )
             }
             return false
         }
@@ -217,8 +220,11 @@ final class VoiceTurnJournal: ObservableObject {
         if envelope.state == .failed {
             // `index` 在 append 之后可能已失效（onStateApplied 是同步回调，
             // 订阅方有可能反过来动 turns），按 requestId 重查。
-            let lockedCode = turns.first { $0.requestId == envelope.requestId }?.errorCode
-            onTerminalFailure?(envelope.requestId, lockedCode ?? envelope.errorCode, true)
+            let record = turns.first { $0.requestId == envelope.requestId }
+            onTerminalFailure?(
+                envelope.requestId, record?.errorCode ?? envelope.errorCode, true,
+                record?.currentState ?? .failed
+            )
         }
         // 纯文本降级（ESS-48）：结果没有配套语音（speech_sha256 为空），不会有
         // transferFile / attachSpeech 后续，在这里按 request_id 通知展示全文。
@@ -261,6 +267,10 @@ final class VoiceTurnJournal: ObservableObject {
     /// 真机 2026-08-22 14:00:04 `relay_terminal_failure_projected applied=false`
     /// 之后 SessionController 卡在 thinking，一路挂到 45s 硬超时才被捞回。
     ///
+    /// 本回调只报事实、不做策略：**转移被拒时是谁吸收了它**由 `currentState`
+    /// 如实带出，由订阅方按各自语义决定要不要动作。journal 自己不判「该不该
+    /// 收口」——那是 Watch 会话层的事，iOS 侧订阅者的口径未必相同。
+    ///
     /// 幂等由订阅方负责——同一 request_id 的失败可能同时经 iPhone 回执
     /// （`WatchVoiceTransport`）与 Bridge WSS（`WatchSettingsStore`）各来一次，
     /// 第二次必然 `applied=false`。
@@ -268,7 +278,12 @@ final class VoiceTurnJournal: ObservableObject {
     ///   - requestId: 失败回合。
     ///   - errorCode: 稳定短码（可能为空）。
     ///   - applied: 状态机是否真的接受了这次 `.failed` 转移。
-    var onTerminalFailure: ((_ requestId: String, _ errorCode: String?, _ applied: Bool) -> Void)?
+    ///   - currentState: 这次投递之后该回合的**实际状态**。`applied=true` 时恒为
+    ///     `.failed`；被拒时是吸收掉它的那个终态（`.completed` / `.cancelled` /
+    ///     早先的 `.failed`）——矛盾终态的判据全在这个字段上。
+    var onTerminalFailure: (
+        (_ requestId: String, _ errorCode: String?, _ applied: Bool, _ currentState: VoiceTurnState) -> Void
+    )?
 
     /// completed 且结果载荷已挂上后的回调（ESS-55 通知链路）。重复/乱序的
     /// completed 信封被状态机拒绝时不会触发（幂等第一层；通知记账是第二层）。

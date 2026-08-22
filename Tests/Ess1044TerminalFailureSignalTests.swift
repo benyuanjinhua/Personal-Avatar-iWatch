@@ -17,6 +17,20 @@ import XCTest
 final class Ess1044TerminalFailureSignalTests: XCTestCase {
     private let requestId = "019fbbdd-5c39-70fa-9760-dc262ee092b0"
 
+    private struct Signal {
+        let requestId: String
+        let errorCode: String?
+        let applied: Bool
+        let currentState: VoiceTurnState
+
+        init(_ requestId: String, _ errorCode: String?, _ applied: Bool, _ currentState: VoiceTurnState) {
+            self.requestId = requestId
+            self.errorCode = errorCode
+            self.applied = applied
+            self.currentState = currentState
+        }
+    }
+
     private func makeJournal() -> VoiceTurnJournal {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("ess1044-journal-\(UUID().uuidString)")
@@ -31,41 +45,87 @@ final class Ess1044TerminalFailureSignalTests: XCTestCase {
         )
     }
 
-    /// 状态机接受时照常发信号，且带上已锁定的 error_code。
+    /// 状态机接受时照常发信号，且带上已锁定的 error_code 与当前状态。
     func testAppliedFailureFiresSignal() {
         let journal = makeJournal()
         journal.begin(requestId: requestId)
-        var observed: [(String, String?, Bool)] = []
-        journal.onTerminalFailure = { rid, code, applied in observed.append((rid, code, applied)) }
+        var observed: [Signal] = []
+        journal.onTerminalFailure = { rid, code, applied, state in
+            observed.append(Signal(rid, code, applied, state))
+        }
 
         XCTAssertTrue(journal.apply(failedEnvelope()))
 
         XCTAssertEqual(observed.count, 1)
-        XCTAssertEqual(observed.first?.0, requestId)
-        XCTAssertEqual(observed.first?.1, "ERR_VOICE_BUSY")
-        XCTAssertEqual(observed.first?.2, true)
+        XCTAssertEqual(observed.first?.requestId, requestId)
+        XCTAssertEqual(observed.first?.errorCode, "ERR_VOICE_BUSY")
+        XCTAssertEqual(observed.first?.applied, true)
+        XCTAssertEqual(observed.first?.currentState, .failed)
     }
 
     /// 本单核心回归：回合已终态 → `apply` 返回 false、`onStateApplied` 不触发，
     /// 但 `onTerminalFailure` **必须**照发（applied=false），否则会话层无从收口。
+    ///
+    /// 真机那一支的吸收方是**早先的 `.failed`**（同一次失败经两条通道各来一次）。
     func testRejectedFailureStillFiresSignal() {
         let journal = makeJournal()
         journal.begin(requestId: requestId)
-        // 先把回合推到终态，让后到的 failed 被状态机拒绝（真机 applied=false 的成因）。
-        XCTAssertTrue(journal.apply(.status(requestId: requestId, state: .cancelled)))
+        XCTAssertTrue(journal.apply(failedEnvelope()))
 
         var stateApplied: [VoiceTurnState] = []
-        var observed: [(String, String?, Bool)] = []
+        var observed: [Signal] = []
         journal.onStateApplied = { _, state in stateApplied.append(state) }
-        journal.onTerminalFailure = { rid, code, applied in observed.append((rid, code, applied)) }
+        journal.onTerminalFailure = { rid, code, applied, state in
+            observed.append(Signal(rid, code, applied, state))
+        }
 
         XCTAssertFalse(journal.apply(failedEnvelope()), "终态吸收，转移仍应被拒")
 
         XCTAssertTrue(stateApplied.isEmpty, "转移被拒时 onStateApplied 不该触发（既有语义不变）")
         XCTAssertEqual(observed.count, 1, "但终态失败信号必须照发")
-        XCTAssertEqual(observed.first?.0, requestId)
-        XCTAssertEqual(observed.first?.1, "ERR_VOICE_BUSY", "被拒路径回滚了 errorCode，只能取信封上的码")
-        XCTAssertEqual(observed.first?.2, false)
+        XCTAssertEqual(observed.first?.requestId, requestId)
+        XCTAssertEqual(observed.first?.applied, false)
+        XCTAssertEqual(observed.first?.currentState, .failed, "吸收方是早先的 failed → 订阅方应派发")
+    }
+
+    /// 复审阻断（毕玄-cx，2026-08-22）：矛盾终态必须**如实带出吸收方**，
+    /// 订阅方才有依据执行 success-wins。journal 自己不做策略，但不能不报事实。
+    func testRejectedByCompletedReportsCompletedAsCurrentState() {
+        let journal = makeJournal()
+        journal.begin(requestId: requestId)
+        XCTAssertTrue(journal.apply(.status(requestId: requestId, state: .completed)))
+
+        var observed: [Signal] = []
+        journal.onTerminalFailure = { rid, code, applied, state in
+            observed.append(Signal(rid, code, applied, state))
+        }
+
+        XCTAssertFalse(journal.apply(failedEnvelope()))
+
+        XCTAssertEqual(observed.count, 1)
+        XCTAssertEqual(observed.first?.applied, false)
+        XCTAssertEqual(observed.first?.currentState, .completed,
+                       "吸收方是 completed → 订阅方据此不得派发失败")
+        XCTAssertEqual(journal.turn(withId: requestId)?.currentState, .completed,
+                       "终态吸收：成功回合不被 failed 改写")
+        XCTAssertNil(journal.turn(withId: requestId)?.errorCode,
+                     "被拒路径必须回滚 errorCode，成功回合不得留下失败码")
+    }
+
+    /// `.cancelled` 同理：吸收方如实带出，不冒充 failed。
+    func testRejectedByCancelledReportsCancelledAsCurrentState() {
+        let journal = makeJournal()
+        journal.begin(requestId: requestId)
+        XCTAssertTrue(journal.apply(.status(requestId: requestId, state: .cancelled)))
+
+        var observed: [Signal] = []
+        journal.onTerminalFailure = { rid, code, applied, state in
+            observed.append(Signal(rid, code, applied, state))
+        }
+
+        XCTAssertFalse(journal.apply(failedEnvelope()))
+
+        XCTAssertEqual(observed.first?.currentState, .cancelled)
     }
 
     /// 非失败终态（completed）不得误发失败信号。
@@ -73,7 +133,7 @@ final class Ess1044TerminalFailureSignalTests: XCTestCase {
         let journal = makeJournal()
         journal.begin(requestId: requestId)
         var fired = 0
-        journal.onTerminalFailure = { _, _, _ in fired += 1 }
+        journal.onTerminalFailure = { _, _, _, _ in fired += 1 }
 
         XCTAssertTrue(journal.apply(.status(requestId: requestId, state: .completed)))
         // 重复 completed 被拒，同样不发。
@@ -87,7 +147,7 @@ final class Ess1044TerminalFailureSignalTests: XCTestCase {
         let journal = makeJournal()
         journal.begin(requestId: requestId)
         var fired = 0
-        journal.onTerminalFailure = { _, _, _ in fired += 1 }
+        journal.onTerminalFailure = { _, _, _, _ in fired += 1 }
 
         let broken = VoiceStatusEnvelope.status(requestId: "", state: .failed)
         XCTAssertNotNil(broken.validate(), "空 request_id 必须校验不过")

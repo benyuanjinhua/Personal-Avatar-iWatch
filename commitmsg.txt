@@ -1,0 +1,41 @@
+fix(ESS-1044): 矛盾终态 success-wins——已成功的回合不再被迟到 failed 误杀
+
+复审阻断（毕玄-cx，2026-08-22）成立，已复现：纯文本结果（ESS-48）与段落
+屏障期间，journal 已是 .completed 而 SessionController 仍停在 .thinking
+（相位由真实起播推进，不由 journal 终态推进），此时相位闸门是敞开的，
+一条乱序的 failed 会把成功回合显示成「这轮没答上来」。
+
+复现证据（修复前，生产接线本体）：
+  testCompletedThenLateFailureDoesNotEnterFailed
+  XCTAssertNotEqual failed: ("failed") is equal to ("failed")
+
+改动：
+- VoiceTurnJournal.onTerminalFailure 增加 currentState 参数，如实带出
+  **这次投递之后该回合的实际状态**：applied=true 恒为 .failed；被拒时是
+  吸收方（.completed / .cancelled / 早先的 .failed）。journal 只报事实、
+  不做策略——iOS 侧订阅者的口径未必与 Watch 会话层相同。
+- PushToTalkController 落 success-wins 策略：只有 currentState == .failed
+  才向会话层派发；.completed / .cancelled 吸收掉的 failed 只留证不动作。
+  丢弃同样落 turn_terminal_failure_signal，带 dispatched / current_state，
+  乱序矛盾终态在日志里可判定。
+- 策略放在接线层而非只靠 SessionController 相位闸门（复审整改项 1），
+  相位闸门降为纵深防御，已在注释中写明理由。
+
+判据是「这一轮现在到底是什么状态」，不是「转移有没有被接受」——事故目标
+（真机 applied=false，吸收方是早先的 .failed）仍然立即收口，未被削弱。
+
+验证（R-02.5 关卡一全绿）：
+- swift test：727 tests 0 failures（Ess1044TerminalFailureSignalTests 6 例）
+- xcodebuild test「WristAgent Watch App」：382 tests 0 failures
+  （Ess1044RelayFailureClosureTests 6 例，新增 completed / cancelled 两条迟到 failed 回归）
+- 运行时证据 · completed → 迟到 failed：
+  turn_terminal_failure_signal applied=false dispatched=false current_state=completed
+  （无 session_turn_failed，session 保持 listening + thinking）
+- 运行时证据 · 事故目标路径：
+  turn_terminal_failure_signal applied=false dispatched=true current_state=failed
+  → session_turn_failed → session_failed_notice_shown retryable=true
+- xcodebuild build（iOS + watchOS）：BUILD SUCCEEDED
+- Bridge npm test 176/176、projection mock 12/12
+- xcodegen 无 pbxproj 漂移、git diff --check 干净
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
