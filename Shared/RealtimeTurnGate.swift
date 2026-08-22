@@ -30,13 +30,14 @@ struct RealtimeTurnGate: Equatable {
         /// 放行：可以建立通道。
         case open
         /// 拦下：该回合已判终态，不得再复活。`reason` 进日志。
-        case suppress(reason: String)
+        case suppress(reason: String, shouldLog: Bool)
     }
 
     private struct Entry: Equatable {
         let turn: Turn
         var handshakeFailures: Int
         var closed: Bool
+        var suppressionLogged: Bool
     }
 
     /// 最近若干个回合的闸门状态。
@@ -83,7 +84,8 @@ struct RealtimeTurnGate: Equatable {
             Entry(
                 turn: turn,
                 handshakeFailures: wasActive ? 0 : 1,
-                closed: wasActive || maxHandshakeAttempts <= 1
+                closed: wasActive || maxHandshakeAttempts <= 1,
+                suppressionLogged: false
             )
         )
         if entries.count > capacity { entries.removeFirst(entries.count - capacity) }
@@ -102,13 +104,15 @@ struct RealtimeTurnGate: Equatable {
     /// 这个信封能不能打开通道。
     ///
     /// - Parameter isTurnStart: 该信封是否为 `stream.start`。
-    func decide(requestId: String, sessionId: String, isTurnStart: Bool) -> Decision {
+    mutating func decide(requestId: String, sessionId: String, isTurnStart: Bool) -> Decision {
         if isTurnStart { return .open }
         let turn = Turn(requestId: requestId, sessionId: sessionId)
-        guard let entry = entries.first(where: { $0.turn == turn }), entry.closed else {
+        guard let index = entries.firstIndex(where: { $0.turn == turn }), entries[index].closed else {
             return .open
         }
-        return .suppress(reason: "turn_closed_terminal")
+        let shouldLog = !entries[index].suppressionLogged
+        entries[index].suppressionLogged = true
+        return .suppress(reason: "turn_closed_terminal", shouldLog: shouldLog)
     }
 
     /// 取证用：当前封死了几个回合。
