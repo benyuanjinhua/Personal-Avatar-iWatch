@@ -125,7 +125,28 @@ export class QwenAgentTransport {
     // chosen only to sit above the Watch-visible turn budget. Calibrate from
     // `upstream_segment_closed` → `upstream_turn_terminal` deltas once real
     // tool-calling turns are in gateway.log (n ≥ 20).
-    turnIdleBackstopMs = 45_000,
+    // ESS-1004：**backstop 必须显著小于客户端硬超时**。
+    //
+    // ESS-969 选 `voice.state {state:'idle'}` 作终态，依据是一句未经验证的推断；
+    // 同一段注释也承认「No real-device sample of「末段 audio.done → voice.state
+    // idle」exists yet」。样本现在有了，是反例：
+    //
+    //   三轮真机（08-22 03:29 / 05:37 / 10:34）`downlink_done` **全部为 0**。
+    //
+    // 上游源码（`QwenAudio/qwen-audio-agent`）里 `state:'idle'` 共 5 处，全是
+    // 异常/边缘路径，其中 `realtime-gateway.mjs:1267` 是
+    // `if (!responseContext?.hasAudio)` —— **只在 response 没有音频时发**。
+    // 正常回答必然有音频，因此健康回合**永远收不到 idle**，只能落到本兜底。
+    //
+    // 而原值 45 s 与客户端 `SessionController.thinkingHardTimeoutSeconds`
+    // **完全相等**：真机上客户端每次先到，误报「回答超时」并自动挂断，
+    // 下一问落进正在挂断/重启的 App。兜底从未生效过一次。
+    //
+    // 30 s 让兜底稳定先于客户端触发（余量 15 s，足够覆盖播放排空的抖动）。
+    // **这是止血，不是终态判定的正解**：正解需要一个上游真的会发的回合终态
+    // 信号，见 ESS-1004 的后续项——在那之前不要把这个值再调小，
+    // 它必须容得下工具时延。
+    turnIdleBackstopMs = 30_000,
     takeover = true,
     // ESS-978: our own identity on the upstream. The label embeds the pid so
     // two copies of this gateway on one machine are distinguishable, and the
@@ -242,6 +263,8 @@ export class QwenAgentTransport {
       // boundary if the upstream goes idle. Deferring the choice is what
       // keeps a plain one-segment turn from emitting a spurious interim.
       segmentIndex: 0, closedSegment: null, segmentsClosed: 0,
+      // ESS-1004：本回合还有多少后台工作在跑。段落收口时据此选等待档位。
+      outstandingTasks: new Set(),
       sawVoiceState: false, multiSegment: null,
       turnIdleTimer: null, turnEnded: false,
       // ESS-969 B1: the turn terminal can legitimately arrive while the
@@ -446,6 +469,10 @@ export class QwenAgentTransport {
         this.log('upstream_turn_idle_backstop', {
           ...scopeLog, backstop_ms: this.turnIdleBackstopMs,
           segment_index: turn.closedSegment.segmentIndex,
+          // ESS-1004 取证：兜底触发时手上还有几件后台工作。这是把 backstop
+          // 收紧成「按工作量分档」所缺的那组数据 —— 在拿到 n≥20 的真机样本
+          // 之前不据此改判定，只记录。
+          outstanding_tasks: turn.outstandingTasks.size,
         })
         endTurn('idle_backstop', turn.closedSegment.finalSequence)
       }, this.turnIdleBackstopMs)
@@ -637,6 +664,20 @@ export class QwenAgentTransport {
         if (!this.#isCurrent(turn)) return
         let event
         try { event = JSON.parse(raw.toString()) } catch { return }
+        // ESS-1004：**所有非 audio.delta 的上游事件类型都要留证。**
+        // 此前只有 audio.delta / audio.done 会落 `upstream_event_received`，
+        // 于是真机日志里看不出 `voice.state` / `task.*` / `response.started`
+        // 到底有没有到 —— ESS-969 的终态假设正是因此没能被证伪，
+        // 我判 ESS-977 根因时也因此推错过一次。audio.delta 量太大不在此记，
+        // 它已有 `upstream_audio_delta` 专线。
+        if (event.type !== 'audio.delta') {
+          this.log('upstream_event_seen', {
+            ...scopeLog, upstream_event_type: event.type,
+            origin: event.origin ?? null,
+            state: event.state ?? null,
+            task_status: event.task?.status ?? null,
+          })
+        }
         if (event.type === 'voice.ready') {
           if (turn.ready) return
           turn.ready = true
@@ -873,6 +914,18 @@ export class QwenAgentTransport {
         }
         if (event.type.startsWith('task.') && event.task?.id) {
           noteResponseProgress()
+          // ESS-1004：后台工作的起止决定「段落收口后还该不该等」。
+          // 终态字面量取上游 `shared/realtime-events.mjs` 的 TaskEvent 定义。
+          const taskId = String(event.task.id)
+          const taskStatus = String(event.task.status ?? event.type.slice(5))
+          const settled = taskStatus === 'completed' || taskStatus === 'failed'
+            || taskStatus === 'cancelled'
+          if (settled) turn.outstandingTasks.delete(taskId)
+          else turn.outstandingTasks.add(taskId)
+          this.log('upstream_task_state', {
+            ...scopeLog, task_id: taskId, status: taskStatus,
+            outstanding: turn.outstandingTasks.size,
+          })
           onEvent({ type: 'agent.task', response_id: responseId,
             task: { id: String(event.task.id), status: event.task.status ?? event.type.slice(5) } })
           return
