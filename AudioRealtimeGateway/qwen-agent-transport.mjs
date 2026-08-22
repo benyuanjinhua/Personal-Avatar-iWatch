@@ -119,6 +119,21 @@ export class QwenAgentTransport {
     this.clientLabel = clientLabel
     this.log = log
     this.turns = new Map()
+    // ESS-974: an upstream supersede can produce a delayed ownership broadcast
+    // after the replacement socket is already active. Remember the exact
+    // retired instance identities so that broadcast cannot fence its successor.
+    // The queue bounds process-lifetime memory without relying on timers.
+    this.retiredClientInstanceIds = new Set()
+    this.retiredClientInstanceOrder = []
+  }
+
+  #retireClientInstance(clientInstanceId) {
+    if (this.retiredClientInstanceIds.has(clientInstanceId)) return
+    this.retiredClientInstanceIds.add(clientInstanceId)
+    this.retiredClientInstanceOrder.push(clientInstanceId)
+    while (this.retiredClientInstanceOrder.length > 64) {
+      this.retiredClientInstanceIds.delete(this.retiredClientInstanceOrder.shift())
+    }
   }
 
   // Remove a turn from the active map ONLY if that slot still holds this exact
@@ -194,6 +209,7 @@ export class QwenAgentTransport {
     turn.supersede = nextRequestId => {
       if (turn.terminal) return
       turn.terminal = true
+      this.#retireClientInstance(turn.clientInstanceId)
       clearTimeout(turn.connectTimer)
       clearTimeout(turn.doneTimer)
       clearTimeout(turn.gapTimer)
@@ -490,6 +506,15 @@ export class QwenAgentTransport {
         if (event.type === 'voice.ownership' || event.type === 'voice.deactivated') {
           const holder = event.holder ?? null
           const holderIsSelf = holder?.instanceId === turn.clientInstanceId
+          if (holder?.instanceId
+            && this.retiredClientInstanceIds.has(holder.instanceId)) {
+            this.log('upstream_ownership_ignored', {
+              ...scopeLog, event_type: event.type,
+              holder_label: holder?.label ?? null,
+              reason: 'retired_client_instance',
+            })
+            return
+          }
           turn.ownershipState = event.type === 'voice.deactivated'
             ? 'deactivated' : (event.state ?? null)
           turn.ownershipHolderLabel = holder?.label ?? null

@@ -146,6 +146,56 @@ test('late close of a superseded same-requestId turn does not evict its replacem
   newTurn.close()
 })
 
+// ESS-974: the provider broadcasts ownership state globally. A superseded
+// instance's delayed deactivate can therefore arrive on the replacement
+// socket; socket-local current-turn checks alone cannot distinguish it.
+test('delayed deactivate naming a superseded instance cannot kill its replacement', async () => {
+  const instanceIds = []
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') {
+      instanceIds.push(message.clientInstanceId)
+      ws.send(JSON.stringify({ type: 'voice.ready' }))
+      if (instanceIds.length === 2) {
+        setTimeout(() => ws.send(JSON.stringify({
+          type: 'voice.deactivated',
+          holder: {
+            type: 'cli', label: 'watch-direct-gateway', instanceId: instanceIds[0],
+          },
+        })), 20)
+      }
+    }
+    if (message.type === 'audio.commit') {
+      setTimeout(() => {
+        ws.send(JSON.stringify({ type: 'audio.delta', sequence: 0, audio: 'AAAA' }))
+        ws.send(JSON.stringify({ type: 'audio.done' }))
+      }, 50)
+    }
+  })
+  const logs = []; const oldEvents = []; const newEvents = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, doneSettleMs: 10,
+    log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  transport.openTurn({
+    requestId: 'old', sessionId: 's974', deviceId: 'd974', generation: 1,
+    responseId: 'old:gen1', onEvent: event => oldEvents.push(event),
+  })
+  await waitFor(() => instanceIds.length === 1)
+  const replacement = transport.openTurn({
+    requestId: 'new', sessionId: 's974', deviceId: 'd974', generation: 2,
+    responseId: 'new:gen2', onEvent: event => newEvents.push(event),
+  })
+  replacement.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  replacement.commit()
+  await waitFor(() => newEvents.some(event => event.type === 'agent.audio.done'))
+
+  assert.deepEqual(oldEvents, [])
+  assert.ok(!newEvents.some(event => event.type === 'agent.error'))
+  assert.ok(logs.some(item => item.evt === 'upstream_ownership_ignored'
+    && item.reason === 'retired_client_instance'))
+  replacement.close()
+})
+
 // ESS-773. The downstream done barrier can only release on a dense 0..N run,
 // so this adapter owns the contract sequence and treats the provider's as
 // diagnostic. These cases are the contract: restart, replay, legitimate
