@@ -1005,34 +1005,45 @@ export class QwenAgentTransport {
         // carries `hasFunctionCall` — the signal the model is about to run a
         // tool and produce at least one more segment. The upstream only knows
         // this when the response completes, so this is the earliest reliable
-        // place to learn「the turn is not over yet」. `hasFunctionCall` is read
-        // from the qwen dialect's top-level field, with the OpenAI-style nested
-        // `response.hasFunctionCall` and snake_case accepted too so a shape
-        // change cannot silently drop the signal.
+        // place to learn「the turn is not over yet」.
+        //
+        // 契约（上游 ESS-1052 `publicResponseDoneEvent` 经 WSS 转发，v822 前只写日志）：
+        //   { type:'response.done', responseId, turnId, origin, status, hasFunctionCall }
+        // `hasFunctionCall` 是 TRI-state 读法：缺失 / 显式 false / true。只有 agent
+        // 工具结果段（`origin === 'agent'` 且显式 false）才能 resolve 一个 pending
+        // tool call——字段缺失、或归属 announcement（按 origin 或按 response.started
+        // 登记的 announcementResponseIds）的 done，绝不得清除它（ESS-1043 复审阻断 2）。
         if (event.type === 'response.done') {
-          noteResponseProgress()
-          const hasFunctionCall = event.hasFunctionCall === true
-            || event.response?.hasFunctionCall === true
-            || event.has_function_call === true
+          const rawHasFunctionCall = event.hasFunctionCall
+            ?? event.response?.hasFunctionCall
+            ?? event.has_function_call
+          const hasFunctionCall = rawHasFunctionCall === true
+          const explicitNoFunctionCall = rawHasFunctionCall === false
           const upstreamResponseId = event.responseId ?? event.response?.id ?? null
+          const origin = event.origin ?? event.response?.origin ?? null
+          const isAnnouncement = origin === 'announcement'
+            || (upstreamResponseId !== null
+              && turn.announcementResponseIds.has(String(upstreamResponseId)))
+          // An announcement is not this turn's answer; it must not disarm the
+          // committed-response deadline (same stance as ESS-849's audio filter).
+          if (!isAnnouncement) noteResponseProgress()
           this.log('upstream_response_done', {
-            ...scopeLog, upstream_response_id: upstreamResponseId,
-            origin: event.origin ?? event.response?.origin ?? null,
+            ...scopeLog, upstream_response_id: upstreamResponseId, origin,
             status: event.status ?? event.response?.status ?? null,
-            has_function_call: hasFunctionCall,
+            has_function_call: hasFunctionCall ? true : explicitNoFunctionCall ? false : null,
           })
           if (hasFunctionCall) {
             if (!turn.pendingToolCall) {
               turn.pendingToolCall = true
-              this.log('upstream_tool_call_pending', { ...scopeLog, upstream_response_id: upstreamResponseId })
+              this.log('upstream_tool_call_pending', { ...scopeLog, upstream_response_id: upstreamResponseId, origin })
             }
             // A parked segment must not close the turn while the tool runs:
             // re-arm its window with the dedicated tool-call window (the
             // re-arm only ever widens — see `armSegmentGap`).
             if (turn.closedSegment) armSegmentGap('tool_call_pending')
-          } else if (turn.pendingToolCall) {
+          } else if (turn.pendingToolCall && explicitNoFunctionCall && origin === 'agent' && !isAnnouncement) {
             turn.pendingToolCall = false
-            this.log('upstream_tool_call_resolved', { ...scopeLog, upstream_response_id: upstreamResponseId })
+            this.log('upstream_tool_call_resolved', { ...scopeLog, upstream_response_id: upstreamResponseId, origin })
             // The tool result is the final segment. End the turn as soon as its
             // audio settles — immediately if the segment already closed, or on
             // the pending `flushDone` otherwise.
@@ -1041,6 +1052,15 @@ export class QwenAgentTransport {
             } else if (turn.pendingDone) {
               turn.endAfterDone = true
             }
+          } else if (turn.pendingToolCall) {
+            // A done that cannot be the tool result (missing field, announcement,
+            // or a non-agent origin) must not resolve the pending tool call.
+            this.log('upstream_response_done_ignored', {
+              ...scopeLog, upstream_response_id: upstreamResponseId, origin,
+              reason: !explicitNoFunctionCall ? 'missing_has_function_call'
+                : isAnnouncement ? 'announcement'
+                : `origin_${origin ?? 'missing'}`,
+            })
           }
           return
         }

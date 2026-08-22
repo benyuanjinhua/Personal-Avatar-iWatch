@@ -218,3 +218,114 @@ test('ESS-1043 · 工具调用声明后若结果永不回来，tool-call 窗口�
   assert.ok(logs.some(l => l.evt === 'upstream_tool_call_pending'))
   turn.close()
 })
+
+// 阻断 2 回归：pending tool call 期间，无关的 response.done 不得提前清除 pending。
+// 只有 origin=agent 且显式 hasFunctionCall=false 的工具结果段才收口，且终态唯一。
+test('ESS-1043 · pending 期间夹入 announcement/缺字段/model 的 response.done 不提前收口', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') {
+      send(ws, { type: 'voice.ready' })
+      send(ws, { type: 'voice.state', state: 'listening', origin: 'model' })
+    }
+    if (message.type === 'audio.commit') {
+      // 段 0：announcement「我正在查询」
+      send(ws, { type: 'response.started', responseId: 'up-ann', origin: 'announcement' })
+      audioDelta(ws, 0, 'announcement')
+      send(ws, { type: 'audio.done' })
+      send(ws, { type: 'response.done', responseId: 'up-ann', origin: 'announcement', hasFunctionCall: false, status: 'completed' })
+      // 段 1：model 决定调用工具 → pending
+      setTimeout(() => {
+        send(ws, { type: 'response.started', responseId: 'up-model', origin: 'model' })
+        send(ws, { type: 'audio.done' })
+        send(ws, { type: 'response.done', responseId: 'up-model', origin: 'model', hasFunctionCall: true, status: 'completed' })
+        // 工具执行期间夹入三类无关 done：
+        setTimeout(() => {
+          send(ws, { type: 'response.done', responseId: 'up-ann2', origin: 'announcement', hasFunctionCall: false, status: 'completed' })
+          send(ws, { type: 'response.done', responseId: 'up-unknown', origin: 'model', status: 'completed' })
+          send(ws, { type: 'response.done', responseId: 'up-model2', origin: 'model', hasFunctionCall: false, status: 'completed' })
+        }, 100)
+      }, 200)
+      // 段 2：agent 工具结果 → 收口
+      setTimeout(() => {
+        send(ws, { type: 'response.started', responseId: 'up-agent', origin: 'agent' })
+        audioDelta(ws, 1, 'real-answer-a')
+        audioDelta(ws, 2, 'real-answer-b')
+        send(ws, { type: 'audio.done' })
+        send(ws, { type: 'response.done', responseId: 'up-agent', origin: 'agent', hasFunctionCall: false, status: 'completed' })
+      }, 700)
+    }
+  })
+  const events = []; const logs = []
+  const transport = transportFor(url, {
+    logs, segmentGapMs: 100, segmentGapBusyMs: 200, toolCallWindowMs: 2_000,
+  })
+  const turn = openTurn(transport, { requestId: 'r5', events })
+  turn.appendAudio({ sequence: 0, bytes: Buffer.from('audio') })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'), 4_000)
+
+  // 两段答案音频都到，序号连续。
+  assert.deepEqual(events.filter(e => e.type === 'agent.audio.delta').map(e => e.sequence), [0, 1, 2])
+  // 终态唯一，且只由 agent 工具结果触发。
+  const terminals = logs.filter(l => l.evt === 'upstream_turn_terminal')
+  assert.equal(terminals.length, 1, '唯一终态')
+  assert.equal(terminals[0].reason, 'tool_result_done')
+  assert.equal(terminals[0].final_sequence, 2)
+  // 三类无关 done 都被识别并留证，没有清除 pending。
+  const ignored = logs.filter(l => l.evt === 'upstream_response_done_ignored')
+  assert.ok(ignored.some(l => l.reason === 'announcement'), 'announcement done 被忽略')
+  assert.ok(ignored.some(l => l.reason === 'missing_has_function_call'), '缺字段 done 被忽略')
+  assert.ok(ignored.some(l => l.reason === 'origin_model'), 'model 非工具结果 done 被忽略')
+  turn.close()
+})
+
+// 阻断 2 回归：登记在 announcementResponseIds 的 response.done（本身不带 origin）
+// 也不得清除 pending——归属靠 responseId → announcementResponseIds 映射。
+test('ESS-1043 · 登记在 announcementResponseIds 的 response.done（无 origin）不清除 pending', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') {
+      send(ws, { type: 'voice.ready' })
+      send(ws, { type: 'voice.state', state: 'listening', origin: 'model' })
+    }
+    if (message.type === 'audio.commit') {
+      send(ws, { type: 'response.started', responseId: 'up-1', origin: 'model' })
+      audioDelta(ws, 0, 'seg1')
+      send(ws, { type: 'audio.done' })
+      setTimeout(() => {
+        // 模型决定调用工具 → pending
+        send(ws, { type: 'response.started', responseId: 'up-model', origin: 'model' })
+        send(ws, { type: 'audio.done' })
+        send(ws, { type: 'response.done', responseId: 'up-model', origin: 'model', hasFunctionCall: true, status: 'completed' })
+        // 工具执行期间夹入一条已登记播报：response.started 登记了 responseId，
+        // 其 response.done 不带 origin，只能靠 responseId 映射识别为 announcement。
+        setTimeout(() => {
+          send(ws, { type: 'response.started', responseId: 'up-ann-live', origin: 'announcement' })
+          send(ws, { type: 'response.done', responseId: 'up-ann-live', hasFunctionCall: false, status: 'completed' })
+        }, 100)
+      }, 200)
+      // agent 工具结果 → 收口
+      setTimeout(() => {
+        send(ws, { type: 'response.started', responseId: 'up-agent', origin: 'agent' })
+        audioDelta(ws, 1, 'real-answer')
+        send(ws, { type: 'audio.done' })
+        send(ws, { type: 'response.done', responseId: 'up-agent', origin: 'agent', hasFunctionCall: false, status: 'completed' })
+      }, 700)
+    }
+  })
+  const events = []; const logs = []
+  const transport = transportFor(url, {
+    logs, segmentGapMs: 100, segmentGapBusyMs: 200, toolCallWindowMs: 2_000,
+  })
+  const turn = openTurn(transport, { requestId: 'r6', events })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'), 4_000)
+
+  assert.deepEqual(events.filter(e => e.type === 'agent.audio.delta').map(e => e.sequence), [0, 1])
+  const terminals = logs.filter(l => l.evt === 'upstream_turn_terminal')
+  assert.equal(terminals.length, 1, '唯一终态')
+  assert.equal(terminals[0].reason, 'tool_result_done')
+  const ignored = logs.filter(l => l.evt === 'upstream_response_done_ignored')
+  assert.ok(ignored.some(l => l.reason === 'announcement' && l.upstream_response_id === 'up-ann-live'),
+    '已登记播报的 done 靠 responseId 映射被忽略')
+  turn.close()
+})
