@@ -337,6 +337,7 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
                 + " final_sequence=\(envelope.finalSequence?.description ?? "nil")"
         case .ready, .playbackClear, .responseInterrupted, .bridgeFallback,
              .transcriptDelta, .transcriptFinal, .generationOpen, .bargeInFailed,
+             .transportFailed,
              .unrecognised:
             sequenceDetail = ""
         }
@@ -395,6 +396,8 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             }
         case .bargeInFailed:
             adapter.markBargeInFailed(reason: envelope.reason ?? "unspecified")
+        case .transportFailed:
+            adapter.markTransportFailed(reason: envelope.reason ?? "unspecified")
         }
     }
 

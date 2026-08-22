@@ -706,6 +706,23 @@ final class WatchRealtimeMediaAdapter {
         session.markDownlinkBridgeFallback()
     }
 
+    /// ESS-1008: the control plane (WCSession) is still alive even though the
+    /// Agent WSS is not. Fail the active answer immediately through the same
+    /// production callback used by renderer failures, then collapse realtime
+    /// buffering. The session controller will re-enter listening and cancel
+    /// its thinking timeout.
+    func markTransportFailed(reason: String) {
+        guard let handle = currentTurn else { return }
+        WatchLog.error(
+            "realtime", "transport_failed",
+            requestId: handle.requestId,
+            detail: "reason=\(reason)",
+            code: "ERR_REALTIME_TRANSPORT_FAILED"
+        )
+        onAnswerPlaybackFailed?(handle, "transport_failed:\(reason)")
+        session.markDownlinkBridgeFallback()
+    }
+
     private func handle(_ event: RealtimeMediaSession.Event) {
         switch event {
         case .uplinkStart(let start):

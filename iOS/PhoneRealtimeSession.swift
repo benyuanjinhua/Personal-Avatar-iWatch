@@ -235,6 +235,13 @@ final class PhoneRealtimeSession {
         (pendingDownlink.pendingCount, pendingDownlink.pendingBytes)
     }
 
+    /// Current identity for lifecycle evidence. The iPhone app logs scene
+    /// transitions with this tuple so a socket failure can be aligned with
+    /// the exact Gateway request instead of an unscoped app-level message.
+    var currentTurnIdentity: (requestId: String, sessionId: String)? {
+        Self.turnIdentity(of: state)
+    }
+
     /// Agent transports push events through callbacks instead of the Bridge
     /// receive loop. Funnel them through the same current-transport gate so a
     /// callback already queued by a superseded turn cannot reach Watch.
