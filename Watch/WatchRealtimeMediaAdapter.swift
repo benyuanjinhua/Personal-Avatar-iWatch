@@ -658,7 +658,8 @@ final class WatchRealtimeMediaAdapter {
         session.receiveDone(
             finalSequence: finalSequence,
             responseId: responseId,
-            generation: generation
+            generation: generation,
+            isSegmentBoundary: true
         )
     }
 
