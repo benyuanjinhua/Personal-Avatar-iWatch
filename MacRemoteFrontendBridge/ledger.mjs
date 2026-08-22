@@ -27,12 +27,6 @@ export const BRIDGE_TASK_TERMINAL_ERRORS = new Set([
   'ERR_RESULT_UNKNOWN',
 ])
 
-// ESS-983: 确定性失败（重试必然再次失败）——投递一次即收口，不进入终态
-// 结果的重投退避链（result_redelivered 2s/4s/8s...）。密钥缺失即此类。
-export const NO_REDELIVERY_ERRORS = new Set([
-  'ERR_FALLBACK_NOT_CONFIGURED',
-])
-
 const CLIENT_FAILURE_DETAILS = new Map([
   ['ERR_UPSTREAM_UNAVAILABLE', 'Mac 那边没应答。确认助手在运行，点重试不用重新说。'],
   ['ERR_TASK_NOT_FOUND', 'Mac 那边找不到这件事了，点重试我重新交一次。'],
@@ -411,12 +405,6 @@ export class TurnLedger extends EventEmitter {
     const delay = Math.min(maxDelayMs, baseDelayMs * 2 ** Math.max(0, turn.delivery_attempts - 1))
     turn.next_delivery_at = new Date(now + delay).toISOString()
     this.save(turn)
-    // ESS-983: 确定性失败（如降级 HMAC 密钥缺失）投递一次即收口——重试必然
-    // 再次失败，不进入指数退避的重投链（bridge 侧不再 2s/4s/8s 反复重发）。
-    if (NO_REDELIVERY_ERRORS.has(turn.error)) {
-      this.acknowledgeResult(requestId, { source: 'bridge_deterministic' })
-      return { attempt: turn.delivery_attempts, delay_ms: 0 }
-    }
     return { attempt: turn.delivery_attempts, delay_ms: delay }
   }
 
