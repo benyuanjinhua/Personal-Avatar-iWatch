@@ -13,7 +13,7 @@ import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
 import WebSocket from 'ws'
 
-import { createGateway } from '../server.mjs'
+import { createGateway, extractProtocolBearer } from '../server.mjs'
 import { signRequest } from '../device-auth.mjs'
 
 function collectLogs() {
@@ -85,6 +85,32 @@ describe('Gateway end-to-end', () => {
     const body = await r.json()
     assert.equal(body.ok, true)
     assert.equal(body.service, 'audio-realtime-gateway')
+  })
+
+  it('serves the H5 shell with restrictive browser security headers', async () => {
+    const r = await fetch(baseUrl + '/')
+    assert.equal(r.status, 200)
+    assert.match(r.headers.get('content-type'), /text\/html/)
+    assert.match(r.headers.get('content-security-policy'), /default-src 'self'/)
+    assert.match(await r.text(), /Qwen Audio/)
+  })
+
+  it('extracts a browser bearer from WebSocket subprotocols', () => {
+    assert.equal(extractProtocolBearer('realtime-v1, rtk_abc_123'), 'rtk_abc_123')
+    assert.equal(extractProtocolBearer('realtime-v1, not-a-token'), null)
+  })
+
+  it('accepts a scope-bound token through the browser WebSocket protocol header', async () => {
+    const body = scopeBody()
+    const mint = await mintToken(body)
+    const url = `ws://127.0.0.1:${gateway.server.address().port}/api/realtime`
+      + `?device_id=${body.device_id}&session_id=${body.session_id}`
+      + `&request_id=${body.request_id}&generation=${body.generation}`
+    const ws = new WebSocket(url, ['realtime-v1', mint.body.token])
+    await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject) })
+    assert.equal(ws.protocol, 'realtime-v1')
+    ws.close()
+    await new Promise(resolve => ws.once('close', resolve))
   })
 
   it('mints an ephemeral token and lets a valid WSS upgrade through', async () => {
