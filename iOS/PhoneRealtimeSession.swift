@@ -257,15 +257,17 @@ final class PhoneRealtimeSession {
         if isTurnStart {
             turnGate.noteTurnStart(requestId: requestId, sessionId: sessionId)
         }
-        if case .suppress(let reason) = turnGate.decide(
+        if case .suppress(let reason, let shouldLog) = turnGate.decide(
             requestId: requestId, sessionId: sessionId, isTurnStart: isTurnStart
         ) {
-            PhoneAgentClientLog.info(
-                module: "phone_session",
-                event: "realtime_reopen_suppressed",
-                requestId: requestId, sessionId: sessionId,
-                detail: "reason=\(reason) closed_turns=\(turnGate.closedTurnCount)"
-            )
+            if shouldLog {
+                PhoneAgentClientLog.info(
+                    module: "phone_session",
+                    event: "realtime_reopen_suppressed",
+                    requestId: requestId, sessionId: sessionId,
+                    detail: "reason=\(reason) closed_turns=\(turnGate.closedTurnCount)"
+                )
+            }
             return
         }
         currentTransport?.close(reason: "supersede")

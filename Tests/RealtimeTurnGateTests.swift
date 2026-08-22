@@ -11,7 +11,7 @@ final class RealtimeTurnGateTests: XCTestCase {
 
     /// 未失败时一律放行——不能因为加了闸门就把正常链路拦住。
     func testOpensWhenNothingFailed() {
-        let gate = RealtimeTurnGate()
+        var gate = RealtimeTurnGate()
         XCTAssertEqual(gate.decide(requestId: rid, sessionId: sid, isTurnStart: false), .open)
         XCTAssertEqual(gate.decide(requestId: rid, sessionId: sid, isTurnStart: true), .open)
     }
@@ -22,10 +22,10 @@ final class RealtimeTurnGateTests: XCTestCase {
         gate.noteFailure(requestId: rid, sessionId: sid, wasActive: true)
 
         // 真机那一轮 47 秒里泵了 255 次；这里用 20 帧代表同一形态。
-        for _ in 0..<20 {
+        for index in 0..<20 {
             XCTAssertEqual(
                 gate.decide(requestId: rid, sessionId: sid, isTurnStart: false),
-                .suppress(reason: "turn_closed_terminal")
+                .suppress(reason: "turn_closed_terminal", shouldLog: index == 0)
             )
         }
     }
@@ -52,7 +52,7 @@ final class RealtimeTurnGateTests: XCTestCase {
         gate.noteFailure(requestId: rid, sessionId: sid, wasActive: false)
         XCTAssertEqual(
             gate.decide(requestId: rid, sessionId: sid, isTurnStart: false),
-            .suppress(reason: "turn_closed_terminal")
+            .suppress(reason: "turn_closed_terminal", shouldLog: true)
         )
     }
 
@@ -62,7 +62,7 @@ final class RealtimeTurnGateTests: XCTestCase {
         gate.noteFailure(requestId: rid, sessionId: sid, wasActive: true)
         XCTAssertEqual(
             gate.decide(requestId: rid, sessionId: sid, isTurnStart: false),
-            .suppress(reason: "turn_closed_terminal")
+            .suppress(reason: "turn_closed_terminal", shouldLog: true)
         )
     }
 
@@ -102,7 +102,7 @@ final class RealtimeTurnGateTests: XCTestCase {
         // 最近 4 个仍被封
         XCTAssertEqual(
             gate.decide(requestId: "rid-49", sessionId: sid, isTurnStart: false),
-            .suppress(reason: "turn_closed_terminal")
+            .suppress(reason: "turn_closed_terminal", shouldLog: true)
         )
         // 被挤出去的老回合放行（它早就不会再有帧进来，丢掉无损）
         XCTAssertEqual(gate.decide(requestId: "rid-0", sessionId: sid, isTurnStart: false), .open)
