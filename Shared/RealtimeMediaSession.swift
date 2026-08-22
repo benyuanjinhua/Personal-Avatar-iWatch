@@ -299,10 +299,17 @@ final class RealtimeMediaSession {
     /// the buffer's barrier logic and emits `doneArrived(...)` with the
     /// decision. `generation` guards against stale done events closing a
     /// newer generation's session (U8 core regression).
+    /// - Parameter isSegmentBoundary: ESS-971。`true` 表示这是**段落**边界
+    ///   （`audio.segment_done`）而不是回合终态（`audio.done`）：屏障照常释放、
+    ///   本段音频照常播完，但**绝不关闭 downlink session**——下一段的 delta
+    ///   正是 `endSession()` 注释里说的「late frames」，关了就全被判
+    ///   `.sessionEnded`。2026-08-22 真机上第二段 10 帧就是这么整段消失的
+    ///   （`downlink_drop reason=sessionEnded` ×10，最后靠 45s 思考超时才收场）。
     func receiveDone(
         finalSequence: Int?,
         responseId: String? = nil,
-        generation: Int? = nil
+        generation: Int? = nil,
+        isSegmentBoundary: Bool = false
     ) {
         guard let handle = currentTurn else { return }
         let outcome = downlink.markDone(
@@ -317,7 +324,12 @@ final class RealtimeMediaSession {
             // rejected as `.sessionEnded` (a new response's deltas still
             // arrive under the same generation once the coordinator's next
             // turn opens).
-            _ = downlink.endSession()
+            //
+            // ESS-971：段落边界例外。上面这句「late frames」对回合终态成立，
+            // 对段落边界恰恰相反——下一段的 delta 就是 late frames，而它们是
+            // 本回合真正的答案。`markDone` 已在释放时清了 `pendingFinalSequence`，
+            // 所以不关 session 也不会有残留屏障。
+            if !isSegmentBoundary { _ = downlink.endSession() }
         case .missingFinalSequence:
             // Gateway did not send `final_sequence` (legacy / rollout).
             // Spec §3.2 row 3 degrades to `n = max emitted seq` — meaning
