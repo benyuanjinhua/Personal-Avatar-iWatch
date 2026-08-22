@@ -42,7 +42,7 @@
   "agent_response_timeout_ms": 8000,
   "agent_takeover_voice": true,
   "agent_multi_segment_mode": "auto",
-  "agent_turn_idle_backstop_ms": 32000,
+  "agent_turn_idle_backstop_ms": 45000,
   "fallback_jobs_enabled": false,
   "fallback_hmac_secret_env": "FALLBACK_JOB_HMAC_SECRET",
   "fallback_hmac_secret_file": "./state/fallback-hmac-secret",

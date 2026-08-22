@@ -225,15 +225,7 @@ final class SessionController: ObservableObject {
     /// 思考慢提示：提交后无回答 > 此值显示慢提示。
     static let thinkingSlowHintSeconds: TimeInterval = 25.0
     /// 思考硬超时：进入 P6。
-    ///
-    /// ESS-1004：这个值不再是本文件的自由参数。段落播完后 `markAnswerInterim`
-    /// 会重新武装它，于是它与 Gateway 的回合终态（`agent_turn_idle_backstop_ms`）
-    /// 构成一对竞争的截止时间。ESS-969 两边都取 45.0 s，真机上客户端每次先到点、
-    /// 误报「回答超时」并自动挂断，Gateway 的终态从未有机会送达。
-    /// 取自 Shared 的常量，好让「必须显著晚于 Gateway 终态」这条不变量能被
-    /// `swift test` 检查（`Ess1004TurnTerminalBudgetTests`）。
-    static let thinkingHardTimeoutSeconds: TimeInterval =
-        AudioRealtimeAgentConfig.clientThinkingHardTimeout
+    static let thinkingHardTimeoutSeconds: TimeInterval = 45.0
     /// 静默 1 级提示。
     static let silenceHint1Seconds: TimeInterval = 30.0
     /// 静默 2 级提示 + 触觉。

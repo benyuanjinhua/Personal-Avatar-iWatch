@@ -116,7 +116,8 @@ export class QwenAgentTransport {
     // pre-ESS-969 behaviour, so an upstream without the signal cannot regress
     // into waiting on a backstop. `'always'` / `'off'` force either side.
     multiSegmentMode = 'auto',
-    // ESS-969 backstop, recalibrated by ESS-1004 from real-device data.
+    // ESS-969 backstop. ESS-1004 did NOT recalibrate it — see below for why the
+    // recalibration it originally proposed was withdrawn.
     //
     // ESS-1004 L2: `voice.state {state:'idle'}` is NOT reachable for this
     // client shape. For an audio-bearing response the upstream only emits it
@@ -130,21 +131,32 @@ export class QwenAgentTransport {
     // the wire, THIS timer is the only terminal a multi-segment turn has —
     // treat it as load-bearing, not as a backstop.
     //
-    // Both bounds are measured (R-04.4) and pinned by
-    // `test/ess1004-turn-terminal-budget.test.mjs`.
-    //
-    // LOWER bound — must not truncate a turn that is still producing. Window:
+    // LOWER bound — measured, and the one that matters. Window:
     // `logs/gateway.log` 2026-08-22; sample = every multi-segment turn in it
     // (n=4); metric = `upstream_segment_closed` → next `upstream_response_started`:
-    //   15.054 / 15.157 / 14.954 / 0.363 s. Slowest 15.157 s, so the timer
-    //   must sit at >= 2x that. n=4 is thin, which is why this stays a knob.
+    //   15.054 / 15.157 / 14.954 / 0.363 s. Slowest 15.157 s. Shrinking this
+    //   timer toward that number truncates exactly the turns ESS-969 exists to
+    //   fix, so it must stay well above it. Pinned by
+    //   `test/ess1004-turn-terminal-budget.test.mjs`. n=4 is thin (R-04.4),
+    //   which is why this stays a knob.
     //
-    // UPPER bound — the `audio.done` it produces has to reach a client that is
-    // still waiting. The Watch re-arms `SessionController.thinkingHardTimeoutSeconds`
-    // (45 s) when a segment finishes playing; at the ESS-969 value of 45 s the
-    // two deadlines were IDENTICAL and which one fired first was pure
-    // scheduling order. The client must lose that race by a wide margin.
-    turnIdleBackstopMs = 32_000,
+    // NO upper bound from the client's 45 s thinking timeout. ESS-1004 first
+    // claimed the two 45 s deadlines raced and that scheduling order decided
+    // the winner; 毕玄-cx refuted it on PR #378 with the issue's own L1, and the
+    // refutation is correct — the two timers do not start together:
+    //   10:34:35.112  upstream_segment_closed   → backstop armed (flushDone)
+    //   10:35:20.112  backstop(45 s) WOULD fire
+    //   10:35:02.657  Watch session_answer_interim → client 45 s armed
+    //   10:35:47.740  client hard timeout fires
+    // The backstop is armed when the audio has been DELIVERED, the client's is
+    // armed when it has been PLAYED, so the client always starts later by the
+    // residual playback time (27.5 s in that turn). At 45 s the backstop still
+    // wins by 27.6 s. It never fired for an unrelated reason: the socket died
+    // 0.534 s after the segment closed (`session_ended peer_closed 1006`), and
+    // `RealtimeSession.onSocketClose` → `agentTurn.close()` clears this timer.
+    // That is ESS-1008, not a budget problem. Changing this constant does
+    // nothing for it, so it is left at its ESS-969 value.
+    turnIdleBackstopMs = 45_000,
     takeover = true,
     // ESS-978: our own identity on the upstream. The label embeds the pid so
     // two copies of this gateway on one machine are distinguishable, and the

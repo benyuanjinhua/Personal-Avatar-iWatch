@@ -1,4 +1,4 @@
-// ESS-1004 —— 回合终态的预算约束。
+// ESS-1004 —— 回合终态：唯一性、可产出性，以及不得被调到段间隔以下。
 //
 // 事故：多段回合答完后 `downlink_done` 一次都没下发过（真机 4/4），客户端在
 // 45 s 后误报「回答超时」并自动挂断，下一问落进一个正在重启的 App。
@@ -6,14 +6,21 @@
 // 取证结论（详见 `qwen-agent-transport.mjs` 的 `turnIdleBackstopMs` 注释）：
 // 上游的 `voice.state {state:'idle'}` 对本客户端形态**不可达**，所以
 // `agent_turn_idle_backstop_ms` 事实上是多段回合**唯一**的终态来源。
-// 既然它是承重的，它的两侧边界就必须被钉住，而不是留一个「待标定」的占位值。
 //
-// 本文件钉三件事：
-//   1. 出厂配置的兜底值落在实测下界与客户端硬超时之间；
-//   2. 兜底值不得与客户端硬超时相等 —— 相等时谁先触发全看调度顺序，
-//      这正是 ESS-1004 要消除的竞态本身；
-//   3. 兜底路径确实产出回合终态：上游只发段落、永不发终态时，
-//      `agent.audio.done` 必然出现，且 `RealtimeSession` 必然记 `downlink_done`。
+// ⚠️ 已撤回的一条断言（R-04.5 / R-04.6）：本文件最初还钉了「兜底必须显著
+// 小于客户端 45 s 硬超时、且两者不得相等」。毕玄-cx 在 PR #378 上用同一份
+// L1 反证了它，反证成立：两个计时器不同时起跑 —— 兜底在音频**投递完**武装
+// （10:34:35.112），客户端在音频**播完**武装（10:35:02.657），45 s 的兜底
+// 本应在 10:35:20.112 触发，比客户端的 10:35:47.740 早 27.6 s。它没触发是因为
+// socket 在段落关闭后 0.534 s 就 1006 断开（ESS-1008），`onSocketClose` →
+// `agentTurn.close()` 把这个计时器清掉了。那两条上界断言据此**全部删除**，
+// 常数也退回 ESS-969 的 45 s —— 改它对本故障零增益。
+//
+// 现在只钉三件仍然成立的事：
+//   1. 兜底不得被调到实测段间隔以下（下界，这是真实的截断风险）；
+//   2. 上游只发段落、永不发终态时，兜底路径**确实**产出回合终态，且只产出一次；
+//   3. 回合终态到达 `RealtimeSession` 时，`downlink_done` 必然出现且只出现一次
+//      —— 这就是真机上 0 次的那条日志。
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -38,53 +45,20 @@ const BASE = dirname(fileURLToPath(import.meta.url))
 // 那就是 ESS-969 存在的理由本身。n=4 偏薄（R-04.4），故仍是配置项。
 const OBSERVED_SLOWEST_SEGMENT_GAP_MS = 15_157
 
-// 客户端硬超时：`Watch/SessionController.swift` 的 `thinkingHardTimeoutSeconds`
-// = 45.0 s，段落播完后由 `markAnswerInterim` 重新武装。到点即
-// `session_failed_notice_shown` →「回答超时」→ 15 s 后自动挂断。
-const CLIENT_THINKING_HARD_TIMEOUT_MS = 45_000
-
-// 兜底到点 → `agent.audio.done` → `audio.done` 帧穿过 WAN 到 Watch 并被处理。
-// 与 ESS-842 的 `ERROR_DELIVERY_MARGIN_MS` 同口径、同数量级。
-const TERMINAL_DELIVERY_MARGIN_MS = 1_500
-
-// 「显著小于」的下限。两个 45 s 撞在一起时客户端先到（真机 10:35:47.740），
-// 兜底从未起作用；要让兜底真正有机会赢，光是「不相等」不够，必须留出
-// 一个大于任何单次调度抖动与一次 WAN 往返的间隔。
-const REQUIRED_SEPARATION_MS = 8_000
-
-describe('ESS-1004 · 回合终态预算', () => {
-  it('出厂兜底值同时满足实测下界与客户端硬超时上界', () => {
+describe('ESS-1004 · 回合终态下界', () => {
+  it('出厂兜底值不得被调到实测段间隔以下', () => {
     const config = JSON.parse(readFileSync(join(BASE, '..', 'config.json'), 'utf8'))
     const backstop = config.agent_turn_idle_backstop_ms
     assert.equal(typeof backstop, 'number', 'agent_turn_idle_backstop_ms 必须出厂就有值')
     assert.ok(backstop > 0, '兜底为 0 等于关掉多段回合唯一的终态来源')
-
-    // 下界：不能提前收口，把还要继续说话的回合砍掉。
     assert.ok(
       backstop >= 2 * OBSERVED_SLOWEST_SEGMENT_GAP_MS,
       `兜底(${backstop}ms) 必须 ≥ 实测最慢段间隔 ${OBSERVED_SLOWEST_SEGMENT_GAP_MS}ms 的 2 倍，`
-      + '否则会在上游还要说下一段时提前收口',
-    )
-
-    // 上界：兜底产出的终态必须还能送到一个仍在等待的客户端。
-    assert.ok(
-      backstop + TERMINAL_DELIVERY_MARGIN_MS
-        <= CLIENT_THINKING_HARD_TIMEOUT_MS - REQUIRED_SEPARATION_MS,
-      `兜底(${backstop}ms) + 送达余量(${TERMINAL_DELIVERY_MARGIN_MS}ms) 必须 ≤ `
-      + `客户端硬超时(${CLIENT_THINKING_HARD_TIMEOUT_MS}ms) - 必需间隔(${REQUIRED_SEPARATION_MS}ms)`,
+      + '否则会在上游还要说下一段时提前收口 —— 这正是 ESS-969 要修的那个 bug',
     )
   })
 
-  it('兜底值与客户端硬超时不得相等（ESS-1004 点名的竞态）', () => {
-    const config = JSON.parse(readFileSync(join(BASE, '..', 'config.json'), 'utf8'))
-    assert.notEqual(
-      config.agent_turn_idle_backstop_ms,
-      CLIENT_THINKING_HARD_TIMEOUT_MS,
-      '两个 45 s 撞在一起时谁先触发只看调度顺序 —— 真机上客户端先到，兜底从未起作用',
-    )
-  })
-
-  it('server.mjs 的兜底默认值与出厂配置一致（配置缺失时不得回到 45 s）', () => {
+  it('server.mjs 的兜底默认值与出厂配置一致', () => {
     const source = readFileSync(join(BASE, '..', 'server.mjs'), 'utf8')
     const config = JSON.parse(readFileSync(join(BASE, '..', 'config.json'), 'utf8'))
     const match = source.match(/agent_turn_idle_backstop_ms \?\? ([\d_]+)/)
@@ -92,7 +66,7 @@ describe('ESS-1004 · 回合终态预算', () => {
     assert.equal(
       Number(match[1].replaceAll('_', '')),
       config.agent_turn_idle_backstop_ms,
-      '默认值与出厂配置漂移时，删掉一行配置就会静默回到出事的那个数',
+      '默认值与出厂配置漂移时，删掉一行配置就会静默换掉唯一的终态来源',
     )
   })
 })
@@ -156,7 +130,7 @@ test('ESS-1004 · 上游永不发终态时，兜底仍然产出 agent.audio.done
   const events = []; const logs = []
   const transport = new QwenAgentTransport({
     gatewayUrl: url,
-    // 出厂值是 32 s；用例只验证「兜底路径成立」，不验证它的长度。
+    // 出厂值是 45 s；用例只验证「兜底路径成立」，不验证它的长度。
     turnIdleBackstopMs: 400,
     log: (evt, extra) => logs.push({ evt, ...extra }),
   })
