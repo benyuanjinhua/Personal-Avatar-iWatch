@@ -319,6 +319,22 @@ final class ConversationAudioController {
     }
 
     private static func elapsedMs(since start: DispatchTime) -> Int {
-        Int(DispatchTime.now().uptimeNanoseconds &- start.uptimeNanoseconds) / 1_000_000
+        elapsedMs(fromUptimeNs: start.uptimeNanoseconds, toUptimeNs: DispatchTime.now().uptimeNanoseconds)
+    }
+
+    /// ESS-1028：**除法必须在 `Int(_:)` 之内**。watchOS 目标是 arm64_32，
+    /// `Int` 只有 32 位（`Int.max == 2_147_483_647`）；先收窄再除的写法
+    /// （`Int(ns) / 1_000_000`）在纳秒差越过 `Int32.max` 时——也就是仅仅
+    /// **2.147 秒**——就会陷入「Not enough bits to represent the passed value」
+    /// 并 SIGTRAP 杀进程。`&-` 只保证减法回绕，救不了后面的收窄。
+    ///
+    /// 真机崩溃点是 `endConversation` 里的 `acquiredAt.map { elapsedMs(since: $0) }`：
+    /// 它度量整场会话持有音频会话的时长，播完一段播报即远超阈值。
+    /// 其余调用点传的都是函数入口处的 `now()`，跨度毫秒级，所以长期没暴露。
+    ///
+    /// 拆成接受两个 `UInt64` 的纯函数，是为了让边界能在单测里直接钉住——
+    /// 真机上「跑满 2.147 秒」不可控，靠真机复现不了回归。
+    static func elapsedMs(fromUptimeNs start: UInt64, toUptimeNs now: UInt64) -> Int {
+        Int((now &- start) / 1_000_000)
     }
 }

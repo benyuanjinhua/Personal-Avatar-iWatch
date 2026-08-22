@@ -579,6 +579,50 @@ final class ConversationAudioControllerTests: XCTestCase {
                        "adapter 预热不得 acquire——首个流式回合才获取会话")
     }
 
+    // MARK: - ESS-1028 · elapsedMs 在 32 位 Int 上的溢出边界
+
+    /// 真机崩溃（EXC_BREAKPOINT，5 份报告同一故障地址）的根因：
+    /// 老写法 `Int(now &- start) / 1_000_000` 先收窄再除。watchOS 目标是
+    /// arm64_32，`Int` 只有 32 位，纳秒差一旦越过 `Int32.max` 就陷入。
+    /// 阈值仅 **2.147 秒**——一场会话必然超过。
+    ///
+    /// ⚠️ 本用例**不能**在测试宿主上复现那次陷入：单测跑在模拟器/Mac 上，
+    /// `Int` 是 64 位，老写法在这里同样返回正确值。所以它钉的是
+    /// **语义**（超阈值时毫秒值仍正确）与**不变量**（见下一个用例），
+    /// 不是 trap 本身。trap 只有真机 arm64_32 才会发生。
+    func testElapsedMsIsCorrectBeyondInt32NanosecondRange() {
+        // 恰好越过 Int32.max 纳秒（≈2.147s）
+        let justOver = UInt64(Int32.max) + 1
+        XCTAssertEqual(
+            ConversationAudioController.elapsedMs(fromUptimeNs: 0, toUptimeNs: justOver),
+            Int(justOver / 1_000_000)
+        )
+
+        // 一场典型会话：90 秒
+        let ninetySeconds: UInt64 = 90 * 1_000_000_000
+        XCTAssertEqual(
+            ConversationAudioController.elapsedMs(fromUptimeNs: 1_000, toUptimeNs: 1_000 + ninetySeconds),
+            90_000
+        )
+
+        // 阈值以下仍与老写法同值（没有改坏短跨度口径）
+        XCTAssertEqual(
+            ConversationAudioController.elapsedMs(fromUptimeNs: 0, toUptimeNs: 250_000_000),
+            250
+        )
+    }
+
+    /// 与宿主字长无关地钉住「先除后转」这个顺序不变量：
+    /// 同一个纳秒差，收窄到 32 位放不下，先除成毫秒就放得下。
+    /// 这是 arm64_32 上老写法必崩、新写法必安全的算术依据。
+    func testNanosecondDeltaOverflowsInt32ButMillisecondQuotientDoesNot() {
+        let ninetySeconds: UInt64 = 90 * 1_000_000_000
+        XCTAssertNil(Int32(exactly: ninetySeconds),
+                     "纳秒差放不进 32 位 Int——老写法在真机上就是在这里陷入")
+        XCTAssertNotNil(Int32(exactly: ninetySeconds / 1_000_000),
+                        "先除成毫秒后放得进 32 位 Int——新写法安全")
+    }
+
     // MARK: - helpers
 
     private static func intField(_ key: String, in detail: String) -> Int? {
