@@ -202,6 +202,12 @@ export class QwenAgentTransport {
       segmentIndex: 0, closedSegment: null, segmentsClosed: 0,
       sawVoiceState: false, multiSegment: null,
       turnIdleTimer: null, turnEnded: false,
+      // ESS-969 B1: the turn terminal can legitimately arrive while the
+      // segment's `audio.done` is still blocked by a reorder hole
+      // (`reorderWaitMs` exists precisely because the provider emits done with
+      // frames still in flight). The terminal is a FACT, not an instant — latch
+      // it here and consume it when the segment finally closes.
+      pendingTurnTerminal: null,
     }
     const scopeLog = { request_id: requestId, session_id: sessionId, device_id: deviceId, generation }
     turn.supersede = nextRequestId => {
@@ -332,6 +338,19 @@ export class QwenAgentTransport {
       this.log('upstream_segment_closed', {
         ...scopeLog, segment_index: turn.segmentIndex, final_sequence: finalSequence,
       })
+      // ESS-969 B1 (毕玄 review on PR #365): a turn terminal that arrived while
+      // this done was still blocked by a reorder hole was LATCHED, not lost.
+      // Consume it the instant the segment closes — otherwise a perfectly
+      // healthy turn whose tail delta merely arrived late would fall through
+      // to the 45 s backstop, turning the backstop into the normal path.
+      if (turn.pendingTurnTerminal) {
+        const reason = turn.pendingTurnTerminal
+        turn.pendingTurnTerminal = null
+        this.log('upstream_turn_terminal_latch_consumed', {
+          ...scopeLog, reason, final_sequence: finalSequence,
+        })
+        return endTurn(reason, finalSequence)
+      }
       armTurnIdleBackstop()
     }
 
@@ -608,6 +627,16 @@ export class QwenAgentTransport {
             ...scopeLog, upstream_response_id: event.responseId ?? null,
             origin: event.origin ?? null, segment_index: turn.segmentIndex,
           })
+          // ESS-969 B1: a new segment outranks a latched terminal — the
+          // upstream demonstrably went on producing, so the earlier `idle`
+          // was a segment gap, not the end of the turn. Without this a stale
+          // latch would cut the turn short at the previous segment.
+          if (turn.pendingTurnTerminal) {
+            this.log('upstream_turn_terminal_latch_invalidated', {
+              ...scopeLog, reason: turn.pendingTurnTerminal, cause: 'response.started',
+            })
+            turn.pendingTurnTerminal = null
+          }
           releaseClosedSegment('response.started')
           return
         }
@@ -624,6 +653,22 @@ export class QwenAgentTransport {
             // If idle ever lands elsewhere, this line is the evidence — and
             // the bounded backstop still closes the turn.
             if (turn.closedSegment) endTurn('voice_state_idle', turn.closedSegment.finalSequence)
+            // ESS-969 B1: `flushDone` above returns without closing the segment
+            // when a reorder hole is still open, so `pendingDone` still being
+            // set here means exactly「终态到了，但这一段的 done 还卡在洞上」.
+            // Latch the terminal instead of discarding it; `flushDone` consumes
+            // it the moment the late delta backfills the hole and the settle
+            // window closes. Dropping it here is what made the 45 s backstop
+            // the normal path for a healthy but out-of-order turn.
+            else if (turn.pendingDone && !turn.turnEnded) {
+              turn.pendingTurnTerminal = 'voice_state_idle'
+              this.log('upstream_turn_terminal_latched', {
+                ...scopeLog, reason: 'voice_state_idle',
+                reorder_pending: turn.reorderBuffer.size,
+                dense_high_watermark: turn.nextOutputSequence - 1,
+                segments_closed: turn.segmentsClosed,
+              })
+            }
             else if (turn.responded && !turn.turnEnded) {
               this.log('upstream_voice_state_idle_ignored', {
                 ...scopeLog, pending_done: turn.pendingDone,

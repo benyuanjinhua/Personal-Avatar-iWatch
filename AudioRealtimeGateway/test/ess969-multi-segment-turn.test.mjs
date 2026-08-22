@@ -437,6 +437,98 @@ test('ESS-969 · 全栈：工具调用回合的两段音频都到达客户端且
   session.onSocketClose(1000, 'test_done')
 })
 
+// B1（毕玄 review on PR #365）：`reorderWaitMs` 的存在本身就说明上游会在
+// 帧还在飞的时候发 `audio.done`。终态在洞未补齐时到达是**合法时序**，不是
+// 异常——把它一次性消费掉，健康回合就会白等 45 秒兜底，兜底从异常路径变成
+// 正常路径。终态是事实不是瞬间：先闩住，洞补齐、settle 完成后立即消费。
+test('ESS-969 B1 · idle 在乱序洞未补齐时到达：闩住终态，补洞后立即收口，不走兜底', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') {
+      send(ws, { type: 'voice.ready' })
+      send(ws, { type: 'voice.state', state: 'listening', origin: 'model' })
+    }
+    if (message.type === 'audio.commit') {
+      send(ws, { type: 'response.started', responseId: 'up-1', origin: 'model' })
+      audioDelta(ws, 0, 'seq0')
+      audioDelta(ws, 2, 'seq2')                                  // seq1 缺席，进重排缓冲
+      send(ws, { type: 'audio.done' })                           // 洞未补齐 → flushDone 直接返回
+      send(ws, { type: 'voice.state', state: 'idle', origin: 'model' })  // 终态在洞上到达
+      // 迟到帧在 reorderWaitMs(300ms) 之内补齐。
+      setTimeout(() => audioDelta(ws, 1, 'seq1'), 120)
+    }
+  })
+  const events = []; const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url,
+    // 兜底设成 60s：若它才是收口机制，本用例会在 waitFor 超时处变红，
+    // 而不是靠「跑得快」蒙混过关。
+    turnIdleBackstopMs: 60_000,
+    log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  const turn = transport.openTurn({
+    requestId: 'r7', sessionId: 's7', deviceId: 'd7', generation: 1, responseId: 'r7:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+
+  // 尾帧顺序正确：补洞帧先出，终态在最后，且全程只有一个终态。
+  assert.deepEqual(events.map(e => e.type), [
+    'agent.audio.delta', 'agent.audio.delta', 'agent.audio.delta', 'agent.audio.done',
+  ])
+  assert.deepEqual(events.filter(e => e.type === 'agent.audio.delta').map(e => e.sequence), [0, 1, 2])
+  assert.equal(events.filter(e => e.type === 'agent.audio.done').length, 1, '唯一终态')
+  assert.equal(events.at(-1).final_sequence, 2, '终态覆盖迟到补齐的尾帧')
+  // 终态被闩住而不是被丢弃。
+  assert.ok(logs.some(l => l.evt === 'upstream_turn_terminal_latched' && l.reason === 'voice_state_idle'))
+  assert.ok(logs.some(l => l.evt === 'upstream_turn_terminal_latch_consumed'))
+  assert.ok(!logs.some(l => l.evt === 'upstream_voice_state_idle_ignored'), '终态不得被忽略')
+  // 收口来自终态，不是兜底。
+  assert.ok(logs.some(l => l.evt === 'upstream_turn_terminal' && l.reason === 'voice_state_idle'))
+  assert.ok(!logs.some(l => l.evt === 'upstream_turn_idle_backstop'), '正常路径不得触发兜底')
+  turn.close()
+})
+
+test('ESS-969 B1 · 闩住的终态被新段落作废：迟到的 idle 不得把多段回合截短', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') {
+      send(ws, { type: 'voice.ready' })
+      send(ws, { type: 'voice.state', state: 'listening', origin: 'model' })
+    }
+    if (message.type === 'audio.commit') {
+      send(ws, { type: 'response.started', responseId: 'up-1', origin: 'model' })
+      audioDelta(ws, 0, 'seg1-a')
+      audioDelta(ws, 2, 'seg1-c')                                // 洞：seq1
+      send(ws, { type: 'audio.done' })
+      send(ws, { type: 'voice.state', state: 'idle', origin: 'model' })  // 被闩住
+      setTimeout(() => {
+        // 上游又开了一段——闩住的终态必须作废，回合继续。
+        send(ws, { type: 'response.started', responseId: 'up-2', origin: 'model' })
+        audioDelta(ws, 1, 'seg1-b')                              // 同时补齐第一段的洞
+        audioDelta(ws, 3, 'seg2')
+        send(ws, { type: 'audio.done' })
+        setTimeout(() => send(ws, { type: 'voice.state', state: 'idle', origin: 'model' }), 200)
+      }, 120)
+    }
+  })
+  const events = []; const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, turnIdleBackstopMs: 60_000, log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  const turn = transport.openTurn({
+    requestId: 'r8', sessionId: 's8', deviceId: 'd8', generation: 1, responseId: 'r8:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  assert.equal(events.filter(e => e.type === 'agent.audio.done').length, 1, '唯一终态')
+  assert.equal(events.at(-1).final_sequence, 3, '第二段的帧不得被闩住的旧终态截掉')
+  assert.deepEqual(events.filter(e => e.type === 'agent.audio.delta').map(e => e.sequence), [0, 1, 2, 3])
+  assert.ok(logs.some(l => l.evt === 'upstream_turn_terminal_latch_invalidated'))
+  assert.ok(!logs.some(l => l.evt === 'upstream_turn_idle_backstop'))
+  turn.close()
+})
+
 test('ESS-969 · 兜底窗口（待标定）在上游宣告 voice.state 却始终不 idle 时收口', async () => {
   const url = await upstream((ws, message) => {
     if (message.type === 'connect') {
