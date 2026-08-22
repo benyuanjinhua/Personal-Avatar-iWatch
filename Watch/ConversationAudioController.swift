@@ -318,7 +318,14 @@ final class ConversationAudioController {
         try session.setActive(true, options: [])
     }
 
+    /// ESS-1028：算法收归 `MonotonicDuration`。此处曾写成
+    /// `Int(now &- start) / 1_000_000`（先转后除），在 arm64_32 真机上
+    /// 纳秒差超过 `Int32.max`（2.147 秒）即 SIGTRAP——而第 234 行
+    /// `heldMs` 量的是整场会话时长，必然越界。
     private static func elapsedMs(since start: DispatchTime) -> Int {
-        Int(DispatchTime.now().uptimeNanoseconds &- start.uptimeNanoseconds) / 1_000_000
+        MonotonicDuration.elapsedMsClamped(
+            fromUptimeNanos: start.uptimeNanoseconds,
+            toUptimeNanos: DispatchTime.now().uptimeNanoseconds
+        )
     }
 }
