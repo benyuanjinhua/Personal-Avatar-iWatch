@@ -206,9 +206,20 @@ final class VoiceTurnJournal: ObservableObject {
             turns[index].result = priorResult
             turns[index].firstResultAt = priorFirstResultAt
             turns[index].errorCode = priorErrorCode
+            // ESS-1044：转移被拒不代表「这一轮没失败」——会话层仍须收口，
+            // 否则 turnPhase 卡在 thinking 直到 45s 硬超时。
+            if envelope.state == .failed {
+                onTerminalFailure?(envelope.requestId, envelope.errorCode, false)
+            }
             return false
         }
         save()
+        if envelope.state == .failed {
+            // `index` 在 append 之后可能已失效（onStateApplied 是同步回调，
+            // 订阅方有可能反过来动 turns），按 requestId 重查。
+            let lockedCode = turns.first { $0.requestId == envelope.requestId }?.errorCode
+            onTerminalFailure?(envelope.requestId, lockedCode ?? envelope.errorCode, true)
+        }
         // 纯文本降级（ESS-48）：结果没有配套语音（speech_sha256 为空），不会有
         // transferFile / attachSpeech 后续，在这里按 request_id 通知展示全文。
         if envelope.state == .completed, let result = envelope.result, result.speechSha256 == nil {
@@ -243,6 +254,21 @@ final class VoiceTurnJournal: ObservableObject {
     /// onChange——结果/失败到达时 App 可能熄屏或视图未挂载，只有事件层触发
     /// 才能保证「熄屏状态下结果到达能靠触觉感知」。
     var onStateApplied: ((String, VoiceTurnState) -> Void)?
+
+    /// ESS-1044：**终态失败信号**，与 `onStateApplied(.failed)` 的区别只有一条——
+    /// 本回调**不看状态机是否接受**。回合已是终态时 `apply` 返回 false、
+    /// `onStateApplied` 不触发，但「这一轮失败了」对会话层仍是必须收口的事实：
+    /// 真机 2026-08-22 14:00:04 `relay_terminal_failure_projected applied=false`
+    /// 之后 SessionController 卡在 thinking，一路挂到 45s 硬超时才被捞回。
+    ///
+    /// 幂等由订阅方负责——同一 request_id 的失败可能同时经 iPhone 回执
+    /// （`WatchVoiceTransport`）与 Bridge WSS（`WatchSettingsStore`）各来一次，
+    /// 第二次必然 `applied=false`。
+    /// - Parameters:
+    ///   - requestId: 失败回合。
+    ///   - errorCode: 稳定短码（可能为空）。
+    ///   - applied: 状态机是否真的接受了这次 `.failed` 转移。
+    var onTerminalFailure: ((_ requestId: String, _ errorCode: String?, _ applied: Bool) -> Void)?
 
     /// completed 且结果载荷已挂上后的回调（ESS-55 通知链路）。重复/乱序的
     /// completed 信封被状态机拒绝时不会触发（幂等第一层；通知记账是第二层）。

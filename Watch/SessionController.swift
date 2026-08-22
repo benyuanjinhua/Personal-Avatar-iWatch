@@ -674,6 +674,47 @@ final class SessionController: ObservableObject {
         startNextTurn(reason: success ? "answer_finished" : "answer_failed:\(reason)")
     }
 
+    /// ESS-1044：本轮在服务端**判了终态失败**（relay `phase=failed` /
+    /// Bridge `state=failed`）。thinking → P6 失败态，**不等 45s 硬超时**。
+    ///
+    /// 为什么单开一条边而不是复用 `markChannelFailed`：通道没坏——坏的是
+    /// 这一轮的执行（真机证据 `failure_stage=execution`「助手这边还没准备好」）。
+    /// `markChannelFailed` 会 `onTeardownChannel?()` 把整条链拆掉并补一次
+    /// `.failure` 触觉；这里两者都不做，与既有的 `session_thinking_hard_timeout`
+    /// 收口路径完全同构（`enterFailed` → P6 → 15s 无操作自动挂断），
+    /// 只是把 45s 的干等提前到失败到达的那一刻。触觉由 ESS-180 的
+    /// `AvatarErrorPresenter` 一次性兑现，本控制器不叠加第二下。
+    ///
+    /// 三重闸门，缺一不可：
+    /// - `isInSession`：PTT 模式的失败与会话无关，直接丢；
+    /// - `activeTurnRequestId` 归属：陈旧回合的迟到失败不许杀掉当前会话；
+    /// - `turnPhase == .thinking`：只有「在等回答」才有卡死可言。已 speaking
+    ///   （答案在放）或已收口（P6/已回聆听）时收到的重复失败一律丢弃留证——
+    ///   同一次失败会经 iPhone 回执与 Bridge WSS 各来一次，本闸门即幂等所在。
+    func markTurnFailed(requestId: String, errorCode: String? = nil, reason: String = "relay_failed") {
+        guard isInSession else { return }
+        guard let active = activeTurnRequestId, active == requestId else {
+            WatchLog.info(
+                "session", "session_stale_turn_event", requestId: requestId,
+                detail: "event=turn_failed active_request_id=\(activeTurnRequestId ?? "nil") turn_index=\(turnIndex)"
+            )
+            return
+        }
+        guard turnPhase == .thinking else {
+            WatchLog.info(
+                "session", "session_turn_event_dropped", requestId: requestId,
+                detail: "event=turn_failed state=\(state.logName) phase=\(turnPhase.logName) reason=phase_not_thinking turn_index=\(turnIndex)"
+            )
+            return
+        }
+        WatchLog.error(
+            "session", "session_turn_failed", requestId: requestId,
+            detail: "turn_index=\(turnIndex) reason=\(reason)",
+            code: errorCode ?? "ERR_SESSION_TURN_FAILED"
+        )
+        enterFailed(reason: Self.turnFailureCopy, retryable: true)
+    }
+
     /// 本轮**零提交**收场（说得太短 / 收尾抛错）。没有 thinking 可进，
     /// 直接重开采集；但 Watch 无 AEC，错误提示音正在外放时立刻开麦会被
     /// 自己的声音再次触发 VAD，因此退避一小段再开。
@@ -1046,6 +1087,11 @@ final class SessionController: ObservableObject {
 
     /// 文案纪律（PRD 异常链 A/B）：说清「怎么办」，不出现错误码。
     /// 建立中失败 → 引导用户检查 iPhone；会话中断开 → 告知本轮已结束。
+    /// ESS-1044：本轮执行失败（通道还在）的 P6 文案。与「连接断了」区分开——
+    /// 链路没断，是这一轮没答上来，可重试是有意义的（PRD 异常链口径：
+    /// 说清「怎么办」而非「什么错了」）。
+    static let turnFailureCopy = "这轮没答上来，要再试一次吗？"
+
     static func failureCopy(forState state: State) -> String {
         switch state {
         case .connecting:
@@ -1204,6 +1250,10 @@ enum SessionTurnWiring {
         }
         pushToTalk.onSessionTurnAborted = { [weak session] requestId, reason in
             session?.markTurnAborted(requestId: requestId, reason: reason)
+        }
+        // ESS-1044：服务端判本轮终态失败 → 立刻收口，不等 45s 硬超时。
+        pushToTalk.onSessionTurnFailed = { [weak session] requestId, errorCode in
+            session?.markTurnFailed(requestId: requestId, errorCode: errorCode)
         }
         pushToTalk.onLocalCaptureChanged = { [weak session] active in
             session?.markLocalCapture(active: active)

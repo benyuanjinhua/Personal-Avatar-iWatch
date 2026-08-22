@@ -769,6 +769,100 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertEqual(controller.lastExitReasonCode, .userExit)
     }
 
+    // MARK: - ESS-1044 relay 终态失败收口
+
+    /// 本单核心：relay 判本轮失败后，会话必须**立刻**转出 thinking 进 P6，
+    /// 而不是干等 45s 硬超时（真机 14:00:04 失败 → 14:00:45 才被捞回）。
+    func testRelayFailureLeavesThinkingImmediately() {
+        controller.enterSession()
+        controller.markChannelReady()
+        let requestId = controller.activeTurnRequestId!
+        var startTurnCount = 0
+        controller.onStartTurn = { startTurnCount += 1; return "req-next" }
+        controller.markTurnCommitted(requestId: requestId)
+        XCTAssertEqual(controller.turnPhase, .thinking)
+
+        controller.markTurnFailed(requestId: requestId, errorCode: "ERR_VOICE_BUSY")
+
+        XCTAssertEqual(controller.state, .failed, "必须进 P6，不再卡在 thinking")
+        XCTAssertEqual(controller.turnPhase, .idle)
+        XCTAssertEqual(controller.failedReason, SessionController.turnFailureCopy)
+        XCTAssertTrue(controller.failedRetryable, "执行失败可重试")
+        XCTAssertEqual(startTurnCount, 0, "失败不自动开下一轮")
+    }
+
+    /// 收口后 45s 硬超时不得再触发——计时器必须被 enterFailed 取消掉，
+    /// 否则用户在 P6 上停留时会被第二次「回答超时」文案盖掉。
+    func testRelayFailureCancelsThinkingHardTimeout() {
+        controller.enterSession()
+        controller.markChannelReady()
+        let requestId = controller.activeTurnRequestId!
+        controller.onStartTurn = { "req-next" }
+        controller.markTurnCommitted(requestId: requestId)
+
+        controller.markTurnFailed(requestId: requestId)
+        XCTAssertEqual(controller.failedReason, SessionController.turnFailureCopy)
+
+        // 计时器已取消；即便调度器把闭包漏出来触发，也不该改写 P6 文案。
+        fireDelay(SessionController.thinkingHardTimeoutSeconds)
+        XCTAssertEqual(controller.failedReason, SessionController.turnFailureCopy,
+                       "硬超时不得二次覆盖失败文案")
+    }
+
+    /// 幂等：同一次失败经 iPhone 回执与 Bridge WSS 各来一次，第二次必须被丢弃，
+    /// 不得把 P6 的 15s 自动挂断计时器重新武装（等于永远挂不断）。
+    func testRepeatedRelayFailureIsIdempotent() {
+        controller.enterSession()
+        controller.markChannelReady()
+        let requestId = controller.activeTurnRequestId!
+        controller.onStartTurn = { "req-next" }
+        controller.markTurnCommitted(requestId: requestId)
+
+        controller.markTurnFailed(requestId: requestId)
+        let scheduledAfterFirst = scheduled.count
+        controller.markTurnFailed(requestId: requestId)
+
+        XCTAssertEqual(controller.state, .failed)
+        XCTAssertEqual(scheduled.count, scheduledAfterFirst, "第二次失败不得再排任何计时器")
+    }
+
+    /// 陈旧回合的迟到失败不许杀掉当前会话（ESS-642 事故面）。
+    func testStaleRequestFailureIsIgnored() {
+        controller.enterSession()
+        controller.markChannelReady()
+        let requestId = controller.activeTurnRequestId!
+        controller.onStartTurn = { "req-next" }
+        controller.markTurnCommitted(requestId: requestId)
+
+        controller.markTurnFailed(requestId: "req-from-a-previous-call")
+
+        XCTAssertEqual(controller.state, .listening)
+        XCTAssertEqual(controller.turnPhase, .thinking, "别人的失败不动本轮")
+    }
+
+    /// 回答已经在放了才收到失败（乱序 / 重复投递）：答案是真实的，
+    /// 不得把正在出声的这一轮打进 P6。
+    func testFailureDuringSpeakingIsDropped() {
+        controller.enterSession()
+        controller.markChannelReady()
+        let requestId = controller.activeTurnRequestId!
+        controller.onStartTurn = { "req-next" }
+        controller.markTurnCommitted(requestId: requestId)
+        controller.markAnswerStarted(requestId: requestId)
+
+        controller.markTurnFailed(requestId: requestId)
+
+        XCTAssertEqual(controller.state, .listening)
+        XCTAssertEqual(controller.turnPhase, .speaking)
+    }
+
+    /// 不在会话里（PTT 模式）的失败与本控制器无关，不得凭空造出一个 P6。
+    func testFailureOutsideSessionIsIgnored() {
+        controller.markTurnFailed(requestId: "req-1")
+        XCTAssertEqual(controller.state, .idle)
+        XCTAssertNil(controller.failedReason)
+    }
+
     // MARK: - helpers
 
     /// 静默治理是嵌套调度，两级的相对延迟都是 45s。`fireDelay` 取的是**最早**
