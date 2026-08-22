@@ -1225,6 +1225,18 @@ final class PushToTalkController: ObservableObject {
         adapter.onAnswerPlaybackStarted = { [weak self] handle in
             self?.onSessionAnswerStarted?(handle.requestId)
         }
+        // ESS-1023 整改（毕玄复审阻断）：AEC 可用性必须读**当前会话已经配置成
+        // 什么 mode**，不能读「用户期望的开关」。
+        //
+        // `ConversationAudioController:283-285` 明写 mode 只在**下一次**
+        // `beginConversation` 生效、通话中不重配。若接实时开关，则：
+        // 会话以 OFF 启动（实际 `.spokenAudio`、无 AEC）→ 播放中用户翻到 ON
+        // → 抑制立刻停止 → **而会话仍然没有 AEC** → 自激当场复发。
+        //
+        // `.default` 回落档（`:316`）同样没有 AEC，因此判据只认 `.voiceChat`。
+        adapter.aecAvailable = { [weak self] in
+            self?.conversationAudioController?.lastConfiguredMode == .voiceChat
+        }
         // ESS-971：段落播完 → interim（回合保持打开，等下一段）。
         adapter.onAnswerPlaybackSegmentFinished = { [weak self] handle, bytes in
             WatchLog.info(
