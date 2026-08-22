@@ -42,6 +42,13 @@ const TASK_NON_LIFECYCLE_EVENTS = new Set([
 ])
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/
 
+// ESS-849: cap on the per-turn responseId → announcement book-keeping. A turn
+// lives seconds and the biggest real capture held 2 announcements, so this is a
+// memory backstop against a misbehaving upstream, not a functional limit —
+// trimming the OLDEST entry is safe because a long-finished announcement can no
+// longer produce frames, while a live one is always among the newest.
+const MAX_ANNOUNCEMENT_RESPONSES = 64
+
 // ESS-773: replay identity for an upstream audio frame. Composite on purpose —
 // the upstream sequence AND the payload, never the payload alone, since a later
 // frame with identical bytes (silence is the common case) is legitimate audio.
@@ -289,6 +296,11 @@ export class QwenAgentTransport {
       // own (see `noteTurnBusy`), they only widen the window.
       outstandingTasks: new Set(), announcementResponseIds: new Set(),
       turnBusy: false,
+      // ESS-849 announcement isolation book-keeping. `announcementDropped`
+      // counts what the voice channel threw away per announcement response;
+      // `forwardedResponseIds` is what makes a 「先 delta 后 started」 leak
+      // visible instead of silent (see `announcementResponseIdOf`).
+      announcementDropped: new Map(), forwardedResponseIds: new Set(),
     }
     const scopeLog = { request_id: requestId, session_id: sessionId, device_id: deviceId, generation }
     turn.supersede = nextRequestId => {
@@ -520,6 +532,50 @@ export class QwenAgentTransport {
       turn.turnBusy = true
       this.log('upstream_turn_busy', { ...scopeLog, cause })
       armSegmentGap(cause)
+    }
+
+    // ESS-849 announcement isolation. 上游把「后台任务播报」和「本回合的回答」
+    // 混在同一条 WSS 上，而**只有 `response.started` 带 `origin`**——实测
+    // `audio.delta` / `audio.done` 94/94 条 `origin=null`
+    // （2026-08-22 `smoke/upstream-turn-capture.mjs` 对真实上游取证）。
+    // 所以归属只能靠 responseId → origin 映射，这张表只存在于本层：客户端
+    // 拿不到 origin，过滤也就只能在这里做。
+    //
+    // 不过滤的后果已在真机实测（2026-08-22 13:59–14:00）：播报的 `audio.done`
+    // 把本回合的下行闩死（`downlink_audio_done_accepted final_seq=51 gen=1`），
+    // 随后真正的答案 4 帧被整段丢弃（`downlink_segment_dropped reason=post_done`），
+    // 界面停在「思考中」直到 15 s 预算耗尽；播报内容还会串台（深圳那一轮
+    // 播出「刚才查询的是杭州今天的天气情况」）。
+    //
+    // **映射缺失默认放行**（毕玄-cx 2026-08-22 拍板，正本见 ESS-849）：只有
+    // responseId 明确登记在册才拦。上游若出现「先 delta 后 started」的乱序，
+    // 那几帧会漏进本回合——宁可多播一段无关的，也不可吞掉用户的回答。
+    // 漏网时 `upstream_announcement_started_late` 会留证；改这条口径前先看它。
+    const announcementResponseIdOf = event => {
+      if (event.responseId == null) return null
+      const id = String(event.responseId)
+      return turn.announcementResponseIds.has(id) ? id : null
+    }
+
+    // 播报音频不进入本回合的下行。语音通道按「只在当轮说、过期不补」允许丢弃
+    // （白梦林定案），但丢弃必须留证——哪个 responseId、丢了多少帧/字节。
+    // 非语音兜底（手表通知列表 / iPhone 侧）不在本单范围，另单跟进。
+    const dropAnnouncementAudio = (id, event) => {
+      let stat = turn.announcementDropped.get(id)
+      if (!stat) {
+        stat = { frames: 0, bytes: 0 }
+        turn.announcementDropped.set(id, stat)
+        // 逐帧记会把本回合真正的下行淹掉（一次播报实测 26 帧），所以只在第一
+        // 帧留行级日志，总量交给 `audio.done` 的汇总。
+        this.log('upstream_announcement_audio_dropped', {
+          ...scopeLog, upstream_response_id: id,
+        })
+        while (turn.announcementDropped.size > MAX_ANNOUNCEMENT_RESPONSES) {
+          turn.announcementDropped.delete(turn.announcementDropped.keys().next().value)
+        }
+      }
+      stat.frames += 1
+      stat.bytes += typeof event.audio === 'string' ? event.audio.length : 0
     }
 
     const scheduleDone = () => {
@@ -815,11 +871,25 @@ export class QwenAgentTransport {
         // evidence that the turn is not over without ever becoming a segment.
         if (event.type === 'response.started') {
           if (event.origin === 'announcement') {
-            if (event.responseId) turn.announcementResponseIds.add(String(event.responseId))
+            const id = event.responseId == null ? null : String(event.responseId)
+            if (id !== null) {
+              turn.announcementResponseIds.add(id)
+              while (turn.announcementResponseIds.size > MAX_ANNOUNCEMENT_RESPONSES) {
+                turn.announcementResponseIds.delete(turn.announcementResponseIds.values().next().value)
+              }
+            }
             this.log('upstream_announcement_response_started', {
               ...scopeLog, upstream_response_id: event.responseId ?? null,
               upstream_task_id: event.taskId ?? event.task?.id ?? null,
             })
+            // ESS-849 兜底口径的留证点：这条 `response.started` 来晚了，它的音频
+            // 已经按「映射缺失默认放行」进了本回合。目前没有实测到这种乱序，
+            // 若它真的发生，这条日志（而不是猜测）才是改口径的依据。
+            if (id !== null && turn.forwardedResponseIds.has(id)) {
+              this.log('upstream_announcement_started_late', {
+                ...scopeLog, upstream_response_id: id,
+              })
+            }
             noteTurnBusy('announcement_response')
             return
           }
@@ -860,6 +930,24 @@ export class QwenAgentTransport {
           return
         }
         if (event.type === 'audio.delta' && event.audio) {
+          // ESS-849: 播报音频在触碰本回合任何状态之前就被拦下。位置很重要——
+          // 它必须早于 `noteResponseProgress()`：播报不证明本回合有回答，让它
+          // 解除 commit 后的应答死线，客户端就再也拿不到可判定的
+          // ERR_UPSTREAM_NO_RESPONSE（本单用例实测：修复前只有播报的那一轮，
+          // 10 s 内一条 `agent.error` 都没有）。也必须早于下行预算计数，和
+          // `enqueueOrdered`——播报有自己的 sequence 轴，混进本回合的序号轴
+          // 只会被当成空洞或重放（未实测到具体失败形态，但它本就不该进来）。
+          const announcementId = announcementResponseIdOf(event)
+          if (announcementId !== null) {
+            dropAnnouncementAudio(announcementId, event)
+            return
+          }
+          if (event.responseId != null) {
+            turn.forwardedResponseIds.add(String(event.responseId))
+            while (turn.forwardedResponseIds.size > MAX_ANNOUNCEMENT_RESPONSES) {
+              turn.forwardedResponseIds.delete(turn.forwardedResponseIds.values().next().value)
+            }
+          }
           noteResponseProgress()
           const audio = event.audio
           if (typeof audio !== 'string' || audio.length % 4 !== 0 || !BASE64.test(audio)) {
@@ -927,6 +1015,20 @@ export class QwenAgentTransport {
           return
         }
         if (event.type === 'audio.done') {
+          // ESS-849 的核心一条：播报的 `audio.done` 不是本回合的段落收口。
+          // 真机 14:00 那次「界面停在思考中」就是它闩死了下行，答案随后到达
+          // 却被客户端按 `post_done` 整段丢弃。不带 responseId 的 done 同样按
+          // 「映射缺失默认放行」处理——它落到下面的正常收口路径。
+          const doneAnnouncementId = announcementResponseIdOf(event)
+          if (doneAnnouncementId !== null) {
+            const stat = turn.announcementDropped.get(doneAnnouncementId) ?? { frames: 0, bytes: 0 }
+            turn.announcementDropped.delete(doneAnnouncementId)
+            this.log('upstream_announcement_audio_done_dropped', {
+              ...scopeLog, upstream_response_id: doneAnnouncementId,
+              dropped_frames: stat.frames, dropped_bytes: stat.bytes,
+            })
+            return
+          }
           noteResponseProgress()
           this.log('upstream_event_received', {
             ...scopeLog, upstream_event_type: 'audio.done',
@@ -940,6 +1042,16 @@ export class QwenAgentTransport {
         // ignores unknown agent events) but required by the full-file job
         // executor so Bridge can preserve text and background task semantics.
         if (event.type === 'transcript.final') {
+          // 同一张表也管文本：播报的 transcript 走这条路会串台——实测深圳那一轮
+          // 下行里出现「刚才查询的是杭州今天的天气情况，不是深圳的」。
+          const transcriptAnnouncementId = announcementResponseIdOf(event)
+          if (transcriptAnnouncementId !== null) {
+            this.log('upstream_announcement_transcript_dropped', {
+              ...scopeLog, upstream_response_id: transcriptAnnouncementId,
+              content_length: typeof event.content === 'string' ? event.content.length : 0,
+            })
+            return
+          }
           noteResponseProgress()
           onEvent({ type: 'agent.transcript.final', response_id: responseId,
             role: event.role, content: typeof event.content === 'string' ? event.content : '' })
