@@ -53,6 +53,10 @@ final class WatchRealtimeMediaAdapter {
         /// ESS-650（F2-3）：播放器此刻是否还在出声。`stop_ms` 若只量到同步
         /// 函数返回，量的是调用开销而不是停播延迟（ESS-667 复审阻断 4）。
         var isRenderingDownlink: Bool { get }
+        /// ESS-1023：渲染链路里还有没有音频（已排队、完成回调未回来）。
+        /// 这是「此刻会不会有声音从扬声器出来」的唯一诚实读点，见
+        /// `RealtimePlaybackEngine.hasAudioInRenderPipeline` 的注释。
+        var hasAudioInRenderPipeline: Bool { get }
         func prepare(for turn: RealtimeMediaSession.TurnHandle) throws
         /// ESS-330 v3: each playable carries its own response_id so per-response
         /// bookkeeping stays intact across out-of-order releases.
@@ -148,16 +152,21 @@ final class WatchRealtimeMediaAdapter {
     private let barrierTimer: BarrierTimer
     private let transportFailureDrainTimer: BarrierTimer
     private var vadEndpointer: LocalVADEndpointer?
-    /// ESS-1023：下行**此刻是否在出声**。只由播放器回执驱动：`.started` 是
-    /// 首个 buffer 真的渲染，`.ended` 是最后一个排队 buffer 渲染完毕。
+    /// ESS-1023：下行**此刻是否可能有声音出来**。判据是播放器的渲染链路里
+    /// 还有没有音频，不是任何一种回执或节点状态：
     ///
-    /// **不能**用 `player.isRenderingDownlink`：它读的是
-    /// `AVAudioPlayerNode.isPlaying`（`RealtimePlaybackEngine.swift:128`），
-    /// 而 `prepare(for:)` 末尾就 `playerNode.play()` 了，适配器又在
-    /// `beginTurn` 里调 `prepare`——于是它整轮恒为 true（运行时取证见
-    /// `testRealPlayerReportsRenderingRightAfterPrepareWithNothingEnqueued`）。
-    /// 拿它当门，无 AEC 时整轮麦克风全被静音，用户永远说不了话。
-    private(set) var isDownlinkAudible = false
+    /// * `player.isRenderingDownlink` 读 `AVAudioPlayerNode.isPlaying`，
+    ///   `prepare(for:)` 里就 `play()` 了、而适配器在 `beginTurn` 调 `prepare`
+    ///   ——整轮恒真，拿它当门等于整轮静音麦克风（运行时取证见
+    ///   `testRealPlayerReportsRenderingRightAfterPrepareWithNothingEnqueued`）；
+    /// * `.started` 回执挂在 `.dataPlayedBack` 上，是**首个 buffer 播完之后**
+    ///   才到的，拿它当门会漏掉首个 buffer 出声的那一整段（复审阻断）；
+    /// * 单个 Bool 也表达不了「一个回合多个 response 并存」——旧 response 的
+    ///   `.ended` 会在新 response 还在播时把门打开（复审阻断）。
+    ///
+    /// 渲染链路计数天然满足这三条：排队前置位、排空即解除、跨 response 累计，
+    /// 并且由播放器自己记账——它不会对自己的队列撒谎。
+    var isDownlinkAudible: Bool { player.hasAudioInRenderPipeline }
     /// 本段压制已丢弃的帧数与时长（`0` 表示当前没有在压制）。
     private var suppressedVADFrames = 0
     private var suppressedVADMs: Int64 = 0
@@ -253,10 +262,6 @@ final class WatchRealtimeMediaAdapter {
             guard let self else { return }
             switch event {
             case .started(let requestId, let sessionId, let responseId):
-                // ESS-1023：出声了就是出声了，与这段音频属于哪一轮无关——
-                // 扬声器不认 requestId，所以这一行必须在下面的 stale 守卫
-                // **之前**（`.ended` 里的 `playbackEndedForVADGuard()` 同理）。
-                self.isDownlinkAudible = true
                 // ESS-532: first frame rendered — playback is live now, the
                 // ExtendedRuntimeSession can be released.
                 self.onRealtimePlaybackStarted?()
@@ -280,7 +285,6 @@ final class WatchRealtimeMediaAdapter {
                 guard let responseId else { break }
                 self.transport.sendPlaybackStarted(handle: handle, responseId: responseId)
             case .ended(let requestId, let sessionId, let responseId, let bytesPlayed):
-                self.isDownlinkAudible = false
                 self.playbackEndedForVADGuard()
                 guard let handle = self.currentTurn,
                       handle.requestId == requestId, handle.sessionId == sessionId else {
@@ -346,10 +350,8 @@ final class WatchRealtimeMediaAdapter {
                 // as `.sessionEnded`. Explicit cancel, interruption, or the
                 // next turn remains responsible for closing/replacing it.
             case .bargedIn:
-                // ESS-1023：打断即静音，压制随之解除。
-                self.isDownlinkAudible = false
+                break
             case .failed(let requestId, let sessionId, _, let code):
-                self.isDownlinkAudible = false
                 WatchLog.error(
                     "realtime", "playback_engine_failed",
                     requestId: requestId,
@@ -381,10 +383,9 @@ final class WatchRealtimeMediaAdapter {
         currentResponseId = nil
         vadFrameStartedAtMs = Self.uptimeMs()
         vadLastLevelLogAtMs = nil
-        // ESS-1023：`player.prepare(for:)`（下面）会 `stop(barge:)` 掉上一轮
-        // 还在渲染的音频，所以新回合起点上「下行在出声」必然为假。上一轮的
-        // `.ended` 若因为被 stop 掉而永远不来，压制也不会挂在这里。
-        isDownlinkAudible = false
+        // ESS-1023：抑制状态归零。真正的「渲染链路清空」由下面的
+        // `player.prepare(for:)`（内部 `stop(barge:)` → 丢弃排队 buffer →
+        // 计数清零）兑现——适配器这边只清自己的取证账。
         resetVADSuppressionAccounting()
         // ESS-600：守卫带过回合边界（见 `vadGuardUntilMs`）。
         vadEndpointer?.reset(atMs: max(vadFrameStartedAtMs, vadGuardUntilMs))
@@ -572,7 +573,7 @@ final class WatchRealtimeMediaAdapter {
         //
         // 时间戳照常推进：丢的是**判定**，不是时间轴——否则播放结束后
         // VAD 的窗口会与录音实际时刻错位。
-        if isDownlinkAudible, !aecAvailable() {
+        if player.hasAudioInRenderPipeline, !aecAvailable() {
             suppressVADFrame(frame)
             return
         }
@@ -601,14 +602,6 @@ final class WatchRealtimeMediaAdapter {
             }
             onVADEvent?(event)
         }
-    }
-
-    /// ESS-1023：主动让播放器闭嘴的唯一入口。停播路径**不保证**还会有
-    /// `.ended` 回执（`stop`/`bargeIn` 把排队 buffer 直接丢掉），所以压制
-    /// 状态必须在这里同步解除——漏一处，用户就永远说不了话，比自激更坏。
-    private func silenceDownlink(barge: Bool) {
-        isDownlinkAudible = false
-        player.stop(barge: barge)
     }
 
     /// ESS-1023：丢弃一帧播放期的麦克风输入。只推进时间轴，不进 VAD、
@@ -711,7 +704,7 @@ final class WatchRealtimeMediaAdapter {
         recorder.stop()
         session.cancelUplink()
         session.finishTurn(reason: reason)
-        silenceDownlink(barge: reason == .interrupted)
+        player.stop(barge: reason == .interrupted)
     }
 
     /// Feed a downlink chunk received from the iPhone. Called by
@@ -910,7 +903,7 @@ final class WatchRealtimeMediaAdapter {
             )
         case .uplinkFallback(let reason, let handle):
             recorder.stop()
-            silenceDownlink(barge: false)
+            player.stop(barge: false)
             // ESS-573: 快速上行已死——无论完整文件回退是否执行，都向
             // 会话层如实上报（PTT 层忽略此回调，行为不变）。
             onUplinkFallback?(handle.requestId)
@@ -933,7 +926,6 @@ final class WatchRealtimeMediaAdapter {
         case .playbackReady(let playables):
             player.enqueue(playables: playables)
         case .playbackCleared(let bytesDropped):
-            isDownlinkAudible = false
             player.bargeIn(clearedBytes: bytesDropped)
             WatchLog.info(
                 "realtime", "bargein_playback_stopped",
@@ -946,7 +938,7 @@ final class WatchRealtimeMediaAdapter {
             // fallback on top (the buffer would absorb it, but the log noise
             // is R-02 evidence pollution).
             barrierTimer.cancel()
-            silenceDownlink(barge: false)
+            player.stop(barge: false)
             logger("downlink_fallback reason=\(reason)")
             // ESS-532: downlink fallback resolves pending so the keeper releases.
             onRealtimePendingResolved?()

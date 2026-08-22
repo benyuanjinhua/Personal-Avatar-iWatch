@@ -31,13 +31,25 @@ final class VoiceBargeInWiringTests: XCTestCase {
         var onPlaybackEvent: ((RealtimePlaybackEngine.PlaybackEvent) -> Void)?
         /// ESS-650：与真实引擎同语义——入队即出声，`bargeIn`/`stop` 即静音。
         private(set) var isRenderingDownlink = false
+        /// ESS-1023：渲染链路计数。入队置位；`.ended`/`.failed`/`.bargedIn`
+        /// 回执与主动停播即排空（与真实引擎一致：那些回执正是最后一个
+        /// buffer 播完时才发出来的）。
+        private(set) var pendingRenderedBuffers = 0
+        var hasAudioInRenderPipeline: Bool { pendingRenderedBuffers > 0 }
         func prepare(for turn: RealtimeMediaSession.TurnHandle) throws {}
         func enqueue(playables: [RealtimeDownlinkPlayback.PlayableChunk]) {
             if !playables.isEmpty { isRenderingDownlink = true }
+            pendingRenderedBuffers += playables.count
         }
-        func bargeIn(clearedBytes: Int) { isRenderingDownlink = false }
+        func bargeIn(clearedBytes: Int) {
+            isRenderingDownlink = false
+            pendingRenderedBuffers = 0
+        }
         func finish(responseId: String?) {}
-        func stop(barge: Bool) { isRenderingDownlink = false }
+        func stop(barge: Bool) {
+            isRenderingDownlink = false
+            pendingRenderedBuffers = 0
+        }
     }
 
     private final class MockTransport: WatchRealtimeMediaAdapter.Transport {
