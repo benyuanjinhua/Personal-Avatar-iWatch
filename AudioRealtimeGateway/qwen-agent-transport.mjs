@@ -17,6 +17,12 @@ const scopeKey = ({ deviceId, sessionId, generation, requestId }) =>
 const conversationKey = ({ deviceId, sessionId }) =>
   JSON.stringify([deviceId ?? null, sessionId ?? null])
 
+// ESS-978: the client-label family every instance of this gateway presents on
+// the upstream. A production instance appends its pid (`watch-direct-gateway:
+// <pid>`), so two copies on one machine are distinguishable in ownership logs
+// and — crucially — never take the single voice slot from each other.
+const GATEWAY_LABEL = 'watch-direct-gateway'
+
 // Adapter from the secure northbound Gateway contract to the already deployed
 // qwen-audio-agent realtime WSS. The qwen service owns the provider credential;
 // this process only talks to its loopback endpoint, so provider secrets never
@@ -91,6 +97,10 @@ export class QwenAgentTransport {
     // n=9 is a thin sample (R-04.4), which is why this stays a config knob.
     responseTimeoutMs = 8_000,
     takeover = true,
+    // ESS-978: our own identity on the upstream. The label embeds the pid so
+    // two copies of this gateway on one machine are distinguishable, and the
+    // takeover guard treats "same label" as "same process, our own residual".
+    clientLabel = `watch-direct-gateway:${process.pid}`,
     log = () => {},
   } = {}) {
     this.gatewayUrl = gatewayUrl
@@ -106,6 +116,7 @@ export class QwenAgentTransport {
     this.maxReorderFrames = maxReorderFrames
     this.responseTimeoutMs = responseTimeoutMs
     this.takeover = takeover
+    this.clientLabel = clientLabel
     this.log = log
     this.turns = new Map()
   }
@@ -122,6 +133,21 @@ export class QwenAgentTransport {
   // registered instance for its scope key.
   #isCurrent(turn) {
     return !turn.terminal && this.turns.get(turn.key) === turn
+  }
+
+  // ESS-978: may this turn steal the single voice slot from `holder`?
+  // A second copy of this gateway on the same machine shares our label family
+  // but not our process, so a foreign `watch-direct-gateway:*` is never taken
+  // over — that is the exact shape of the 2026-08-22 02:19 incident. Our own
+  // prior connection (same client label → same process) is always reclaimable,
+  // and a frontend / bridge holder is taken over only when configured
+  // (`agent_takeover_voice`, the `takeover` constructor flag).
+  #takeoverEligible(holder) {
+    const label = holder?.label ?? ''
+    if (!label) return false
+    if (label === this.clientLabel) return true
+    if (label === GATEWAY_LABEL || label.startsWith(`${GATEWAY_LABEL}:`)) return false
+    return this.takeover === true
   }
 
   openTurn({ requestId, sessionId, deviceId = null, generation, responseId, onEvent }) {
@@ -161,6 +187,7 @@ export class QwenAgentTransport {
       doneTimer: null, pendingDone: false, recentUpstreamFrames: new Map(),
       expectedUpstream: 0, anchored: false, reorderBuffer: new Map(), gapTimer: null,
       clientInstanceId, ownershipState: null, ownershipHolderLabel: null,
+      ownershipHolderInstanceId: null, takeoverAttempted: false,
       responseTimer: null, responded: false, commitSentAt: null,
     }
     const scopeLog = { request_id: requestId, session_id: sessionId, device_id: deviceId, generation }
@@ -228,6 +255,7 @@ export class QwenAgentTransport {
           upstream_ready: turn.ready,
           ownership_state: turn.ownershipState,
           ownership_holder_label: turn.ownershipHolderLabel,
+          ownership_holder_instance_id: turn.ownershipHolderInstanceId,
         })
         fail('ERR_UPSTREAM_NO_RESPONSE',
           `upstream produced no response within ${this.responseTimeoutMs}ms of audio.commit`)
@@ -394,33 +422,54 @@ export class QwenAgentTransport {
       return false
     }
 
-    try {
-      const ws = new WebSocket(url)
+    // ESS-978: two-step upstream connect. The first attempt connects WITHOUT
+    // takeover so the upstream reports who currently holds the single voice
+    // slot; we only steal it when the holder is provably ours (our own prior
+    // connection, same process) or an allowed frontend. A foreign gateway
+    // instance — a second copy of this module on the same machine — is never
+    // stolen from, so a stray dev/test process cannot silently kill a live
+    // production turn (2026-08-22 02:19 incident).
+    const connect = takeover => {
+      if (turn.terminal) return
+      let ws
+      try {
+        ws = new WebSocket(url)
+      } catch (error) {
+        fail('ERR_UPSTREAM_UNAVAILABLE', error.message)
+        return
+      }
       turn.ws = ws
+      clearTimeout(turn.connectTimer)
       turn.connectTimer = setTimeout(() => {
         fail('ERR_UPSTREAM_TIMEOUT', `upstream connect exceeded ${this.connectTimeoutMs}ms`)
       }, this.connectTimeoutMs)
       turn.connectTimer.unref?.()
 
       ws.on('open', () => {
-        // The turn can be superseded/cancelled while the handshake is still in
-        // flight; do not announce a connection nobody owns any more.
+        // A stale socket — superseded/cancelled, or retired for a takeover
+        // retry — must not announce a connection nobody owns any more.
+        if (turn.ws !== ws) {
+          try { ws.close(1000, 'superseded') } catch { /* best effort */ }
+          return
+        }
         if (!this.#isCurrent(turn)) {
           try { ws.close(1000, 'superseded') } catch { /* best effort */ }
           return
         }
         ws.send(JSON.stringify({
-          type: 'connect', clientType: 'cli', clientLabel: 'watch-direct-gateway',
+          type: 'connect', clientType: 'cli', clientLabel: this.clientLabel,
           clientInstanceId: turn.clientInstanceId, voiceEnabled: true,
-          manualTurnDetection: true, takeover: this.takeover,
+          manualTurnDetection: true, takeover,
           timeZone: 'Asia/Shanghai', locale: 'zh-CN',
         }))
       })
       ws.on('message', raw => {
-        // Every frame is validated against THIS turn instance before it can
-        // touch downstream state: a superseded socket may still be draining
-        // the provider's prior response, and forwarding it would stamp those
-        // bytes with a scope that no longer owns the conversation (ESS-745).
+        // Every frame is validated against THIS turn instance — and against
+        // THIS socket — before it can touch downstream state: a superseded or
+        // retired socket may still be draining the provider's prior response,
+        // and forwarding it would stamp those bytes with a scope that no
+        // longer owns the conversation (ESS-745).
+        if (turn.ws !== ws) return
         if (!this.#isCurrent(turn)) return
         let event
         try { event = JSON.parse(raw.toString()) } catch { return }
@@ -444,17 +493,41 @@ export class QwenAgentTransport {
           turn.ownershipState = event.type === 'voice.deactivated'
             ? 'deactivated' : (event.state ?? null)
           turn.ownershipHolderLabel = holder?.label ?? null
+          turn.ownershipHolderInstanceId = holder?.instanceId ?? null
           // ESS-842 forensics: the single fact that decides whether a silent
           // upstream is "still thinking" or "discarding our audio" was never
-          // recorded. It is cheap, and the holder identity is a client label,
-          // not a credential.
+          // recorded. ESS-978 adds the holder's per-connection instance id —
+          // with every instance sharing the same client label, only the
+          // instance id distinguishes WHICH gateway copy stole the voice. The
+          // holder identity is a client label / instance id, not a credential.
           this.log('upstream_ownership', {
             ...scopeLog, event_type: event.type,
             state: turn.ownershipState, holder_label: turn.ownershipHolderLabel,
+            holder_instance_id: turn.ownershipHolderInstanceId,
             holder_is_self: holderIsSelf, upstream_ready: turn.ready,
           })
           if (!turn.ready) {
-            if (event.state === 'busy') fail('ERR_VOICE_BUSY', 'upstream voice ownership is busy')
+            if (event.state !== 'busy') return
+            // Connect-time busy: the single voice slot is held by somebody
+            // else. Only steal when the holder is provably ours or an allowed
+            // frontend — never a foreign gateway instance. The retry is
+            // attempted once, with takeover, on a fresh socket.
+            if (!turn.takeoverAttempted && this.#takeoverEligible(holder)) {
+              turn.takeoverAttempted = true
+              this.log('upstream_takeover_retry', {
+                ...scopeLog, holder_label: turn.ownershipHolderLabel,
+                holder_instance_id: turn.ownershipHolderInstanceId,
+              })
+              // Terminate rather than gracefully close: the retry reuses this
+              // turn's clientInstanceId, so two sockets must never coexist
+              // under the same identity (mirrors the Bridge supervisor).
+              try { ws.terminate() } catch { /* closing */ }
+              connect(true)
+              return
+            }
+            fail('ERR_VOICE_BUSY',
+              `upstream voice ownership held by ${turn.ownershipHolderLabel ?? 'unknown'}`
+              + (turn.ownershipHolderInstanceId ? ` (${turn.ownershipHolderInstanceId})` : ''))
             return
           }
           // Ownership lost mid-turn. The upstream drops a non-owner's
@@ -464,7 +537,8 @@ export class QwenAgentTransport {
           if (event.type === 'voice.deactivated'
             || (event.state === 'busy' && !holderIsSelf)) {
             fail('ERR_VOICE_OWNERSHIP_LOST',
-              `upstream voice ownership lost mid-turn (holder=${turn.ownershipHolderLabel ?? 'unknown'})`)
+              `upstream voice ownership lost mid-turn (holder=${turn.ownershipHolderLabel ?? 'unknown'}`
+              + (turn.ownershipHolderInstanceId ? `/${turn.ownershipHolderInstanceId}` : '') + ')')
           }
           return
         }
@@ -565,8 +639,12 @@ export class QwenAgentTransport {
           fail(event.code ?? 'ERR_UPSTREAM_UNAVAILABLE', event.message ?? event.detail ?? 'upstream error')
         }
       })
-      ws.on('error', error => fail('ERR_UPSTREAM_UNAVAILABLE', error.message))
+      ws.on('error', error => {
+        if (turn.ws !== ws) return
+        fail('ERR_UPSTREAM_UNAVAILABLE', error.message)
+      })
       ws.on('close', (code, reason) => {
+        if (turn.ws !== ws) return
         if (turn.terminal) return
         // The provider may close right after `audio.done`. The response is
         // complete, so release the barrier instead of reporting a disconnect —
@@ -582,9 +660,8 @@ export class QwenAgentTransport {
         }
         fail('ERR_UPSTREAM_DISCONNECTED', `code=${code} reason=${String(reason)}`)
       })
-    } catch (error) {
-      fail('ERR_UPSTREAM_UNAVAILABLE', error.message)
     }
+    connect(false)
 
     return {
       appendAudio: ({ bytes, parentRequestId = null, contextSummary = null }) => sendOrQueue({
