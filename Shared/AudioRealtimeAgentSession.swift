@@ -119,6 +119,15 @@ final class AudioRealtimeAgentSession {
     /// Params: (requestId, responseId, generation, finalSequence).
     var onAudioDone: ((String, String?, Int, Int) -> Void)?
 
+    /// ESS-969 / ESS-971：**本段结束，回合未结束**。
+    /// Params: (requestId, responseId, generation, segmentIndex, finalSequence)。
+    ///
+    /// 与 `onAudioDone` 的区别是唯一且关键的：**不得置位任何回合终态闩锁**。
+    /// 上层收到它应退回等待态、重新武装有界超时，**不开下一轮**——
+    /// 开下一轮的话，第二段（真正的答案）到达时会落进下一轮，重演 ESS-600 复审
+    /// 阻断 B 钉住的跨轮错乱。
+    var onAudioSegmentDone: ((String, String?, Int, Int, Int) -> Void)?
+
     /// ESS-957：本回合 `audio.done` 之后上游又产出音频、被网关丢弃。
     /// Params: (requestId, responseId, generation, droppedCount)。
     ///
@@ -338,6 +347,25 @@ final class AudioRealtimeAgentSession {
                 detail: "final_seq=\(finalSeq) gen=\(gen)"
             )
             onAudioDone?(rid, respId, gen, finalSeq)
+
+        case .audioSegmentDone(let sid, let rid, let respId, let gen,
+                               let segmentIndex, let finalSeq):
+            guard sid == sessionId, let turn = currentTurn,
+                  turn.requestId == rid else { return }
+            // 段落屏障也要撤掉「等首个响应」的预算——上游已经在答了。
+            cancelResponseWait()
+            // **刻意不写 currentTurn?.finalSequence**：那是回合终态用的字段
+            // （`audio.done` 才写），段落边界写进去会让本轮被当成已收口。
+            Self.logger.info(
+                "agent audio.segment_done rid=\(rid.prefix(8), privacy: .public) gen=\(gen) seg=\(segmentIndex) final_seq=\(finalSeq)"
+            )
+            PhoneAgentClientLog.info(
+                module: Self.logModule,
+                event: "downlink_audio_segment_done_accepted",
+                requestId: rid, sessionId: sid,
+                detail: "segment_index=\(segmentIndex) final_seq=\(finalSeq) gen=\(gen)"
+            )
+            onAudioSegmentDone?(rid, respId, gen, segmentIndex, finalSeq)
 
         case .segmentDropped(let sid, let rid, let respId, let gen, let seq,
                              let droppedCount, let reason):

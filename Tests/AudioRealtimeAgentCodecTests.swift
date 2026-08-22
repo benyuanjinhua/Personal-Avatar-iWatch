@@ -122,6 +122,65 @@ final class AudioRealtimeAgentCodecTests: XCTestCase {
         } else { XCTFail("decode failed") }
     }
 
+    /// ESS-971：`audio.segment_done` 必须被当成一等事件解码。
+    ///
+    /// 2026-08-22 真机（`request_id=01a02783-7e78`）：网关侧 ESS-969 已经在发这一帧
+    /// （`downlink_segment_done segment_index=0`），但 Watch 侧只落了一条
+    /// `downlink_decode_unrecognised type=audio.segment_done` —— 协议上线、客户端没接，
+    /// 于是回合既收不到「这段完了」也收不到「这轮完了」，一直挂到用户关掉 App。
+    func testAudioSegmentDoneDecodes() {
+        let raw: [String: Any] = [
+            "type": "audio.segment_done", "session_id": sessionId,
+            "request_id": requestId, "response_id": "resp-1", "generation": 1,
+            "segment_index": 0, "final_sequence": 46
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: raw)
+        guard case .event(let ev) = AudioRealtimeAgentCodec.decodeOutcome(data) else {
+            return XCTFail("decode failed")
+        }
+        guard case .audioSegmentDone(let sid, let rid, let respId, let gen,
+                                     let segmentIndex, let finalSeq) = ev else {
+            return XCTFail("wrong event")
+        }
+        XCTAssertEqual(sid, sessionId)
+        XCTAssertEqual(rid, requestId)
+        XCTAssertEqual(respId, "resp-1")
+        XCTAssertEqual(gen, 1)
+        XCTAssertEqual(segmentIndex, 0)
+        XCTAssertEqual(finalSeq, 46)
+    }
+
+    /// `segment_index` 缺失时按 0 计，不得整帧判 malformed——
+    /// 判 malformed 等于回到「客户端什么都不知道」，正是本单要修的状态。
+    func testAudioSegmentDoneToleratesMissingSegmentIndex() {
+        let raw: [String: Any] = [
+            "type": "audio.segment_done", "session_id": sessionId,
+            "request_id": requestId, "response_id": "resp-1", "generation": 1,
+            "final_sequence": 46
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: raw)
+        guard case .event(let ev) = AudioRealtimeAgentCodec.decodeOutcome(data) else {
+            return XCTFail("decode failed")
+        }
+        guard case .audioSegmentDone(_, _, _, _, let segmentIndex, let finalSeq) = ev else {
+            XCTFail("wrong event"); return
+        }
+        XCTAssertEqual(segmentIndex, 0)
+        XCTAssertEqual(finalSeq, 46)
+    }
+
+    /// `final_sequence` 是屏障值，缺了就没法判「这一段收齐没有」——必须判 malformed。
+    func testAudioSegmentDoneWithoutFinalSequenceIsMalformed() {
+        let raw: [String: Any] = [
+            "type": "audio.segment_done", "session_id": sessionId,
+            "request_id": requestId, "response_id": "resp-1", "generation": 1,
+            "segment_index": 0
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: raw)
+        if case .malformed = AudioRealtimeAgentCodec.decodeOutcome(data) { return }
+        XCTFail("缺 final_sequence 应判 malformed")
+    }
+
     /// ESS-957 / ESS-969：网关在丢弃 post-done 帧时下发的
     /// `audio.segment_dropped` 必须被**当成一等事件解码**，而不是掉进
     /// `default: .unrecognised`。

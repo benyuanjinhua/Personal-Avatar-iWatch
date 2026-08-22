@@ -1225,6 +1225,14 @@ final class PushToTalkController: ObservableObject {
         adapter.onAnswerPlaybackStarted = { [weak self] handle in
             self?.onSessionAnswerStarted?(handle.requestId)
         }
+        // ESS-971：段落播完 → interim（回合保持打开，等下一段）。
+        adapter.onAnswerPlaybackSegmentFinished = { [weak self] handle, bytes in
+            WatchLog.info(
+                "player", "segment_playback_not_final", requestId: handle.requestId,
+                detail: "bytes=\(bytes) reason=segment_boundary"
+            )
+            self?.onSessionAnswerInterim?(handle.requestId)
+        }
         adapter.onAnswerPlaybackFinished = { [weak self] handle, bytes in
             self?.onSessionAnswerFinished?(handle.requestId, true, "realtime_rendered:\(bytes)")
         }

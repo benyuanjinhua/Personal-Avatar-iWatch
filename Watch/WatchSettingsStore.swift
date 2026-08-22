@@ -332,8 +332,12 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             sequenceDetail = " sequence=\(envelope.audio?.sequence.description ?? "nil")"
         case .audioDone:
             sequenceDetail = " final_sequence=\(envelope.finalSequence?.description ?? "nil")"
+        case .audioSegmentDone:
+            sequenceDetail = " segment_index=\(envelope.sequence?.description ?? "nil")"
+                + " final_sequence=\(envelope.finalSequence?.description ?? "nil")"
         case .ready, .playbackClear, .responseInterrupted, .bridgeFallback,
-             .transcriptDelta, .transcriptFinal, .generationOpen, .bargeInFailed:
+             .transcriptDelta, .transcriptFinal, .generationOpen, .bargeInFailed,
+             .unrecognised:
             sequenceDetail = ""
         }
         WatchLog.info(
@@ -359,6 +363,23 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
                 responseId: envelope.responseId,
                 generation: envelope.generation,
                 finalSequence: envelope.finalSequence
+            )
+        case .audioSegmentDone:
+            // ESS-971：与 `audioDone` 共用同一套播放屏障（本段音频要照常收齐、
+            // 播完），区别只在**播完之后**——走 interim 而不是回合终态。
+            adapter.markDownlinkSegmentComplete(
+                responseId: envelope.responseId,
+                generation: envelope.generation,
+                finalSequence: envelope.finalSequence,
+                segmentIndex: envelope.sequence ?? 0
+            )
+        case .unrecognised:
+            // 未知 kind：不认识就跳过，但要留证——ESS-971 之前正是因为
+            // 「只落一条 unrecognised 日志」而让协议上线却毫无效果。
+            WatchLog.info(
+                "turn", "realtime_downlink_unrecognised_kind",
+                requestId: envelope.requestId,
+                detail: "session=\(envelope.sessionId)"
             )
         case .playbackClear, .responseInterrupted:
             adapter.bargeIn()
