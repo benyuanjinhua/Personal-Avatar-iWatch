@@ -19,13 +19,13 @@ final class RealtimeTurnGateTests: XCTestCase {
     /// 事故复现的核心断言：终态失败后，后续上行帧全部被拦。
     func testTerminalFailureSuppressesEveryLaterUplinkFrame() {
         var gate = RealtimeTurnGate()
-        gate.noteFailure(requestId: rid, sessionId: sid, wasActive: true)
+        gate.noteFailure(requestId: rid, sessionId: sid, wasActive: true, nowSeconds: 0)
 
         // 真机那一轮 47 秒里泵了 255 次；这里用 20 帧代表同一形态。
-        for index in 0..<20 {
+        for _ in 0..<20 {
             XCTAssertEqual(
                 gate.decide(requestId: rid, sessionId: sid, isTurnStart: false),
-                .suppress(reason: "turn_closed_terminal", shouldLog: index == 0)
+                .suppress(reason: "turn_closed_terminal")
             )
         }
     }
@@ -38,7 +38,7 @@ final class RealtimeTurnGateTests: XCTestCase {
     /// **已经握手成功过**的通道——那时 token 才真的被消耗了。
     func testHandshakeFailureDoesNotCloseImmediately() {
         var gate = RealtimeTurnGate()
-        gate.noteFailure(requestId: rid, sessionId: sid, wasActive: false)
+        gate.noteFailure(requestId: rid, sessionId: sid, wasActive: false, nowSeconds: 0)
         XCTAssertEqual(gate.decide(requestId: rid, sessionId: sid, isTurnStart: false), .open)
         XCTAssertEqual(gate.closedTurnCount, 0)
     }
@@ -46,30 +46,30 @@ final class RealtimeTurnGateTests: XCTestCase {
     /// 但握手重试必须有界——无界就退回 255 次风暴。
     func testRepeatedHandshakeFailuresEventuallyClose() {
         var gate = RealtimeTurnGate(maxHandshakeAttempts: 3)
-        gate.noteFailure(requestId: rid, sessionId: sid, wasActive: false)
-        gate.noteFailure(requestId: rid, sessionId: sid, wasActive: false)
+        gate.noteFailure(requestId: rid, sessionId: sid, wasActive: false, nowSeconds: 0)
+        gate.noteFailure(requestId: rid, sessionId: sid, wasActive: false, nowSeconds: 0)
         XCTAssertEqual(gate.decide(requestId: rid, sessionId: sid, isTurnStart: false), .open)
-        gate.noteFailure(requestId: rid, sessionId: sid, wasActive: false)
+        gate.noteFailure(requestId: rid, sessionId: sid, wasActive: false, nowSeconds: 0)
         XCTAssertEqual(
             gate.decide(requestId: rid, sessionId: sid, isTurnStart: false),
-            .suppress(reason: "turn_closed_terminal", shouldLog: true)
+            .suppress(reason: "turn_closed_terminal")
         )
     }
 
     /// 已经握手成功过再断：token 确实被消耗了，一次即终态。
     func testFailureAfterActiveClosesImmediately() {
         var gate = RealtimeTurnGate()
-        gate.noteFailure(requestId: rid, sessionId: sid, wasActive: true)
+        gate.noteFailure(requestId: rid, sessionId: sid, wasActive: true, nowSeconds: 0)
         XCTAssertEqual(
             gate.decide(requestId: rid, sessionId: sid, isTurnStart: false),
-            .suppress(reason: "turn_closed_terminal", shouldLog: true)
+            .suppress(reason: "turn_closed_terminal")
         )
     }
 
     /// `stream.start` 是「开新一轮」的显式意图，永远放行，并解封该回合。
     func testTurnStartAlwaysOpensAndClearsTheSeal() {
         var gate = RealtimeTurnGate()
-        gate.noteFailure(requestId: rid, sessionId: sid, wasActive: true)
+        gate.noteFailure(requestId: rid, sessionId: sid, wasActive: true, nowSeconds: 0)
         XCTAssertEqual(gate.decide(requestId: rid, sessionId: sid, isTurnStart: true), .open)
 
         gate.noteTurnStart(requestId: rid, sessionId: sid)
@@ -80,7 +80,7 @@ final class RealtimeTurnGateTests: XCTestCase {
     /// 只封被判死的那一个回合，别的回合不受牵连。
     func testOtherTurnsUnaffected() {
         var gate = RealtimeTurnGate()
-        gate.noteFailure(requestId: rid, sessionId: sid, wasActive: true)
+        gate.noteFailure(requestId: rid, sessionId: sid, wasActive: true, nowSeconds: 0)
         XCTAssertEqual(gate.decide(requestId: "other-rid", sessionId: sid, isTurnStart: false), .open)
         XCTAssertEqual(gate.decide(requestId: rid, sessionId: "other-sid", isTurnStart: false), .open)
     }
@@ -88,7 +88,7 @@ final class RealtimeTurnGateTests: XCTestCase {
     /// 同一回合重复判死不重复入表。
     func testRepeatedTerminalFailureIsIdempotent() {
         var gate = RealtimeTurnGate()
-        for _ in 0..<10 { gate.noteFailure(requestId: rid, sessionId: sid, wasActive: true) }
+        for _ in 0..<10 { gate.noteFailure(requestId: rid, sessionId: sid, wasActive: true, nowSeconds: 0) }
         XCTAssertEqual(gate.closedTurnCount, 1)
     }
 
@@ -96,13 +96,15 @@ final class RealtimeTurnGateTests: XCTestCase {
     func testClosedTurnsAreBounded() {
         var gate = RealtimeTurnGate(capacity: 4)
         for i in 0..<50 {
-            gate.noteFailure(requestId: "rid-\(i)", sessionId: sid, wasActive: true)
+            gate.noteFailure(
+                requestId: "rid-\(i)", sessionId: sid, wasActive: true, nowSeconds: 0
+            )
         }
         XCTAssertEqual(gate.closedTurnCount, 4)
         // 最近 4 个仍被封
         XCTAssertEqual(
             gate.decide(requestId: "rid-49", sessionId: sid, isTurnStart: false),
-            .suppress(reason: "turn_closed_terminal", shouldLog: true)
+            .suppress(reason: "turn_closed_terminal")
         )
         // 被挤出去的老回合放行（它早就不会再有帧进来，丢掉无损）
         XCTAssertEqual(gate.decide(requestId: "rid-0", sessionId: sid, isTurnStart: false), .open)
