@@ -56,15 +56,16 @@ test('ESS-849 · 播报音频不进入本回合的下行，本回合的答案完
   const url = await upstream((ws, message) => {
     if (message.type === 'connect') send(ws, { type: 'voice.ready' })
     if (message.type === 'audio.commit') {
-      // 播报抢在答案前面出音频（实测早 8.6 s）。它有自己的 sequence 轴。
+      // 播报抢在答案前面出音频（实测早 8.6 s）。**上游 sequence 跨 response
+      // 连续**（真机：播报占到 51、答案 52..55），所以这里也必须连续。
       send(ws, { type: 'response.started', responseId: 'ann-1', origin: 'announcement' })
       audioDelta(ws, 0, '杭州天气查询失败了', 'ann-1')
       audioDelta(ws, 1, '这是后台任务的播报', 'ann-1')
       send(ws, { type: 'audio.done', responseId: 'ann-1' })
-      // 本回合真正的答案。
+      // 本回合真正的答案，序号接着播报往下走。
       send(ws, { type: 'response.started', responseId: 'ans-1', origin: 'agent' })
-      audioDelta(ws, 0, 'answer-a', 'ans-1')
-      audioDelta(ws, 1, 'answer-b', 'ans-1')
+      audioDelta(ws, 2, 'answer-a', 'ans-1')
+      audioDelta(ws, 3, 'answer-b', 'ans-1')
       send(ws, { type: 'audio.done', responseId: 'ans-1' })
     }
   })
@@ -84,6 +85,8 @@ test('ESS-849 · 播报音频不进入本回合的下行，本回合的答案完
   assert.ok(!JSON.stringify(events).includes(Buffer.from('杭州天气查询失败了').toString('base64')))
   assert.deepEqual(events.map(event => event.type),
     ['agent.audio.delta', 'agent.audio.delta', 'agent.audio.done'])
+  // 播报占掉的上游序号不占下行契约序号：下行仍是从 0 起的稠密序列。
+  assert.deepEqual(events.filter(e => e.type === 'agent.audio.delta').map(e => e.sequence), [0, 1])
   // 播报的 `audio.done` 没有提前收口：终态覆盖答案的全部序号。
   assert.equal(events.at(-1).final_sequence, 1)
   assert.equal(events.filter(event => event.type === 'agent.error').length, 0)
@@ -109,13 +112,13 @@ test('ESS-849 · 播报的 audio.done 落在两段之间：第二段（答案）
       audioDelta(ws, 0, 'seg1', 'ans-1')
       send(ws, { type: 'audio.done', responseId: 'ans-1' })
       send(ws, { type: 'response.started', responseId: 'ann-1', origin: 'announcement' })
-      audioDelta(ws, 0, '播报第一帧', 'ann-1')
-      audioDelta(ws, 1, '播报第二帧', 'ann-1')
+      audioDelta(ws, 1, '播报第一帧', 'ann-1')
+      audioDelta(ws, 2, '播报第二帧', 'ann-1')
       send(ws, { type: 'audio.done', responseId: 'ann-1' })
       setTimeout(() => {
         send(ws, { type: 'response.started', responseId: 'ans-2', origin: 'agent' })
-        audioDelta(ws, 1, 'seg2-a', 'ans-2')
-        audioDelta(ws, 2, 'seg2-b', 'ans-2')
+        audioDelta(ws, 3, 'seg2-a', 'ans-2')
+        audioDelta(ws, 4, 'seg2-b', 'ans-2')
         send(ws, { type: 'audio.done', responseId: 'ans-2' })
         send(ws, { type: 'voice.state', state: 'idle', origin: 'agent' })
       }, 200)
@@ -143,6 +146,61 @@ test('ESS-849 · 播报的 audio.done 落在两段之间：第二段（答案）
   assert.equal(events.filter(event => event.type === 'agent.audio.segment_done').length, 1)
   assert.equal(logs.filter(l => l.evt === 'upstream_turn_terminal').length, 1)
   assert.equal(events.filter(event => event.type === 'agent.error').length, 0)
+  // 回合已锚定后播报占走 seq 1..2：答案的 3..4 必须照常放行，不能被扣在重排缓冲里。
+  assert.equal(logs.filter(l => l.evt === 'upstream_error'
+    && l.code === 'ERR_UPSTREAM_SEQUENCE_GAP').length, 0)
+  assert.deepEqual(events.filter(e => e.type === 'agent.audio.delta').map(e => e.sequence), [0, 1, 2])
+  turn.close()
+})
+
+// 毕玄-cx 对 PR #391 的复审阻断（2026-08-22 14:42）：第一版把播报帧直接 return，
+// 不推进 `expectedUpstream`。本单 14:19 的 L1 说得很清楚——上游序号**跨 response
+// 连续**：播报的 `audio.done` 覆盖到 `final_seq=51`，答案随后是 `seq=52..55`。
+// 那一版会在 51 之前留一串洞，答案全被扣在重排缓冲里，`armGapTimer` 到点把整轮
+// 判成 ERR_UPSTREAM_SEQUENCE_GAP —— 比原 bug 更糟：原来是播错，那样是全丢。
+// 这条用例按事故的真实序号写，不是示意。
+test('ESS-849 · 真机序号轴：播报占到 seq=51、答案从 52 继续，答案不得被扣住', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') send(ws, { type: 'voice.ready' })
+    if (message.type === 'audio.commit') {
+      // 回合先出一帧真音频——**必须先锚定**，否则 `armGapTimer` 的未锚定分支会
+      // 把 expectedUpstream 重锚到 52，缺陷被掩盖（这一版差点漏掉：未锚定的
+      // 变体在修复前也是绿的）。
+      send(ws, { type: 'response.started', responseId: 'ans-1', origin: 'model' })
+      audioDelta(ws, 0, 'seg1', 'ans-1')
+      send(ws, { type: 'response.started', responseId: 'ann-1', origin: 'announcement' })
+      for (let sequence = 1; sequence <= 51; sequence += 1) {
+        audioDelta(ws, sequence, `播报-${sequence}`, 'ann-1')
+      }
+      send(ws, { type: 'audio.done', responseId: 'ann-1' })
+      for (let sequence = 52; sequence <= 55; sequence += 1) {
+        audioDelta(ws, sequence, `answer-${sequence}`, 'ans-1')
+      }
+      send(ws, { type: 'audio.done', responseId: 'ans-1' })
+    }
+  })
+  const events = []; const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  const turn = transport.openTurn({
+    requestId: 'r6', sessionId: 's6', deviceId: 'd6', generation: 1, responseId: 'r6:gen1',
+    onEvent: event => events.push(event),
+  })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'), 4_000)
+
+  // 答案 4 帧一帧不少，下行契约序号稠密从 0 起——播报占走的 52 个上游序号
+  // 被消费掉了，但没有占用下行的号。
+  assert.deepEqual(spoken(events),
+    ['seg1', 'answer-52', 'answer-53', 'answer-54', 'answer-55'])
+  assert.deepEqual(events.filter(e => e.type === 'agent.audio.delta').map(e => e.sequence), [0, 1, 2, 3, 4])
+  assert.equal(events.at(-1).final_sequence, 4)
+  assert.equal(events.filter(event => event.type === 'agent.error').length, 0)
+  assert.equal(logs.filter(l => l.evt === 'upstream_error').length, 0,
+    '播报留下的序号洞会以 ERR_UPSTREAM_SEQUENCE_GAP 吞掉整轮——这条断言就是为它写的')
+  const dropped = logs.find(l => l.evt === 'upstream_announcement_audio_done_dropped')
+  assert.equal(dropped.dropped_frames, 51)
   turn.close()
 })
 

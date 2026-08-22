@@ -591,6 +591,14 @@ export class QwenAgentTransport {
     // Forward one accepted frame and stamp it with the downstream contract's
     // sequence. Ordering has already been settled by `enqueueOrdered`.
     const emitDelta = frame => {
+      // ESS-849: 播报帧走到这里，说明它的上游序号已经被 `enqueueOrdered` /
+      // `drainContiguous` 消费掉了（连续性因此不断）。到此为止：不下发、不占
+      // 下行契约序号、不释放已关闭的段落（播报不是「本回合又出声了」的证据）、
+      // 不延长 `pendingDone` 的收口窗口。
+      if (frame.announcementId != null) {
+        dropAnnouncementAudio(frame.announcementId, frame)
+        return
+      }
       // ESS-969: audio after a closed segment proves the turn went on. The
       // boundary must reach the client BEFORE the new segment's first frame,
       // otherwise the client attributes this audio to the previous segment.
@@ -930,25 +938,33 @@ export class QwenAgentTransport {
           return
         }
         if (event.type === 'audio.delta' && event.audio) {
-          // ESS-849: 播报音频在触碰本回合任何状态之前就被拦下。位置很重要——
-          // 它必须早于 `noteResponseProgress()`：播报不证明本回合有回答，让它
-          // 解除 commit 后的应答死线，客户端就再也拿不到可判定的
-          // ERR_UPSTREAM_NO_RESPONSE（本单用例实测：修复前只有播报的那一轮，
-          // 10 s 内一条 `agent.error` 都没有）。也必须早于下行预算计数，和
-          // `enqueueOrdered`——播报有自己的 sequence 轴，混进本回合的序号轴
-          // 只会被当成空洞或重放（未实测到具体失败形态，但它本就不该进来）。
+          // ESS-849: 播报帧**照常走完排序机制，只在 `emitDelta` 最后一步不下发**。
+          //
+          // 这里曾经直接 `return`，被毕玄-cx 在 PR #391 复审时拦下——上游的
+          // sequence **跨 response 连续**（真机 2026-08-22：播报占到 `final_seq=51`，
+          // 答案是 `seq=52..55`），直接 return 不推进 `expectedUpstream`，会在
+          // 51 之前留一串洞：答案全部被扣在重排缓冲里，`armGapTimer` 到点把整轮
+          // 判成 ERR_UPSTREAM_SEQUENCE_GAP。本机复现（回合已锚定，播报占 1..51）：
+          // 下行只有 `delta#0=seg1`，随后就是 `agent.error` / ERR_UPSTREAM_SEQUENCE_GAP，
+          // 答案 4 帧一帧不到——比原 bug 更糟，原来只是播错，那样是全丢。
+          //
+          // 播报帧因此只跳过「与本回合语义有关」的三件事，序号该占的照占：
+          //   • 不 `noteResponseProgress()` —— 播报不证明本回合有回答，让它解除
+          //     commit 后的应答死线，客户端就再也拿不到可判定的
+          //     ERR_UPSTREAM_NO_RESPONSE（用例实测：修复前只有播报的那一轮，
+          //     10 s 内一条 `agent.error` 都没有）；
+          //   • 不占下行契约序号、不 `releaseClosedSegment`、不延长 done 窗口
+          //     —— 见 `emitDelta` 顶部。
           const announcementId = announcementResponseIdOf(event)
-          if (announcementId !== null) {
-            dropAnnouncementAudio(announcementId, event)
-            return
-          }
-          if (event.responseId != null) {
-            turn.forwardedResponseIds.add(String(event.responseId))
-            while (turn.forwardedResponseIds.size > MAX_ANNOUNCEMENT_RESPONSES) {
-              turn.forwardedResponseIds.delete(turn.forwardedResponseIds.values().next().value)
+          if (announcementId === null) {
+            if (event.responseId != null) {
+              turn.forwardedResponseIds.add(String(event.responseId))
+              while (turn.forwardedResponseIds.size > MAX_ANNOUNCEMENT_RESPONSES) {
+                turn.forwardedResponseIds.delete(turn.forwardedResponseIds.values().next().value)
+              }
             }
+            noteResponseProgress()
           }
-          noteResponseProgress()
           const audio = event.audio
           if (typeof audio !== 'string' || audio.length % 4 !== 0 || !BASE64.test(audio)) {
             rejectFrame('ERR_UPSTREAM_FRAME_INVALID', 'audio payload is not base64', {
@@ -1009,6 +1025,8 @@ export class QwenAgentTransport {
           const frame = {
             upstreamSequence, audio: event.audio,
             sampleRate: event.sampleRate ?? 24_000,
+            // ESS-849: 非 null 表示这一帧属于播报——排序照做，下发不做。
+            announcementId,
           }
           if (upstreamSequence === null) emitDelta(frame)
           else enqueueOrdered(frame)
