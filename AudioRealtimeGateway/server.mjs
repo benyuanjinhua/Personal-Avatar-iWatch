@@ -624,7 +624,11 @@ function createAgentTransport(CONFIG, { log }) {
       // multi-segment path for a turn whose upstream proved it emits
       // `voice.state`; anything else keeps the pre-ESS-969 behaviour.
       multiSegmentMode: CONFIG.agent_multi_segment_mode ?? 'auto',
-      turnIdleBackstopMs: CONFIG.agent_turn_idle_backstop_ms ?? 45_000,
+      // ESS-990: the two calibrated segment-gap windows replace the old
+      // `agent_turn_idle_backstop_ms` (45 s), which was both un-calibrated and
+      // above the Watch's own 45 s hard thinking timeout.
+      segmentGapMs: CONFIG.agent_segment_gap_ms ?? 2_500,
+      segmentGapBusyMs: CONFIG.agent_segment_gap_busy_ms ?? 12_000,
       takeover: CONFIG.agent_takeover_voice !== false,
       log: (evt, extra) => log(evt, extra),
     })

@@ -180,19 +180,35 @@ inspect control frames.
 一个回合可以承载多段回答：工具调用回合先说「我正在查询…」，跑工具，再说
 真正的答案。上游的 `audio.done` 是**段落**边界，不是回合终态。
 
-- 回合终态取自上游信号 `voice.state {state:'idle'}`——与部署中的 Bridge 对同一
-  端点（`ws://127.0.0.1:3101/api/realtime`）的读法一致，见
-  `MacRemoteFrontendBridge/supervisor.mjs` 的 `TurnCapture.onEvent`。不是超时。
+- **上游没有回合终态信号**（ESS-990 取证）。`voice.state {state:'idle'}` 曾被
+  当作终态（ESS-969 / PR #365），实测推翻：真实上游在**每一段** `audio.done`
+  之后 0.14–0.54 ms 内就发 idle，10/10 的工具调用回合在首条 idle 之后又开了
+  新段。L2 也一致——上游 `server/src/voice/realtime-gateway.mjs` 在
+  `finishPlayback` / `cancelPlayback` 每段播完发 idle，`shared/realtime-events.mjs`
+  的 `GatewayServerEvent` 只有 `turn.started`，没有任何 turn 终态事件。
+  取证脚本：`smoke/upstream-turn-capture.mjs`。
+- 因此回合终态只能用**段落收口后的有界空闲窗口**（启发式，R-04.4）：段落
+  `audio.done` settle 之后挂起，窗口内没有新的 `response.started` / 音频就收口
+  （`upstream_turn_terminal reason=segment_gap`）。socket 关闭 / 错误 / supersede
+  仍然立即收口。
 - 下游序号在整个回合内单调稠密，跨段连续，所以稠密前缀屏障对段落边界与
   回合终态同样成立。
 - `agent_multi_segment_mode`：`auto`（默认）只对**已证明上游会发 `voice.state`**
-  的回合启用新语义；没有该信号的回合逐字节保持 ESS-969 之前的行为。
-  `always` / `off` 强制两侧。每个回合落一条 `upstream_turn_terminal_mode`
-  日志，直接说明本次走了哪条分支。
-- `agent_turn_idle_backstop_ms`（默认 45000）是**兜底**，不是收口机制：只在
-  上游宣告了 `voice.state` 却始终不 `idle` 时触发。**该值待标定**（R-04.4）：
-  目前没有任何真机采样，标定依据是 `upstream_segment_closed` →
-  `upstream_turn_terminal` 的时间差，需要 n ≥ 20 个真实工具调用回合。
+  的回合启用新语义（把 idle 当方言指纹用，不当终态用）；没有该信号的回合
+  逐字节保持 ESS-969 之前的行为。`always` / `off` 强制两侧。每个回合落一条
+  `upstream_turn_terminal_mode` 日志，直接说明本次走了哪条分支。
+- `agent_segment_gap_ms`（默认 2500）/ `agent_segment_gap_busy_ms`（默认 12000）：
+  空闲窗口的基础档与延长档。标定样本 = 2026-08-22 真实上游 10 个工具调用回合、
+  n=17 个回合内段落间隔：min 326.6 / p50 1171.2 / p90 4143.4 / max 7332.5 ms；
+  其中所有 > 1194.7 ms 的间隔都伴有「声道忙」的显式证据（后台播报在途或
+  未终结 task），所以有证据时才用延长档。上界受 Watch 端
+  `SessionController.thinkingHardTimeoutSeconds = 45` 约束——旧的
+  `agent_turn_idle_backstop_ms = 45000` 正好等于它，即使触发也永远晚于客户端
+  自己判超时，已删除。n=17 仍是薄样本（R-04.4），继续用
+  `upstream_turn_terminal` 的 `gap_ms` / `window_ms` / `outstanding_tasks` 累积。
+- **task 生命周期只延长窗口，不否决收口**：`task.accepted` 实测比第一段
+  `audio.done` 晚 795–8689 ms（n=10），护不住第一段；而 task 常比回合多活
+  30–70 s，「有未终结 task 就不收口」会把每个工具回合挂到客户端硬超时。
 
 #### Barge-in
 

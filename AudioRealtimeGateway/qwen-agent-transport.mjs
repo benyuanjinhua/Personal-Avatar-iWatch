@@ -28,6 +28,18 @@ const GATEWAY_LABEL = 'watch-direct-gateway'
 // this process only talks to its loopback endpoint, so provider secrets never
 // cross this adapter or enter its logs.
 
+// ESS-990 upstream task lifecycle. `task.completed` / `.failed` / `.cancelled`
+// are the terminal events in the upstream's own enum (`GatewayTaskEvent` in
+// `shared/realtime-events.mjs`); `task.progress.check` /
+// `.notification.pending` / `.notification.delivered` / `.permission.*` are
+// notifications ABOUT a task, not a change of its lifecycle state.
+const TASK_TERMINAL_EVENTS = new Set(['task.completed', 'task.failed', 'task.cancelled'])
+const TASK_TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled'])
+const TASK_NON_LIFECYCLE_EVENTS = new Set([
+  'task.progress.check', 'task.notification.pending', 'task.notification.delivered',
+  'task.notification.offline', 'task.permission.requested', 'task.permission.resolved',
+  'task.snapshot',
+])
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/
 
 // ESS-773: replay identity for an upstream audio frame. Composite on purpose —
@@ -102,45 +114,50 @@ export class QwenAgentTransport {
     // second response with the real answer. Treating the first `audio.done`
     // as terminal is what made the second segment unreachable.
     //
-    // The turn terminal is an upstream signal, not a timeout: the SAME
-    // upstream endpoint (`ws://127.0.0.1:3101/api/realtime`, identical
-    // `connect` handshake) emits `voice.state {state:'idle'}`, and that is
-    // exactly what the deployed Bridge uses to finish a turn
-    // (`MacRemoteFrontendBridge/supervisor.mjs` `TurnCapture.onEvent`
-    // case `voice.state`). Segment starts are witnessed by `response.started`
-    // (same file, `beginAnnouncement`).
-    //
-    // `'auto'` only enables the new terminal rule for a turn that has PROVEN
-    // the upstream speaks that dialect (a `voice.state` frame was seen before
-    // the first segment settles). A turn that never sees one keeps the exact
-    // pre-ESS-969 behaviour, so an upstream without the signal cannot regress
-    // into waiting on a backstop. `'always'` / `'off'` force either side.
+    // ESS-990 取证结果：上游**没有**回合终态信号。#365 曾把
+    // `voice.state {state:'idle'}` 当作终态，实测已推翻：
+    //   • L1（2026-08-22、真实上游 `ws://127.0.0.1:3101/api/realtime`、
+    //     10 个工具调用回合）—— idle 在**每一段** `audio.done` 后
+    //     0.14–0.54 ms 内到达，且 10/10 的回合在首条 idle 之后又开了新段。
+    //     按 #365 的规则，每个工具调用回合都会在第 1 段就收口。
+    //   • L2：上游 `server/src/voice/realtime-gateway.mjs` 在 `finishPlayback` /
+    //     `cancelPlayback`（每个 response 播放结束）与 `response.done`
+    //     （无音频时）发 idle——它是**段落级播放状态**，不是回合终态；
+    //     `shared/realtime-events.mjs` 的 `GatewayServerEvent` 有 `turn.started`，
+    //     没有任何 turn 终态事件。
+    // 所以这里只能用「段落收口后的有界空闲窗口」（R-04.4 启发式），
+    // 并把 idle 降级为方言指纹：`'auto'` 仍然只对「说过 voice.state」的
+    // 上游启用分段路径，其它上游逐字节保持 ESS-969 之前的行为。
     multiSegmentMode = 'auto',
-    // ESS-969 BACKSTOP ONLY — 待标定 (R-04.4). Bounds a turn whose upstream
-    // announced `voice.state` but never sent `idle`. It is NOT the mechanism
-    // that ends a healthy turn, and it must stay well above tool latency:
-    // shrinking it would truncate exactly the turns this issue exists to fix.
-    // No real-device sample of「段落 audio.done → 下一段 response.started」or
-    // 「末段 audio.done → voice.state idle」exists yet; 45 s is a placeholder
-    // chosen only to sit above the Watch-visible turn budget. Calibrate from
-    // `upstream_segment_closed` → `upstream_turn_terminal` deltas once real
-    // tool-calling turns are in gateway.log (n ≥ 20).
-    // ESS-1004 复审整改（毕玄 REQUEST CHANGES，我核对后接受）：
-    // **本 PR 原先把 45 s 改成 30 s，理由是「与客户端硬超时数值相等，客户端总是抢先」。
-    // 那个因果是错的，已撤回改动。** 两个计时器不在同一时刻起表：
+    // ESS-990 已标定，替换 ESS-969 的 `turnIdleBackstopMs = 45_000` 占位值。
+    // 一个已收口的段落要等多久才能判定「回合真的完了」。
+    // 样本：2026-08-22 真实上游 10 个工具调用回合、n=17 个回合内段落间隔
+    // （`audio.done` → 下一条非播报 `response.started`）：
+    //   min 326.6 / p50 1171.2 / p90 4143.4 / max 7332.5 ms。
+    // 其中所有 > 1194.7 ms 的间隔（n=6）都伴有「上游声道忙着别的事」的显式
+    // 证据（后台播报开始 / task 事件），所以分两档：
+    //   • `segmentGapMs`（基础）盖住无证据时的最大间隔 1194.7 ms，取 2.5 s ≈ 2.1x；
+    //   • `segmentGapBusyMs`（延长）盖住全部实测间隔 7332.5 ms，取 12 s ≈ 1.6x。
+    // 生产侧交叉验证（`Services/.../logs/gateway.log`，2026-08-22）：
+    // `upstream_segment_closed` → 下一条 `upstream_response_started` 共 8 例，
+    // 其中 **7 例中间夹着 `uplink_committed`** —— 那是用户又说了一句，后面的
+    // response 回答的是新话，不是工具调用的第二段，不能当段间隔用（PR #377
+    // 把这 7 例的 ~15 s 当成「段间隔下界」，据此的下界主张不成立）。
+    // 唯一一例干净的同一句续段是 363 ms，与下面这组采样一致。
     //
-    //   10:34:35.112  upstream_segment_closed segment_index=1   ← backstop 在这里武装
-    //   10:34:35.646  session_ended reason=peer_closed          ← 0.534 s 后连接就没了
-    //   10:35:02.657  [Watch] session_answer_interim            ← 客户端 45 s 才起表
-    //   10:35:47.740  [Watch] session_thinking_hard_timeout
+    // 采样口径（必须连着结论一起读）：取证脚本按 Bridge 的方言回了
+    // `playback.started` / `playback.ended` 回执，而本适配器**不回回执**
+    // （见下方 idle 那段），上游据此决定何时开下一段，所以真机 Watch 链路上的
+    // 间隔分布可能与这 17 个样本不同——两个值因此都是配置项，并由
+    // `upstream_turn_terminal` 的 `gap_ms` / `window_ms` / `outstanding_tasks`
+    // 继续累积（R-04.4，n=17 仍是薄样本，且取自一台机器、任务队列较忙的时段）。
     //
-    // 连接若存活，45 s backstop 应在 10:35:20.112 触发，**比客户端早 27.5 秒**。
-    // 现场没触发不是因为数值相等，而是因为连接在武装后 0.5 秒就断了（ESS-1008）。
-    // 把常数从 45 改成 30 对本故障零增益，只会无谓压缩工具时延预算。
-    //
-    // 保持 45 s 并维持 R-04.4 的「待标定」标注：标定依据要等 ESS-990 采到
-    // n≥20 的 `upstream_segment_closed` → `upstream_turn_terminal` 实测分布。
-    turnIdleBackstopMs = 45_000,
+    // 上界参考 ESS-1004 实测的两条时间线（不是「两个 45 s 相等」——那个因果
+    // 已被 ESS-1004 复审推翻并撤回）：段落收口时本窗口起表，客户端
+    // `SessionController.thinkingHardTimeoutSeconds = 45` 要等到收到 interim
+    // 才起表，因此本窗口天然早于客户端。12 s 距客户端预算仍有充足余量。
+    segmentGapMs = 2_500,
+    segmentGapBusyMs = 12_000,
     takeover = true,
     // ESS-978: our own identity on the upstream. The label embeds the pid so
     // two copies of this gateway on one machine are distinguishable, and the
@@ -161,7 +178,8 @@ export class QwenAgentTransport {
     this.maxReorderFrames = maxReorderFrames
     this.responseTimeoutMs = responseTimeoutMs
     this.multiSegmentMode = multiSegmentMode
-    this.turnIdleBackstopMs = turnIdleBackstopMs
+    this.segmentGapMs = segmentGapMs
+    this.segmentGapBusyMs = segmentGapBusyMs
     this.takeover = takeover
     this.clientLabel = clientLabel
     this.log = log
@@ -254,19 +272,23 @@ export class QwenAgentTransport {
       // ESS-969 segment book-keeping. `closedSegment` holds a segment whose
       // `audio.done` has settled but whose meaning is not decided yet: it is
       // a SEGMENT boundary if the turn goes on to produce more, and the TURN
-      // boundary if the upstream goes idle. Deferring the choice is what
-      // keeps a plain one-segment turn from emitting a spurious interim.
+      // boundary if it does not (ESS-990: decided by the idle window below,
+      // NOT by `voice.state idle`). Deferring the choice is what keeps a plain
+      // one-segment turn from emitting a spurious interim.
       segmentIndex: 0, closedSegment: null, segmentsClosed: 0,
-      // ESS-1004：本回合还有多少后台工作在跑。段落收口时据此选等待档位。
-      outstandingTasks: new Set(),
       sawVoiceState: false, multiSegment: null,
-      turnIdleTimer: null, turnEnded: false,
-      // ESS-969 B1: the turn terminal can legitimately arrive while the
-      // segment's `audio.done` is still blocked by a reorder hole
-      // (`reorderWaitMs` exists precisely because the provider emits done with
-      // frames still in flight). The terminal is a FACT, not an instant — latch
-      // it here and consume it when the segment finally closes.
-      pendingTurnTerminal: null,
+      turnEnded: false,
+      // ESS-990: the parked segment's idle window. `segmentGapTimer` is the
+      // ONLY thing that can turn a closed segment into a turn terminal now
+      // (besides the unambiguous ones: a new segment, socket close, error,
+      // supersede). `segmentGapWindowMs` records which of the two calibrated
+      // windows is armed so a late piece of evidence can widen it once.
+      segmentGapTimer: null, segmentGapWindowMs: 0, segmentClosedAt: 0,
+      // ESS-990 corroborating signals (`outstandingTasks` first added by
+      // ESS-1004 as evidence-only). Neither can decide the terminal on its
+      // own (see `noteTurnBusy`), they only widen the window.
+      outstandingTasks: new Set(), announcementResponseIds: new Set(),
+      turnBusy: false,
     }
     const scopeLog = { request_id: requestId, session_id: sessionId, device_id: deviceId, generation }
     turn.supersede = nextRequestId => {
@@ -277,7 +299,7 @@ export class QwenAgentTransport {
       clearTimeout(turn.doneTimer)
       clearTimeout(turn.gapTimer)
       clearTimeout(turn.responseTimer)
-      clearTimeout(turn.turnIdleTimer)
+      clearTimeout(turn.segmentGapTimer)
       this.log('upstream_turn_superseded', {
         ...scopeLog, superseded_by_request_id: nextRequestId,
       })
@@ -297,7 +319,7 @@ export class QwenAgentTransport {
       clearTimeout(turn.doneTimer)
       clearTimeout(turn.gapTimer)
       clearTimeout(turn.responseTimer)
-      clearTimeout(turn.turnIdleTimer)
+      clearTimeout(turn.segmentGapTimer)
       this.log('upstream_error', { ...scopeLog, code })
       onEvent({ type: 'agent.error', response_id: responseId, code, detail, retriable: true })
       try { turn.ws?.close() } catch { /* best effort */ }
@@ -361,13 +383,15 @@ export class QwenAgentTransport {
     //
     // ESS-969 makes the *meaning* of that settled done conditional. An
     // upstream `audio.done` closes one RESPONSE; whether that is also the end
-    // of the turn is decided by the upstream, not by this adapter:
-    //   • `voice.state {state:'idle'}`  → turn over        → `agent.audio.done`
+    // of the turn is decided by what happens next:
     //   • more output (`response.started` / a new delta)   → `agent.audio.segment_done`
     //     for the segment that just closed, and the turn continues
+    //   • nothing for a bounded window (ESS-990)           → `agent.audio.done`
     // so the closed segment is PARKED in `turn.closedSegment` until one of
-    // those arrives (or the bounded backstop fires). Parking is what stops a
-    // plain one-segment turn from ever emitting a spurious segment boundary.
+    // those happens. Parking is what stops a plain one-segment turn from ever
+    // emitting a spurious segment boundary. ESS-990 removed `voice.state idle`
+    // from this decision entirely — it fires after EVERY segment (10/10 real
+    // turns), so it carries no information about the turn being over.
     const flushDone = () => {
       if (!turn.pendingDone) return
       // A hole is still outstanding: the run is not complete, so it is not done.
@@ -399,20 +423,13 @@ export class QwenAgentTransport {
       this.log('upstream_segment_closed', {
         ...scopeLog, segment_index: turn.segmentIndex, final_sequence: finalSequence,
       })
-      // ESS-969 B1 (毕玄 review on PR #365): a turn terminal that arrived while
-      // this done was still blocked by a reorder hole was LATCHED, not lost.
-      // Consume it the instant the segment closes — otherwise a perfectly
-      // healthy turn whose tail delta merely arrived late would fall through
-      // to the 45 s backstop, turning the backstop into the normal path.
-      if (turn.pendingTurnTerminal) {
-        const reason = turn.pendingTurnTerminal
-        turn.pendingTurnTerminal = null
-        this.log('upstream_turn_terminal_latch_consumed', {
-          ...scopeLog, reason, final_sequence: finalSequence,
-        })
-        return endTurn(reason, finalSequence)
-      }
-      armTurnIdleBackstop()
+      // The window starts when the segment CLOSES (after the reorder hole is
+      // filled and the settle window expires), so a healthy turn whose tail
+      // delta merely arrived late is not penalised — that was ESS-969 B1
+      // (毕玄 review on PR #365), and it no longer needs a latch because the
+      // terminal is no longer an instantaneous upstream event.
+      turn.segmentClosedAt = Date.now()
+      armSegmentGap('segment_closed')
     }
 
     // The turn produced more output after a segment closed: that closed
@@ -423,8 +440,9 @@ export class QwenAgentTransport {
       if (!closed) return
       turn.closedSegment = null
       turn.segmentIndex += 1
-      clearTimeout(turn.turnIdleTimer)
-      turn.turnIdleTimer = null
+      clearTimeout(turn.segmentGapTimer)
+      turn.segmentGapTimer = null
+      turn.segmentGapWindowMs = 0
       this.log('upstream_segment_done', {
         ...scopeLog, segment_index: closed.segmentIndex,
         final_sequence: closed.finalSequence, cause,
@@ -441,36 +459,67 @@ export class QwenAgentTransport {
       if (turn.turnEnded) return
       turn.turnEnded = true
       turn.closedSegment = null
-      clearTimeout(turn.turnIdleTimer)
-      turn.turnIdleTimer = null
+      clearTimeout(turn.segmentGapTimer)
+      turn.segmentGapTimer = null
+      // `gap_ms` / `window_ms` / `outstanding_tasks` are the ESS-990 calibration
+      // feed: they are what a future run needs to re-derive the two windows
+      // from production traffic instead of from this one 10-turn sample.
       this.log('upstream_turn_terminal', {
         ...scopeLog, reason, final_sequence: finalSequence,
         segments: turn.segmentsClosed || 1,
+        gap_ms: turn.segmentClosedAt ? Date.now() - turn.segmentClosedAt : null,
+        window_ms: turn.segmentGapWindowMs || null,
+        outstanding_tasks: turn.outstandingTasks.size,
       })
+      turn.segmentGapWindowMs = 0
       onEvent({
         type: 'agent.audio.done', response_id: responseId, final_sequence: finalSequence,
         segments: turn.segmentsClosed || 1,
       })
     }
 
-    // BACKSTOP, not the mechanism (see `turnIdleBackstopMs`). Only armed while
-    // a closed segment is parked and the upstream has said nothing since.
-    const armTurnIdleBackstop = () => {
-      if (this.turnIdleBackstopMs <= 0 || turn.turnIdleTimer) return
-      turn.turnIdleTimer = setTimeout(() => {
-        turn.turnIdleTimer = null
+    // ESS-990 THE terminal mechanism for a multi-segment turn: a parked
+    // segment becomes the turn endpoint once the upstream has produced nothing
+    // for `window` ms. Armed from the moment the segment closed, so widening
+    // the window later never restarts the clock.
+    const armSegmentGap = cause => {
+      if (turn.terminal || turn.turnEnded || !turn.closedSegment) return
+      const window = turn.turnBusy ? this.segmentGapBusyMs : this.segmentGapMs
+      if (window <= 0) return endTurn('segment_gap_disabled', turn.closedSegment.finalSequence)
+      if (turn.segmentGapWindowMs >= window) return
+      clearTimeout(turn.segmentGapTimer)
+      turn.segmentGapWindowMs = window
+      const remaining = Math.max(0, turn.segmentClosedAt + window - Date.now())
+      this.log('upstream_segment_gap_armed', {
+        ...scopeLog, cause, window_ms: window, remaining_ms: remaining,
+        segment_index: turn.closedSegment.segmentIndex,
+        outstanding_tasks: turn.outstandingTasks.size,
+      })
+      turn.segmentGapTimer = setTimeout(() => {
+        turn.segmentGapTimer = null
         if (turn.terminal || turn.turnEnded || !turn.closedSegment) return
-        this.log('upstream_turn_idle_backstop', {
-          ...scopeLog, backstop_ms: this.turnIdleBackstopMs,
-          segment_index: turn.closedSegment.segmentIndex,
-          // ESS-1004 取证：兜底触发时手上还有几件后台工作。这是把 backstop
-          // 收紧成「按工作量分档」所缺的那组数据 —— 在拿到 n≥20 的真机样本
-          // 之前不据此改判定，只记录。
-          outstanding_tasks: turn.outstandingTasks.size,
-        })
-        endTurn('idle_backstop', turn.closedSegment.finalSequence)
-      }, this.turnIdleBackstopMs)
-      turn.turnIdleTimer.unref?.()
+        endTurn('segment_gap', turn.closedSegment.finalSequence)
+      }, remaining)
+      turn.segmentGapTimer.unref?.()
+    }
+
+    // ESS-990 corroborating evidence that this turn is NOT over: the upstream
+    // voice slot is busy with other output for this session (an announcement
+    // response), or a background task spawned by this turn has not reached a
+    // terminal status. Both only WIDEN the window, never end or block a turn:
+    //   • as a veto they are refuted by measurement — `task.accepted` lands
+    //     795–8689 ms AFTER the first segment's `audio.done` (n=10), so it
+    //     cannot protect the first segment, and tasks stay un-terminated 30–70 s
+    //     past the last segment (`task.progress` still firing at 42.5 s in the
+    //     南京 sample), so 「未终结 task ⇒ 不得收口」 would hold every
+    //     tool-calling turn open until the client's own 45 s hard timeout;
+    //   • as a widener they are exactly right: every measured segment gap
+    //     longer than 1194.7 ms had one of these two in flight.
+    const noteTurnBusy = cause => {
+      if (turn.turnBusy) return
+      turn.turnBusy = true
+      this.log('upstream_turn_busy', { ...scopeLog, cause })
+      armSegmentGap(cause)
     }
 
     const scheduleDone = () => {
@@ -757,66 +806,56 @@ export class QwenAgentTransport {
           }
           return
         }
-        // ESS-969 turn structure. `response.started` opens a response segment
-        // and `voice.state {state:'idle'}` ends the turn — both are upstream
-        // facts, mirrored from the deployed Bridge's reading of this same
-        // endpoint (`MacRemoteFrontendBridge/supervisor.mjs`). `origin` is
-        // `model` | `agent` | `announcement`; only `announcement` is an
-        // unrelated background broadcast and must not steer this turn (ESS-36).
-        if (event.type === 'response.started' && event.origin !== 'announcement') {
+        // ESS-969 turn structure. `response.started` opens a response segment.
+        // `origin` is `model` | `agent` | `announcement`; only `announcement`
+        // is an unrelated background broadcast and must not steer this turn
+        // (ESS-36) — but ESS-990 measured that an announcement occupying the
+        // upstream voice slot is exactly what delays this turn's next segment
+        // (5/5 of the gaps longer than 1.2 s had one), so it is recorded as
+        // evidence that the turn is not over without ever becoming a segment.
+        if (event.type === 'response.started') {
+          if (event.origin === 'announcement') {
+            if (event.responseId) turn.announcementResponseIds.add(String(event.responseId))
+            this.log('upstream_announcement_response_started', {
+              ...scopeLog, upstream_response_id: event.responseId ?? null,
+              upstream_task_id: event.taskId ?? event.task?.id ?? null,
+            })
+            noteTurnBusy('announcement_response')
+            return
+          }
           this.log('upstream_response_started', {
             ...scopeLog, upstream_response_id: event.responseId ?? null,
             origin: event.origin ?? null, segment_index: turn.segmentIndex,
           })
-          // ESS-969 B1: a new segment outranks a latched terminal — the
-          // upstream demonstrably went on producing, so the earlier `idle`
-          // was a segment gap, not the end of the turn. Without this a stale
-          // latch would cut the turn short at the previous segment.
-          if (turn.pendingTurnTerminal) {
-            this.log('upstream_turn_terminal_latch_invalidated', {
-              ...scopeLog, reason: turn.pendingTurnTerminal, cause: 'response.started',
-            })
-            turn.pendingTurnTerminal = null
-          }
           releaseClosedSegment('response.started')
           return
         }
         if (event.type === 'voice.state' && event.origin !== 'announcement') {
           turn.sawVoiceState = true
           if (event.state === 'idle') {
-            // Settle first: idle normally lands right behind the last
-            // `audio.done`, inside its settle window.
+            // ESS-990: idle is a per-RESPONSE playback state, not a turn
+            // terminal (upstream `realtime-gateway.mjs` emits it from
+            // `finishPlayback` / `cancelPlayback`; measured 0.14–0.54 ms after
+            // every segment's `audio.done`, n=10, with 10/10 turns producing
+            // another segment afterwards). It therefore decides nothing here.
+            //
+            // 两件事必须一起读，否则会以为这里在防一个不存在的问题：
+            // 上游的 `finishPlayback` 只由客户端的 `playback.ended` 回执触发
+            // （upstream `realtime-gateway.mjs` 的 PLAYBACK_ENDED 分支），而本
+            // 适配器**从不回 playback 回执**——所以真机 Watch 链路上，有音频的
+            // 回答根本收不到 idle（与 ESS-1004 三轮真机 `downlink_done=0` 一致）；
+            // ESS-990 的取证脚本按 Bridge 的方言回了回执，才把 idle 抓出来。
+            // 两条证据指向同一个结论：idle 既不可靠、也不表示回合结束。
+            //
+            // 它仍然会 settle 一个挂起的 done（那是关于段落的真事实），
+            // 也仍然是 `auto` 的方言指纹。
             if (turn.pendingDone) flushDone()
-            // Only a PARKED closed segment may be converted into the turn
-            // endpoint. Ending on anything else would cut a response that is
-            // still streaming (or one whose tail is still held by the reorder
-            // barrier) and present the truncation to the Watch as success.
-            // If idle ever lands elsewhere, this line is the evidence — and
-            // the bounded backstop still closes the turn.
-            if (turn.closedSegment) endTurn('voice_state_idle', turn.closedSegment.finalSequence)
-            // ESS-969 B1: `flushDone` above returns without closing the segment
-            // when a reorder hole is still open, so `pendingDone` still being
-            // set here means exactly「终态到了，但这一段的 done 还卡在洞上」.
-            // Latch the terminal instead of discarding it; `flushDone` consumes
-            // it the moment the late delta backfills the hole and the settle
-            // window closes. Dropping it here is what made the 45 s backstop
-            // the normal path for a healthy but out-of-order turn.
-            else if (turn.pendingDone && !turn.turnEnded) {
-              turn.pendingTurnTerminal = 'voice_state_idle'
-              this.log('upstream_turn_terminal_latched', {
-                ...scopeLog, reason: 'voice_state_idle',
-                reorder_pending: turn.reorderBuffer.size,
-                dense_high_watermark: turn.nextOutputSequence - 1,
-                segments_closed: turn.segmentsClosed,
-              })
-            }
-            else if (turn.responded && !turn.turnEnded) {
-              this.log('upstream_voice_state_idle_ignored', {
-                ...scopeLog, pending_done: turn.pendingDone,
-                reorder_pending: turn.reorderBuffer.size,
-                segments_closed: turn.segmentsClosed,
-              })
-            }
+            this.log('upstream_voice_state_idle', {
+              ...scopeLog, pending_done: turn.pendingDone,
+              reorder_pending: turn.reorderBuffer.size,
+              segments_closed: turn.segmentsClosed,
+              parked_segment: turn.closedSegment ? turn.closedSegment.segmentIndex : null,
+            })
           }
           return
         }
@@ -906,22 +945,31 @@ export class QwenAgentTransport {
             role: event.role, content: typeof event.content === 'string' ? event.content : '' })
           return
         }
-        if (event.type.startsWith('task.') && event.task?.id) {
+        // ESS-990 task lifecycle. Real captured frames carry the id on
+        // `event.task.id` (`{type:'task.accepted', task:{id, workId, status,
+        // sessionId, turnId, …}}`, 2026-08-22 capture) — `event.taskId` and
+        // `task.workId` are accepted too so a shape change cannot silently
+        // drop the signal. Terminal statuses are the `GatewayTaskEvent` ones
+        // (`shared/realtime-events.mjs`); `task.accepted` is real but off-enum,
+        // so membership is decided by「not terminal」rather than by a whitelist.
+        if (event.type.startsWith('task.')) {
+          const taskId = event.task?.id ?? event.task?.workId ?? event.taskId ?? null
+          if (taskId === null) return
           noteResponseProgress()
-          // ESS-1004：后台工作的起止决定「段落收口后还该不该等」。
-          // 终态字面量取上游 `shared/realtime-events.mjs` 的 TaskEvent 定义。
-          const taskId = String(event.task.id)
-          const taskStatus = String(event.task.status ?? event.type.slice(5))
-          const settled = taskStatus === 'completed' || taskStatus === 'failed'
-            || taskStatus === 'cancelled'
-          if (settled) turn.outstandingTasks.delete(taskId)
-          else turn.outstandingTasks.add(taskId)
+          const id = String(taskId)
+          const status = String(event.task?.status ?? event.type.slice(5))
+          const terminal = TASK_TERMINAL_EVENTS.has(event.type) || TASK_TERMINAL_STATUSES.has(status)
+          if (terminal) turn.outstandingTasks.delete(id)
+          else if (!TASK_NON_LIFECYCLE_EVENTS.has(event.type)) {
+            turn.outstandingTasks.add(id)
+            noteTurnBusy('task_in_flight')
+          }
+          // ESS-1004 取证线，保留：真机日志靠它才看得出后台工作的起止。
           this.log('upstream_task_state', {
-            ...scopeLog, task_id: taskId, status: taskStatus,
+            ...scopeLog, task_id: id, status,
             outstanding: turn.outstandingTasks.size,
           })
-          onEvent({ type: 'agent.task', response_id: responseId,
-            task: { id: String(event.task.id), status: event.task.status ?? event.type.slice(5) } })
+          onEvent({ type: 'agent.task', response_id: responseId, task: { id, status } })
           return
         }
         if (event.type === 'error' || event.type === 'session.error' || event.type === 'voice.error') {
@@ -950,7 +998,7 @@ export class QwenAgentTransport {
           turn.terminal = true
           clearTimeout(turn.connectTimer)
           clearTimeout(turn.responseTimer)
-          clearTimeout(turn.turnIdleTimer)
+          clearTimeout(turn.segmentGapTimer)
           this.#release(turn)
           return
         }
@@ -980,7 +1028,7 @@ export class QwenAgentTransport {
         clearTimeout(turn.doneTimer)
         clearTimeout(turn.gapTimer)
         clearTimeout(turn.responseTimer)
-        clearTimeout(turn.turnIdleTimer)
+        clearTimeout(turn.segmentGapTimer)
         turn.ws?.close()
         this.#release(turn)
       },
@@ -991,7 +1039,7 @@ export class QwenAgentTransport {
         clearTimeout(turn.doneTimer)
         clearTimeout(turn.gapTimer)
         clearTimeout(turn.responseTimer)
-        clearTimeout(turn.turnIdleTimer)
+        clearTimeout(turn.segmentGapTimer)
         if (turn.ws?.readyState === WebSocket.OPEN) {
           turn.ws.send(JSON.stringify({ type: 'mute' }))
         }
