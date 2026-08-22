@@ -11,9 +11,10 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
     /// ESS-1008 B1: a dead WSS must not truncate PCM already owned by the
     /// Watch player. Failure is held until the real renderer emits `.ended`.
     func testTransportFailureDrainsBufferedAudioBeforeTerminal() {
+        let drainTimer = ManualBarrierTimer()
         let (adapter, _, player, _, _) = makeAdapter(sessionIds: [
             "10081008-0000-4000-8000-000000000001"
-        ])
+        ], transportFailureDrainTimer: drainTimer)
         let handle = adapter.beginTurn(requestId: "10081008-0000-4000-8000-000000000002")
         var failures: [String] = []
         adapter.onAnswerPlaybackFailed = { _, code in failures.append(code) }
@@ -29,6 +30,10 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
         XCTAssertTrue(player.isRenderingDownlink)
         XCTAssertFalse(player.stopped, "WSS failure must not truncate buffered PCM")
         XCTAssertTrue(failures.isEmpty)
+        XCTAssertEqual(
+            drainTimer.lastRequestedInterval,
+            WatchRealtimeMediaAdapter.transportFailureDrainDeadlineSeconds
+        )
 
         player.onPlaybackEvent?(.ended(
             requestId: handle.requestId, sessionId: handle.sessionId,
@@ -37,6 +42,41 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
 
         XCTAssertEqual(failures, ["transport_failed:recv_error"])
         XCTAssertTrue(player.stopped, "fallback cleanup runs only after renderer drained")
+        XCTAssertFalse(drainTimer.isArmed, "normal drain must cancel the deadline")
+    }
+
+    /// ESS-1019: without an audio.done barrier the player cannot emit
+    /// `.ended`; the bounded drain deadline must terminate before the
+    /// SessionController's 45-second hard timeout instead of hanging forever.
+    func testTransportFailureWithoutBarrierTerminatesAtDrainDeadline() {
+        let drainTimer = ManualBarrierTimer()
+        let (adapter, _, player, _, _) = makeAdapter(
+            sessionIds: ["10191019-0000-4000-8000-000000000001"],
+            transportFailureDrainTimer: drainTimer
+        )
+        let handle = adapter.beginTurn(requestId: "10191019-0000-4000-8000-000000000002")
+        var failures: [String] = []
+        adapter.onAnswerPlaybackFailed = { _, code in failures.append(code) }
+        adapter.ingestDownlink(VoiceStreamChunk(
+            requestId: handle.requestId, streamId: handle.sessionId,
+            direction: .downlink, sequence: 0, capturedAtMs: 1,
+            codec: "pcm_s16le", sampleRate: 24_000,
+            payload: Data(repeating: 1, count: 96)
+        ))
+
+        adapter.markTransportFailed(reason: "recv_error_before_barrier")
+
+        XCTAssertTrue(failures.isEmpty)
+        XCTAssertTrue(drainTimer.isArmed)
+        XCTAssertLessThan(
+            WatchRealtimeMediaAdapter.transportFailureDrainDeadlineSeconds,
+            SessionController.thinkingHardTimeoutSeconds
+        )
+
+        XCTAssertTrue(drainTimer.fire())
+        XCTAssertEqual(failures, ["transport_failed:recv_error_before_barrier"])
+        XCTAssertTrue(player.stopped, "deadline terminal must collapse realtime playback")
+        XCTAssertFalse(drainTimer.isArmed)
     }
 
     /// ESS-1008 B1: when no PCM is queued, there is nothing to preserve and
@@ -395,6 +435,7 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
     private func makeAdapter(
         sessionIds: [String],
         barrierTimer: WatchRealtimeMediaAdapter.BarrierTimer = TaskBasedBarrierTimer(),
+        transportFailureDrainTimer: WatchRealtimeMediaAdapter.BarrierTimer = TaskBasedBarrierTimer(),
         loggerSink: LoggerSink? = nil
     ) -> (
         WatchRealtimeMediaAdapter, MockRecorder, MockPlayer, MockTransport, FallbackCounter
@@ -421,7 +462,8 @@ final class WatchRealtimeMediaAdapterTests: XCTestCase {
             session: session, recorder: recorder, player: player, transport: transport,
             fullFileFallback: { handle, reason in counter.record(handle, reason) },
             logger: { line in loggerSink?.append(line) },
-            barrierTimer: barrierTimer
+            barrierTimer: barrierTimer,
+            transportFailureDrainTimer: transportFailureDrainTimer
         )
         return (adapter, recorder, player, transport, counter)
     }

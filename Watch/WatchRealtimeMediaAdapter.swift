@@ -35,6 +35,12 @@ final class WatchRealtimeMediaAdapter {
     /// out and the buffer-level fallback reason (`.doneBarrierTimedOut`).
     static let doneBarrierTimeoutSeconds: TimeInterval = 2.0
 
+    /// ESS-1019: a WSS failure can arrive before `audio.done`, so the player
+    /// may never emit `.ended` even after its already-buffered PCM runs out.
+    /// 20 s is above the 15.157 s inter-segment lower-bound captured by
+    /// ESS-1004, while remaining well below the session's 45 s hard timeout.
+    static let transportFailureDrainDeadlineSeconds: TimeInterval = 20.0
+
     protocol Recorder: AnyObject {
         var onFrame: ((Data) -> Void)? { get set }
         var onFailure: ((Error) -> Void)? { get set }
@@ -140,6 +146,7 @@ final class WatchRealtimeMediaAdapter {
     private let fullFileFallback: FullFileFallback
     private let logger: (String) -> Void
     private let barrierTimer: BarrierTimer
+    private let transportFailureDrainTimer: BarrierTimer
     private var vadEndpointer: LocalVADEndpointer?
     private let vadSampleRate: Int
     private let automaticallyCommitOnSpeechFinal: Bool
@@ -197,6 +204,7 @@ final class WatchRealtimeMediaAdapter {
         fullFileFallback: @escaping FullFileFallback = { _, _ in },
         logger: @escaping (String) -> Void = { _ in },
         barrierTimer: BarrierTimer = TaskBasedBarrierTimer(),
+        transportFailureDrainTimer: BarrierTimer = TaskBasedBarrierTimer(),
         vadConfiguration: LocalVADConfiguration? = nil,
         automaticallyCommitOnSpeechFinal: Bool = false
     ) {
@@ -207,6 +215,7 @@ final class WatchRealtimeMediaAdapter {
         self.fullFileFallback = fullFileFallback
         self.logger = logger
         self.barrierTimer = barrierTimer
+        self.transportFailureDrainTimer = transportFailureDrainTimer
         self.vadEndpointer = vadConfiguration.map(LocalVADEndpointer.init(configuration:))
         self.vadSampleRate = vadConfiguration?.sampleRate ?? RealtimeMediaFormat.uplinkPCM16.sampleRate
         self.automaticallyCommitOnSpeechFinal = automaticallyCommitOnSpeechFinal
@@ -348,6 +357,7 @@ final class WatchRealtimeMediaAdapter {
         didTriggerCompleteFileFallback = false
         didSignalChannelReady = false
         pendingTransportFailureReason = nil
+        transportFailureDrainTimer.cancel()
         currentResponseId = nil
         vadFrameStartedAtMs = Self.uptimeMs()
         vadLastLevelLogAtMs = nil
@@ -735,6 +745,9 @@ final class WatchRealtimeMediaAdapter {
         )
         guard !player.isRenderingDownlink else {
             pendingTransportFailureReason = reason
+            transportFailureDrainTimer.arm(after: Self.transportFailureDrainDeadlineSeconds) { [weak self] in
+                self?.transportFailureDrainDeadlineReached(handle: handle)
+            }
             WatchLog.info(
                 "realtime", "transport_failure_deferred",
                 requestId: handle.requestId,
@@ -754,6 +767,8 @@ final class WatchRealtimeMediaAdapter {
         reason: String,
         disposition: String
     ) {
+        transportFailureDrainTimer.cancel()
+        pendingTransportFailureReason = nil
         WatchLog.info(
             "realtime", "transport_failure_terminal",
             requestId: handle.requestId,
@@ -761,6 +776,19 @@ final class WatchRealtimeMediaAdapter {
         )
         onAnswerPlaybackFailed?(handle, "transport_failed:\(reason)")
         session.markDownlinkBridgeFallback()
+    }
+
+    private func transportFailureDrainDeadlineReached(
+        handle: RealtimeMediaSession.TurnHandle
+    ) {
+        guard handle == currentTurn,
+              let reason = pendingTransportFailureReason else { return }
+        pendingSegmentBoundary = false
+        finishTransportFailure(
+            handle: handle,
+            reason: reason,
+            disposition: "drain_deadline"
+        )
     }
 
     private func handle(_ event: RealtimeMediaSession.Event) {
