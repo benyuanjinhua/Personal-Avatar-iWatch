@@ -125,28 +125,22 @@ export class QwenAgentTransport {
     // chosen only to sit above the Watch-visible turn budget. Calibrate from
     // `upstream_segment_closed` → `upstream_turn_terminal` deltas once real
     // tool-calling turns are in gateway.log (n ≥ 20).
-    // ESS-1004：**backstop 必须显著小于客户端硬超时**。
+    // ESS-1004 复审整改（毕玄 REQUEST CHANGES，我核对后接受）：
+    // **本 PR 原先把 45 s 改成 30 s，理由是「与客户端硬超时数值相等，客户端总是抢先」。
+    // 那个因果是错的，已撤回改动。** 两个计时器不在同一时刻起表：
     //
-    // ESS-969 选 `voice.state {state:'idle'}` 作终态，依据是一句未经验证的推断；
-    // 同一段注释也承认「No real-device sample of「末段 audio.done → voice.state
-    // idle」exists yet」。样本现在有了，是反例：
+    //   10:34:35.112  upstream_segment_closed segment_index=1   ← backstop 在这里武装
+    //   10:34:35.646  session_ended reason=peer_closed          ← 0.534 s 后连接就没了
+    //   10:35:02.657  [Watch] session_answer_interim            ← 客户端 45 s 才起表
+    //   10:35:47.740  [Watch] session_thinking_hard_timeout
     //
-    //   三轮真机（08-22 03:29 / 05:37 / 10:34）`downlink_done` **全部为 0**。
+    // 连接若存活，45 s backstop 应在 10:35:20.112 触发，**比客户端早 27.5 秒**。
+    // 现场没触发不是因为数值相等，而是因为连接在武装后 0.5 秒就断了（ESS-1008）。
+    // 把常数从 45 改成 30 对本故障零增益，只会无谓压缩工具时延预算。
     //
-    // 上游源码（`QwenAudio/qwen-audio-agent`）里 `state:'idle'` 共 5 处，全是
-    // 异常/边缘路径，其中 `realtime-gateway.mjs:1267` 是
-    // `if (!responseContext?.hasAudio)` —— **只在 response 没有音频时发**。
-    // 正常回答必然有音频，因此健康回合**永远收不到 idle**，只能落到本兜底。
-    //
-    // 而原值 45 s 与客户端 `SessionController.thinkingHardTimeoutSeconds`
-    // **完全相等**：真机上客户端每次先到，误报「回答超时」并自动挂断，
-    // 下一问落进正在挂断/重启的 App。兜底从未生效过一次。
-    //
-    // 30 s 让兜底稳定先于客户端触发（余量 15 s，足够覆盖播放排空的抖动）。
-    // **这是止血，不是终态判定的正解**：正解需要一个上游真的会发的回合终态
-    // 信号，见 ESS-1004 的后续项——在那之前不要把这个值再调小，
-    // 它必须容得下工具时延。
-    turnIdleBackstopMs = 30_000,
+    // 保持 45 s 并维持 R-04.4 的「待标定」标注：标定依据要等 ESS-990 采到
+    // n≥20 的 `upstream_segment_closed` → `upstream_turn_terminal` 实测分布。
+    turnIdleBackstopMs = 45_000,
     takeover = true,
     // ESS-978: our own identity on the upstream. The label embeds the pid so
     // two copies of this gateway on one machine are distinguishable, and the
