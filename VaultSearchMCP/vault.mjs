@@ -4,6 +4,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 export class VaultError extends Error {
@@ -19,7 +20,8 @@ export const ERROR_CODES = Object.freeze({
   INVALID_NOTE_ID: "INVALID_NOTE_ID",
   PATH_DENIED: "PATH_DENIED",
   NOT_FOUND: "NOT_FOUND",
-  INVALID_ARGUMENT: "INVALID_ARGUMENT"
+  INVALID_ARGUMENT: "INVALID_ARGUMENT",
+  WRITE_FAILED: "WRITE_FAILED"
 });
 
 // 硬编码密钥类文件拒绝名单，配置不可放宽。
@@ -35,10 +37,72 @@ export const DEFAULT_LIMITS = Object.freeze({
   readMaxChars: 20000,
   maxQueryChars: 256,
   maxNoteIdChars: 512,
+  maxIdeaChars: 10000,
+  maxIdeaContextChars: 2000,
   maxIndexFileBytes: 2 * 1024 * 1024,
   maxIndexFiles: 20000,
   indexTtlMs: 30000
 });
+
+export const IDEA_DIRECTORY = "Jackson/Idea";
+
+function compactTimestamp(date) {
+  return date.toISOString().replace(/[-:]/g, "").replace("T", "-").replace("Z", "Z");
+}
+
+// Idea 写入是唯一获准的 Vault 写操作：目标目录固定、文件排他创建，调用方不能传路径。
+export function captureIdea(config, args, dependencies = {}) {
+  if (args?.intent !== "record_idea") {
+    throw new VaultError(ERROR_CODES.INVALID_ARGUMENT,
+      "仅接受用户明确记录灵感时的 intent=record_idea；普通对话不得写入");
+  }
+  if (typeof args.content !== "string" || args.content.trim() === "") {
+    throw new VaultError(ERROR_CODES.INVALID_ARGUMENT, "灵感正文不能为空");
+  }
+  const content = args.content.trim();
+  if (content.length > config.limits.maxIdeaChars) {
+    throw new VaultError(ERROR_CODES.INVALID_ARGUMENT, "灵感正文超长");
+  }
+  if (args.context !== undefined && typeof args.context !== "string") {
+    throw new VaultError(ERROR_CODES.INVALID_ARGUMENT, "context 必须是字符串");
+  }
+  const context = args.context?.trim() ?? "";
+  if (context.length > config.limits.maxIdeaContextChars) {
+    throw new VaultError(ERROR_CODES.INVALID_ARGUMENT, "context 超长");
+  }
+
+  const root = resolveVaultRoot(config);
+  const ideaDirectory = path.join(root, ...IDEA_DIRECTORY.split("/"));
+  try {
+    fs.mkdirSync(ideaDirectory, { recursive: true, mode: 0o700 });
+    const realDirectory = fs.realpathSync(ideaDirectory);
+    if (realDirectory !== root && !realDirectory.startsWith(root + path.sep)) {
+      throw new VaultError(ERROR_CODES.PATH_DENIED, "Idea 目录指向 Vault 外部");
+    }
+
+    const now = dependencies.now?.() ?? new Date();
+    const id = dependencies.randomUUID?.() ?? crypto.randomUUID();
+    const fileName = `${compactTimestamp(now)}-${id}.md`;
+    const noteId = `${IDEA_DIRECTORY}/${fileName}`;
+    const markdown = [
+      "# Idea",
+      "",
+      `- 记录时间：${now.toISOString()}`,
+      `- ID：${id}`,
+      "",
+      "## 原始想法",
+      "",
+      content,
+      ...(context ? ["", "## 上下文", "", context] : []),
+      ""
+    ].join("\n");
+    fs.writeFileSync(path.join(realDirectory, fileName), markdown, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    return { note_id: noteId, recorded_at: now.toISOString(), id };
+  } catch (error) {
+    if (error instanceof VaultError) throw error;
+    throw new VaultError(ERROR_CODES.WRITE_FAILED, `灵感写入失败: ${error.message}`);
+  }
+}
 
 export function loadConfig(env = process.env) {
   const configPath = env.VAULT_MCP_CONFIG

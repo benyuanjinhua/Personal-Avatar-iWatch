@@ -19,7 +19,7 @@
 
   "gateway_url": "http://127.0.0.1:3101",
   "audio_realtime_gateway_url": "http://127.0.0.1:8445",
-  "fallback_jobs_enabled": true,
+  "fallback_jobs_enabled": false,
   "fallback_hmac_secret_env": "FALLBACK_JOB_HMAC_SECRET",
   "fallback_hmac_secret_file": "../AudioRealtimeGateway/state/fallback-hmac-secret",
   "fallback_job_poll_ms": 100,

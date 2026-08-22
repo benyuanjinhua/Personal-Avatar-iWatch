@@ -287,9 +287,17 @@ final class RealtimeMediaSession {
         // trigger release right here — otherwise the coordinator would sit
         // on `pendingFinalSequence` until the next barrier tick and delay
         // `player.finish(...)` past the point of the last render.
+        //
+        // ESS-1002：这条**异步**释放路径必须与 `receiveDone` 的同步分支同口径。
+        // `audio.segment_done` 先到、尾帧后到时，`markDone` 返回 `.waiting`，
+        // 释放就发生在这里；此处若无条件 `endSession()`，下一段的 delta 照样
+        // 被判 `.sessionEnded`——ESS-971 只修了同步那一半。边界类型由屏障自己
+        // 带过来（`consumePendingDoneIsSegmentBoundary`），不靠调用方重传。
         if let release = downlink.checkBarrierRelease() {
             if case .barrierReleased(let final, let responseId) = release {
-                _ = downlink.endSession()
+                if !downlink.consumePendingDoneIsSegmentBoundary() {
+                    _ = downlink.endSession()
+                }
                 onEvent?(.doneBarrierReleased(handle, finalSequence: final, responseId: responseId))
             }
         }
@@ -299,14 +307,22 @@ final class RealtimeMediaSession {
     /// the buffer's barrier logic and emits `doneArrived(...)` with the
     /// decision. `generation` guards against stale done events closing a
     /// newer generation's session (U8 core regression).
+    /// - Parameter isSegmentBoundary: ESS-971。`true` 表示这是**段落**边界
+    ///   （`audio.segment_done`）而不是回合终态（`audio.done`）：屏障照常释放、
+    ///   本段音频照常播完，但**绝不关闭 downlink session**——下一段的 delta
+    ///   正是 `endSession()` 注释里说的「late frames」，关了就全被判
+    ///   `.sessionEnded`。2026-08-22 真机上第二段 10 帧就是这么整段消失的
+    ///   （`downlink_drop reason=sessionEnded` ×10，最后靠 45s 思考超时才收场）。
     func receiveDone(
         finalSequence: Int?,
         responseId: String? = nil,
-        generation: Int? = nil
+        generation: Int? = nil,
+        isSegmentBoundary: Bool = false
     ) {
         guard let handle = currentTurn else { return }
         let outcome = downlink.markDone(
-            finalSequence: finalSequence, responseId: responseId, generation: generation
+            finalSequence: finalSequence, responseId: responseId, generation: generation,
+            isSegmentBoundary: isSegmentBoundary
         )
         onEvent?(.doneArrived(handle, outcome))
         switch outcome {
@@ -317,7 +333,12 @@ final class RealtimeMediaSession {
             // rejected as `.sessionEnded` (a new response's deltas still
             // arrive under the same generation once the coordinator's next
             // turn opens).
-            _ = downlink.endSession()
+            //
+            // ESS-971：段落边界例外。上面这句「late frames」对回合终态成立，
+            // 对段落边界恰恰相反——下一段的 delta 就是 late frames，而它们是
+            // 本回合真正的答案。`markDone` 已在释放时清了 `pendingFinalSequence`，
+            // 所以不关 session 也不会有残留屏障。
+            if !isSegmentBoundary { _ = downlink.endSession() }
         case .missingFinalSequence:
             // Gateway did not send `final_sequence` (legacy / rollout).
             // Spec §3.2 row 3 degrades to `n = max emitted seq` — meaning
@@ -328,6 +349,8 @@ final class RealtimeMediaSession {
             // visible so the Gateway side gets fixed.
             break
         case .waiting,
+             // ESS-1002：屏障 armed 但未收齐。边界类型已由 `markDone` 存进
+             // buffer，异步释放（`receiveDownlink` 尾部）据此决定是否 endSession。
              .droppedStaleGeneration,
              .droppedFutureGeneration,
              .droppedPendingGeneration:

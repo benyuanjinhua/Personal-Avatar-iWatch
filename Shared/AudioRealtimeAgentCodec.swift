@@ -178,6 +178,27 @@ enum AudioRealtimeAgentCodec {
         /// of downlink sequences the server delivered.
         case audioDone(sessionId: String, requestId: String, responseId: String,
                        generation: Int, finalSequence: Int)
+        /// Gateway `audio.segment_done`（ESS-969）——**本段结束，回合未结束**。
+        ///
+        /// 工具调用回合里模型先说「我正在查询…」并关闭该 response，跑完工具后再开
+        /// 第二个 response 说真正的答案。屏障语义与 `audio.done` 一致（`final_sequence`
+        /// 之前的序号收齐即释放），但客户端**必须保持本轮打开**：退回等待态、
+        /// 重新武装有界超时、**不开下一轮**（Watch：`SessionController.markAnswerInterim`）。
+        ///
+        /// 一个回合可以有 0..N 个 `audio.segment_done`，但有且只有一个 `audio.done`。
+        case audioSegmentDone(sessionId: String, requestId: String, responseId: String,
+                              generation: Int, segmentIndex: Int, finalSequence: Int)
+        /// Gateway `audio.segment_dropped`（ESS-957）——本回合 `audio.done`
+        /// 之后上游又产出了音频，被网关丢弃。
+        ///
+        /// 工具调用场景：模型先说「我正在查询…」并 `audio.done`，工具返回后
+        /// 再产出**真正的答案**；而网关的会话模型把一个回合绑死成一段回答
+        /// （`realtime-session.mjs:98` 的 `responseId = request_id:genN`），
+        /// 第二段无处可回。能力层的修复见 ESS-969；在那之前，至少不能让
+        /// 用户对着一句「我正在查询…」干等——这条事件就是唯一的知情来源。
+        case segmentDropped(sessionId: String, requestId: String, responseId: String,
+                            generation: Int, sequence: Int, droppedCount: Int,
+                            reason: String?)
         /// Gateway `cancel.ack` — server-authoritative cancel confirmation.
         case cancelAck(sessionId: String, requestId: String, generation: Int,
                        cancelledResponseId: String)
@@ -239,6 +260,36 @@ enum AudioRealtimeAgentCodec {
             return .event(.audioDone(
                 sessionId: sid, requestId: rid, responseId: respId,
                 generation: gen, finalSequence: finalSeq
+            ))
+
+        case "audio.segment_done":
+            guard let sid = raw["session_id"] as? String,
+                  let rid = raw["request_id"] as? String,
+                  let respId = raw["response_id"] as? String,
+                  let gen = raw["generation"] as? Int,
+                  // `final_sequence` 是屏障值，缺了就无法判定这一段收齐没有。
+                  let finalSeq = raw["final_sequence"] as? Int else { return .malformed }
+            // `segment_index` 只用于取证与排序，缺省按 0——不值得为它把整帧判死。
+            let segmentIndex = (raw["segment_index"] as? Int) ?? 0
+            return .event(.audioSegmentDone(
+                sessionId: sid, requestId: rid, responseId: respId,
+                generation: gen, segmentIndex: segmentIndex, finalSequence: finalSeq
+            ))
+
+        case "audio.segment_dropped":
+            guard let sid = raw["session_id"] as? String,
+                  let rid = raw["request_id"] as? String,
+                  let respId = raw["response_id"] as? String,
+                  let gen = raw["generation"] as? Int,
+                  let sequence = raw["sequence"] as? Int else { return .malformed }
+            // `dropped_count` / `reason` 是取证补充，缺了不该把整帧判死——
+            // 那等于又回到「客户端什么都不知道」的老路。
+            let droppedCount = (raw["dropped_count"] as? Int) ?? 1
+            let reason = raw["reason"] as? String
+            return .event(.segmentDropped(
+                sessionId: sid, requestId: rid, responseId: respId,
+                generation: gen, sequence: sequence,
+                droppedCount: droppedCount, reason: reason
             ))
 
         case "cancel.ack":

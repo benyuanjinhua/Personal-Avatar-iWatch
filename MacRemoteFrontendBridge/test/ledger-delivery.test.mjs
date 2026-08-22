@@ -38,6 +38,32 @@ describe('ESS-255 D2 terminal error projection', () => {
     assert.equal(isAutomaticallyRetryableTerminalError('ERR_NOT_ENUMERATED'), false)
   })
 
+  it('keeps deterministic failures non-retryable but still reliably redeliverable', () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'deterministic-failure-'))
+    const ledger = new TurnLedger({ stateDir })
+    ledger.create({ requestId: 'req-deterministic', deviceId: 'watch', bodySha256: 'sha', sessionId: 's' })
+    ledger.fail('req-deterministic', 'ERR_FALLBACK_NOT_CONFIGURED')
+
+    // 确定性失败不进「业务重试」链：非可重试终态码，不会自动重发整轮。
+    assert.equal(isAutomaticallyRetryableTerminalError('ERR_FALLBACK_NOT_CONFIGURED'), false)
+
+    const projection = ledger.projection('req-deterministic')
+    assert.equal(projection.detail, '助手这边还没准备好，这次没接上，稍后再试。')
+    assert.equal(projection.detail.includes('ERR_'), false)
+
+    // 终态投递仍走既有的有界补投：Bridge 不自写 delivered_ack，
+    // 只有 Watch 的真实 ACK 才收口（ESS-988 复审阻断项 1）。
+    assert.deepEqual(ledger.markResultRedelivered('req-deterministic', { now: 1_000, baseDelayMs: 100 }), {
+      attempt: 1, delay_ms: 100,
+    })
+    assert.equal(ledger.get('req-deterministic').delivered_ack, null)
+    assert.equal(ledger.replayable({ now: 1_100, maxDeliveryAttempts: 5 }).length, 1)
+
+    ledger.acknowledgeResult('req-deterministic', { source: 'watch' })
+    assert.equal(ledger.get('req-deterministic').delivered_ack.source, 'watch')
+    assert.equal(ledger.replayable({ now: 99_999, maxDeliveryAttempts: 5 }).length, 0)
+  })
+
   it('never exposes unknown error codes or raw failed detail', () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'terminal-error-fallback-'))
     const ledger = new TurnLedger({ stateDir })

@@ -119,6 +119,23 @@ final class AudioRealtimeAgentSession {
     /// Params: (requestId, responseId, generation, finalSequence).
     var onAudioDone: ((String, String?, Int, Int) -> Void)?
 
+    /// ESS-969 / ESS-971：**本段结束，回合未结束**。
+    /// Params: (requestId, responseId, generation, segmentIndex, finalSequence)。
+    ///
+    /// 与 `onAudioDone` 的区别是唯一且关键的：**不得置位任何回合终态闩锁**。
+    /// 上层收到它应退回等待态、重新武装有界超时，**不开下一轮**——
+    /// 开下一轮的话，第二段（真正的答案）到达时会落进下一轮，重演 ESS-600 复审
+    /// 阻断 B 钉住的跨轮错乱。
+    var onAudioSegmentDone: ((String, String?, Int, Int, Int) -> Void)?
+
+    /// ESS-957：本回合 `audio.done` 之后上游又产出音频、被网关丢弃。
+    /// Params: (requestId, responseId, generation, droppedCount)。
+    ///
+    /// 典型来源是工具调用——「我正在查询…」之后的**真正答案**。能力层修复
+    /// 见 ESS-969；在那之前这条回调的作用是让会话层能收口，而不是让用户
+    /// 对着半句话干等。
+    var onSegmentDropped: ((String, String?, Int, Int) -> Void)?
+
     /// Emitted on Gateway `error`.
     /// Params: (code, requestId, generation, retriable, detail).
     var onError: ((String, String, Int, Bool, String?) -> Void)?
@@ -330,6 +347,44 @@ final class AudioRealtimeAgentSession {
                 detail: "final_seq=\(finalSeq) gen=\(gen)"
             )
             onAudioDone?(rid, respId, gen, finalSeq)
+
+        case .audioSegmentDone(let sid, let rid, let respId, let gen,
+                               let segmentIndex, let finalSeq):
+            guard sid == sessionId, let turn = currentTurn,
+                  turn.requestId == rid else { return }
+            // 段落屏障也要撤掉「等首个响应」的预算——上游已经在答了。
+            cancelResponseWait()
+            // **刻意不写 currentTurn?.finalSequence**：那是回合终态用的字段
+            // （`audio.done` 才写），段落边界写进去会让本轮被当成已收口。
+            Self.logger.info(
+                "agent audio.segment_done rid=\(rid.prefix(8), privacy: .public) gen=\(gen) seg=\(segmentIndex) final_seq=\(finalSeq)"
+            )
+            PhoneAgentClientLog.info(
+                module: Self.logModule,
+                event: "downlink_audio_segment_done_accepted",
+                requestId: rid, sessionId: sid,
+                detail: "segment_index=\(segmentIndex) final_seq=\(finalSeq) gen=\(gen)"
+            )
+            onAudioSegmentDone?(rid, respId, gen, segmentIndex, finalSeq)
+
+        case .segmentDropped(let sid, let rid, let respId, let gen, let seq,
+                             let droppedCount, let reason):
+            guard sid == sessionId else { return }
+            // ESS-957：本回合 done 之后上游还有音频，被网关丢了。能力层的修复
+            // 在 ESS-969；在那之前这条事件是客户端唯一的知情来源——**不落成
+            // 一等取证，真机上就永远分不清「模型没答」与「答了被丢」**。
+            Self.logger.error(
+                "agent segment dropped rid=\(rid.prefix(8), privacy: .public) gen=\(gen) resp=\(respId.prefix(8), privacy: .public) seq=\(seq) dropped=\(droppedCount)"
+            )
+            PhoneAgentClientLog.error(
+                module: Self.logModule,
+                event: "downlink_segment_dropped",
+                requestId: rid, sessionId: sid,
+                detail: "seq=\(seq) dropped_count=\(droppedCount) gen=\(gen) "
+                    + "reason=\(reason ?? "unknown")",
+                code: "ERR_UPSTREAM_AUDIO_AFTER_DONE"
+            )
+            onSegmentDropped?(rid, respId, gen, droppedCount)
 
         case .cancelAck(let sid, let rid, let gen, let cancelledRespId):
             guard sid == sessionId else { return }

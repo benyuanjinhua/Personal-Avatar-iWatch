@@ -25,6 +25,11 @@ function harness(overrides = {}) {
     log: (evt, extra) => logs.push({ evt, ...extra }),
     heartbeatIntervalMs: 0,
     idleDisconnectMs: 0,
+    // ESS-959: commit deadline watchdog disabled by default in the harness —
+    // the controlledClock asserts an exact pending-timer count, and the
+    // watchdog arms a timer on session.start. The dedicated commit-deadline
+    // tests re-enable it with an explicit value.
+    commitDeadlineMs: 0,
     ...overrides,
   })
   return { session, sent, logs, closes, agent, scope }
@@ -116,8 +121,10 @@ describe('RealtimeSession — happy path', () => {
     }))
     const err = sent.find(e => e.type === 'error')
     assert.equal(err?.code, 'ERR_STREAM_SEQUENCE')
-    assert.equal(err.expected, 3)
-    assert.equal(err.got, 4)
+    // ESS-958: error frame carries expected/got sequence so the client can
+    // self-heal or diagnose instead of blindly reconnecting.
+    assert.equal(err.expected_sequence, 3)
+    assert.equal(err.got_sequence, 4)
   })
 
   it('rejects scope mismatch on any subsequent frame', () => {
@@ -403,5 +410,47 @@ describe('pcm16Level (ESS-891)', () => {
   it('reports the -6.02 dBFS reference for a half-scale constant signal', () => {
     const level = pcm16Level(pcm([16384, 16384, 16384, 16384]))
     assert.ok(Math.abs(level.peak_dbfs - (-6.02)) < 0.05, `peak_dbfs=${level.peak_dbfs}`)
+  })
+
+  // ESS-959: 建连后迟迟不 commit 的看门狗。
+  it('fails closed when no audio.commit arrives within the commit deadline', () => {
+    const clock = controlledClock()
+    const { session, sent, scope, closes, logs } = harness({
+      commitDeadlineMs: 30_000,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    // 只发一帧，从不 commit。
+    session.onFrame(JSON.stringify({
+      type: 'audio.append',
+      session_id: scope.session_id, request_id: scope.request_id, generation: scope.generation,
+      sequence: 0, audio: b64('frame'),
+    }))
+    assert.equal(clock.pendingCount(), 1, 'commit deadline armed on session.start')
+    clock.fireAll()
+    const err = sent.find(e => e.type === 'error')
+    assert.equal(err?.code, 'ERR_COMMIT_DEADLINE_TIMEOUT')
+    assert.ok(logs.some(l => l.evt === 'commit_deadline_timeout' && l.frames_seen === 1))
+    assert.ok(closes.some(c => c.code === 1008))
+  })
+
+  it('commit clears the deadline so a healthy turn is not killed', () => {
+    const clock = controlledClock()
+    const { session, scope } = harness({
+      commitDeadlineMs: 30_000,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    session.onFrame(JSON.stringify({
+      type: 'audio.append',
+      session_id: scope.session_id, request_id: scope.request_id, generation: scope.generation,
+      sequence: 0, audio: b64('frame'),
+    }))
+    session.onFrame(JSON.stringify({
+      type: 'audio.commit',
+      session_id: scope.session_id, request_id: scope.request_id, generation: scope.generation,
+      sequence: 0,
+    }))
+    assert.equal(clock.pendingCount(), 0, 'commit cleared the deadline timer')
   })
 })

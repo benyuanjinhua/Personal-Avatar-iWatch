@@ -253,6 +253,32 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
             )
             self.onDownlink?(envelope)
         }
+        // ESS-971：段落屏障。与 `onAudioDone` 共用同一套 generation 门禁，
+        // 但**不**触发任何回合终态——它只是「这一段完了」。
+        agentSession.onAudioSegmentDone = { [weak self] rid, responseId, gen, segIdx, finalSeq in
+            guard let self else { return }
+            guard gen == self.gate.generation else {
+                PhoneAgentClientLog.info(
+                    module: Self.logModule,
+                    event: "downlink_audio_segment_done_stale_generation",
+                    requestId: rid, sessionId: self.sessionId,
+                    detail: "segment_index=\(segIdx) final_seq=\(finalSeq) frame_gen=\(gen) current_gen=\(self.gate.generation)"
+                )
+                return
+            }
+            let envelope = RealtimeDownlinkEnvelope.audioSegmentDone(
+                requestId: rid, sessionId: self.sessionId,
+                responseId: responseId, generation: gen,
+                segmentIndex: segIdx, finalSequence: finalSeq
+            )
+            PhoneAgentClientLog.info(
+                module: Self.logModule,
+                event: "downlink_enqueued",
+                requestId: rid, sessionId: self.sessionId,
+                detail: "type=audio.segment_done segment_index=\(segIdx) final_seq=\(finalSeq) gen=\(gen)"
+            )
+            self.onDownlink?(envelope)
+        }
         agentSession.onError = { [weak self] code, rid, gen, retriable, detail in
             guard let self else { return }
             Self.logger.error(

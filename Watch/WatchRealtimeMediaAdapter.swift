@@ -112,6 +112,9 @@ final class WatchRealtimeMediaAdapter {
     /// 只有本回合（requestId + sessionId 双匹配）的事件才上报；上一轮的迟到
     /// `.ended` 在这里就被 `currentTurn` 挡掉，并留证 `stale_playback_dropped`。
     var onAnswerPlaybackFinished: (@MainActor (RealtimeMediaSession.TurnHandle, _ bytesPlayed: Int) -> Void)?
+    /// ESS-971：**本段**播完，回合未完。上层应走 `markAnswerInterim`
+    /// （退回等待态、重新武装有界超时、**不开下一轮**），而不是回合终态。
+    var onAnswerPlaybackSegmentFinished: (@MainActor (RealtimeMediaSession.TurnHandle, _ bytesPlayed: Int) -> Void)?
     /// ESS-600：realtime 播放失败。失败不得伪装成播完——会话层据此走
     /// `session_answer_failed` 的显式恢复路径。
     var onAnswerPlaybackFailed: (@MainActor (RealtimeMediaSession.TurnHandle, _ code: String) -> Void)?
@@ -281,6 +284,18 @@ final class WatchRealtimeMediaAdapter {
                         "realtime", "superseded_response_ended", requestId: requestId,
                         detail: "response_id=\(responseId) current_response_id=\(current)"
                     )
+                    break
+                }
+                if self.pendingSegmentBoundary {
+                    // ESS-971：这一段播完了，回合没完。清标志后走 interim——
+                    // **绝不能**落到 onAnswerPlaybackFinished，那会开下一轮，
+                    // 第二段到达时就落进了下一轮（ESS-600 复审阻断 B）。
+                    self.pendingSegmentBoundary = false
+                    WatchLog.info(
+                        "realtime", "segment_playback_finished", requestId: handle.requestId,
+                        detail: "bytes_played=\(bytesPlayed)"
+                    )
+                    self.onAnswerPlaybackSegmentFinished?(handle, bytesPlayed)
                     break
                 }
                 self.onAnswerPlaybackFinished?(handle, bytesPlayed)
@@ -619,6 +634,35 @@ final class WatchRealtimeMediaAdapter {
     /// asynchronously via `checkBarrierRelease` after the missing deltas
     /// arrive). This is what closes G2 — a done before the last delta no
     /// longer prematurely closes the session.
+    /// ESS-971：`audio.segment_done` 释放的屏障是**段落**边界，不是回合终态。
+    /// 播放链路完全复用 `audio.done` 那一套（收齐 → 播完 → `.ended`），
+    /// 只在 `.ended` 那一刻按本标志分流到 interim。
+    private var pendingSegmentBoundary = false
+
+    /// ESS-971：段落屏障。与 `markDownlinkComplete` 走同一条 `receiveDone`，
+    /// 因为「收齐 0..final_sequence 再播完」的语义两者完全一致；区别只在
+    /// 播完之后由谁接手。
+    func markDownlinkSegmentComplete(
+        responseId: String? = nil,
+        generation: Int? = nil,
+        finalSequence: Int? = nil,
+        segmentIndex: Int = 0
+    ) {
+        pendingSegmentBoundary = true
+        WatchLog.info(
+            "realtime", "downlink_segment_barrier",
+            detail: "segment_index=\(segmentIndex) "
+                + "final_sequence=\(finalSequence?.description ?? "nil") "
+                + "response_id=\(responseId ?? "nil")"
+        )
+        session.receiveDone(
+            finalSequence: finalSequence,
+            responseId: responseId,
+            generation: generation,
+            isSegmentBoundary: true
+        )
+    }
+
     func markDownlinkComplete(
         responseId: String? = nil,
         generation: Int? = nil,

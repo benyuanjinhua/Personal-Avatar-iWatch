@@ -114,6 +114,17 @@ final class ErrorCueCatalogTests: XCTestCase {
         }
     }
 
+    /// ESS-983：全文件降级路径确定性不可用（HMAC 密钥缺失 / fallback 关闭）。
+    /// 族 C（稍后再叫）：不出「重试」按钮，避免白等——重试必然再次失败。
+    func testFallbackNotConfiguredDoesNotAllowCachedRetry() {
+        let entry = ErrorCueCatalog.cue(for: "ERR_FALLBACK_NOT_CONFIGURED")
+        XCTAssertEqual(entry.code, "ERR_FALLBACK_NOT_CONFIGURED", "code 原样保留供日志追溯")
+        XCTAssertTrue(entry.text.contains("稍后再试"), "确定性配置失败应提示稍后再试")
+        XCTAssertEqual(entry.recoveryFamily, .waitAndRetry, "ESS-983 族 C")
+        XCTAssertFalse(entry.recoveryFamily.allowsCachedRetry, "确定性失败不得出重试按钮")
+        XCTAssertNil(entry.clip, "无预置语音，走文字 + 触觉")
+    }
+
     /// D2 E-26：Mac 找不到这次任务（`gateway.mjs` / `taskwatch.mjs`）。
     /// ESS-262：clip 落 `ErrorCue_Retryable`。
     func testTaskNotFoundShowsE26CopyAndAllowsRetry() {
@@ -275,6 +286,7 @@ final class ErrorCueCatalogTests: XCTestCase {
             "ERR_NO_SPEECH_FILE", "ERR_VAULT_LOAD", "ERR_VAULT_STORE",
             "ERR_WC_NOT_ACTIVATED",
             "ERR_PROCESSING_FAILED", "ERR_INTERNAL",
+            "ERR_FALLBACK_NOT_CONFIGURED",
         ] {
             let entry = ErrorCueCatalog.cue(for: code)
             XCTAssertFalse(entry.text.contains("ERR_"), "\(code) 卡片文案不得含裸码")

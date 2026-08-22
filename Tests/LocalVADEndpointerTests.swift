@@ -137,6 +137,105 @@ struct LocalVADEndpointerTests {
         #expect(events.isEmpty)
     }
 
+    /// ESS-961（2026-08-22 真机回归）：麦克风启动瞬态**不得**被回判成语音。
+    ///
+    /// 换 `.spokenAudio` 后（ESS-891 音量修复）真机首轮实测：
+    ///
+    /// ```
+    /// 17:54:47.496  vad_level      rms=0.00660 noise_floor=0.00660 threshold=0.01800 speech_detected=false
+    /// 17:54:47.656  speech_started rms=0.00125 noise_floor=0.00125 threshold=0.00374 speech_frames=0  ← 零语音帧却起判
+    /// 17:54:48.163  speech_final   reason=silence frames=8 speech_frames=0
+    /// ```
+    ///
+    /// 麦克风刚启动的几帧电平偏高（0.00660），底噪就按它初始化；随后落到真实
+    /// 底噪 0.00125，门从 0.01800 掉到 0.00374 → 触发 pre-roll 回判 → 而
+    /// pre-roll 里那帧 0.00660 **正是当初构成高底噪的那一帧**，在新门下当然
+    /// 跨门 → 补发 `speechStarted` → 700ms 静音立刻 `speechFinal`。
+    /// 整轮 956ms，用户根本来不及开口，提交上去的是空音频。
+    ///
+    /// `.voiceChat` 一直替它遮着：AGC 让底噪平稳，门全程钉在下限从不下降，
+    /// 回判分支一次都走不到。
+    @Test func micStartupTransientIsNotReplayedAsSpeech() {
+        var vad = LocalVADEndpointer()
+        // 真机数值：先 2 帧启动瞬态，再落到真实底噪。
+        var events = feed(&vad, rms: 0.00660, frames: 2, startingAt: 0)
+        events += feed(&vad, rms: 0.00125, frames: 10, startingAt: 200)
+
+        #expect(events.isEmpty)
+        #expect(!vad.metrics.didDetectSpeech)
+    }
+
+    /// 对照：ESS-865 复审阻断 1 要救的那条时序**必须继续成立**——
+    /// 一开麦就说话，底噪只能从语音帧里估，门被顶高压住了起判；
+    /// 说完安静下来门落回，这段真语音要被回判救回。
+    ///
+    /// 与上一条的差别只有一个：真语音相对底噪的余量足够大
+    /// （0.01098/0.00125 ≈ 8.8×，而启动瞬态只有 0.0066/0.00125 ≈ 5.3×）。
+    ///
+    /// 取 08-20 真机 `speech_started rms=0.01098` 那一轮的量级——它低于
+    /// 绝对上限 `speechRMS = 0.018`，所以实时路径判不出来，**只能靠回判救回**，
+    /// 正是这条用例要守的路径。
+    @Test func immediateSpeechIsStillRescuedByPreRollReplay() {
+        var vad = LocalVADEndpointer()
+        var events = feed(&vad, rms: 0.01098, frames: 4, startingAt: 0)
+        events += feed(&vad, rms: 0.00125, frames: 10, startingAt: 400)
+
+        #expect(events.contains { if case .speechStarted = $0 { return true }; return false })
+    }
+
+    /// 回判救回的帧必须计进 `speech_frames`，否则真机日志出现
+    /// 「`speech_started` 却 `speech_frames=0`」这种自相矛盾的取证，
+    /// 定位时无法分辨是回判救回的还是误判。
+    @Test func replayedFramesAreCountedAsSpeechFrames() {
+        var vad = LocalVADEndpointer()
+        _ = feed(&vad, rms: 0.01098, frames: 4, startingAt: 0)
+        _ = feed(&vad, rms: 0.00125, frames: 10, startingAt: 400)
+
+        #expect(vad.metrics.didDetectSpeech)
+        #expect(vad.metrics.speechFrameCount > 0,
+                "speech_started 却 speech_frames=0 是不可解释的取证")
+    }
+
+    /// ESS-961 第二轮（2026-08-21 18:14 真机）：**单帧脉冲不得开启一轮**。
+    ///
+    /// 上一版修好了回判误判（这轮 `speech_frames=1` 说明走的是实时路径，
+    /// 回判分支没再触发），但暴露了下一层：
+    ///
+    /// ```
+    /// 18:14:13.309  frames=1   rms=0.00134 noise_floor=0.00134 threshold=0.00401 speech_detected=false
+    /// 18:14:14.964  speech_started frames=18 speech_frames=1 rms=0.00670 noise_floor=0.00069 threshold=0.00350
+    /// 18:14:15.679  speech_final   reason=silence frames=25 speech_frames=1
+    /// ```
+    ///
+    /// 整轮**只有 1 帧**越过门。帧长约 97ms，而 `speechStartMs = 100ms`——
+    /// 一帧的时长就已经满足 `frameEndedAtMs - candidateStart >= speechStartMs`，
+    /// 于是任意一个孤立脉冲（咂嘴、碰撞、环境瞬态）都能开启一轮，700ms 后
+    /// 收口提交，用户来不及说话。
+    ///
+    /// 时长条件挡不住这个：一帧就是 100ms。只能显式要求**连续多帧**。
+    @Test func isolatedLoudFrameDoesNotStartSpeech() {
+        var vad = LocalVADEndpointer()
+        // 真机数值：底噪 0.00069 附近，中间夹一帧 0.00670 的孤立脉冲。
+        var events = feed(&vad, rms: 0.00069, frames: 15, startingAt: 0)
+        events += feed(&vad, rms: 0.00670, frames: 1, startingAt: 1_500)
+        events += feed(&vad, rms: 0.00072, frames: 12, startingAt: 1_600)
+
+        #expect(events.isEmpty)
+        #expect(!vad.metrics.didDetectSpeech)
+    }
+
+    /// 对照：真说话（连续多帧）必须照常起判并断句——不能为了挡脉冲把
+    /// 短促但真实的一句话也挡掉。
+    @Test func shortRealUtteranceStillStartsAndEndpoints() {
+        var vad = LocalVADEndpointer()
+        var events = feed(&vad, rms: 0.00069, frames: 15, startingAt: 0)
+        events += feed(&vad, rms: 0.00670, frames: 4, startingAt: 1_500)
+        events += feed(&vad, rms: 0.00072, frames: 10, startingAt: 1_900)
+
+        #expect(events.contains { if case .speechStarted = $0 { return true }; return false })
+        #expect(events.contains { if case .speechFinal = $0 { return true }; return false })
+    }
+
     /// 单轮上限必须小于 `AudioRecorder.maxDuration`（60s），否则提交发生在
     /// AVAudioRecorder 自停之后，本地 AAC 收尾会走进「从未起录」误判。
     @Test func defaultMaximumTurnLeavesHeadroomBeforeRecorderHardStop() {
