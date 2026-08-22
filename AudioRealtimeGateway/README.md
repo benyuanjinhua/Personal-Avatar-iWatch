@@ -201,11 +201,18 @@ inspect control frames.
   空闲窗口的基础档与延长档。标定样本 = 2026-08-22 真实上游 10 个工具调用回合、
   n=17 个回合内段落间隔：min 326.6 / p50 1171.2 / p90 4143.4 / max 7332.5 ms；
   其中所有 > 1194.7 ms 的间隔都伴有「声道忙」的显式证据（后台播报在途或
-  未终结 task），所以有证据时才用延长档。上界受 Watch 端
-  `SessionController.thinkingHardTimeoutSeconds = 45` 约束——旧的
-  `agent_turn_idle_backstop_ms = 45000` 正好等于它，即使触发也永远晚于客户端
-  自己判超时，已删除。n=17 仍是薄样本（R-04.4），继续用
-  `upstream_turn_terminal` 的 `gap_ms` / `window_ms` / `outstanding_tasks` 累积。
+  未终结 task），所以有证据时才用延长档。
+  取样口径要连着结论一起读：取证脚本按 Bridge 的方言回了 `playback.started` /
+  `playback.ended`，而本网关**不回回执**，上游据此决定何时开下一段，所以真机
+  Watch 链路上的间隔分布可能与这 17 个样本不同；n=17 也仍是薄样本（R-04.4）。
+  两个值因此都是配置项，并继续用 `upstream_turn_terminal` 的
+  `gap_ms` / `window_ms` / `outstanding_tasks` 累积样本。
+  与客户端预算的关系（**不是**「两个 45 s 相等所以客户端总是抢先」——那条因果
+  已在 ESS-1004 复审中被推翻并撤回）：本窗口在**段落收口**时起表，Watch 的
+  `SessionController.thinkingHardTimeoutSeconds = 45` 要等收到 interim 才起表，
+  因此本窗口天然早于客户端，12 s 距客户端预算仍有充足余量。
+  旧的 `agent_turn_idle_backstop_ms = 45000` 是 ESS-969 的未标定占位值，
+  已由上面两个标定值替换（删除的理由是「没标定 + 判据换了」，不是时序竞争）。
 - **task 生命周期只延长窗口，不否决收口**：`task.accepted` 实测比第一段
   `audio.done` 晚 795–8689 ms（n=10），护不住第一段；而 task 常比回合多活
   30–70 s，「有未终结 task 就不收口」会把每个工具回合挂到客户端硬超时。
