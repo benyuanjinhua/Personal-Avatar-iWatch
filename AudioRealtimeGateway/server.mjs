@@ -593,6 +593,11 @@ function createAgentTransport(CONFIG, { log }) {
       maxDownlinkFrames: CONFIG.max_downlink_frames ?? 4096,
       maxDownlinkBytes: CONFIG.max_downlink_bytes ?? 32 * 1024 * 1024,
       responseTimeoutMs: CONFIG.agent_response_timeout_ms ?? 8_000,
+      // ESS-969: 'auto' | 'always' | 'off'. `auto` only takes the
+      // multi-segment path for a turn whose upstream proved it emits
+      // `voice.state`; anything else keeps the pre-ESS-969 behaviour.
+      multiSegmentMode: CONFIG.agent_multi_segment_mode ?? 'auto',
+      turnIdleBackstopMs: CONFIG.agent_turn_idle_backstop_ms ?? 45_000,
       takeover: CONFIG.agent_takeover_voice !== false,
       log: (evt, extra) => log(evt, extra),
     })

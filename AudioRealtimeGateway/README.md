@@ -145,7 +145,8 @@ verifiable).
 |---|---|---|
 | `ready` | echoes scope, adds `heartbeat_interval_ms` | Sent once after `session.start` is accepted. |
 | `audio.delta` | `sequence`, `sample_rate`, `codec`, `audio` (base64 PCM16LE 24 kHz) | Sequences are monotone and dense per `response_id`. |
-| `audio.done` | `final_sequence` | Barrier — client waits until it has seen every `0..final_sequence` before signalling playback complete. |
+| `audio.segment_done` | `segment_index`, `final_sequence` | **本段结束，回合未结束**（ESS-969）。同一屏障语义，但客户端应保持本轮打开、退回等待态（Watch：`SessionController.markAnswerInterim`），不得开下一轮。未实现的老客户端忽略该帧即可——后续 `audio.delta` 与最终的 `audio.done` 不受影响。 |
+| `audio.done` | `final_sequence` | Barrier — client waits until it has seen every `0..final_sequence` before signalling playback complete. **回合终态**：一个回合有且只有一帧。 |
 | `cancel.ack` | echoes scope + `cancelled_response_id?` | Response to a `cancel` message. |
 | `error` | `code`, `retriable`, `detail?` | Structured failure; connection is closed with WebSocket code 1008 unless `retriable: true`. |
 | `pong` | echoes `nonce` | Heartbeat reply. |
@@ -173,6 +174,25 @@ inspect control frames.
   `done_barrier_clamped` with `reason` in {`gap_before_final_sequence`,
   `final_sequence_not_yet_emitted`}. A response that produced zero
   contiguous deltas ends with `final_sequence == -1`.
+
+#### 多段回合（ESS-969）
+
+一个回合可以承载多段回答：工具调用回合先说「我正在查询…」，跑工具，再说
+真正的答案。上游的 `audio.done` 是**段落**边界，不是回合终态。
+
+- 回合终态取自上游信号 `voice.state {state:'idle'}`——与部署中的 Bridge 对同一
+  端点（`ws://127.0.0.1:3101/api/realtime`）的读法一致，见
+  `MacRemoteFrontendBridge/supervisor.mjs` 的 `TurnCapture.onEvent`。不是超时。
+- 下游序号在整个回合内单调稠密，跨段连续，所以稠密前缀屏障对段落边界与
+  回合终态同样成立。
+- `agent_multi_segment_mode`：`auto`（默认）只对**已证明上游会发 `voice.state`**
+  的回合启用新语义；没有该信号的回合逐字节保持 ESS-969 之前的行为。
+  `always` / `off` 强制两侧。每个回合落一条 `upstream_turn_terminal_mode`
+  日志，直接说明本次走了哪条分支。
+- `agent_turn_idle_backstop_ms`（默认 45000）是**兜底**，不是收口机制：只在
+  上游宣告了 `voice.state` 却始终不 `idle` 时触发。**该值待标定**（R-04.4）：
+  目前没有任何真机采样，标定依据是 `upstream_segment_closed` →
+  `upstream_turn_terminal` 的时间差，需要 n ≥ 20 个真实工具调用回合。
 
 #### Barge-in
 
