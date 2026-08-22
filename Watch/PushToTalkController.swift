@@ -1225,6 +1225,10 @@ final class PushToTalkController: ObservableObject {
         adapter.onAnswerPlaybackStarted = { [weak self] handle in
             self?.onSessionAnswerStarted?(handle.requestId)
         }
+        // ESS-1013：AEC 是否可用 = 语音打断是否开启（它决定 `.voiceChat` vs
+        // `.spokenAudio`）。无 AEC 时播放期的麦克风帧必须不喂 VAD，
+        // 否则系统会把自己的播报当成用户提问（真机 2026-08-22 12:15）。
+        adapter.aecAvailable = { [weak self] in self?.voiceBargeInEnabled() ?? false }
         // ESS-971：段落播完 → interim（回合保持打开，等下一段）。
         adapter.onAnswerPlaybackSegmentFinished = { [weak self] handle, bytes in
             WatchLog.info(

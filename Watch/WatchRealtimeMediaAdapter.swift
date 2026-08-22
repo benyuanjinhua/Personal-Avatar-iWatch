@@ -148,6 +148,8 @@ final class WatchRealtimeMediaAdapter {
     private let barrierTimer: BarrierTimer
     private let transportFailureDrainTimer: BarrierTimer
     private var vadEndpointer: LocalVADEndpointer?
+    /// ESS-1013 取证：本轮因「播放中且无 AEC」被丢弃的麦克风帧数。
+    private var selfEchoSuppressedFrames = 0
     private let vadSampleRate: Int
     private let automaticallyCommitOnSpeechFinal: Bool
     private var vadFrameStartedAtMs: Int64 = 0
@@ -491,6 +493,14 @@ final class WatchRealtimeMediaAdapter {
     /// 「我们调用过 stop()」不是停播证据。
     var isRenderingDownlink: Bool { player.isRenderingDownlink }
 
+    /// ESS-1013：当前音频会话是否带 AEC（回声消除）。
+    ///
+    /// 生产接 `WatchDebugSettings.voiceBargeInEnabled` —— 它同时决定
+    /// `ConversationAudioController` 用 `.voiceChat`（有 AEC）还是
+    /// `.spokenAudio`（无 AEC）。**默认 `false`**：没接线时按最保守的
+    /// 「无 AEC」处理，宁可少听一段，也不能把自己的播报当成用户提问。
+    var aecAvailable: () -> Bool = { false }
+
     /// 累计的疑似自身回声帧数（守卫窗内的高能量帧）。F2-5 的对账口径。
     var bargeInSelfEchoFrameCount: Int { bargeInDetector.selfEchoFrameCount }
 
@@ -527,6 +537,31 @@ final class WatchRealtimeMediaAdapter {
     private func consumeVAD(_ frame: Data) {
         guard var endpointer = vadEndpointer else { return }
         let frameStartedAtMs = vadFrameStartedAtMs
+        // ESS-1013：播放期间且**没有 AEC** 时，麦克风拾到的是我们自己的
+        // 扬声器输出，不是用户。真机 2026-08-22 12:15：用户一句话没说，
+        // `play_started` 后 0.298 s VAD 就起判，`speech_frames` 跟着播报
+        // 从 8 涨到 121，最终把 14.7 秒的**系统播报**当成提问提交上行，
+        // 整轮被占掉，用户从此卡在「思考中」。
+        //
+        // 既有的 `playbackEndedForVADGuard` 只守播完后的 300 ms，
+        // 缺的正是播放进行中这一段。
+        //
+        // 时间戳照常推进：丢的是**判定**，不是时间轴——否则播放结束后
+        // VAD 的窗口会与录音实际时刻错位。
+        if player.isRenderingDownlink && !aecAvailable() {
+            vadFrameStartedAtMs += Int64(
+                frame.count / MemoryLayout<Int16>.size * 1_000 / vadSampleRate
+            )
+            selfEchoSuppressedFrames += 1
+            if selfEchoSuppressedFrames % 25 == 1 {
+                WatchLog.info(
+                    "vad", "vad_input_suppressed_during_playback",
+                    requestId: currentTurn?.requestId,
+                    detail: "reason=no_aec frames=\(selfEchoSuppressedFrames)"
+                )
+            }
+            return
+        }
         let events = endpointer.processPCM16(frame, frameStartedAtMs: frameStartedAtMs)
         vadFrameStartedAtMs += Int64(
             frame.count / MemoryLayout<Int16>.size * 1_000 / vadSampleRate
