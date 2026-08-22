@@ -38,6 +38,26 @@ describe('ESS-255 D2 terminal error projection', () => {
     assert.equal(isAutomaticallyRetryableTerminalError('ERR_NOT_ENUMERATED'), false)
   })
 
+  it('settles deterministic failures after one delivery and never auto-retries them', () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'deterministic-failure-'))
+    const ledger = new TurnLedger({ stateDir })
+    ledger.create({ requestId: 'req-deterministic', deviceId: 'watch', bodySha256: 'sha', sessionId: 's' })
+    ledger.fail('req-deterministic', 'ERR_FALLBACK_NOT_CONFIGURED')
+
+    assert.equal(isAutomaticallyRetryableTerminalError('ERR_FALLBACK_NOT_CONFIGURED'), false)
+
+    const projection = ledger.projection('req-deterministic')
+    assert.equal(projection.detail, '助手这边还没准备好，这次没接上，稍后再试。')
+    assert.equal(projection.detail.includes('ERR_'), false)
+
+    // ESS-983：确定性失败第一次投递即收口——delay_ms=0，不再进入退避重投链。
+    assert.deepEqual(ledger.markResultRedelivered('req-deterministic', { now: 1_000, baseDelayMs: 100 }), {
+      attempt: 1, delay_ms: 0,
+    })
+    assert.equal(ledger.get('req-deterministic').delivered_ack.source, 'bridge_deterministic')
+    assert.equal(ledger.replayable({ now: 99_999, maxDeliveryAttempts: 5 }).length, 0)
+  })
+
   it('never exposes unknown error codes or raw failed detail', () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'terminal-error-fallback-'))
     const ledger = new TurnLedger({ stateDir })
