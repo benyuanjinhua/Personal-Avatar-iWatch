@@ -224,6 +224,13 @@ inspect control frames.
 - **task 生命周期只延长窗口，不否决收口**：`task.accepted` 实测比第一段
   `audio.done` 晚 795–8689 ms（n=10），护不住第一段；而 task 常比回合多活
   30–70 s，「有未终结 task 就不收口」会把每个工具回合挂到客户端硬超时。
+- **播报结果归属与投递（ESS-1068）**：`origin=announcement` 的后台播报不再
+  一律隔离。以 `taskId` 为首期归属键、按 task 的 session/device 与当前 turn
+  对齐（播报自带的 `task.sessionId` 优先，其次 `task.*` 事件建立的 taskId→
+  身份表）——归属明确的播报音频/文本作为新段落下发，并按 taskId 去重只消费
+  一次；无归属或跨 session 的播报继续隔离（ESS-849 安全默认）。播报/task
+  结束后清除 busy 使直答回合回落到 `agent_segment_gap_ms` 基础窗口，不再被
+  锁在忙档。
 
 #### Barge-in
 
