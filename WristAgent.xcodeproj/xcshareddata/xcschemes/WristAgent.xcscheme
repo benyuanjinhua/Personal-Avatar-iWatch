@@ -53,7 +53,31 @@
          </BuildableReference>
       </MacroExpansion>
       <Testables>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "7E749452923A53A9D8408282"
+               BuildableName = "WristAgent iOSTests.xctest"
+               BlueprintName = "WristAgent iOSTests"
+               ReferencedContainer = "container:WristAgent.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "4DEDBCFFC6FBD241C13DA076"
+               BuildableName = "WristAgent Watch Tests.xctest"
+               BlueprintName = "WristAgent Watch Tests"
+               ReferencedContainer = "container:WristAgent.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
+      <CommandLineArguments>
+      </CommandLineArguments>
    </TestAction>
    <LaunchAction
       buildConfiguration = "Debug"
