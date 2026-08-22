@@ -8,6 +8,53 @@ import XCTest
 @MainActor
 final class WatchRealtimeMediaAdapterTests: XCTestCase {
 
+    /// ESS-1008 B1: a dead WSS must not truncate PCM already owned by the
+    /// Watch player. Failure is held until the real renderer emits `.ended`.
+    func testTransportFailureDrainsBufferedAudioBeforeTerminal() {
+        let (adapter, _, player, _, _) = makeAdapter(sessionIds: [
+            "10081008-0000-4000-8000-000000000001"
+        ])
+        let handle = adapter.beginTurn(requestId: "10081008-0000-4000-8000-000000000002")
+        var failures: [String] = []
+        adapter.onAnswerPlaybackFailed = { _, code in failures.append(code) }
+        adapter.ingestDownlink(VoiceStreamChunk(
+            requestId: handle.requestId, streamId: handle.sessionId,
+            direction: .downlink, sequence: 0, capturedAtMs: 1,
+            codec: "pcm_s16le", sampleRate: 24_000,
+            payload: Data(repeating: 1, count: 96)
+        ))
+
+        adapter.markTransportFailed(reason: "recv_error")
+
+        XCTAssertTrue(player.isRenderingDownlink)
+        XCTAssertFalse(player.stopped, "WSS failure must not truncate buffered PCM")
+        XCTAssertTrue(failures.isEmpty)
+
+        player.onPlaybackEvent?(.ended(
+            requestId: handle.requestId, sessionId: handle.sessionId,
+            responseId: nil, bytesPlayed: 96
+        ))
+
+        XCTAssertEqual(failures, ["transport_failed:recv_error"])
+        XCTAssertTrue(player.stopped, "fallback cleanup runs only after renderer drained")
+    }
+
+    /// ESS-1008 B1: when no PCM is queued, there is nothing to preserve and
+    /// the turn should terminate immediately rather than waiting 45 seconds.
+    func testTransportFailureWithoutBufferedAudioTerminatesImmediately() {
+        let (adapter, _, player, _, _) = makeAdapter(sessionIds: [
+            "10081008-0000-4000-8000-000000000003"
+        ])
+        adapter.beginTurn(requestId: "10081008-0000-4000-8000-000000000004")
+        var failures: [String] = []
+        adapter.onAnswerPlaybackFailed = { _, code in failures.append(code) }
+
+        adapter.markTransportFailed(reason: "recv_error")
+
+        XCTAssertEqual(failures, ["transport_failed:recv_error"])
+        XCTAssertTrue(player.stopped)
+    }
+
     func testVADFinalAutomaticallyCommitsExactlyOnce() {
         let recorder = MockRecorder()
         let player = MockPlayer()

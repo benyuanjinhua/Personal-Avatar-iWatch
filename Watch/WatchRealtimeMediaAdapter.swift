@@ -179,6 +179,10 @@ final class WatchRealtimeMediaAdapter {
     /// (`playback.started/ended`) to echo the same value so multi-response
     /// sessions stay disambiguated. Cleared when the turn ends.
     private(set) var currentResponseId: String?
+    /// ESS-1008: the Agent WSS may die while already-received PCM is still
+    /// rendering. Preserve that audio and convert the eventual `.ended` into
+    /// a transport failure terminal instead of truncating the answer.
+    private var pendingTransportFailureReason: String?
 
     /// ESS-509: called when the adapter finishes the current turn (any reason).
     /// The outer controller uses this to release the WCSession keep-alive hold
@@ -286,6 +290,16 @@ final class WatchRealtimeMediaAdapter {
                     )
                     break
                 }
+                if let reason = self.pendingTransportFailureReason {
+                    self.pendingTransportFailureReason = nil
+                    self.pendingSegmentBoundary = false
+                    self.finishTransportFailure(
+                        handle: handle,
+                        reason: reason,
+                        disposition: "after_buffer_drained"
+                    )
+                    break
+                }
                 if self.pendingSegmentBoundary {
                     // ESS-971：这一段播完了，回合没完。清标志后走 interim——
                     // **绝不能**落到 onAnswerPlaybackFinished，那会开下一轮，
@@ -333,6 +347,7 @@ final class WatchRealtimeMediaAdapter {
     func beginTurn(requestId: String) -> RealtimeMediaSession.TurnHandle {
         didTriggerCompleteFileFallback = false
         didSignalChannelReady = false
+        pendingTransportFailureReason = nil
         currentResponseId = nil
         vadFrameStartedAtMs = Self.uptimeMs()
         vadLastLevelLogAtMs = nil
@@ -707,10 +722,9 @@ final class WatchRealtimeMediaAdapter {
     }
 
     /// ESS-1008: the control plane (WCSession) is still alive even though the
-    /// Agent WSS is not. Fail the active answer immediately through the same
-    /// production callback used by renderer failures, then collapse realtime
-    /// buffering. The session controller will re-enter listening and cancel
-    /// its thinking timeout.
+    /// Agent WSS is not. Already-buffered PCM is user-visible output, so an
+    /// active renderer is allowed to drain; only then do we fail the answer
+    /// through the production callback and collapse realtime buffering.
     func markTransportFailed(reason: String) {
         guard let handle = currentTurn else { return }
         WatchLog.error(
@@ -718,6 +732,32 @@ final class WatchRealtimeMediaAdapter {
             requestId: handle.requestId,
             detail: "reason=\(reason)",
             code: "ERR_REALTIME_TRANSPORT_FAILED"
+        )
+        guard !player.isRenderingDownlink else {
+            pendingTransportFailureReason = reason
+            WatchLog.info(
+                "realtime", "transport_failure_deferred",
+                requestId: handle.requestId,
+                detail: "reason=\(reason) disposition=drain_buffered_audio"
+            )
+            return
+        }
+        finishTransportFailure(
+            handle: handle,
+            reason: reason,
+            disposition: "no_buffered_audio"
+        )
+    }
+
+    private func finishTransportFailure(
+        handle: RealtimeMediaSession.TurnHandle,
+        reason: String,
+        disposition: String
+    ) {
+        WatchLog.info(
+            "realtime", "transport_failure_terminal",
+            requestId: handle.requestId,
+            detail: "reason=\(reason) disposition=\(disposition)"
         )
         onAnswerPlaybackFailed?(handle, "transport_failed:\(reason)")
         session.markDownlinkBridgeFallback()
