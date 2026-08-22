@@ -691,6 +691,12 @@ final class SessionController: ObservableObject {
     /// - `turnPhase == .thinking`：只有「在等回答」才有卡死可言。已 speaking
     ///   （答案在放）或已收口（P6/已回聆听）时收到的重复失败一律丢弃留证——
     ///   同一次失败会经 iPhone 回执与 Bridge WSS 各来一次，本闸门即幂等所在。
+    ///
+    /// 相位闸门**不足以**单独承担「成功回合不被误杀」：纯文本结果（ESS-48）与
+    /// 段落屏障期间，journal 已是 `.completed` 而本控制器仍停在 `.thinking`
+    /// （相位由真实起播推进），此刻闸门是敞开的。矛盾终态的 success-wins 判定
+    /// 在上游 `PushToTalkController.journal.onTerminalFailure` 就地做掉，
+    /// 本闸门只作纵深防御。
     func markTurnFailed(requestId: String, errorCode: String? = nil, reason: String = "relay_failed") {
         guard isInSession else { return }
         guard let active = activeTurnRequestId, active == requestId else {

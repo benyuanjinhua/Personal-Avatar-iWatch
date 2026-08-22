@@ -71,14 +71,23 @@ final class Ess1044RelayFailureClosureTests: XCTestCase {
                       "R-02.1：收口必须落一条可对账的运行时事件")
     }
 
-    /// 本单核心回归：真机上就是这一支——回合已被推到终态，`journal.apply`
-    /// 返回 false、`onStateApplied` 不触发，旧实现在这里彻底静默。
+    /// 本单核心回归：真机上就是这一支——回合**已经是 failed**，第二条同 request_id
+    /// 的失败经另一条通道到达，`journal.apply` 返回 false、`onStateApplied` 不触发，
+    /// 旧实现在这里彻底静默，会话一路挂到 45s 硬超时。
+    ///
+    /// 构造方式说明：先让 journal 落到 `.failed`（此时会话还在 idle，信号被
+    /// `isInSession` 闸门丢弃、不产生副作用），再把会话推到 thinking，然后投递
+    /// 重复的那一条——等价于「第一条失败在会话接手之前就已入账」。
     func testRejectedRelayFailureStillClosesSession() throws {
         let (session, pushToTalk) = makeWiredPair()
         let transport = WatchVoiceTransport(journal: pushToTalk.journal)
-        let requestId = enterThinking(session: session, journal: pushToTalk.journal)
-        // 让后到的 failed 被状态机吸收掉（真机 applied=false 的成因）。
-        XCTAssertTrue(pushToTalk.journal.apply(.status(requestId: requestId, state: .cancelled)))
+        let requestId = UUID().uuidString.lowercased()
+        pushToTalk.journal.begin(requestId: requestId)
+        XCTAssertTrue(pushToTalk.journal.apply(
+            .status(requestId: requestId, state: .failed, errorCode: "ERR_VOICE_BUSY")
+        ))
+        XCTAssertEqual(session.state, .idle, "会话尚未开始，第一条失败不产生副作用")
+        enterThinking(session: session, requestId: requestId)
 
         let events = LogCapture()
         events.install()
@@ -93,6 +102,25 @@ final class Ess1044RelayFailureClosureTests: XCTestCase {
         print("ESS-1044 runtime evidence (applied=false path):\n" + events.transcript())
     }
 
+    /// `.cancelled` 吸收掉的 failed 同样不派发——已取消的回合不是「答不上来」。
+    /// 与 `.completed` 同属矛盾终态，判据是当前状态而非「转移有没有被接受」。
+    func testCancelledThenLateFailureDoesNotEnterFailed() throws {
+        let (session, pushToTalk) = makeWiredPair()
+        let transport = WatchVoiceTransport(journal: pushToTalk.journal)
+        let requestId = enterThinking(session: session, journal: pushToTalk.journal)
+        XCTAssertTrue(pushToTalk.journal.apply(.status(requestId: requestId, state: .cancelled)))
+
+        let events = LogCapture()
+        events.install()
+        transport.handleRelayStatus(data: try relayFailure(requestId: requestId).jsonData())
+
+        XCTAssertNotEqual(session.state, .failed)
+        XCTAssertFalse(events.contains("session_turn_failed"))
+        XCTAssertTrue(events.contains("turn_terminal_failure_signal",
+                                      detailContains: "dispatched=false current_state=cancelled"),
+                      "丢弃必须留证，不得静默")
+    }
+
     /// 成功回合不得被误伤：`completed` 走完之后，同一条链路一个失败都不该产生。
     func testCompletedTurnIsNotClosedAsFailure() throws {
         let (session, pushToTalk) = makeWiredPair()
@@ -102,6 +130,36 @@ final class Ess1044RelayFailureClosureTests: XCTestCase {
 
         XCTAssertEqual(session.state, .listening)
         XCTAssertEqual(session.turnPhase, .thinking, "completed 不经本条链路改相位")
+    }
+
+    /// 复审阻断（毕玄-cx，2026-08-22）：**已成功的回合不得被迟到的 failed 误杀**。
+    ///
+    /// 真实成因：纯文本结果（ESS-48）或段落屏障期间，journal 已经是 `.completed`
+    /// 而会话仍停在 `.thinking`（相位由真实起播推进，不由 journal 终态推进）。
+    /// 此时双通道乱序送来一条 failed —— 状态机按「终态吸收」拒绝它，
+    /// 但失败信号若无条件派发，用户会看到「这轮没答上来」盖掉一个成功回合。
+    /// 口径：矛盾终态 success-wins。
+    func testCompletedThenLateFailureDoesNotEnterFailed() throws {
+        let (session, pushToTalk) = makeWiredPair()
+        let transport = WatchVoiceTransport(journal: pushToTalk.journal)
+        let requestId = enterThinking(session: session, journal: pushToTalk.journal)
+        XCTAssertTrue(pushToTalk.journal.apply(.status(requestId: requestId, state: .completed)))
+
+        let events = LogCapture()
+        events.install()
+        transport.handleRelayStatus(data: try relayFailure(requestId: requestId).jsonData())
+
+        XCTAssertEqual(pushToTalk.journal.turn(withId: requestId)?.currentState, .completed,
+                       "终态吸收：journal 仍是 completed")
+        XCTAssertNotEqual(session.state, .failed, "成功回合不得被迟到 failed 打进 P6")
+        XCTAssertEqual(session.state, .listening)
+        XCTAssertEqual(session.turnPhase, .thinking, "相位不受影响，仍等真实起播")
+        XCTAssertFalse(events.contains("session_turn_failed"),
+                       "成功回合不得产生失败收口事件")
+        XCTAssertTrue(events.contains("turn_terminal_failure_signal",
+                                      detailContains: "dispatched=false current_state=completed"),
+                      "丢弃必须留证，不得静默——否则乱序矛盾终态在日志里不可判定")
+        print("ESS-1044 runtime evidence (completed → late failed):\n" + events.transcript())
     }
 
     // MARK: - helpers
@@ -120,13 +178,17 @@ final class Ess1044RelayFailureClosureTests: XCTestCase {
     @discardableResult
     private func enterThinking(session: SessionController, journal: VoiceTurnJournal) -> String {
         let requestId = UUID().uuidString.lowercased()
+        journal.begin(requestId: requestId)
+        enterThinking(session: session, requestId: requestId)
+        return requestId
+    }
+
+    private func enterThinking(session: SessionController, requestId: String) {
         session.onBeginChannel = { requestId }
         session.enterSession()
         session.markChannelReady()
         session.markTurnCommitted(requestId: requestId)
         XCTAssertEqual(session.turnPhase, .thinking)
-        journal.begin(requestId: requestId)
-        return requestId
     }
 
     private func relayFailure(requestId: String) -> RelayStatusUpdate {

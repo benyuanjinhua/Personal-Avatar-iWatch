@@ -350,12 +350,25 @@ final class PushToTalkController: ObservableObject {
         // 与 Bridge WSS `WatchSettingsStore.applyVoiceStatus`）都收敛到
         // `journal.apply(_:)` 这一个入口——挂在这里两条都覆盖，且不必给
         // transport / settings store 各拉一条到 SessionController 的新引用。
-        journal.onTerminalFailure = { [weak self] requestId, errorCode, applied in
+        // 复审阻断（毕玄-cx，2026-08-22）：**矛盾终态 success-wins**。
+        // journal 只报事实，「该不该收口」的策略落在这里，且必须落在这里而不是
+        // 只靠 SessionController 的相位闸门——纯文本结果（ESS-48）与段落屏障
+        // 期间，journal 已是 `.completed` 而会话仍停在 `.thinking`（相位由真实
+        // 起播推进，不由 journal 终态推进），相位闸门此刻是敞开的，一条乱序的
+        // failed 会把一个成功回合显示成「这轮没答上来」。
+        //
+        // 判据是**这一轮现在到底是什么状态**，不是「转移有没有被接受」：
+        // 只有 `.failed` 才向会话层派发失败，`.completed` / `.cancelled` 吸收掉的
+        // failed 一律只留证不动作。
+        journal.onTerminalFailure = { [weak self] requestId, errorCode, applied, currentState in
             guard let self else { return }
+            let dispatched = currentState == .failed
             WatchLog.info(
                 "turn", "turn_terminal_failure_signal", requestId: requestId,
-                detail: "applied=\(applied) error_code=\(errorCode ?? "nil")"
+                detail: "applied=\(applied) dispatched=\(dispatched) "
+                    + "current_state=\(currentState.rawValue) error_code=\(errorCode ?? "nil")"
             )
+            guard dispatched else { return }
             self.onSessionTurnFailed?(requestId, errorCode)
         }
 
