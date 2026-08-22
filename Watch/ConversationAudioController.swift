@@ -334,7 +334,13 @@ final class ConversationAudioController {
     ///
     /// 拆成接受两个 `UInt64` 的纯函数，是为了让边界能在单测里直接钉住——
     /// 真机上「跑满 2.147 秒」不可控，靠真机复现不了回归。
+    /// 逆序与上溢都必须收敛，不能靠「调用方不会传反」兜底：本函数是 `static`
+    /// 且已暴露，`&-` 在 `now < start` 时回绕成约 1.8e19，先除成毫秒仍有约
+    /// 1.8e13——照样放不进 arm64_32 的 `Int32`，照样陷入。当前唯一调用点取的是
+    /// 单调时钟先后两值、走不到这条路，但暴露出去的入口不留可陷入的输入。
     static func elapsedMs(fromUptimeNs start: UInt64, toUptimeNs now: UInt64) -> Int {
-        Int((now &- start) / 1_000_000)
+        guard now > start else { return 0 }
+        let ms = (now - start) / 1_000_000
+        return ms > UInt64(Int.max) ? Int.max : Int(ms)
     }
 }

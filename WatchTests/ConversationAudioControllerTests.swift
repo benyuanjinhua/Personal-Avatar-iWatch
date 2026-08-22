@@ -612,6 +612,32 @@ final class ConversationAudioControllerTests: XCTestCase {
         )
     }
 
+    /// 复审补强：本函数是 `static` 且已暴露，任何输入都不得陷入。
+    /// 逆序（`now < start`）下 `&-` 回绕后即使先除成毫秒也仍有约 1.8e13，
+    /// 在 arm64_32 上放不进 `Int32`——必须由 guard 拦住，而不是靠调用方自律。
+    func testElapsedMsNeverTrapsOnReversedOrExtremeInputs() {
+        XCTAssertEqual(
+            ConversationAudioController.elapsedMs(fromUptimeNs: 5_000_000_000, toUptimeNs: 1_000),
+            0,
+            "逆序必须收敛到 0，不得走回绕路径"
+        )
+        XCTAssertEqual(
+            ConversationAudioController.elapsedMs(fromUptimeNs: 42, toUptimeNs: 42),
+            0
+        )
+        // 上溢：极端输入不得陷入。**具体返回值随宿主字长而异**——64 位宿主放得下
+        // 毫秒商（约 1.8e13）不触发截断，arm64_32 放不下才截到 `Int.max`。所以这里
+        // 只断言「不陷入且落在合法区间」，不写死平台相关的期望值。
+        let huge = ConversationAudioController.elapsedMs(fromUptimeNs: 0, toUptimeNs: .max)
+        XCTAssertGreaterThan(huge, 0)
+        XCTAssertLessThanOrEqual(UInt64(huge), UInt64.max / 1_000_000)
+
+        // 与宿主字长无关地说明「截断分支为什么必须存在」：
+        // 逆序回绕后的毫秒商在 32 位上依然放不下。
+        XCTAssertNil(Int32(exactly: UInt64.max / 1_000_000),
+                     "毫秒商仍越 32 位——arm64_32 上没有截断就会陷入")
+    }
+
     /// 与宿主字长无关地钉住「先除后转」这个顺序不变量：
     /// 同一个纳秒差，收窄到 32 位放不下，先除成毫秒就放得下。
     /// 这是 arm64_32 上老写法必崩、新写法必安全的算术依据。
