@@ -122,6 +122,55 @@ final class AudioRealtimeAgentCodecTests: XCTestCase {
         } else { XCTFail("decode failed") }
     }
 
+    /// ESS-957 / ESS-969：网关在丢弃 post-done 帧时下发的
+    /// `audio.segment_dropped` 必须被**当成一等事件解码**，而不是掉进
+    /// `default: .unrecognised`。
+    ///
+    /// 背景：`faed305` 在网关侧加了这个 warning 帧，理由是「让客户端能
+    /// 提示/降级」。但全仓 Swift 当时搜不到任何 `segment_dropped`，客户端
+    /// 只会落一条 `downlink_decode_unrecognised` 日志——**那个理由一行都
+    /// 没兑现**。这条用例钉住它确实被接上了。
+    func testSegmentDroppedDecodes() {
+        let raw: [String: Any] = [
+            "type": "audio.segment_dropped", "session_id": sessionId,
+            "request_id": requestId, "response_id": "resp-1", "generation": 1,
+            "sequence": 13, "dropped_count": 3, "reason": "post_done"
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: raw)
+        if case .event(let ev) = AudioRealtimeAgentCodec.decodeOutcome(data) {
+            if case .segmentDropped(let sid, let rid, let respId, let gen,
+                                    let seq, let droppedCount, let reason) = ev {
+                XCTAssertEqual(sid, sessionId)
+                XCTAssertEqual(rid, requestId)
+                XCTAssertEqual(respId, "resp-1")
+                XCTAssertEqual(gen, 1)
+                XCTAssertEqual(seq, 13)
+                XCTAssertEqual(droppedCount, 3)
+                XCTAssertEqual(reason, "post_done")
+            } else { XCTFail("wrong event") }
+        } else { XCTFail("decode failed") }
+    }
+
+    /// 网关未来可能只发必填字段。缺 `dropped_count` / `reason` 时不得整帧
+    /// 判 malformed——那等于又回到「客户端什么都不知道」。
+    func testSegmentDroppedToleratesOptionalFields() {
+        let raw: [String: Any] = [
+            "type": "audio.segment_dropped", "session_id": sessionId,
+            "request_id": requestId, "response_id": "resp-1", "generation": 1,
+            "sequence": 4
+        ]
+        let data = try! JSONSerialization.data(withJSONObject: raw)
+        guard case .event(let ev) = AudioRealtimeAgentCodec.decodeOutcome(data) else {
+            return XCTFail("decode failed")
+        }
+        guard case .segmentDropped(_, _, _, _, let seq, let droppedCount, let reason) = ev else {
+            return XCTFail("wrong event")
+        }
+        XCTAssertEqual(seq, 4)
+        XCTAssertEqual(droppedCount, 1, "缺省按至少丢了一帧计")
+        XCTAssertNil(reason)
+    }
+
     func testAudioDeltaDecodes() {
         let audioBytes = Data(repeating: 0xAB, count: 64)
         let raw: [String: Any] = [

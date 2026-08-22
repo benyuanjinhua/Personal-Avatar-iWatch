@@ -247,6 +247,87 @@ final class SessionControllerTests: XCTestCase {
         XCTAssertFalse(controller.lowVolumeHint)
     }
 
+    // MARK: - ESS-960 无人说话的回合到上限后不得留下死麦克风
+
+    /// 事故形态（2026-08-21 真机 `request_id=01a02531-03e5`）：本轮录到
+    /// 59.9 秒、rms=5（≈ -76 dBFS，近乎静音），VAD 阈值约 0.00785
+    /// （int16 ≈ 257）差了 50 倍，永远不可能断句，于是永远不 commit。
+    ///
+    /// `AudioRecorder.maxDuration = 60s`，而 `turnCapSeconds = maxDuration - 10`。
+    /// 旧实现在 turnCap 到点时只落一条 `session_turn_cap_skipped` 就 return：
+    /// 10 秒后录音器自己到顶停录，**而会话仍认为自己在 listening，直到 120s
+    /// 静默挂断**。中间这 60 秒麦克风是死的，用户说什么都没人接。
+    ///
+    /// 正是 `armTurnCap` 自己的注释要避免的「聆听悬在已停录的死麦克风上」，
+    /// 只不过当时只为说过话的回合兑现了。
+    func testTurnCapWithoutSpeechRestartsCaptureWithoutCommitting() {
+        controller.enterSession()
+        controller.markChannelReady()
+        var startTurnCount = 0
+        controller.onStartTurn = {
+            startTurnCount += 1
+            return "req-restarted"
+        }
+        let commitsBefore = commitCount
+        let turnIndexBefore = controller.turnIndex
+
+        fireDelay(SessionController.turnCapSeconds)
+
+        XCTAssertEqual(commitCount, commitsBefore,
+                       "ESS-865 阻断 2：无人说话不得把静音提交上去")
+        XCTAssertEqual(startTurnCount, 1,
+                       "麦克风必须重开——否则录音器 10s 后到顶停录，会话却还在 listening")
+        XCTAssertEqual(controller.turnIndex, turnIndexBefore + 1)
+        XCTAssertEqual(controller.turnPhase, .listening,
+                       "ESS-865 阻断 2：必须留在聆听相位，静默治理才接得上")
+        XCTAssertFalse(controller.didDetectSpeechThisTurn, "新一轮重新计「有没有人说话」")
+    }
+
+    /// 重开采集**不得**重置静默治理时钟：用户放下手走开时，30s/75s/120s
+    /// 的收场策略必须照原计划走完，不能被换麦克风这件事无限推迟。
+    func testTurnCapRestartDoesNotResetSilenceGovernance() {
+        controller.enterSession()
+        controller.markChannelReady()
+        controller.onStartTurn = { "req-restarted" }
+
+        let silenceArmsBefore = scheduled.filter {
+            abs($0.delay - SessionController.silenceHint1Seconds) < 0.001
+        }.count
+
+        fireDelay(SessionController.turnCapSeconds)
+
+        let silenceArmsAfter = scheduled.filter {
+            abs($0.delay - SessionController.silenceHint1Seconds) < 0.001
+        }.count
+        XCTAssertEqual(silenceArmsAfter, silenceArmsBefore,
+                       "静默时钟被重新武装 → 静默挂断永远到不了")
+    }
+
+    /// 重开采集失败时**不得**把会话推出聆听态：静默治理以 listening 为前提，
+    /// 打断它比留一个死麦克风更糟（用户走开后再也等不到自动挂断）。
+    func testTurnCapRestartFailureKeepsSessionListening() {
+        controller.enterSession()
+        controller.markChannelReady()
+        controller.onStartTurn = { nil }
+
+        fireDelay(SessionController.turnCapSeconds)
+
+        XCTAssertEqual(controller.turnPhase, .listening)
+        XCTAssertEqual(controller.state, .listening)
+    }
+
+    /// 对照：听到过人说话时，到上限走的仍是提交（既有行为不变）。
+    func testTurnCapWithSpeechStillCommits() {
+        controller.enterSession()
+        controller.markChannelReady()
+        controller.markSpeechDetected(requestId: controller.activeTurnRequestId!)
+        let commitsBefore = commitCount
+
+        fireDelay(SessionController.turnCapSeconds)
+
+        XCTAssertEqual(commitCount, commitsBefore + 1, "听到过说话就该按 60s 上限提交")
+    }
+
     // MARK: - 失败路径
 
     /// 就绪超时：5s 无真实 ack → 进入 P6 failed 态（不退回 idle）。

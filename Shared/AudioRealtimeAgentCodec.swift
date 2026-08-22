@@ -178,6 +178,17 @@ enum AudioRealtimeAgentCodec {
         /// of downlink sequences the server delivered.
         case audioDone(sessionId: String, requestId: String, responseId: String,
                        generation: Int, finalSequence: Int)
+        /// Gateway `audio.segment_dropped`（ESS-957）——本回合 `audio.done`
+        /// 之后上游又产出了音频，被网关丢弃。
+        ///
+        /// 工具调用场景：模型先说「我正在查询…」并 `audio.done`，工具返回后
+        /// 再产出**真正的答案**；而网关的会话模型把一个回合绑死成一段回答
+        /// （`realtime-session.mjs:98` 的 `responseId = request_id:genN`），
+        /// 第二段无处可回。能力层的修复见 ESS-969；在那之前，至少不能让
+        /// 用户对着一句「我正在查询…」干等——这条事件就是唯一的知情来源。
+        case segmentDropped(sessionId: String, requestId: String, responseId: String,
+                            generation: Int, sequence: Int, droppedCount: Int,
+                            reason: String?)
         /// Gateway `cancel.ack` — server-authoritative cancel confirmation.
         case cancelAck(sessionId: String, requestId: String, generation: Int,
                        cancelledResponseId: String)
@@ -239,6 +250,22 @@ enum AudioRealtimeAgentCodec {
             return .event(.audioDone(
                 sessionId: sid, requestId: rid, responseId: respId,
                 generation: gen, finalSequence: finalSeq
+            ))
+
+        case "audio.segment_dropped":
+            guard let sid = raw["session_id"] as? String,
+                  let rid = raw["request_id"] as? String,
+                  let respId = raw["response_id"] as? String,
+                  let gen = raw["generation"] as? Int,
+                  let sequence = raw["sequence"] as? Int else { return .malformed }
+            // `dropped_count` / `reason` 是取证补充，缺了不该把整帧判死——
+            // 那等于又回到「客户端什么都不知道」的老路。
+            let droppedCount = (raw["dropped_count"] as? Int) ?? 1
+            let reason = raw["reason"] as? String
+            return .event(.segmentDropped(
+                sessionId: sid, requestId: rid, responseId: respId,
+                generation: gen, sequence: sequence,
+                droppedCount: droppedCount, reason: reason
             ))
 
         case "cancel.ack":

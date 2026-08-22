@@ -317,6 +317,7 @@ final class AudioRealtimeAgentTransport {
         case .ready: return "ready"
         case .audioDelta: return "audio.delta"
         case .audioDone: return "audio.done"
+        case .segmentDropped: return "audio.segment_dropped"
         case .cancelAck: return "cancel.ack"
         case .error: return "error"
         case .pong: return "pong"

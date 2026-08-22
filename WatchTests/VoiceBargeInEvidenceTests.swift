@@ -62,11 +62,28 @@ final class VoiceBargeInEvidenceTests: XCTestCase {
 
     // MARK: - F2-4：gate 的默认值、持久化与契约事件
 
-    func testGateDefaultsOnForFreshInstall() {
-        XCTAssertTrue(
+    /// ESS-891（2026-08-22）：默认从 ON 改为 OFF。
+    ///
+    /// 这个开关同时决定音频 mode——ON 时用 `.voiceChat` 取 AEC，而
+    /// `.voiceChat` 走通话音量通道：真机 7/7 读数 `output_volume` 精确
+    /// 恒为 0.500，且**旋转表冠调不动**，应用侧也改不了（`outputVolume`
+    /// 只读）。源峰值只剩 2~5.6 dB 余量，补增益抵不掉 50% 音量的 -6 dB。
+    ///
+    /// 取舍：听得清回答 > 能打断回答。ESS-711 关心的是「缺 key 被读成
+    /// false 导致开关形同虚设」，那条契约由 `testGatePersistsAcrossRelaunch`
+    /// 与显式打开路径继续保证——**默认值本身不是 ESS-711 的验收对象**。
+    func testGateDefaultsOffForFreshInstallSoPlaybackStaysAudible() {
+        XCTAssertFalse(
             WatchDebugSettings(defaults: isolatedDefaults("default")).voiceBargeInEnabled,
-            "ESS-711：新安装必须默认支持语音打断"
+            "ESS-891：新安装默认走 .spokenAudio，否则回答音量被通话通道压到 50% 且用户调不动"
         )
+    }
+
+    /// 显式打开仍然生效——退出开关是双向的。
+    func testGateCanBeExplicitlyEnabled() {
+        let defaults = isolatedDefaults("explicit-on")
+        WatchDebugSettings(defaults: defaults).setVoiceBargeInEnabled(true)
+        XCTAssertTrue(WatchDebugSettings(defaults: defaults).voiceBargeInEnabled)
     }
 
     func testGatePersistsAcrossRelaunch() {
@@ -84,11 +101,12 @@ final class VoiceBargeInEvidenceTests: XCTestCase {
         let log = LogSpy(); log.install(); defer { log.uninstall() }
         let settings = WatchDebugSettings(defaults: isolatedDefaults("contract"))
 
-        settings.setVoiceBargeInEnabled(false)
+        // ESS-891：新默认为 OFF，所以从 ON 起手才走得到双向。
         settings.setVoiceBargeInEnabled(true)
+        settings.setVoiceBargeInEnabled(false)
 
         let details = log.details(of: "voice_barge_in_gate")
-        XCTAssertEqual(details, ["state=off reason=user_toggle", "state=on reason=user_toggle"])
+        XCTAssertEqual(details, ["state=on reason=user_toggle", "state=off reason=user_toggle"])
         for detail in details {
             XCTAssertNoThrow(
                 try PhoneModeTelemetry.validate(
@@ -103,8 +121,9 @@ final class VoiceBargeInEvidenceTests: XCTestCase {
     /// 分不清是 gate 关着还是开着但没检测到。
     func testLaunchSnapshotReportsGateState() {
         let log = LogSpy(); log.install(); defer { log.uninstall() }
+        // ESS-891：新安装默认 OFF（`.spokenAudio`，保住可听音量）。
         WatchDebugSettings(defaults: isolatedDefaults("launch")).logStateAtLaunch()
-        XCTAssertEqual(log.details(of: "voice_barge_in_gate"), ["state=on reason=launch_snapshot"])
+        XCTAssertEqual(log.details(of: "voice_barge_in_gate"), ["state=off reason=launch_snapshot"])
     }
 
     /// **ON 也要通知订阅者。** 只在 OFF 时回调等于「运行中打开」永远不闭环：
@@ -114,11 +133,12 @@ final class VoiceBargeInEvidenceTests: XCTestCase {
         var observed: [Bool] = []
         settings.onVoiceBargeInChanged { observed.append($0) }
 
-        settings.setVoiceBargeInEnabled(false)
-        settings.setVoiceBargeInEnabled(false)    // 幂等：同值不重复通知
+        // ESS-891：新默认为 OFF，所以从 ON 起手。
         settings.setVoiceBargeInEnabled(true)
+        settings.setVoiceBargeInEnabled(true)     // 幂等：同值不重复通知
+        settings.setVoiceBargeInEnabled(false)
 
-        XCTAssertEqual(observed, [false, true])
+        XCTAssertEqual(observed, [true, false])
     }
 
     /// gate 必须有**真实调用点**。整改前 `setVoiceBargeInEnabled` 一个调用点

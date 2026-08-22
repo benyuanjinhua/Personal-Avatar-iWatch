@@ -14,12 +14,39 @@ public struct LocalVADConfiguration: Equatable, Sendable {
     public var minimumSpeechRMS: Double
     /// 相对噪声底的信噪比要求（线性倍数，3.0 ≈ +9.5 dB）。
     public var noiseFloorRatio: Double
+    /// **回判**专用的信噪比要求，必须严于 `noiseFloorRatio`。
+    ///
+    /// ESS-961：回判是一次「推翻既有判决」的动作——同一帧此前已经被判过
+    /// 一次「不是语音」，而回判并没有任何新证据，只是门降下来了。门降下来
+    /// 本身可能恰恰是因为**那几帧就是当初把门顶高的噪声**（麦克风启动瞬态），
+    /// 此时按实时门回判等于用噪声推翻对噪声的正确判决。所以要更高的门槛。
+    ///
+    /// 6.0 ≈ +15.6 dB。标定依据是两次真机实测：
+    ///
+    /// | 场景 | rms / 底噪 | 倍数 | 期望 |
+    /// |---|---|---|---|
+    /// | 麦克风启动瞬态（08-22 回归） | 0.00660 / 0.00125 | 5.3× | 不得救回 |
+    /// | 一开麦就说话（ESS-865 阻断 1） | 0.01098 / 0.00125 | 8.8× | 必须救回 |
+    ///
+    /// 【标定样本 n=2】按 R-04.4 这不足以支撑一个普遍常数，两侧余量也不宽
+    /// （5.3 与 8.8 之间只夹得下一个值）。真机多设备采样后应重新标定。
+    public var replayNoiseFloorRatio: Double
     /// 噪声底的最小统计窗口。窗内取最小值作为底噪估计（min-statistics）。
     public var noiseWindowMs: Int64
     /// 起判前 pre-roll 的最长回溯跨度。判定门下降时按新门重判这段历史，
     /// 救回「一开麦就说话、底噪只能从语音帧里估」那条时序（ESS-865 复审阻断 1）。
     public var preRollMs: Int64
     public var speechStartMs: Int64
+    /// 起判所需的**最少连续帧数**。
+    ///
+    /// ESS-961 第二轮：`speechStartMs = 100ms` 而真机帧长约 97ms——一帧的
+    /// 时长就已经满足时长条件，于是任意一个孤立脉冲（咂嘴、碰撞、环境瞬态）
+    /// 都能开启一轮，700ms 后收口提交，用户来不及说话（2026-08-21 18:14
+    /// 真机：整轮 `speech_frames=1`，rms=0.00670 单帧越过 0.00350 的门）。
+    ///
+    /// 时长条件从原理上挡不住它——一帧就是一个 `speechStartMs`。判据必须
+    /// 显式落在「连续性」上：孤立脉冲只有一帧，真语音跨多帧。
+    public var minimumSpeechFrames: Int
     public var endpointSilenceMs: Int64
     public var playbackGuardMs: Int64
     /// 单轮硬上限。**必须小于 `AudioRecorder.maxDuration`**：AVAudioRecorder
@@ -32,9 +59,11 @@ public struct LocalVADConfiguration: Equatable, Sendable {
         speechRMS: Double = 0.018,
         minimumSpeechRMS: Double = 0.0035,
         noiseFloorRatio: Double = 3.0,
+        replayNoiseFloorRatio: Double = 6.0,
         noiseWindowMs: Int64 = 2_000,
         preRollMs: Int64 = 8_000,
         speechStartMs: Int64 = 100,
+        minimumSpeechFrames: Int = 2,
         endpointSilenceMs: Int64 = 700,
         playbackGuardMs: Int64 = 300,
         maximumTurnMs: Int64 = 55_000
@@ -44,9 +73,11 @@ public struct LocalVADConfiguration: Equatable, Sendable {
         precondition(minimumSpeechRMS >= 0)
         precondition(minimumSpeechRMS <= speechRMS)
         precondition(noiseFloorRatio >= 1)
+        precondition(replayNoiseFloorRatio >= noiseFloorRatio)
         precondition(noiseWindowMs > 0)
         precondition(preRollMs > 0)
         precondition(speechStartMs > 0)
+        precondition(minimumSpeechFrames >= 1)
         precondition(endpointSilenceMs > 0)
         precondition(playbackGuardMs >= 0)
         precondition(maximumTurnMs > 0)
@@ -54,9 +85,11 @@ public struct LocalVADConfiguration: Equatable, Sendable {
         self.speechRMS = speechRMS
         self.minimumSpeechRMS = minimumSpeechRMS
         self.noiseFloorRatio = noiseFloorRatio
+        self.replayNoiseFloorRatio = replayNoiseFloorRatio
         self.noiseWindowMs = noiseWindowMs
         self.preRollMs = preRollMs
         self.speechStartMs = speechStartMs
+        self.minimumSpeechFrames = minimumSpeechFrames
         self.endpointSilenceMs = endpointSilenceMs
         self.playbackGuardMs = playbackGuardMs
         self.maximumTurnMs = maximumTurnMs
@@ -107,6 +140,8 @@ public struct LocalVADEndpointer: Sendable {
 
     private var turnStartedAtMs: Int64 = 0
     private var speechCandidateStartedAtMs: Int64?
+    /// ESS-961：当前候选段已连续跨门的帧数。孤立脉冲与真语音的唯一区别。
+    private var candidateSpeechFrames = 0
     private var speechStartedAtMs: Int64?
     private var lastSpeechAtMs: Int64?
     private var guardUntilMs: Int64 = 0
@@ -146,6 +181,7 @@ public struct LocalVADEndpointer: Sendable {
     public mutating func reset(atMs: Int64 = 0) {
         turnStartedAtMs = atMs
         speechCandidateStartedAtMs = nil
+        candidateSpeechFrames = 0
         speechStartedAtMs = nil
         lastSpeechAtMs = nil
         guardUntilMs = atMs
@@ -164,6 +200,7 @@ public struct LocalVADEndpointer: Sendable {
     /// 只可能发生在回答播完之后）。
     public mutating func playbackEnded(atMs: Int64) {
         speechCandidateStartedAtMs = nil
+        candidateSpeechFrames = 0
         lastSpeechAtMs = nil
         guardUntilMs = atMs + configuration.playbackGuardMs
         turnStartedAtMs = guardUntilMs
@@ -241,7 +278,12 @@ public struct LocalVADEndpointer: Sendable {
             if speechStartedAtMs == nil {
                 let candidateStart = speechCandidateStartedAtMs ?? frameStartedAtMs
                 speechCandidateStartedAtMs = candidateStart
-                if frameEndedAtMs - candidateStart >= configuration.speechStartMs {
+                candidateSpeechFrames += 1
+                // ESS-961 第二轮：时长条件挡不住孤立脉冲——真机帧长 ≈97ms，
+                // 一帧就已经满足 `speechStartMs = 100ms`。必须同时要求
+                // **连续帧数**，孤立脉冲只有一帧，真语音跨多帧。
+                if frameEndedAtMs - candidateStart >= configuration.speechStartMs,
+                   candidateSpeechFrames >= configuration.minimumSpeechFrames {
                     speechStartedAtMs = candidateStart
                     events.append(.speechStarted(atMs: candidateStart))
                 }
@@ -254,6 +296,7 @@ public struct LocalVADEndpointer: Sendable {
             appendPreRoll(startedAtMs: frameStartedAtMs, endedAtMs: frameEndedAtMs, rms: rms)
         }
         speechCandidateStartedAtMs = nil
+        candidateSpeechFrames = 0
         guard speechStartedAtMs != nil, let lastSpeechAtMs else { return events }
         if frameEndedAtMs - lastSpeechAtMs >= configuration.endpointSilenceMs {
             isFinal = true
@@ -277,27 +320,49 @@ public struct LocalVADEndpointer: Sendable {
     ///
     /// 只在「本轮还没起判」时调用；一旦起判，pre-roll 不再增长也不再回放。
     private mutating func replayPreRoll() -> LocalVADEvent? {
-        let threshold = thresholdRMS
+        // ESS-961：回判用**更严的门**，不是实时门。
+        //
+        // 回判要推翻的是「这帧不是语音」这个已经做过的判决，而它手上没有任何
+        // 新证据——只是门降下来了。而门降下来本身可能恰恰是因为那几帧就是当初
+        // 把门顶高的噪声（麦克风启动瞬态），此时按实时门回判 = 用噪声推翻对
+        // 噪声的正确判决。2026-08-22 真机回归正是这一条：0.00660 的启动瞬态
+        // 在降到 0.00374 的新门下"跨门"，补发 speechStarted，700ms 后收口，
+        // 整轮 956ms 提交空音频。
+        let threshold = max(
+            thresholdRMS, noiseFloorRMS * configuration.replayNoiseFloorRatio
+        )
         var runStart: Int64?
         var runEnd: Int64?
+        var runFrames = 0
+        var bestFrames = 0
         for frame in preRoll {
             if frame.rms >= threshold {
-                if runStart == nil { runStart = frame.startedAtMs }
+                if runStart == nil { runStart = frame.startedAtMs; runFrames = 0 }
                 runEnd = frame.endedAtMs
+                runFrames += 1
             } else {
                 if let start = runStart, let end = runEnd,
                    end - start >= configuration.speechStartMs {
+                    bestFrames = runFrames
                     break
                 }
                 runStart = nil
                 runEnd = nil
+                runFrames = 0
             }
         }
+        let rescuedFrames = max(bestFrames, runFrames)
         guard let start = runStart, let end = runEnd,
-              end - start >= configuration.speechStartMs else { return nil }
+              end - start >= configuration.speechStartMs,
+              rescuedFrames >= configuration.minimumSpeechFrames else { return nil }
+        // ESS-961 取证：救回的帧必须计进 speech_frames，否则真机日志会出现
+        // 「speech_started 却 speech_frames=0」这种自相矛盾的记录——本次回归
+        // 的第一条线索就是它，但当时无法分辨那是回判救回的还是纯误判。
+        speechFrameCount += rescuedFrames
         speechStartedAtMs = start
         lastSpeechAtMs = end
         speechCandidateStartedAtMs = nil
+        candidateSpeechFrames = 0
         preRoll.removeAll(keepingCapacity: true)
         return .speechStarted(atMs: start)
     }

@@ -51,6 +51,9 @@ final class PhoneRealtimeSession {
     /// `Shared/RealtimeDownlinkRelay.swift`，因为 `iOS/` 没有单测 target——
     /// 留在这里这条链路就只能靠人眼复核，正是它两次写错还合入的原因。
     private var pendingDownlink = RealtimeDownlinkRelay()
+    /// ESS-960：已判终态的回合闸门。判定逻辑与用例在
+    /// `Shared/RealtimeTurnGate` + `Tests/RealtimeTurnGateTests`。
+    private var turnGate = RealtimeTurnGate()
     /// ESS-391: Agent transports deliver events via callbacks rather than
     /// the Bridge-style `receive(handler:)` loop. When `true`, `scheduleReceive`
     /// is a no-op — the transport itself wires downlink delivery.
@@ -86,7 +89,9 @@ final class PhoneRealtimeSession {
                     "realtime discarding \(discarded) stale downlink envelopes from previous session"
                 )
             }
-            openIfNeeded(requestId: start.requestId, sessionId: start.sessionId)
+            openIfNeeded(
+                requestId: start.requestId, sessionId: start.sessionId, isTurnStart: true
+            )
         case .audioAppend:
             guard let append = envelope.append else { return }
             openIfNeeded(requestId: append.requestId, sessionId: append.streamId)
@@ -233,7 +238,7 @@ final class PhoneRealtimeSession {
         deliverDownlink(envelope)
     }
 
-    private func openIfNeeded(requestId: String, sessionId: String) {
+    private func openIfNeeded(requestId: String, sessionId: String, isTurnStart: Bool = false) {
         switch state {
         case .active(let activeRequest, let activeSession)
                 where activeRequest == requestId && activeSession == sessionId:
@@ -243,6 +248,25 @@ final class PhoneRealtimeSession {
             return
         default:
             break
+        }
+        // ESS-960：一个已判终态的回合不得被上行帧复活。这里以前是直接
+        // 落进 `default: break` 往下建通道，而本方法由**每一个上行音频帧**
+        // 调用——2026-08-21 真机因此打出 255 次握手 / 47 秒的重连风暴，
+        // 节奏 ≈184ms 正是上行帧节奏。判定逻辑在 `Shared/RealtimeTurnGate`
+        // （`iOS/` 没有单测 target，留在这里就只能靠人眼复核）。
+        if isTurnStart {
+            turnGate.noteTurnStart(requestId: requestId, sessionId: sessionId)
+        }
+        if case .suppress(let reason) = turnGate.decide(
+            requestId: requestId, sessionId: sessionId, isTurnStart: isTurnStart
+        ) {
+            PhoneAgentClientLog.info(
+                module: "phone_session",
+                event: "realtime_reopen_suppressed",
+                requestId: requestId, sessionId: sessionId,
+                detail: "reason=\(reason) closed_turns=\(turnGate.closedTurnCount)"
+            )
+            return
         }
         currentTransport?.close(reason: "supersede")
         guard let transport = transportFactory(requestId, sessionId) else {
@@ -289,8 +313,45 @@ final class PhoneRealtimeSession {
 
     private func transition(to newState: State) {
         guard state != newState else { return }
+        // ESS-960：把「这一轮还能不能重开」落成状态，后续上行帧就再也泵不出
+        // 无节制的握手。
+        //
+        // 区分两种失败（2026-08-21 18:27 真机教的）：
+        //
+        // - **已经 `.active` 过**：握手成功、token 已被网关消耗。Gateway token
+        //   是单次上行的（见 `AudioRealtimeAgentSession` "maxReconnectAttempts
+        //   = 0 — single-use tokens make reconnect impossible without a fresh
+        //   token"），重开在协议上不可能成功 → 一次即终态。
+        // - **还停在 `.connecting`**：握手压根没成功，token 没进过网关的账，
+        //   重试是合理的。上一版把这种也判终态，结果当晚网关因 ESS-886 复发
+        //   对所有握手回 401，整轮当场判死，用户连说话的机会都没有。
+        //   现在允许有界重试（闸门内计数），超限才封。
+        if case .failed(let reason) = newState, let turn = Self.turnIdentity(of: state) {
+            let wasActive: Bool
+            if case .active = state { wasActive = true } else { wasActive = false }
+            turnGate.noteFailure(
+                requestId: turn.requestId, sessionId: turn.sessionId, wasActive: wasActive
+            )
+            PhoneAgentClientLog.info(
+                module: "phone_session",
+                event: "realtime_turn_failed",
+                requestId: turn.requestId, sessionId: turn.sessionId,
+                detail: "reason=\(reason) was_active=\(wasActive) "
+                    + "closed_turns=\(turnGate.closedTurnCount)"
+            )
+        }
         state = newState
         onStateChange?(newState)
+    }
+
+    /// 从状态里取出它服务的回合身份；`idle` / `cancelled` / `failed` 不带身份。
+    private static func turnIdentity(of state: State) -> (requestId: String, sessionId: String)? {
+        switch state {
+        case .connecting(let requestId, let sessionId), .active(let requestId, let sessionId):
+            return (requestId, sessionId)
+        case .idle, .cancelled, .failed:
+            return nil
+        }
     }
 
     private func logDroppedDownlink(_ envelope: RealtimeDownlinkEnvelope, reason: String) {

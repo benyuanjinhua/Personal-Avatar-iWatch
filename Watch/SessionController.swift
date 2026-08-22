@@ -402,9 +402,17 @@ final class SessionController: ObservableObject {
         turnCapToken = scheduleDelay(Self.turnCapSeconds) { [weak self] in
             guard let self, self.state == .listening, self.turnPhase == .listening else { return }
             guard self.didDetectSpeechThisTurn else {
-                WatchLog.info("session", "session_turn_cap_skipped",
-                              requestId: self.activeTurnRequestId,
-                              detail: "cap_s=\(Int(Self.turnCapSeconds)) reason=no_speech_detected")
+                // ESS-960：不提交（ESS-865 阻断 2 的口径不变），但**必须重开采集**。
+                // 录音器 10s 后就到 `AudioRecorder.maxDuration` 自己停录，而
+                // 会话要到 120s 静默挂断才收场——中间这一整段麦克风是死的，
+                // 用户说什么都没人接（2026-08-21 真机：59.9s / rms=5 的静音
+                // 录音走完全文件回退后 `audio_too_short` 失败，用户端全程无感）。
+                // 这正是本方法注释里要避免的「聆听悬在已停录的死麦克风上」，
+                // 当时只为说过话的回合兑现了。
+                //
+                // 换麦克风但**不动相位、不重置静默时钟**——细节见
+                // `restartCaptureAfterSilentTurnCap`。
+                self.restartCaptureAfterSilentTurnCap()
                 return
             }
             WatchLog.info("session", "session_turn_cap_reached",
@@ -727,6 +735,37 @@ final class SessionController: ObservableObject {
 
     /// 开启下一轮采集。`onStartTurn` 返回新一轮的 request_id——从这一刻起
     /// 旧 id 的任何事件都会被 `acceptsTurnEvent` 挡在门外。
+    /// ESS-960：无人说话的回合到 `turnCap` 时**只换麦克风，不换相位**。
+    ///
+    /// 刻意不走 `startNextTurn`：那条路在 `onStartTurn` 返回 nil 时会把相位
+    /// 打到 `.idle`，而静默治理的 30s/75s/120s 全部以 `turnPhase == .listening`
+    /// 为前提（ESS-865 阻断 2 的口径）——重开失败却把会话推出聆听态，比死
+    /// 麦克风更糟：用户放下手走开就再也等不到自动挂断了。
+    ///
+    /// 同理**不重新武装静默时钟**：那是会话级策略，不能因为换了个麦克风
+    /// 就从头计时。
+    private func restartCaptureAfterSilentTurnCap() {
+        guard let requestId = onStartTurn?() else {
+            WatchLog.error(
+                "session", "session_turn_cap_restart_failed",
+                requestId: activeTurnRequestId,
+                detail: "turn_index=\(turnIndex) cap_s=\(Int(Self.turnCapSeconds))",
+                code: "ERR_SESSION_TURN_START"
+            )
+            return
+        }
+        turnIndex += 1
+        activeTurnRequestId = requestId
+        didDetectSpeechThisTurn = false
+        WatchLog.info(
+            "session", "session_turn_cap_no_speech_restart", requestId: requestId,
+            detail: "turn_index=\(turnIndex) cap_s=\(Int(Self.turnCapSeconds)) "
+                + "reason=no_speech_detected"
+        )
+        // 继续下一个上限窗口；静默治理的会话级时钟不动。
+        armTurnCap()
+    }
+
     private func startNextTurn(reason: String) {
         guard state == .listening else { return }
         relistenToken?.cancel(); relistenToken = nil
