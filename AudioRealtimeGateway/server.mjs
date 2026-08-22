@@ -16,6 +16,7 @@
 import http from 'node:http'
 import https from 'node:https'
 import { readFileSync } from 'node:fs'
+import { execSync } from 'node:child_process'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer } from 'ws'
@@ -33,6 +34,30 @@ import { verifyServiceRequest } from './service-auth.mjs'
 const BASE = dirname(fileURLToPath(import.meta.url))
 
 const DEFAULT_CONFIG_PATH = join(BASE, 'config.json')
+
+// ESS-887 部署可观测：让 gateway_ready 带可追溯的代码锚点。
+//  - git_sha：优先读部署脚本注入的 DEPLOY_SHA，否则 `git rev-parse HEAD`
+//  - git_clean / git_dirty_count：`git status --porcelain` 是否干净。
+//    脏工作区必须在启动日志里可见——任何一次热补丁都藏不住（ESS-870 #3，
+//    拒绝「升级一次就 done」）。非 git 目录时三项均为 null，优雅降级。
+export function readDeployState({ env = process.env, cwd = resolve(BASE, '..') } = {}) {
+  const runGit = args => {
+    try {
+      return execSync(`git ${args}`, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+    } catch {
+      return null
+    }
+  }
+  const sha = env.DEPLOY_SHA || runGit('rev-parse HEAD')
+  const porcelain = runGit('status --porcelain')
+  const dirtyCount = porcelain === null ? null : porcelain.split('\n').filter(Boolean).length
+  return {
+    git_sha: sha || null,
+    git_clean: porcelain === null ? null : dirtyCount === 0,
+    git_dirty_count: dirtyCount,
+  }
+}
+const DEPLOY_STATE = readDeployState()
 
 export function createGateway(overrides = {}) {
   const fileConfig = readConfig(overrides.config_path ?? DEFAULT_CONFIG_PATH)
@@ -263,6 +288,7 @@ export function createGateway(overrides = {}) {
           tls: !CONFIG.dev_allow_plain_ws,
           protocol_version: CONFIG.protocol_version,
           provider_key_present: Boolean(providerKey),
+          ...DEPLOY_STATE,
         })
         resolveStart(server)
       })
