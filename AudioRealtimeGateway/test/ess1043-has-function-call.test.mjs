@@ -156,6 +156,51 @@ test('ESS-1043 · 嵌套 response.hasFunctionCall 形状同样被识别', async 
   turn.close()
 })
 
+test('ESS-1052 · pending 期间夹入 announcement/缺字段 done 不得冒充工具结果', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') {
+      send(ws, { type: 'voice.ready' })
+      send(ws, { type: 'voice.state', state: 'listening', origin: 'model' })
+    }
+    if (message.type === 'audio.commit') {
+      send(ws, { type: 'response.started', responseId: 'up-model', origin: 'model' })
+      audioDelta(ws, 0, 'prompt')
+      send(ws, { type: 'audio.done' })
+      send(ws, { type: 'response.done', responseId: 'up-model', origin: 'model',
+        hasFunctionCall: true, status: 'completed' })
+
+      // 同一 WSS 的无关完成事件：显式 false 的后台播报，以及缺字段的未知响应。
+      send(ws, { type: 'response.done', responseId: 'up-ann', origin: 'announcement',
+        hasFunctionCall: false, status: 'completed' })
+      send(ws, { type: 'response.done', responseId: 'up-unknown', origin: 'agent',
+        status: 'completed' })
+
+      setTimeout(() => {
+        send(ws, { type: 'response.started', responseId: 'up-agent', origin: 'agent' })
+        audioDelta(ws, 1, 'real-answer')
+        send(ws, { type: 'audio.done' })
+        send(ws, { type: 'response.done', responseId: 'up-agent', origin: 'agent',
+          hasFunctionCall: false, status: 'completed' })
+      }, 250)
+    }
+  })
+  const events = []; const logs = []
+  const transport = transportFor(url, {
+    logs, segmentGapMs: 100, segmentGapBusyMs: 100, toolCallWindowMs: 2_000,
+  })
+  const turn = openTurn(transport, { requestId: 'r-interleaved', events })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'), 4_000)
+
+  assert.deepEqual(events.filter(e => e.type === 'agent.audio.delta').map(e => e.sequence), [0, 1])
+  const terminals = logs.filter(l => l.evt === 'upstream_turn_terminal')
+  assert.equal(terminals.length, 1)
+  assert.equal(terminals[0].reason, 'tool_result_done')
+  assert.equal(logs.filter(l => l.evt === 'upstream_tool_call_resolution_ignored').length, 2)
+  assert.equal(logs.filter(l => l.evt === 'upstream_tool_call_resolved').length, 1)
+  turn.close()
+})
+
 test('ESS-1043 · 上游不发 response.done 时保持 ESS-990 之前的行为（segment_gap 收口）', async () => {
   // 没有 response.done 的回合：不进入 tool-call 路径，普通空闲窗口收口。
   const url = await upstream((ws, message) => {

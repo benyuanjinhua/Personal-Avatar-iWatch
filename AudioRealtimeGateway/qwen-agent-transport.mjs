@@ -1141,15 +1141,21 @@ export class QwenAgentTransport {
         // change cannot silently drop the signal.
         if (event.type === 'response.done') {
           noteResponseProgress()
-          const hasFunctionCall = event.hasFunctionCall === true
-            || event.response?.hasFunctionCall === true
-            || event.has_function_call === true
+          const rawHasFunctionCall = typeof event.hasFunctionCall === 'boolean'
+            ? event.hasFunctionCall
+            : typeof event.response?.hasFunctionCall === 'boolean'
+              ? event.response.hasFunctionCall
+              : typeof event.has_function_call === 'boolean'
+                ? event.has_function_call
+                : null
+          const hasFunctionCall = rawHasFunctionCall === true
           const upstreamResponseId = event.responseId ?? event.response?.id ?? null
+          const responseOrigin = event.origin ?? event.response?.origin ?? null
           this.log('upstream_response_done', {
             ...scopeLog, upstream_response_id: upstreamResponseId,
-            origin: event.origin ?? event.response?.origin ?? null,
+            origin: responseOrigin,
             status: event.status ?? event.response?.status ?? null,
-            has_function_call: hasFunctionCall,
+            has_function_call: rawHasFunctionCall,
           })
           if (hasFunctionCall) {
             if (!turn.pendingToolCall) {
@@ -1160,7 +1166,9 @@ export class QwenAgentTransport {
             // re-arm its window with the dedicated tool-call window (the
             // re-arm only ever widens — see `armSegmentGap`).
             if (turn.closedSegment) armSegmentGap('tool_call_pending')
-          } else if (turn.pendingToolCall) {
+          } else if (turn.pendingToolCall
+            && rawHasFunctionCall === false
+            && responseOrigin === 'agent') {
             turn.pendingToolCall = false
             this.log('upstream_tool_call_resolved', { ...scopeLog, upstream_response_id: upstreamResponseId })
             // The tool result is the final segment. End the turn as soon as its
@@ -1171,6 +1179,16 @@ export class QwenAgentTransport {
             } else if (turn.pendingDone) {
               turn.endAfterDone = true
             }
+          } else if (turn.pendingToolCall) {
+            // ESS-1052: one WSS also carries stale background announcements.
+            // Missing metadata is not explicit false, and an announcement/model
+            // completion is not the agent tool result. Neither may clear the
+            // pending latch or the real answer will arrive after a false
+            // tool_result_done terminal.
+            this.log('upstream_tool_call_resolution_ignored', {
+              ...scopeLog, upstream_response_id: upstreamResponseId,
+              origin: responseOrigin, has_function_call: rawHasFunctionCall,
+            })
           }
           return
         }
