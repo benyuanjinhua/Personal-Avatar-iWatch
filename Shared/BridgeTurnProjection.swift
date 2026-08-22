@@ -173,6 +173,8 @@ extension BridgeTurnProjection {
             return "没听清，请重说"
         case "ERR_UPSTREAM_UNAVAILABLE":
             return "Mac 那边没应答。确认助手在运行，点重试不用重新说。"
+        case "ERR_FALLBACK_NOT_CONFIGURED":
+            return "助手这边还没准备好，这次没接上，稍后再试。"
         case "ERR_TASK_NOT_FOUND":
             return "Mac 那边找不到这件事了，点重试我重新交一次。"
         case "ERR_TASK_FAILED":
