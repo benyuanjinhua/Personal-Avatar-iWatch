@@ -42,6 +42,13 @@ const TASK_NON_LIFECYCLE_EVENTS = new Set([
 ])
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/
 
+// ESS-1068: bound on the per-conversation task identity / delivered tables.
+// A conversation's background tasks are a small working set (measured n=10
+// turns produced at most a couple of tasks each); the cap is a memory backstop
+// against a misbehaving upstream, trimming the OLDEST entry (a long-finished
+// task no longer needs attribution).
+const MAX_TASKS_PER_CONVERSATION = 256
+
 // ESS-849: cap on the per-turn responseId → announcement book-keeping. A turn
 // lives seconds and the biggest real capture held 2 announcements, so this is a
 // memory backstop against a misbehaving upstream, not a functional limit —
@@ -207,6 +214,36 @@ export class QwenAgentTransport {
     // The queue bounds process-lifetime memory without relying on timers.
     this.retiredClientInstanceIds = new Set()
     this.retiredClientInstanceOrder = []
+    // ESS-1068: cross-turn task book-keeping, keyed by conversation (device +
+    // session) so a background task spawned by a closed turn can still have its
+    // result attributed and consumed-once on a LATER turn of the same
+    // conversation. Per-turn state alone loses the taskId→identity mapping when
+    // the acceptance turn closes before the task terminal (measured 30–70 s).
+    // Bounded per conversation to keep process-lifetime memory flat.
+    this.conversationTaskIdentity = new Map() // conversationKey → Map<taskId, identity>
+    this.conversationDelivered = new Map()    // conversationKey → Set<taskId>
+  }
+
+  // ESS-1068: shared per-conversation task identity / delivered dedup tables,
+  // created lazily and bounded (oldest conversation evicted on overflow).
+  #conversationTaskTables(conversation) {
+    let identity = this.conversationTaskIdentity.get(conversation)
+    if (!identity) {
+      identity = new Map()
+      this.conversationTaskIdentity.set(conversation, identity)
+      while (this.conversationTaskIdentity.size > 256) {
+        this.conversationTaskIdentity.delete(this.conversationTaskIdentity.keys().next().value)
+      }
+    }
+    let delivered = this.conversationDelivered.get(conversation)
+    if (!delivered) {
+      delivered = new Set()
+      this.conversationDelivered.set(conversation, delivered)
+      while (this.conversationDelivered.size > 256) {
+        this.conversationDelivered.delete(this.conversationDelivered.keys().next().value)
+      }
+    }
+    return { identity, delivered }
   }
 
   #retireClientInstance(clientInstanceId) {
@@ -303,9 +340,15 @@ export class QwenAgentTransport {
     // holder of the single voice slot; without knowing who WE are, a `busy`
     // frame cannot be told apart from an echo of our own ownership.
     const clientInstanceId = `gateway_${randomUUID()}`
+    // ESS-1068: task identity and delivered dedup are per-CONVERSATION, not
+    // per-turn — a background task spawned by a closed turn still resolves on
+    // a later turn of the same conversation.
+    const taskTables = this.#conversationTaskTables(conversation)
     const turn = {
       key, conversation,
       requestId, sessionId, deviceId, generation, responseId, onEvent,
+      taskIdentity: taskTables.identity,
+      deliveredAnnouncements: taskTables.delivered,
       ws: null, ready: false, terminal: false, committed: false,
       pending: [], pendingBytes: 0, nextOutputSequence: 0,
       downlinkFrames: 0, downlinkBytes: 0,
@@ -344,8 +387,8 @@ export class QwenAgentTransport {
       // exactly-once book-keeping keyed by taskId; `deliverAnnouncementIds`
       // marks the responseIds whose audio/transcript is attributed and must
       // be forwarded rather than dropped.
-      activeAnnouncements: new Set(), taskIdentity: new Map(),
-      deliveredAnnouncements: new Set(), deliverAnnouncementIds: new Set(),
+      activeAnnouncements: new Set(),
+      deliverAnnouncementIds: new Set(),
       // ESS-849 announcement isolation book-keeping. `announcementDropped`
       // counts what the voice channel threw away per announcement response;
       // `forwardedResponseIds` is what makes a 「先 delta 后 started」 leak
@@ -1025,7 +1068,12 @@ export class QwenAgentTransport {
                   ...scopeLog, upstream_response_id: id, upstream_task_id: taskKeyStr,
                 })
               } else {
-                if (taskKeyStr !== null) turn.deliveredAnnouncements.add(taskKeyStr)
+                if (taskKeyStr !== null) {
+                  turn.deliveredAnnouncements.add(taskKeyStr)
+                  while (turn.deliveredAnnouncements.size > MAX_TASKS_PER_CONVERSATION) {
+                    turn.deliveredAnnouncements.delete(turn.deliveredAnnouncements.values().next().value)
+                  }
+                }
                 if (id !== null) turn.deliverAnnouncementIds.add(id)
                 this.log('upstream_announcement_delivered', {
                   ...scopeLog, upstream_response_id: id, upstream_task_id: taskKeyStr,
@@ -1264,6 +1312,9 @@ export class QwenAgentTransport {
               deviceId: event.task?.deviceId ?? prior?.deviceId ?? null,
               turnId: event.task?.turnId ?? prior?.turnId ?? null,
             })
+            while (turn.taskIdentity.size > MAX_TASKS_PER_CONVERSATION) {
+              turn.taskIdentity.delete(turn.taskIdentity.keys().next().value)
+            }
           }
           if (terminal) {
             turn.outstandingTasks.delete(id)

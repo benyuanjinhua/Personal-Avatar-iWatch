@@ -228,9 +228,11 @@ inspect control frames.
   一律隔离。以 `taskId` 为首期归属键、按 task 的 session/device 与当前 turn
   对齐（播报自带的 `task.sessionId` 优先，其次 `task.*` 事件建立的 taskId→
   身份表）——归属明确的播报音频/文本作为新段落下发，并按 taskId 去重只消费
-  一次；无归属或跨 session 的播报继续隔离（ESS-849 安全默认）。播报/task
-  结束后清除 busy 使直答回合回落到 `agent_segment_gap_ms` 基础窗口，不再被
-  锁在忙档。
+  一次；无归属或跨 session 的播报继续隔离（ESS-849 安全默认）。task 身份与
+  已投递去重按 conversation（device+session）跨 turn 持久化，前一轮受理后
+  关闭、后台任务 30–70 s 后才终结的结果，仍能在下一轮归属并只消费一次。
+  播报/task 结束后清除 busy 使直答回合回落到 `agent_segment_gap_ms` 基础
+  窗口，不再被锁在忙档。
 
 #### Barge-in
 

@@ -211,3 +211,82 @@ test('ESS-1068 · 播报结束后清除 turnBusy，直答回合在基础窗口�
   assert.equal(terminal.window_ms, 100)
   turn.close()
 })
+
+test('ESS-1068 · task 身份跨 turn 持久化：后一轮能归属前一轮任务的结果', async () => {
+  const commits = []
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') send(ws, { type: 'voice.ready' })
+    if (message.type === 'audio.commit') {
+      commits.push(ws)
+      if (commits.length === 1) {
+        // 第一轮：只建立 taskId→session 映射（task.accepted），回合随后关闭。
+        send(ws, { type: 'task.accepted', task: { id: 'work_w', sessionId: 's', status: 'accepted' } })
+      } else {
+        // 第二轮：迟到的播报只带 taskId，靠上一轮建立的映射归属。
+        send(ws, { type: 'response.started', responseId: 'ann-w', origin: 'announcement',
+          taskId: 'work_w' })
+        audioDelta(ws, 0, 'cross-turn-result', 'ann-w')
+        send(ws, { type: 'audio.done', responseId: 'ann-w' })
+      }
+    }
+  })
+  const logs = []
+  const transport = new QwenAgentTransport({ gatewayUrl: url, doneSettleMs: 20, log: (evt, extra) => logs.push({ evt, ...extra }) })
+  const events1 = []; const events2 = []
+  const turn1 = transport.openTurn({
+    requestId: 'r1', sessionId: 's', deviceId: 'd', generation: 1, responseId: 'r1:gen1',
+    onEvent: e => events1.push(e),
+  })
+  turn1.commit()
+  await waitFor(() => logs.some(l => l.evt === 'upstream_task_state' && l.task_id === 'work_w'))
+
+  const turn2 = transport.openTurn({
+    requestId: 'r2', sessionId: 's', deviceId: 'd', generation: 2, responseId: 'r2:gen2',
+    onEvent: e => events2.push(e),
+  })
+  turn2.commit()
+  await waitFor(() => events2.some(e => e.type === 'agent.audio.done'))
+
+  assert.deepEqual(events2.filter(e => e.type === 'agent.audio.delta')
+    .map(e => Buffer.from(e.audio, 'base64').toString()), ['cross-turn-result'])
+  assert.ok(logs.some(l => l.evt === 'upstream_announcement_delivered' && l.upstream_task_id === 'work_w'))
+  turn2.close()
+})
+
+test('ESS-1068 · 跨 turn 去重：同一 taskId 的结果只消费一次', async () => {
+  const commits = []
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') send(ws, { type: 'voice.ready' })
+    if (message.type === 'audio.commit') {
+      commits.push(ws)
+      // 两轮都收到同一 taskId 的播报（重投）：第一轮投递，第二轮去重隔离。
+      send(ws, { type: 'response.started', responseId: `ann-${commits.length}`, origin: 'announcement',
+        task: { id: 'work_d', sessionId: 's' } })
+      audioDelta(ws, 0, 'dup-result', `ann-${commits.length}`)
+      send(ws, { type: 'audio.done', responseId: `ann-${commits.length}` })
+    }
+  })
+  const logs = []
+  const transport = new QwenAgentTransport({ gatewayUrl: url, doneSettleMs: 20, log: (evt, extra) => logs.push({ evt, ...extra }) })
+  const events1 = []; const events2 = []
+  const turn1 = transport.openTurn({
+    requestId: 'r1', sessionId: 's', deviceId: 'd', generation: 1, responseId: 'r1:gen1',
+    onEvent: e => events1.push(e),
+  })
+  turn1.commit()
+  await waitFor(() => events1.some(e => e.type === 'agent.audio.done'))
+
+  const turn2 = transport.openTurn({
+    requestId: 'r2', sessionId: 's', deviceId: 'd', generation: 2, responseId: 'r2:gen2',
+    onEvent: e => events2.push(e),
+  })
+  turn2.commit()
+  await waitFor(() => logs.some(l => l.evt === 'upstream_announcement_duplicate' && l.upstream_task_id === 'work_d'))
+
+  // 第一轮投递一帧，第二轮一帧都没有（跨 turn 去重）。
+  assert.equal(events1.filter(e => e.type === 'agent.audio.delta').length, 1)
+  assert.equal(events2.filter(e => e.type === 'agent.audio.delta').length, 0)
+  assert.ok(logs.some(l => l.evt === 'upstream_announcement_delivered' && l.upstream_task_id === 'work_d'))
+  assert.ok(logs.some(l => l.evt === 'upstream_announcement_duplicate' && l.upstream_task_id === 'work_d'))
+  turn2.close()
+})
