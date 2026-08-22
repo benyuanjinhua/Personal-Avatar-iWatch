@@ -53,6 +53,10 @@ final class WatchRealtimeMediaAdapter {
         /// ESS-650（F2-3）：播放器此刻是否还在出声。`stop_ms` 若只量到同步
         /// 函数返回，量的是调用开销而不是停播延迟（ESS-667 复审阻断 4）。
         var isRenderingDownlink: Bool { get }
+        /// ESS-1023：渲染链路里还有没有音频（已排队、完成回调未回来）。
+        /// 这是「此刻会不会有声音从扬声器出来」的唯一诚实读点，见
+        /// `RealtimePlaybackEngine.hasAudioInRenderPipeline` 的注释。
+        var hasAudioInRenderPipeline: Bool { get }
         func prepare(for turn: RealtimeMediaSession.TurnHandle) throws
         /// ESS-330 v3: each playable carries its own response_id so per-response
         /// bookkeeping stays intact across out-of-order releases.
@@ -148,8 +152,24 @@ final class WatchRealtimeMediaAdapter {
     private let barrierTimer: BarrierTimer
     private let transportFailureDrainTimer: BarrierTimer
     private var vadEndpointer: LocalVADEndpointer?
-    /// ESS-1013 取证：本轮因「播放中且无 AEC」被丢弃的麦克风帧数。
-    private var selfEchoSuppressedFrames = 0
+    /// ESS-1023：下行**此刻是否可能有声音出来**。判据是播放器的渲染链路里
+    /// 还有没有音频，不是任何一种回执或节点状态：
+    ///
+    /// * `player.isRenderingDownlink` 读 `AVAudioPlayerNode.isPlaying`，
+    ///   `prepare(for:)` 里就 `play()` 了、而适配器在 `beginTurn` 调 `prepare`
+    ///   ——整轮恒真，拿它当门等于整轮静音麦克风（运行时取证见
+    ///   `testRealPlayerReportsRenderingRightAfterPrepareWithNothingEnqueued`）；
+    /// * `.started` 回执挂在 `.dataPlayedBack` 上，是**首个 buffer 播完之后**
+    ///   才到的，拿它当门会漏掉首个 buffer 出声的那一整段（复审阻断）；
+    /// * 单个 Bool 也表达不了「一个回合多个 response 并存」——旧 response 的
+    ///   `.ended` 会在新 response 还在播时把门打开（复审阻断）。
+    ///
+    /// 渲染链路计数天然满足这三条：排队前置位、排空即解除、跨 response 累计，
+    /// 并且由播放器自己记账——它不会对自己的队列撒谎。
+    var isDownlinkAudible: Bool { player.hasAudioInRenderPipeline }
+    /// 本段压制已丢弃的帧数与时长（`0` 表示当前没有在压制）。
+    private var suppressedVADFrames = 0
+    private var suppressedVADMs: Int64 = 0
     private let vadSampleRate: Int
     private let automaticallyCommitOnSpeechFinal: Bool
     private var vadFrameStartedAtMs: Int64 = 0
@@ -363,6 +383,10 @@ final class WatchRealtimeMediaAdapter {
         currentResponseId = nil
         vadFrameStartedAtMs = Self.uptimeMs()
         vadLastLevelLogAtMs = nil
+        // ESS-1023：抑制状态归零。真正的「渲染链路清空」由下面的
+        // `player.prepare(for:)`（内部 `stop(barge:)` → 丢弃排队 buffer →
+        // 计数清零）兑现——适配器这边只清自己的取证账。
+        resetVADSuppressionAccounting()
         // ESS-600：守卫带过回合边界（见 `vadGuardUntilMs`）。
         vadEndpointer?.reset(atMs: max(vadFrameStartedAtMs, vadGuardUntilMs))
         // `session.beginTurn(...)` fires a `.turnFinished(...)` for any
@@ -493,12 +517,14 @@ final class WatchRealtimeMediaAdapter {
     /// 「我们调用过 stop()」不是停播证据。
     var isRenderingDownlink: Bool { player.isRenderingDownlink }
 
-    /// ESS-1013：当前音频会话是否带 AEC（回声消除）。
+    /// ESS-1023：当前音频会话是否带 AEC（回声消除）。
     ///
-    /// 生产接 `WatchDebugSettings.voiceBargeInEnabled` —— 它同时决定
-    /// `ConversationAudioController` 用 `.voiceChat`（有 AEC）还是
-    /// `.spokenAudio`（无 AEC）。**默认 `false`**：没接线时按最保守的
-    /// 「无 AEC」处理，宁可少听一段，也不能把自己的播报当成用户提问。
+    /// 生产接 `ConversationAudioController.isEchoCancellationActive` ——
+    /// 读的是**当前会话真正配上的 mode**（只有 `.voiceChat` 带 AEC），
+    /// 不是「用户期望的开关」：mode 只在下一次 `beginConversation` 生效，
+    /// 通话中翻开关不重配会话（复审阻断，见 `ConversationAudioController`）。
+    /// **默认 `false`**：没接线时按最保守的「无 AEC」处理，宁可少听一段，
+    /// 也不能把自己的播报当成用户提问。
     var aecAvailable: () -> Bool = { false }
 
     /// 累计的疑似自身回声帧数（守卫窗内的高能量帧）。F2-5 的对账口径。
@@ -536,8 +562,7 @@ final class WatchRealtimeMediaAdapter {
 
     private func consumeVAD(_ frame: Data) {
         guard var endpointer = vadEndpointer else { return }
-        let frameStartedAtMs = vadFrameStartedAtMs
-        // ESS-1013：播放期间且**没有 AEC** 时，麦克风拾到的是我们自己的
+        // ESS-1023：播放期间且**没有 AEC** 时，麦克风拾到的是我们自己的
         // 扬声器输出，不是用户。真机 2026-08-22 12:15：用户一句话没说，
         // `play_started` 后 0.298 s VAD 就起判，`speech_frames` 跟着播报
         // 从 8 涨到 121，最终把 14.7 秒的**系统播报**当成提问提交上行，
@@ -548,24 +573,14 @@ final class WatchRealtimeMediaAdapter {
         //
         // 时间戳照常推进：丢的是**判定**，不是时间轴——否则播放结束后
         // VAD 的窗口会与录音实际时刻错位。
-        if player.isRenderingDownlink && !aecAvailable() {
-            vadFrameStartedAtMs += Int64(
-                frame.count / MemoryLayout<Int16>.size * 1_000 / vadSampleRate
-            )
-            selfEchoSuppressedFrames += 1
-            if selfEchoSuppressedFrames % 25 == 1 {
-                WatchLog.info(
-                    "vad", "vad_input_suppressed_during_playback",
-                    requestId: currentTurn?.requestId,
-                    detail: "reason=no_aec frames=\(selfEchoSuppressedFrames)"
-                )
-            }
+        if player.hasAudioInRenderPipeline, !aecAvailable() {
+            suppressVADFrame(frame)
             return
         }
+        logVADInputResumedIfNeeded()
+        let frameStartedAtMs = vadFrameStartedAtMs
         let events = endpointer.processPCM16(frame, frameStartedAtMs: frameStartedAtMs)
-        vadFrameStartedAtMs += Int64(
-            frame.count / MemoryLayout<Int16>.size * 1_000 / vadSampleRate
-        )
+        vadFrameStartedAtMs += vadFrameDurationMs(frame)
         vadEndpointer = endpointer
         logVADLevelIfDue(metrics: endpointer.metrics, frameStartedAtMs: frameStartedAtMs)
         for event in events {
@@ -587,6 +602,43 @@ final class WatchRealtimeMediaAdapter {
             }
             onVADEvent?(event)
         }
+    }
+
+    /// ESS-1023：丢弃一帧播放期的麦克风输入。只推进时间轴，不进 VAD、
+    /// 不进底噪统计。整段压制落一头一尾两条取证：进入时的
+    /// `vad_input_suppressed_during_playback`（证明压制发生过）与恢复时的
+    /// `vad_input_resumed_after_playback`（证明**恢复也发生过**——少了它，
+    /// 「用户永远说不了话」这个更坏的失败模式在日志上不可区分）。
+    private func suppressVADFrame(_ frame: Data) {
+        let frameDurationMs = vadFrameDurationMs(frame)
+        if suppressedVADFrames == 0 {
+            WatchLog.info(
+                "vad", "vad_input_suppressed_during_playback", requestId: currentTurn?.requestId,
+                detail: "at_ms=\(vadFrameStartedAtMs) reason=no_aec"
+            )
+        }
+        suppressedVADFrames += 1
+        suppressedVADMs += frameDurationMs
+        vadFrameStartedAtMs += frameDurationMs
+    }
+
+    private func logVADInputResumedIfNeeded() {
+        guard suppressedVADFrames > 0 else { return }
+        WatchLog.info(
+            "vad", "vad_input_resumed_after_playback", requestId: currentTurn?.requestId,
+            detail: "at_ms=\(vadFrameStartedAtMs) suppressed_frames=\(suppressedVADFrames) "
+                + "suppressed_ms=\(suppressedVADMs)"
+        )
+        resetVADSuppressionAccounting()
+    }
+
+    private func resetVADSuppressionAccounting() {
+        suppressedVADFrames = 0
+        suppressedVADMs = 0
+    }
+
+    private func vadFrameDurationMs(_ frame: Data) -> Int64 {
+        Int64(frame.count / MemoryLayout<Int16>.size * 1_000 / vadSampleRate)
     }
 
     /// ESS-865：周期性落一条能量/门限取证。首帧必落一条（`vadLastLevelLogAtMs`

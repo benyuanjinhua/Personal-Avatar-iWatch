@@ -287,6 +287,16 @@ final class ConversationAudioController {
     /// 上一次 `beginConversation` 真正用上的 mode，供测试与真机日志对账。
     private(set) var lastConfiguredMode: AVAudioSession.Mode?
 
+    /// ESS-1023：当前会话是否真的拿到了 AEC（回声消除）。
+    ///
+    /// 判据是**真正配上的 mode**而不是 `voiceBargeInEnabled()` 的意图：
+    /// `.voiceChat` 是这条阶梯上唯一带 AEC 的一档，第一级失败后的
+    /// `.minimal`（`.default`）与 gate 关掉时的 `.spokenAudio` 都没有。
+    /// 未持有会话时为 false —— `lastConfiguredMode` 是上一次的残值。
+    var isEchoCancellationActive: Bool {
+        isAcquired && lastConfiguredMode == .voiceChat
+    }
+
     /// 与 `AudioRecorder.configureSession` 同源的 ESS-61 配置序列：
     /// 先 setActive(false, .notifyOthersOnDeactivation) 清掉播放侧残留的
     /// 激活态，再用带 policy 参数的重载显式声明 .default 复位粘性

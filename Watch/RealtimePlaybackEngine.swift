@@ -126,6 +126,25 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
     /// 万一某天不是（换实现、换节点），`session_interrupt_stop_unconfirmed`
     /// 会当场把它暴露出来，而不是让 stop_ms 悄悄变成一个好看的假数字。
     var isRenderingDownlink: Bool { playerNode.isPlaying }
+
+    /// ESS-1023：此刻**渲染链路里还有没有音频**——已 `scheduleBuffer` 进
+    /// playerNode、其 `.dataPlayedBack` 完成回调尚未回来的 buffer 数 > 0。
+    ///
+    /// 为什么不能用现成的两个信号：
+    /// * `isRenderingDownlink` 读 `playerNode.isPlaying`，`prepare(for:)`
+    ///   里就 `play()` 了，整轮恒真——拿它当门会把整轮麦克风静音；
+    /// * `.started` 回执由 `didCompleteBuffer` 发出，而它挂在 `.dataPlayedBack`
+    ///   上，是**首个 buffer 已经播完之后**才到的——拿它当门，首个 buffer
+    ///   出声的那一整段回声照样进 VAD（毕玄复审阻断）。
+    ///
+    /// 本信号在 `scheduleBuffer` 之前就置位（fail-closed：宁可早抑制一点），
+    /// 排空即解除，且**跨 response 累计**——旧 response 的 `.ended` 不会在新
+    /// response 还在播时把门打开。
+    var hasAudioInRenderPipeline: Bool { pendingRenderedBuffers > 0 }
+    /// 已排进渲染链路、完成回调尚未回来的 buffer 数。
+    /// `stop` / `bargeIn` / `prepare` 会连同 playerNode 的排队一起清零；
+    /// 之后迟到的完成回调由 `max(0, …)` 夹住，不会把计数带成负数。
+    private var pendingRenderedBuffers = 0
     /// ESS-509: audio session gate that prevents the engine from stomping
     /// on another player's session (SpeechPlayer, StreamingAudioPlayer)
     /// and ensures deactivation happens exactly once per turn.
@@ -185,6 +204,8 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
             isRunning = true
         }
         playerNode.play()
+        // ESS-1023：新回合的渲染链路是空的（上面 `stop(barge:)` 已清队）。
+        pendingRenderedBuffers = 0
         // ESS-891: reset per-turn level evidence and emit the playback-path
         // snapshot (route / outputVolume / gain / format) for the low-volume
         // diagnosis.
@@ -217,12 +238,20 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
             // `.dataPlayedBack` fires once the buffer has actually been played
             // through the output. This is the "real" completion Bixuan
             // required in ESS-335, not the "we queued it" pseudo-event.
+            // ESS-1023：**先**置位再排队。抑制窗必须覆盖首个 buffer 真正出声
+            // 的那一段——`.dataPlayedBack` 回执要等它播完才来，太晚了。
+            pendingRenderedBuffers += 1
             playerNode.scheduleBuffer(
                 pcmBuffer, at: nil,
                 completionCallbackType: .dataPlayedBack
             ) { [weak self] _ in
                 Task { @MainActor in
-                    self?.didCompleteBuffer(responseId: responseId, bytes: payloadBytes)
+                    guard let self else { return }
+                    // 计数在 `didCompleteBuffer` 之前减：后者遇到 stale turn
+                    // 会直接 return，把减法写在它里面会让计数永远下不来，
+                    // 用户就再也说不了话。
+                    self.pendingRenderedBuffers = max(0, self.pendingRenderedBuffers - 1)
+                    self.didCompleteBuffer(responseId: responseId, bytes: payloadBytes)
                 }
             }
         }
@@ -235,6 +264,8 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
         guard let turn = currentTurn else { return }
         playerNode.stop()
         playerNode.reset()
+        // ESS-1023：排队 buffer 已被丢弃 —— 渲染链路当场为空。
+        pendingRenderedBuffers = 0
         for receipt in tracker.bargeAll() {
             onPlaybackEvent?(.bargedIn(
                 requestId: turn.requestId, sessionId: turn.sessionId,
@@ -267,6 +298,8 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
             playerNode.stop()
             playerNode.reset()
         }
+        // ESS-1023：同上——主动停播即清空渲染链路，抑制随之解除。
+        pendingRenderedBuffers = 0
         pcmLevelAccumulator.reset()
         didLogFirstChunkLevel = false
         currentTurn = nil
@@ -279,6 +312,7 @@ final class RealtimePlaybackEngine: WatchRealtimeMediaAdapter.Player {
 
     func shutdown() {
         playerNode.stop()
+        pendingRenderedBuffers = 0
         audioEngine.stop()
         audioEngine.detach(playerNode)
         isRunning = false
