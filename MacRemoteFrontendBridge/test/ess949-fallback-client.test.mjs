@@ -53,5 +53,31 @@ test('Bridge client maps an unreachable Gateway to an explicit failure', async (
   const client = new FallbackJobClient({ baseUrl: 'http://127.0.0.1:1',
     secret: 'bridge-client-test-secret-32-bytes-minimum', timeoutMs: 20 })
   await assert.rejects(client.submitAndWait({ requestId: 'r3', audio: Buffer.from('x'), audioSha256: 'x' }),
-    error => error.code === 'gateway_unavailable')
+    error => error.code === 'gateway_unreachable')
+})
+
+test('Bridge client maps a missing HMAC secret to a deterministic failure', async () => {
+  const client = new FallbackJobClient({ baseUrl: 'http://127.0.0.1:1', secret: '', timeoutMs: 500 })
+  await assert.rejects(client.submitAndWait({ requestId: 'r4', audio: Buffer.from('x'), audioSha256: 'x' }),
+    error => error.code === 'fallback_hmac_secret_missing')
+})
+
+test('Bridge client maps a short HMAC secret to a deterministic failure', async () => {
+  const client = new FallbackJobClient({ baseUrl: 'http://127.0.0.1:1', secret: 'too-short', timeoutMs: 500 })
+  await assert.rejects(client.submitAndWait({ requestId: 'r5', audio: Buffer.from('x'), audioSha256: 'x' }),
+    error => error.code === 'fallback_hmac_secret_missing')
+})
+
+test('Bridge client maps a gateway rejection to a distinct refusal code', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(500, { 'content-type': 'text/plain' })
+    res.end('boom')
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const client = new FallbackJobClient({ baseUrl: `http://127.0.0.1:${server.address().port}`,
+      secret: 'bridge-client-test-secret-32-bytes-minimum', timeoutMs: 500 })
+    await assert.rejects(client.submitAndWait({ requestId: 'r6', audio: Buffer.from('x'), audioSha256: 'x' }),
+      error => error.code === 'gateway_refused')
+  } finally { await new Promise(resolve => server.close(resolve)) }
 })

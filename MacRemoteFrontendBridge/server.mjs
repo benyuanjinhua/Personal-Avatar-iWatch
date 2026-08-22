@@ -633,7 +633,9 @@ export function createBridge(overrides = {}) {
       if (ledger.get(requestId)?.state === 'cancelled') return
       ledger.update(requestId, { state: 'processing', detail: 'fallback_job_queued' })
       if (CONFIG.fallback_jobs_enabled !== true && CONFIG.allow_test_pcm !== true) {
-        throw Object.assign(new Error('fallback jobs disabled'), { code: 'gateway_unavailable' })
+        // ESS-983: 降级开关被显式关闭也是确定性配置失败，用独立码与
+        // 「网关不可达」区分，客户端一眼可辨、不进重试链。
+        throw Object.assign(new Error('fallback jobs disabled'), { code: 'fallback_jobs_disabled' })
       }
       log({ evt: 'fallback_job_submitting', request_id: requestId, audio_sha256: sha256hex(pcm16k) })
       const fallbackResult = await fallbackJobs.submitAndWait({
@@ -747,8 +749,13 @@ export function createBridge(overrides = {}) {
       } else if (error.code === 'ERR_TRANSCRIPT_DISCARDED') {
         // 语音未被识别为有效指令：稳定错误码，Watch 端可提示"没听清，请重说"
         ledger.fail(requestId, 'ERR_TRANSCRIPT_DISCARDED')
-      } else if (error.code === 'gateway_unavailable' || error.code === 'ERR_NOT_FOUND') {
-        log({ evt: 'fallback_job_failed', request_id: requestId, reason: 'gateway_unavailable' })
+      } else if (error.code === 'fallback_hmac_secret_missing' || error.code === 'fallback_jobs_disabled') {
+        // ESS-983: 密钥缺失 / 降级关闭是确定性配置失败——重试必然再次失败，
+        // 落非可重试终态码 ERR_FALLBACK_NOT_CONFIGURED，不进重试链。
+        log({ evt: 'fallback_job_failed', request_id: requestId, reason: String(error.code) })
+        ledger.fail(requestId, 'ERR_FALLBACK_NOT_CONFIGURED')
+      } else if (error.code === 'gateway_unreachable' || error.code === 'gateway_refused' || error.code === 'ERR_NOT_FOUND') {
+        log({ evt: 'fallback_job_failed', request_id: requestId, reason: String(error.code) })
         ledger.fail(requestId, 'ERR_UPSTREAM_UNAVAILABLE')
       } else if (error.code === 'queue_timeout') {
         log({ evt: 'fallback_job_failed', request_id: requestId, reason: 'queue_timeout' })

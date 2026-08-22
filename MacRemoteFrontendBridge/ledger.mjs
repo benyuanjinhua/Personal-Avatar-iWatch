@@ -32,6 +32,7 @@ const CLIENT_FAILURE_DETAILS = new Map([
   ['ERR_TASK_NOT_FOUND', 'Mac 那边找不到这件事了，点重试我重新交一次。'],
   ['ERR_TASK_FAILED', '这件事我没办成，点重试再跑一次，不用重新说。'],
   ['ERR_RESULT_UNKNOWN', '这件事做完没有我不确定，去 Mac 上看一眼——我不敢替你重跑。'],
+  ['ERR_FALLBACK_NOT_CONFIGURED', '助手这边还没准备好，这次没接上，稍后再试。'],
 ])
 
 export function isAutomaticallyRetryableTerminalError(errorCode) {
