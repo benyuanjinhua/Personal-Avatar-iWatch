@@ -34,4 +34,12 @@ export class AuditLog {
       error: errorCode ?? null
     });
   }
+
+  captureIdea({ noteId, errorCode }) {
+    this.write({
+      tool: "vault_capture_idea",
+      note_id: noteId ?? null,
+      error: errorCode ?? null
+    });
+  }
 }

@@ -2,7 +2,7 @@
   "name": "vault-search-mcp",
   "version": "0.1.0",
   "private": true,
-  "description": "Obsidian Vault 只读 MCP Search（vault_search / vault_read），零外部依赖，基于 node:sqlite FTS5",
+  "description": "Obsidian Vault MCP：安全检索、读取与显式灵感记录，零外部依赖",
   "type": "module",
   "main": "server.mjs",
   "engines": {

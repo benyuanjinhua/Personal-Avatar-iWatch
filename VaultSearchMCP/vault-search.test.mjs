@@ -6,7 +6,7 @@ import path from "node:path";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { DEFAULT_LIMITS } from "./vault.mjs";
+import { captureIdea, DEFAULT_LIMITS } from "./vault.mjs";
 import { createHandlers, handleRequest } from "./server.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -129,6 +129,64 @@ test("Vault 不可用时明确报错，不伪造结果", () => {
   assert.ok(response.result.content[0].text.includes("VAULT_UNAVAILABLE"));
 });
 
+test("明确记录意图创建 Jackson/Idea Markdown，包含时间、原文与上下文", () => {
+  const now = new Date("2026-08-22T12:34:56.789Z");
+  const result = captureIdea(config, {
+    intent: "record_idea",
+    content: "做一个能把散步时灵感自动串起来的视图",
+    context: "讨论个人知识管理时想到"
+  }, {
+    now: () => now,
+    randomUUID: () => "11111111-1111-4111-8111-111111111111"
+  });
+
+  assert.equal(result.note_id,
+    "Jackson/Idea/20260822-123456.789Z-11111111-1111-4111-8111-111111111111.md");
+  const body = fs.readFileSync(path.join(vaultRoot, result.note_id), "utf8");
+  assert.ok(body.includes("记录时间：2026-08-22T12:34:56.789Z"));
+  assert.ok(body.includes("## 原始想法\n\n做一个能把散步时灵感自动串起来的视图"));
+  assert.ok(body.includes("## 上下文\n\n讨论个人知识管理时想到"));
+});
+
+test("连续记录使用唯一文件名，不互相覆盖", () => {
+  const first = handlers.toolCaptureIdea({ intent: "record_idea", content: "第一条" });
+  const second = handlers.toolCaptureIdea({ intent: "record_idea", content: "第二条" });
+  assert.notEqual(first.note_id, second.note_id);
+  assert.ok(fs.readFileSync(path.join(vaultRoot, first.note_id), "utf8").includes("第一条"));
+  assert.ok(fs.readFileSync(path.join(vaultRoot, second.note_id), "utf8").includes("第二条"));
+});
+
+test("空内容、非法参数和非记录意图均不创建文件", () => {
+  const ideaDir = path.join(vaultRoot, "Jackson", "Idea");
+  const before = fs.readdirSync(ideaDir).length;
+  assert.throws(() => handlers.toolCaptureIdea({ intent: "record_idea", content: "  " }),
+    error => error.code === "INVALID_ARGUMENT");
+  assert.throws(() => handlers.toolCaptureIdea({ intent: "ordinary_chat", content: "今天天气如何" }),
+    error => error.code === "INVALID_ARGUMENT");
+  assert.throws(() => handlers.toolCaptureIdea({ intent: "record_idea", content: "想法", context: 42 }),
+    error => error.code === "INVALID_ARGUMENT");
+  assert.equal(fs.readdirSync(ideaDir).length, before);
+});
+
+test("写入失败返回可判定错误，MCP 响应不得假报成功", () => {
+  const brokenRoot = fs.mkdtempSync(path.join(os.tmpdir(), "vault-mcp-write-fail-"));
+  try {
+    fs.writeFileSync(path.join(brokenRoot, "Jackson"), "阻挡目录创建");
+    const broken = createHandlers({ ...makeConfig(), vaultRoot: brokenRoot });
+    assert.throws(() => broken.toolCaptureIdea({ intent: "record_idea", content: "不会写入" }),
+      error => error.code === "WRITE_FAILED");
+    const response = handleRequest(broken, {
+      jsonrpc: "2.0", id: 8, method: "tools/call",
+      params: { name: "vault_capture_idea", arguments: { intent: "record_idea", content: "不会写入" } }
+    });
+    assert.equal(response.result.isError, true);
+    assert.ok(response.result.content[0].text.includes("[WRITE_FAILED]"));
+    assert.ok(!response.result.content[0].text.includes("note_id"));
+  } finally {
+    fs.rmSync(brokenRoot, { recursive: true, force: true });
+  }
+});
+
 test("审计日志记录查询词/命中 ID/读取范围，但不含笔记正文", () => {
   handlers.toolSearch({ query: "WatchConnectivity" });
   handlers.toolRead({ note_id: "Projects/watch-plan.md" });
@@ -179,7 +237,7 @@ test("MCP stdio 端到端：initialize / tools/list / tools/call", async () => {
 
     send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
     const list = await waitFor(2);
-    assert.deepEqual(list.result.tools.map(t => t.name), ["vault_search", "vault_read"]);
+    assert.deepEqual(list.result.tools.map(t => t.name), ["vault_search", "vault_read", "vault_capture_idea"]);
 
     send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "vault.search", arguments: { query: "WatchConnectivity" } } });
     const call = await waitFor(3);
