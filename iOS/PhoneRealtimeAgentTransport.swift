@@ -280,6 +280,24 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
             )
             self.onDownlink?(envelope)
         }
+        // ESS-1097：任务生命周期。**刻意不过 generation 门禁**——一个仍在跑的
+        // 工具任务恰恰是「不许换代」的理由，用换代后的门禁把它滤掉，等于让
+        // Watch 永远看不到那个把它拦在思考态的信号。陈旧性由 Watch 侧的
+        // request_id 归属闸门（`SessionController.acceptsTurnEvent`）承担。
+        agentSession.onTaskState = { [weak self] rid, gen, taskId, status in
+            guard let self else { return }
+            let envelope = RealtimeDownlinkEnvelope.taskState(
+                requestId: rid, sessionId: self.sessionId,
+                generation: gen, taskId: taskId, status: status
+            )
+            PhoneAgentClientLog.info(
+                module: Self.logModule,
+                event: "downlink_enqueued",
+                requestId: rid, sessionId: self.sessionId,
+                detail: "type=task.state task_id=\(taskId ?? "nil") status=\(status) gen=\(gen)"
+            )
+            self.onDownlink?(envelope)
+        }
         agentSession.onError = { [weak self] code, rid, gen, retriable, detail in
             guard let self else { return }
             Self.logger.error(

@@ -147,6 +147,7 @@ verifiable).
 | `audio.delta` | `sequence`, `sample_rate`, `codec`, `audio` (base64 PCM16LE 24 kHz) | Sequences are monotone and dense per `response_id`. |
 | `audio.segment_done` | `segment_index`, `final_sequence` | **本段结束，回合未结束**（ESS-969）。同一屏障语义，但客户端应保持本轮打开、退回等待态（Watch：`SessionController.markAnswerInterim`），不得开下一轮。未实现的老客户端忽略该帧即可——后续 `audio.delta` 与最终的 `audio.done` 不受影响。 |
 | `audio.done` | `final_sequence` | Barrier — client waits until it has seen every `0..final_sequence` before signalling playback complete. **回合终态**：一个回合有且只有一帧。 |
+| `task.state` | `task_id?`, `status` | **上游 `task.*` 生命周期的下发投影**（ESS-1097）。工具回合里 `tool_call_pending` 之后上游会发 `voice.state=idle`，而任务仍在 `running`——没有这一帧，客户端只能拿回合屏障当真相，就会提前回到「正在听」并开新 generation 把在跑的工具任务 supersede 掉（ESS-1095 真机取证）。`task_id` 缺席表示 `tool_call_pending` 这类还没有任务号的闩锁信号；`status` 原样透传，**客户端把未知取值一律当作非终态**。未实现的老客户端忽略该帧即可，其余事件不受影响。 |
 | `cancel.ack` | echoes scope + `cancelled_response_id?` | Response to a `cancel` message. |
 | `error` | `code`, `retriable`, `detail?` | Structured failure; connection is closed with WebSocket code 1008 unless `retriable: true`. |
 | `pong` | echoes `nonce` | Heartbeat reply. |

@@ -128,6 +128,11 @@ final class WatchRealtimeMediaAdapter {
     /// ESS-600：realtime 播放失败。失败不得伪装成播完——会话层据此走
     /// `session_answer_failed` 的显式恢复路径。
     var onAnswerPlaybackFailed: (@MainActor (RealtimeMediaSession.TurnHandle, _ code: String) -> Void)?
+    /// ESS-1097：上游任务生命周期（`task.state`）。**不进播放管线**——
+    /// 它唯一的作用是喂会话层的回合聚合状态机：任务未终结时 UI 保持
+    /// 「正在思考」，且禁止自动开下一轮 generation。
+    /// `taskId == nil` = `tool_call_pending`（上游还没有任务号）。
+    var onAgentTaskState: (@MainActor (RealtimeMediaSession.TurnHandle, _ taskId: String?, _ status: String) -> Void)?
 
     /// ESS-573: 真实通道就绪事件——本回合**首个被对端接受的 uplink ack**
     /// 到达时触发一次。该 ack 由 iPhone 在 WSS 实际发出音频后回发
@@ -779,6 +784,25 @@ final class WatchRealtimeMediaAdapter {
             generation: generation,
             isSegmentBoundary: true
         )
+    }
+
+    /// ESS-1097：上游任务生命周期到达。
+    ///
+    /// 归属校验只认 `currentTurn`——上一轮的迟到 `task.state` 不得把当前回合
+    /// 按在思考态上（那是另一种形式的卡死）。没有活跃回合时只留证。
+    func markAgentTaskState(taskId: String?, status: String) {
+        guard let handle = currentTurn else {
+            WatchLog.info(
+                "realtime", "task_state_no_active_turn",
+                detail: "task_id=\(taskId ?? "nil") status=\(status)"
+            )
+            return
+        }
+        WatchLog.info(
+            "realtime", "task_state", requestId: handle.requestId,
+            detail: "task_id=\(taskId ?? "nil") status=\(status) turn_id=\(handle.turnId)"
+        )
+        onAgentTaskState?(handle, taskId, status)
     }
 
     func markDownlinkComplete(

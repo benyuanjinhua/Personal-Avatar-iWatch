@@ -136,6 +136,15 @@ final class AudioRealtimeAgentSession {
     /// 对着半句话干等。
     var onSegmentDropped: ((String, String?, Int, Int) -> Void)?
 
+    /// ESS-1097：上游 `task.*` 生命周期。
+    /// Params: (requestId, generation, taskId, status)。`taskId == nil` 表示
+    /// `tool_call_pending` 这类还没有任务号的「工具要开跑」信号。
+    ///
+    /// 这条回调**不进播放管线**，它只喂客户端的回合聚合状态机
+    /// （`ToolTurnAggregate`）：任务未终结时 UI 必须保持「正在思考」，
+    /// 并禁止自动开下一轮 generation 把在跑的工具回合 supersede 掉。
+    var onTaskState: ((String, Int, String?, String) -> Void)?
+
     /// Emitted on Gateway `error`.
     /// Params: (code, requestId, generation, retriable, detail).
     var onError: ((String, String, Int, Bool, String?) -> Void)?
@@ -385,6 +394,23 @@ final class AudioRealtimeAgentSession {
                 code: "ERR_UPSTREAM_AUDIO_AFTER_DONE"
             )
             onSegmentDropped?(rid, respId, gen, droppedCount)
+
+        case .taskState(let sid, let rid, let gen, let taskId, let status):
+            guard sid == sessionId, let turn = currentTurn,
+                  turn.requestId == rid else { return }
+            // 任务在跑 = 上游确实在干活。撤掉「等首个响应」的预算，否则一个
+            // 慢工具会被 `awaitResponseTimeout` 判成「上游没答」。
+            cancelResponseWait()
+            Self.logger.info(
+                "agent task.state rid=\(rid.prefix(8), privacy: .public) gen=\(gen) task=\(taskId ?? "nil", privacy: .public) status=\(status, privacy: .public)"
+            )
+            PhoneAgentClientLog.info(
+                module: Self.logModule,
+                event: "downlink_task_state_accepted",
+                requestId: rid, sessionId: sid,
+                detail: "task_id=\(taskId ?? "nil") status=\(status) gen=\(gen)"
+            )
+            onTaskState?(rid, gen, taskId, status)
 
         case .cancelAck(let sid, let rid, let gen, let cancelledRespId):
             guard sid == sessionId else { return }

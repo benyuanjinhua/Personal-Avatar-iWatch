@@ -293,6 +293,13 @@ enum RealtimeDownlinkKind: String, Codable, Sendable {
     /// ESS-969 / ESS-971：**本段结束，回合未结束**。屏障语义与 `audioDone`
     /// 一致，但客户端必须保持本轮打开（`markAnswerInterim`），不开下一轮。
     case audioSegmentDone = "audio.segment_done"
+    /// ESS-1097：上游 `task.*` 生命周期的下发投影（`tool_call_pending` 也走这条，
+    /// `task_id` 缺席即可）。它**不进播放管线**，只喂 Watch 的回合聚合状态机：
+    /// 任务未终结时 UI 保持「正在思考」，并禁止自动开下一轮 generation。
+    ///
+    /// 走 WCSession 控制事件而不是复用 `transcript.*`：这是回合门禁的输入，
+    /// 与字幕不同源、也不同生命周期，混在一起会让「为什么还在思考」不可判定。
+    case taskState = "task.state"
 
     /// 未知 kind 不得让**整个信封**解码失败。
     ///
@@ -353,6 +360,14 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
     var conversationId: String?
     /// ESS-571: optional turn-level identity (Phase 0 dual-write).
     var turnId: String?
+    /// ESS-1097: upstream task id on `task.state`. Absent for the
+    /// `tool_call_pending` flavour (upstream has no task id yet) and for every
+    /// other kind.
+    var taskId: String?
+    /// ESS-1097: raw upstream task status on `task.state`. Kept as the raw
+    /// string — `ToolTaskStatus` does the interpretation and treats anything
+    /// unknown as **non-terminal**.
+    var taskStatus: String?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
@@ -368,6 +383,8 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         case finalSequence = "final_sequence"
         case conversationId = "conversation_id"
         case turnId = "turn_id"
+        case taskId = "task_id"
+        case taskStatus = "task_status"
     }
 
     init(
@@ -383,7 +400,9 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         generation: Int? = nil,
         finalSequence: Int? = nil,
         conversationId: String? = nil,
-        turnId: String? = nil
+        turnId: String? = nil,
+        taskId: String? = nil,
+        taskStatus: String? = nil
     ) {
         self.protocolVersion = protocolVersion
         self.kind = kind
@@ -398,6 +417,8 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         self.finalSequence = finalSequence
         self.conversationId = conversationId
         self.turnId = turnId
+        self.taskId = taskId
+        self.taskStatus = taskStatus
     }
 
     /// Explicit decoder so pre-ESS-404 messages (no `generation`, no
@@ -418,6 +439,8 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         self.finalSequence = try c.decodeIfPresent(Int.self, forKey: .finalSequence)
         self.conversationId = try c.decodeIfPresent(String.self, forKey: .conversationId)
         self.turnId = try c.decodeIfPresent(String.self, forKey: .turnId)
+        self.taskId = try c.decodeIfPresent(String.self, forKey: .taskId)
+        self.taskStatus = try c.decodeIfPresent(String.self, forKey: .taskStatus)
     }
 
     /// Bridge PR #113 handshake ack. Carries no payload. Adapter treats this
@@ -490,6 +513,24 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
             kind: .audioSegmentDone, requestId: requestId, sessionId: sessionId,
             sequence: segmentIndex, audio: nil, transcript: nil, reason: nil,
             responseId: responseId, generation: generation, finalSequence: finalSequence
+        )
+    }
+
+    /// ESS-1097：上游任务生命周期。`taskId == nil` = `tool_call_pending`
+    /// （上游还没有任务号，但「工具要开跑」这件事必须现在就让客户端知道）。
+    static func taskState(
+        requestId: String,
+        sessionId: String,
+        generation: Int? = nil,
+        taskId: String?,
+        status: String
+    ) -> Self {
+        RealtimeDownlinkEnvelope(
+            protocolVersion: RealtimeWireVersion.downlink,
+            kind: .taskState, requestId: requestId, sessionId: sessionId,
+            sequence: nil, audio: nil, transcript: nil, reason: nil,
+            responseId: nil, generation: generation,
+            taskId: taskId, taskStatus: status
         )
     }
 

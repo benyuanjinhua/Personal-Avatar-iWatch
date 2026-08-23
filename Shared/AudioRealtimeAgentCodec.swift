@@ -199,6 +199,18 @@ enum AudioRealtimeAgentCodec {
         case segmentDropped(sessionId: String, requestId: String, responseId: String,
                             generation: Int, sequence: Int, droppedCount: Int,
                             reason: String?)
+        /// Gateway `task.state`（ESS-1097）——上游 `task.*` 生命周期的下发投影。
+        ///
+        /// 工具回合里模型先说「我正在查询…」，随后 `tool_call_pending` +
+        /// `task.accepted/running`；上游此时会发 `voice.state=idle`，而任务**仍在跑**。
+        /// 客户端只有拿到这条事件才能把「还在干活」与「答完了」分开——没有它，
+        /// UI 只能拿回合屏障当真相，正是 ESS-1095 观测到的误判入口。
+        ///
+        /// `status` 原样透传（不在解码层做白名单）：未知取值由
+        /// `ToolTaskStatus` 按**非终态**处理，把没见过的状态当终态等于重演本 bug。
+        /// `tool_call_pending`（无 taskId）用 `taskId == nil` 表达。
+        case taskState(sessionId: String, requestId: String, generation: Int,
+                       taskId: String?, status: String)
         /// Gateway `cancel.ack` — server-authoritative cancel confirmation.
         case cancelAck(sessionId: String, requestId: String, generation: Int,
                        cancelledResponseId: String)
@@ -290,6 +302,21 @@ enum AudioRealtimeAgentCodec {
                 sessionId: sid, requestId: rid, responseId: respId,
                 generation: gen, sequence: sequence,
                 droppedCount: droppedCount, reason: reason
+            ))
+
+        case "task.state":
+            guard let sid = raw["session_id"] as? String,
+                  let rid = raw["request_id"] as? String else { return .malformed }
+            // `generation` 缺省按 0：本事件不进播放管线，代次只用于取证与
+            // 陈旧过滤；为一个取证字段把整帧判死，等于又回到「客户端什么都
+            // 不知道」的老路（ESS-957 的同一条教训）。
+            let gen = (raw["generation"] as? Int) ?? 0
+            // `task_id` 允许缺席：`tool_call_pending` 阶段上游还没有 taskId。
+            let taskId = (raw["task_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            guard let status = raw["status"] as? String, !status.isEmpty else { return .malformed }
+            return .event(.taskState(
+                sessionId: sid, requestId: rid, generation: gen,
+                taskId: taskId, status: status
             ))
 
         case "cancel.ack":

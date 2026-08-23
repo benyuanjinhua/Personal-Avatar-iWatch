@@ -211,6 +211,16 @@ final class SessionController: ObservableObject {
     /// `session_thinking_timeout` 并回到聆听，让用户能再说一遍。
     /// 120s【待调】：长任务走 `backgroundAccepted` 通知链，不靠这条兜底。
     static let thinkingTimeoutSeconds: TimeInterval = 120.0
+    /// ESS-1097：**工具回合**的绝对等待上限，从「首次观测到工具工作」起算，
+    /// 一轮之内**只武装一次**，绝不因为 `task.progress` 刷新而顺延——
+    /// 顺延就等于把「不能永久锁死」这条验收写成了空话。
+    ///
+    /// 为什么不能沿用 45s（`thinkingHardTimeoutSeconds`）：ESS-1095 真机取证里
+    /// `task.progress` 到 42.5s 仍在跳，个人文章查询 / 飞书日程创建都可能更久。
+    /// 45s 到点判失败会把**正常**的工具回合杀掉，正是本单验收 2 要求消除的
+    /// 「UI 提前放弃」。180s【待调】≈ 观测到的最长工具回合的三倍余量；
+    /// 到点仍走与 45s 完全同构的 `enterFailed` 收口路径，不新造终态。
+    static let toolTurnHardTimeoutSeconds: TimeInterval = 180.0
     /// ESS-600：一轮没产生任何提交（说得太短 / 收尾抛错）后重开采集的
     /// 退避。Watch 无 AEC，错误提示语音正在外放时立刻开麦会被自己的
     /// 声音再次触发 VAD，形成「太短 → 报错 → 又太短」的自激循环。
@@ -257,6 +267,8 @@ final class SessionController: ObservableObject {
     /// ESS-652: 思考慢提示 / 硬超时 / 静默 / P6 自动挂断计时器。
     private var thinkingSlowToken: SessionDelayToken?
     private var thinkingHardToken: SessionDelayToken?
+    /// ESS-1097：工具回合的绝对上限计时器。每轮至多武装一次。
+    private var toolTurnHardToken: SessionDelayToken?
     private var silenceToken: SessionDelayToken?
     private var failedAutoToken: SessionDelayToken?
     private var hungupDismissToken: SessionDelayToken?
@@ -272,6 +284,14 @@ final class SessionController: ObservableObject {
     /// `conversation_id` / `turn_id` 真相在 `RealtimeMediaSession.ConversationHandle`
     /// （唯一铸造点），本序号只是会话层日志的可读游标，不另铸 id。
     private(set) var turnIndex = 0
+    /// ESS-1097：当前回合的**本地聚合状态**。UI 相位与「能否自动开下一轮」都
+    /// 由它裁决，而不是任何单一上游信号（这正是本单要修的那条错误映射）。
+    /// 每轮换 `activeTurnRequestId` 时重置——聚合体是回合级的，不是会话级的。
+    private(set) var toolTurn = ToolTurnAggregate()
+    /// 本轮是否已经为工具工作武装过绝对上限。只武装一次（见
+    /// `toolTurnHardTimeoutSeconds` 的注释）。
+    private var toolTurnDeadlineArmed = false
+
     /// ESS-843：最近一次会话结束的原因码（默认 user_exit）。keep-alive 层
     /// （WorkoutSessionKeeper）据此在释放 owner 时落明确 reason。
     private(set) var lastExitReasonCode: ExitReasonCode = .userExit
@@ -319,6 +339,7 @@ final class SessionController: ObservableObject {
         turnIndex = 1
         activeTurnRequestId = onBeginChannel?() ?? nil
         turnPhase = .idle
+        resetToolTurn(reason: "session_enter")
     }
 
     /// ESS-600：本地采集真的开始/停止了（AudioRecorder 层事实）。与网络
@@ -501,11 +522,99 @@ final class SessionController: ObservableObject {
                           detail: "turn_index=\(self.turnIndex)")
         }
         thinkingHardToken?.cancel()
+        thinkingHardToken = nil
+        // ESS-1097：工具在跑的时候 45s 硬超时必须让位——它量的是「上游没答」，
+        // 而工具回合恰恰是**答案还在做**。此时改由 `toolTurnHardToken` 的绝对
+        // 上限承担有界性（一轮只武装一次），两者永远只有一个在跑。
+        guard !toolTurn.hasOutstandingWork else {
+            WatchLog.info(
+                "session", "session_thinking_hard_timeout_deferred",
+                requestId: activeTurnRequestId,
+                detail: "turn_index=\(turnIndex) \(toolTurn.logDetail)"
+            )
+            return
+        }
         thinkingHardToken = scheduleDelay(Self.thinkingHardTimeoutSeconds) { [weak self] in
             guard let self, self.isInSession, self.turnPhase == .thinking else { return }
             WatchLog.info("session", "session_thinking_hard_timeout", requestId: self.activeTurnRequestId)
+            self.toolTurn.apply(.timedOut(reason: "thinking_hard_timeout"))
             self.enterFailed(reason: "回答超时，要再试一次吗？", retryable: true)
         }
+    }
+
+    // MARK: - ESS-1097 工具回合门禁
+
+    /// 上游任务生命周期到达（`task.state`）。
+    ///
+    /// `taskId == nil` 表示 `tool_call_pending` 那一类「工具要开跑但还没有任务号」
+    /// 的信号；`status` 原样来自上游，解释权在 `ToolTaskStatus`——**未知状态一律
+    /// 按非终态处理**，把没见过的状态当终态正是本单要修的 bug。
+    func markTaskState(requestId: String, taskId: String?, status: String) {
+        guard acceptsTurnEvent(requestId, event: "task_state") else { return }
+        let event: ToolTurnAggregate.Event
+        if let taskId {
+            event = .taskState(taskId: taskId, status: ToolTaskStatus(rawValue: status))
+        } else {
+            // 无任务号 = 工具调用闩锁。只有明确的「已解除」才落 resolved，
+            // 其余（含未知取值）都按「还在挂起」处理。
+            switch status.lowercased() {
+            case "resolved", "tool_call_resolved", "completed", "done":
+                event = .toolCallResolved
+            default:
+                event = .toolCallPending
+            }
+        }
+        let hadOutstandingWork = toolTurn.hasOutstandingWork
+        let phaseChanged = toolTurn.apply(event)
+        WatchLog.info(
+            "session", "session_task_state", requestId: requestId,
+            detail: "turn_index=\(turnIndex) task_id=\(taskId ?? "nil") status=\(status) "
+                + "phase_changed=\(phaseChanged) \(toolTurn.logDetail)"
+        )
+        if !hadOutstandingWork, toolTurn.hasOutstandingWork {
+            // 首次观测到工具工作：撤掉 45s 硬超时，改挂一次性的绝对上限。
+            armToolTurnDeadlineIfNeeded()
+            thinkingHardToken?.cancel(); thinkingHardToken = nil
+        } else if hadOutstandingWork, !toolTurn.hasOutstandingWork, turnPhase == .thinking {
+            // 工具活干完了、答案还没播：把 45s 的「等回答」预算重新接上。
+            // 绝对上限仍然挂着，两条都有界。
+            armThinkingTimeout()
+        }
+    }
+
+    /// 一轮之内只武装一次的工具绝对上限。到点走与 45s 硬超时完全同构的收口。
+    private func armToolTurnDeadlineIfNeeded() {
+        guard !toolTurnDeadlineArmed else { return }
+        toolTurnDeadlineArmed = true
+        WatchLog.info(
+            "session", "session_tool_turn_deadline_armed", requestId: activeTurnRequestId,
+            detail: "turn_index=\(turnIndex) timeout_s=\(Int(Self.toolTurnHardTimeoutSeconds))"
+        )
+        toolTurnHardToken?.cancel()
+        toolTurnHardToken = scheduleDelay(Self.toolTurnHardTimeoutSeconds) { [weak self] in
+            guard let self, self.isInSession else { return }
+            guard self.turnPhase == .thinking || self.turnPhase == .speaking else { return }
+            WatchLog.error(
+                "session", "session_tool_turn_timeout", requestId: self.activeTurnRequestId,
+                detail: "turn_index=\(self.turnIndex) timeout_s=\(Int(Self.toolTurnHardTimeoutSeconds)) "
+                    + self.toolTurn.logDetail,
+                code: "ERR_SESSION_TOOL_TURN_TIMEOUT"
+            )
+            self.toolTurn.apply(.timedOut(reason: "tool_turn_timeout"))
+            self.enterFailed(reason: "这件事做得有点久，要再试一次吗？", retryable: true)
+        }
+    }
+
+    /// 每轮开始时重置聚合体。聚合体是**回合级**的：跨轮复用会把上一轮的
+    /// 未结任务按在新一轮头上（另一种形式的卡死）。
+    private func resetToolTurn(reason: String) {
+        toolTurn = ToolTurnAggregate()
+        toolTurnDeadlineArmed = false
+        toolTurnHardToken?.cancel(); toolTurnHardToken = nil
+        WatchLog.info(
+            "session", "session_tool_turn_reset", requestId: activeTurnRequestId,
+            detail: "turn_index=\(turnIndex) reason=\(reason)"
+        )
     }
 
     /// ESS-600 复审阻断 B：完整文件路径的 **interim** 语音播完。
@@ -527,11 +636,13 @@ final class SessionController: ObservableObject {
         let fromPhase = turnPhase
         turnPhase = .thinking
         lowVolumeHint = false
+        // ESS-1097：段落播完 ≠ 回合屏障落定。只清播放面，屏障状态一个字不动。
+        toolTurn.apply(.playbackSegmentEnded)
         // ESS-650：interim 播完退回等待态，已不在 speaking，停采。
         stopBargeInListening(reason: "answer_interim")
         WatchLog.info(
             "session", "session_answer_interim", requestId: requestId,
-            detail: "turn_index=\(turnIndex) from=\(fromPhase.logName) phase=thinking"
+            detail: "turn_index=\(turnIndex) from=\(fromPhase.logName) phase=thinking \(toolTurn.logDetail)"
         )
         armThinkingTimeout()
     }
@@ -549,9 +660,12 @@ final class SessionController: ObservableObject {
         }
         thinkingToken?.cancel(); thinkingToken = nil
         turnPhase = .speaking
+        // ESS-1097：首帧真实起播 = 「正在回答」。它**不**让回合收口——
+        // 工具结果的第一段可能只是「我正在查询…」。
+        toolTurn.apply(.playbackStarted)
         WatchLog.info(
             "session", "session_answer_started", requestId: requestId,
-            detail: "turn_index=\(turnIndex) phase=speaking"
+            detail: "turn_index=\(turnIndex) phase=speaking \(toolTurn.logDetail)"
         )
         // ESS-891：回答真实起播时读一次系统输出音量。应用无法编程式调高
         // 系统音量，过低时给一行可行动提示（用户旋转表冠调高）。
@@ -654,23 +768,44 @@ final class SessionController: ObservableObject {
             return
         }
         let fromPhase = turnPhase
+        // ESS-1097：`onAnswerPlaybackFinished` 的成功终局同时蕴含两件事——
+        // 回合级 `audio.done` 屏障已释放**且**最后一段音频渲染完毕。两者分别
+        // 入账，聚合体才能在乱序（屏障早到 / 任务晚到）下给出正确判定。
+        // 失败终局只清播放面：播放失败不代表上游发过回合屏障。
+        if success { toolTurn.apply(.audioDoneBarrier) }
+        toolTurn.apply(.playbackEnded)
         if success {
             // ESS-944：rounds 口径对齐 play_finished——只有回答真实播完才计一轮，
             // 失败/打断/中止不计数（验收标准 4）。
             markRoundCompleted()
             WatchLog.info(
                 "session", "session_answer_finished", requestId: requestId,
-                detail: "turn_index=\(turnIndex) from=\(fromPhase.logName) reason=\(reason)"
+                detail: "turn_index=\(turnIndex) from=\(fromPhase.logName) reason=\(reason) \(toolTurn.logDetail)"
             )
         } else {
             WatchLog.error(
                 "session", "session_answer_failed", requestId: requestId,
-                detail: "turn_index=\(turnIndex) from=\(fromPhase.logName) reason=\(reason)",
+                detail: "turn_index=\(turnIndex) from=\(fromPhase.logName) reason=\(reason) \(toolTurn.logDetail)",
                 code: "ERR_SESSION_ANSWER_FAILED"
             )
         }
         // ESS-650：离开 speaking 即停采（回答播完 / 失败都算）。
         stopBargeInListening(reason: success ? "answer_finished" : "answer_failed")
+        // ESS-1097 核心闸门：工具回合没终结就**不许自动开下一轮**。
+        // 新一轮会开一个新 generation，把仍在 running 的工具任务 supersede 掉——
+        // 那正是 ESS-1095 观测到的「工具答案丢失」。这里退回等待态、重新武装
+        // 有界预算，与 ESS-971 的段落 interim 走同一条路。
+        guard !toolTurn.blocksAutomaticNextTurn else {
+            turnPhase = .thinking
+            lowVolumeHint = false
+            WatchLog.info(
+                "session", "session_next_turn_suppressed", requestId: requestId,
+                detail: "turn_index=\(turnIndex) reason=tool_turn_open "
+                    + "from=\(fromPhase.logName) answer_reason=\(reason) \(toolTurn.logDetail)"
+            )
+            armThinkingTimeout()
+            return
+        }
         startNextTurn(reason: success ? "answer_finished" : "answer_failed:\(reason)")
     }
 
@@ -713,9 +848,10 @@ final class SessionController: ObservableObject {
             )
             return
         }
+        toolTurn.apply(.turnFailed(code: errorCode ?? "ERR_SESSION_TURN_FAILED"))
         WatchLog.error(
             "session", "session_turn_failed", requestId: requestId,
-            detail: "turn_index=\(turnIndex) reason=\(reason)",
+            detail: "turn_index=\(turnIndex) reason=\(reason) \(toolTurn.logDetail)",
             code: errorCode ?? "ERR_SESSION_TURN_FAILED"
         )
         enterFailed(reason: Self.turnFailureCopy, retryable: true)
@@ -754,6 +890,10 @@ final class SessionController: ObservableObject {
         detectMs: Int = 0
     ) {
         guard state == .listening, turnPhase == .speaking else { return }
+        // ESS-1097：用户主动打断是**明确终态**，本轮就此作废——工具门禁到此
+        // 让路（验收原文：「工具回合未完成时禁止自动开启新 generation；
+        // 用户主动打断除外」）。
+        toolTurn.apply(.userCancelled(reason: source.rawValue))
         // ESS-650：打断即离开 speaking，先停采再停播——顺序有意：停采在前，
         // 停播过程中的扬声器余音才不会再喂进检测器。
         stopBargeInListening(reason: "interrupted")
@@ -804,6 +944,7 @@ final class SessionController: ObservableObject {
         turnIndex += 1
         activeTurnRequestId = requestId
         didDetectSpeechThisTurn = false
+        resetToolTurn(reason: "turn_cap_no_speech_restart")
         WatchLog.info(
             "session", "session_turn_cap_no_speech_restart", requestId: requestId,
             detail: "turn_index=\(turnIndex) cap_s=\(Int(Self.turnCapSeconds)) "
@@ -823,6 +964,7 @@ final class SessionController: ObservableObject {
             // 通道死亡）会经 markChannelFailed 把会话收口。
             turnPhase = .idle
             activeTurnRequestId = nil
+            resetToolTurn(reason: "next_turn_start_failed")
             WatchLog.error(
                 "session", "session_next_turn_start_failed",
                 detail: "turn_index=\(turnIndex) reason=\(reason)",
@@ -834,6 +976,7 @@ final class SessionController: ObservableObject {
         activeTurnRequestId = requestId
         turnPhase = .listening
         didDetectSpeechThisTurn = false
+        resetToolTurn(reason: "next_turn")
         WatchLog.info(
             "session", "session_next_listening", requestId: requestId,
             detail: "turn_index=\(turnIndex) reason=\(reason)"
@@ -852,6 +995,10 @@ final class SessionController: ObservableObject {
     func markChannelFailed(_ failure: ChannelFailure) {
         guard isInSession else { return }
         let failedFrom = state
+        // ESS-1097：通道死了就不会再有 `audio.done` / `task.*` 终态。如实收下
+        // 这个事实，让聚合体走「放弃等待、但在播的音频要放完」那条边，
+        // 而不是把回合永远按在思考态。
+        toolTurn.apply(.downlinkClosed(reason: failure.logReason))
         cancelConnectingTimers()
         cancelTurnTimers()
         stopBargeInListeningOnTeardown()
@@ -980,6 +1127,7 @@ final class SessionController: ObservableObject {
     private func cancelAllESS652Timers() {
         thinkingSlowToken?.cancel()
         thinkingHardToken?.cancel()
+        toolTurnHardToken?.cancel(); toolTurnHardToken = nil
         silenceToken?.cancel()
         failedAutoToken?.cancel()
         hungupDismissToken?.cancel()
@@ -1020,6 +1168,7 @@ final class SessionController: ObservableObject {
         let turns = turnIndex
         state = .disconnecting
         turnPhase = .idle
+        resetToolTurn(reason: "teardown")
         activeTurnRequestId = nil
         turnIndex = 0
         isCapturingLocally = false
@@ -1037,6 +1186,7 @@ final class SessionController: ObservableObject {
     private func resetTurnStateOnExit() {
         cancelTurnTimers()
         stopBargeInListening(reason: "session_exit")
+        resetToolTurn(reason: "session_exit")
         turnPhase = .idle
         activeTurnRequestId = nil
         turnIndex = 0
@@ -1054,6 +1204,8 @@ final class SessionController: ObservableObject {
         // ESS-652: cancel thinking slow/hard timers on turn reset.
         thinkingSlowToken?.cancel(); thinkingSlowToken = nil
         thinkingHardToken?.cancel(); thinkingHardToken = nil
+        // ESS-1097：工具绝对上限属于回合，回合收束时一并取消。
+        toolTurnHardToken?.cancel(); toolTurnHardToken = nil
         thinkingSlowHint = false
     }
 
@@ -1260,6 +1412,10 @@ enum SessionTurnWiring {
         // ESS-1044：服务端判本轮终态失败 → 立刻收口，不等 45s 硬超时。
         pushToTalk.onSessionTurnFailed = { [weak session] requestId, errorCode in
             session?.markTurnFailed(requestId: requestId, errorCode: errorCode)
+        }
+        // ESS-1097：上游任务生命周期 → 会话层回合聚合状态机。
+        pushToTalk.onSessionTaskState = { [weak session] requestId, taskId, status in
+            session?.markTaskState(requestId: requestId, taskId: taskId, status: status)
         }
         pushToTalk.onLocalCaptureChanged = { [weak session] active in
             session?.markLocalCapture(active: active)
