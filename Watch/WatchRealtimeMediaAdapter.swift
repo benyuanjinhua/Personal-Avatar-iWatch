@@ -751,6 +751,11 @@ final class WatchRealtimeMediaAdapter {
     /// 只在 `.ended` 那一刻按本标志分流到 interim。
     private var pendingSegmentBoundary = false
 
+    /// ESS-1070：**这一次** `receiveDone` 调用的边界类型。`receiveDone` 同步派发
+    /// `.doneArrived`，事件处理里据此决定要不要更新 `pendingSegmentBoundary`
+    /// ——只有被门禁接受的 done 才算数。
+    private var incomingDoneIsSegmentBoundary = false
+
     /// ESS-971：段落屏障。与 `markDownlinkComplete` 走同一条 `receiveDone`，
     /// 因为「收齐 0..final_sequence 再播完」的语义两者完全一致；区别只在
     /// 播完之后由谁接手。
@@ -760,7 +765,8 @@ final class WatchRealtimeMediaAdapter {
         finalSequence: Int? = nil,
         segmentIndex: Int = 0
     ) {
-        pendingSegmentBoundary = true
+        incomingDoneIsSegmentBoundary = true
+        defer { incomingDoneIsSegmentBoundary = false }
         WatchLog.info(
             "realtime", "downlink_segment_barrier",
             detail: "segment_index=\(segmentIndex) "
@@ -975,6 +981,20 @@ final class WatchRealtimeMediaAdapter {
                 break
             }
         case .doneArrived(_, let outcome):
+            // ESS-1070：`pendingSegmentBoundary` 是「最近一次**被接受**的 done
+            // 是不是段落边界」。两条整改前的漏洞都在这里收口：
+            //  * 被 generation 门禁丢弃的 done（打断后的 pending 窗口里，
+            //    iPhone 仍在转发旧代的 `audio.segment_done`）不得置位——否则
+            //    新一代答完时那唯一一次 `.ended` 会被当成段落边界，回合永远
+            //    不收口；
+            //  * 回合终态 `audio.done` 必须**清掉**上一段留下的置位——否则
+            //    同一条 `.ended` 又被判成段落，同样收不了口。
+            switch outcome {
+            case .droppedStaleGeneration, .droppedFutureGeneration, .droppedPendingGeneration:
+                break
+            default:
+                pendingSegmentBoundary = incomingDoneIsSegmentBoundary
+            }
             switch outcome {
             case .barrierReleased(let final, let responseId):
                 // Synchronous release: seq 0…final already there when done
