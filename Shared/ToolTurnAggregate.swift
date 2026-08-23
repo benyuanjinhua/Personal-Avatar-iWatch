@@ -133,11 +133,15 @@ public struct ToolTurnAggregate: Equatable, Sendable {
 
     public enum Event: Equatable, Sendable {
         /// 上游 `response.done{hasFunctionCall:true}` 的客户端投影：模型要调工具，
-        /// 本回合还没完。
+        /// 本回合还没完。**闩锁是临时占位**，语义见 `toolCallPending` 字段注释。
         case toolCallPending
         /// `tool_call_pending` 解除（工具结果这一段就是最后一段）。
         case toolCallResolved
         /// `task.*` 生命周期事件。同一 `taskId` 可重复到达，按最后一次为准。
+        ///
+        /// **任何带 taskId 的事件都会解除 `tool_call_pending` 闩锁**——闩锁的
+        /// 全部含义就是「有个任务要来但还没有号」，号一出现它就没有存在意义了，
+        /// 此后由任务集合独占裁决权。见 ESS-1098 复审阻断 1。
         case taskState(taskId: String, status: ToolTaskStatus)
         /// 回答音频**真实起播**（首帧已渲染）。收到 delta / 入队不算。
         case playbackStarted
@@ -165,6 +169,22 @@ public struct ToolTurnAggregate: Equatable, Sendable {
     public private(set) var outstandingTasks: Set<String> = []
     /// 本回合见过的全部 taskId（取证用；终态到达后不从这里删）。
     public private(set) var seenTasks: Set<String> = []
+    /// `tool_call_pending` 闩锁。
+    ///
+    /// **不变量（ESS-1098 复审阻断 1 的收口口径）**：闩锁是「有个任务要来但还
+    /// 没有任务号」的**临时占位**，只由两件事解除，二者都是上游能确定性给出的：
+    ///
+    /// 1. **任何 taskId 出现** —— 占位物被真身取代，此后由 `outstandingTasks`
+    ///    独占裁决权；这是真实工具回合的常态路径，**不需要服务端多发一帧**。
+    /// 2. **显式 `tool_call_resolved` 帧** —— 覆盖「宣告了工具调用却从未产生
+    ///    任务」这一残余情形；网关侧已有 `upstream_tool_call_resolved` 的判定，
+    ///    契约见 `AudioRealtimeGateway/README.md`。
+    ///
+    /// **刻意不设第三条「音频落定即解除」的逃生门**：那正是 ESS-1095 的故障
+    /// 形态——`tool_call_pending` 之后上游发 idle、网关下发回合屏障，而任务帧
+    /// 尚未到达。拿音频落定去解除闩锁，等于把这个 bug 原样装回去。残余情形
+    /// 由回合绝对上限（`SessionController.toolTurnHardTimeoutSeconds`）兜底为
+    /// **有界的明确失败**，而不是静默收口后 supersede 掉在跑的工具。
     public private(set) var toolCallPending = false
     public private(set) var audioDoneSettled = false
     public private(set) var playbackInFlight = false
@@ -256,6 +276,11 @@ public struct ToolTurnAggregate: Equatable, Sendable {
 
         case .taskState(let taskId, let status):
             seenTasks.insert(taskId)
+            // ESS-1098 阻断 1：任务号一出现，闩锁就完成了它的全部使命。
+            // 不清它的话，`pending → running(t1) → completed(t1) → audio.done
+            // → 播完` 这条**成功**路径会永远停在 `hold=[tool_call_pending]`，
+            // 一路挂到 180s 绝对上限判失败——一个答对了的回合被报成超时。
+            toolCallPending = false
             if status.isTerminal {
                 outstandingTasks.remove(taskId)
             } else {

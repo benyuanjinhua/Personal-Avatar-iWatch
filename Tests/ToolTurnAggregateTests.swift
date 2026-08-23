@@ -67,7 +67,10 @@ final class ToolTurnAggregateTests: XCTestCase {
         XCTAssertTrue(agg.hasToolEvidence)
         XCTAssertTrue(agg.blocksAutomaticNextTurn, "禁止自动开新 generation")
         XCTAssertFalse(agg.allowsAutomaticNextTurn)
-        XCTAssertEqual(agg.holdReasons, [.toolCallPending, .taskOutstanding])
+        // ESS-1098 整改后：任务号已经出现，闩锁交棒给任务集合，
+        // 把关的是 `task_outstanding` 这一条——门禁强度不变。
+        XCTAssertFalse(agg.toolCallPending)
+        XCTAssertEqual(agg.holdReasons, [.taskOutstanding])
     }
 
     /// task terminal **晚于** audio.done：终态一到，回合当场收口。
@@ -142,6 +145,101 @@ final class ToolTurnAggregateTests: XCTestCase {
         XCTAssertEqual(ToolTaskStatus(rawValue: "timed_out"), .timedOut)
         XCTAssertFalse(ToolTaskStatus(rawValue: "queued").isTerminal)
         XCTAssertTrue(ToolTaskStatus(rawValue: "failed").isTerminal)
+    }
+
+    // MARK: - ESS-1098 复审阻断 1：闩锁解除契约
+
+    /// **回归钉**：`pending → running → completed → audio.done → 播完` 是工具回合
+    /// 最常见的**成功**时间线。ESS-1098 复审发现闩锁在这条路上永远解不开，
+    /// 一个答对了的回合会一路挂到 180s 绝对上限被报成超时。
+    func testPendingLatchIsReleasedByTaskIdSoSuccessfulToolTurnCloses() {
+        var agg = ToolTurnAggregate()
+        agg.apply(.toolCallPending)
+        XCTAssertEqual(agg.holdReasons, [.toolCallPending, .awaitingAudioDone])
+
+        // 任务号一出现，闩锁完成使命，裁决权交给任务集合。
+        agg.apply(.taskState(taskId: "t1", status: .running))
+        XCTAssertFalse(agg.toolCallPending, "任务号出现后闩锁必须解除")
+        XCTAssertEqual(agg.holdReasons, [.taskOutstanding, .awaitingAudioDone])
+
+        agg.apply(.taskState(taskId: "t1", status: .completed))
+        agg.apply(.audioDoneBarrier)
+        agg.apply(.playbackEnded)
+        XCTAssertEqual(agg.phase, .listening, "成功的工具回合必须收口，不能挂到超时")
+        XCTAssertTrue(agg.allowsAutomaticNextTurn)
+    }
+
+    /// 同一组合的另一种乱序：屏障与播放先落定，任务生命周期后到。
+    func testPendingLatchReleaseIsOrderIndependent() {
+        var agg = ToolTurnAggregate()
+        agg.apply(.toolCallPending)
+        agg.apply(.audioDoneBarrier)
+        agg.apply(.playbackStarted)
+        agg.apply(.playbackEnded)
+        XCTAssertEqual(agg.phase, .thinking, "闩锁还在，音频落定不算答完")
+        XCTAssertEqual(agg.holdReasons, [.toolCallPending])
+
+        agg.apply(.taskState(taskId: "t1", status: .running))
+        XCTAssertEqual(agg.holdReasons, [.taskOutstanding], "闩锁解除，改由任务把关")
+        agg.apply(.taskState(taskId: "t1", status: .completed))
+        XCTAssertEqual(agg.phase, .listening)
+    }
+
+    /// 闩锁解除**不得**顺手把 `hasToolEvidence` 一起抹掉——门禁靠它区分
+    /// 工具回合与普通回合。`seenTasks` 是证据的持久记账。
+    func testEvidenceSurvivesLatchRelease() {
+        var agg = ToolTurnAggregate()
+        agg.apply(.toolCallPending)
+        agg.apply(.taskState(taskId: "t1", status: .running))
+        XCTAssertFalse(agg.toolCallPending)
+        XCTAssertTrue(agg.hasToolEvidence, "闩锁解了，但这仍然是一个工具回合")
+        XCTAssertTrue(agg.blocksAutomaticNextTurn)
+    }
+
+    /// 同一回合内的第二次工具调用：闩锁可以再次落下，并再次被新任务号解除。
+    func testSecondToolCallInSameTurnRelatchesAndReleases() {
+        var agg = ToolTurnAggregate()
+        agg.apply(.toolCallPending)
+        agg.apply(.taskState(taskId: "t1", status: .running))
+        agg.apply(.taskState(taskId: "t1", status: .completed))
+        XCTAssertEqual(agg.holdReasons, [.awaitingAudioDone])
+
+        agg.apply(.toolCallPending)
+        XCTAssertEqual(agg.holdReasons, [.toolCallPending, .awaitingAudioDone], "第二次工具调用重新落闩")
+        agg.apply(.taskState(taskId: "t2", status: .running))
+        XCTAssertFalse(agg.toolCallPending)
+        agg.apply(.taskState(taskId: "t2", status: .completed))
+        agg.apply(.audioDoneBarrier)
+        XCTAssertEqual(agg.phase, .listening)
+    }
+
+    /// 残余情形：宣告了工具调用却**从未**产生任务号。显式 resolved 帧是唯一
+    /// 解除途径（网关侧已有 `upstream_tool_call_resolved` 判定）。
+    func testLatchWithoutAnyTaskIsOnlyReleasedByExplicitResolved() {
+        var agg = ToolTurnAggregate()
+        agg.apply(.toolCallPending)
+        agg.apply(.audioDoneBarrier)
+        agg.apply(.playbackEnded)
+        XCTAssertEqual(agg.phase, .thinking)
+
+        agg.apply(.toolCallResolved)
+        XCTAssertEqual(agg.phase, .listening)
+    }
+
+    /// **反向钉子**：绝不允许「音频落定即解除闩锁」这条逃生门——那正是
+    /// ESS-1095 的故障形态（pending 之后上游发 idle、任务帧尚未到达）。
+    /// 此时收口就会开新 generation 把在跑的工具 supersede 掉。
+    func testAudioSettlementAloneNeverReleasesTheLatch() {
+        var agg = ToolTurnAggregate()
+        agg.apply(.toolCallPending)
+        agg.apply(.playbackStarted)
+        agg.apply(.playbackSegmentEnded)
+        agg.apply(.audioDoneBarrier)
+        agg.apply(.playbackEnded)
+
+        XCTAssertTrue(agg.toolCallPending, "音频落定不是闩锁的解除依据")
+        XCTAssertEqual(agg.phase, .thinking)
+        XCTAssertTrue(agg.blocksAutomaticNextTurn, "任务帧还没到，此刻收口就是 ESS-1095 复发")
     }
 
     // MARK: - 两段音频
@@ -264,15 +362,24 @@ final class ToolTurnAggregateTests: XCTestCase {
     // MARK: - 取证
 
     func testLogDetailCarriesEveryDecisionInput() {
-        var agg = ToolTurnAggregate()
-        agg.apply(.toolCallPending)
-        agg.apply(.taskState(taskId: "t1", status: .running))
-        let detail = agg.logDetail
-        XCTAssertTrue(detail.contains("phase=thinking"), detail)
-        XCTAssertTrue(detail.contains("closed=false"), detail)
-        XCTAssertTrue(detail.contains("hold=tool_call_pending|task_outstanding|awaiting_audio_done"), detail)
-        XCTAssertTrue(detail.contains("outstanding_tasks=1"), detail)
-        XCTAssertTrue(detail.contains("tool_call_pending=true"), detail)
+        // 闩锁态（还没有任务号）：`tool_call_pending` 必须在日志里可判定，
+        // 否则真机上「为什么还在思考」查不出来。
+        var latched = ToolTurnAggregate()
+        latched.apply(.toolCallPending)
+        let latchedDetail = latched.logDetail
+        XCTAssertTrue(latchedDetail.contains("phase=thinking"), latchedDetail)
+        XCTAssertTrue(latchedDetail.contains("closed=false"), latchedDetail)
+        XCTAssertTrue(latchedDetail.contains("hold=tool_call_pending|awaiting_audio_done"), latchedDetail)
+        XCTAssertTrue(latchedDetail.contains("tool_call_pending=true"), latchedDetail)
+
+        // 任务态（闩锁已交棒）：把关原因换成 task_outstanding，同样可判定。
+        var running = latched
+        running.apply(.taskState(taskId: "t1", status: .running))
+        let runningDetail = running.logDetail
+        XCTAssertTrue(runningDetail.contains("hold=task_outstanding|awaiting_audio_done"), runningDetail)
+        XCTAssertTrue(runningDetail.contains("outstanding_tasks=1"), runningDetail)
+        XCTAssertTrue(runningDetail.contains("seen_tasks=1"), runningDetail)
+        XCTAssertTrue(runningDetail.contains("tool_call_pending=false"), runningDetail)
     }
 
     /// `apply` 的返回值是「相位变了没有」——会话层只在变化时落日志，

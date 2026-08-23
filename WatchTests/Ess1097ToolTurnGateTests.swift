@@ -116,6 +116,58 @@ final class Ess1097ToolTurnGateTests: XCTestCase {
         XCTAssertEqual(startTurnCount, 0)
     }
 
+    // MARK: - ESS-1098 复审阻断 1：pending + task 组合的端到端契约
+
+    /// **回归钉**：真实工具回合的完整成功链
+    /// `pending → running → audio.done/播完 → completed`。
+    /// ESS-1098 复审指出原实现里闩锁永不解除，这条链会一路挂到 180s 判失败。
+    func testPendingThenRunningThenAudioSettledThenTerminalRelistens() {
+        let requestId = beginTurn()
+        controller.markTaskState(requestId: requestId, taskId: nil, status: "tool_call_pending")
+        controller.markTaskState(requestId: requestId, taskId: "task-77", status: "running")
+        controller.markAnswerStarted(requestId: requestId)
+        controller.markAnswerFinished(requestId: requestId)
+        XCTAssertEqual(startTurnCount, 0, "任务还在跑，仍不许开下一轮")
+        XCTAssertFalse(controller.toolTurn.toolCallPending, "任务号出现后闩锁必须已解除")
+
+        controller.markTaskState(requestId: requestId, taskId: "task-77", status: "completed")
+
+        XCTAssertTrue(controller.toolTurn.isClosed, "成功的工具回合必须收口，不能挂到超时")
+        XCTAssertFalse(controller.toolTurn.blocksAutomaticNextTurn)
+    }
+
+    /// 另一种乱序：`pending → running → completed → audio.done/播完`。
+    /// 任务先全部终结，音频后落定，同样必须恢复聆听并开下一轮。
+    func testPendingThenFullTaskLifecycleThenAudioSettledRelistens() {
+        let requestId = beginTurn()
+        controller.markTaskState(requestId: requestId, taskId: nil, status: "tool_call_pending")
+        controller.markTaskState(requestId: requestId, taskId: "task-77", status: "running")
+        controller.markTaskState(requestId: requestId, taskId: "task-77", status: "completed")
+        XCTAssertEqual(controller.turnPhase, .thinking, "答案还没播，先别喊听")
+
+        controller.markAnswerStarted(requestId: requestId)
+        controller.markAnswerFinished(requestId: requestId)
+
+        XCTAssertEqual(controller.turnPhase, .listening, "三面齐了才回聆听")
+        XCTAssertEqual(startTurnCount, 1)
+    }
+
+    /// 闩锁**独自**存在（从未出现任务号）时不得被音频落定解除——
+    /// 那正是 ESS-1095 的故障形态。只有显式 resolved 帧能解。
+    func testLatchWithoutTaskIsOnlyReleasedByExplicitResolvedFrame() {
+        let requestId = beginTurn()
+        controller.markTaskState(requestId: requestId, taskId: nil, status: "tool_call_pending")
+        controller.markAnswerStarted(requestId: requestId)
+        controller.markAnswerFinished(requestId: requestId)
+        XCTAssertEqual(controller.turnPhase, .thinking, "任务帧还没到，此刻收口就是 ESS-1095 复发")
+        XCTAssertEqual(startTurnCount, 0)
+
+        controller.markTaskState(requestId: requestId, taskId: nil, status: "tool_call_resolved")
+
+        XCTAssertTrue(controller.toolTurn.isClosed)
+        XCTAssertFalse(controller.toolTurn.blocksAutomaticNextTurn)
+    }
+
     // MARK: - 无工具信号的普通回合：行为与本单之前**逐字节相同**
 
     func testPlainTurnWithoutToolEvidenceRelistensAsBefore() {

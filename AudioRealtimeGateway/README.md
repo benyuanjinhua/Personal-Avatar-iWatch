@@ -147,10 +147,27 @@ verifiable).
 | `audio.delta` | `sequence`, `sample_rate`, `codec`, `audio` (base64 PCM16LE 24 kHz) | Sequences are monotone and dense per `response_id`. |
 | `audio.segment_done` | `segment_index`, `final_sequence` | **本段结束，回合未结束**（ESS-969）。同一屏障语义，但客户端应保持本轮打开、退回等待态（Watch：`SessionController.markAnswerInterim`），不得开下一轮。未实现的老客户端忽略该帧即可——后续 `audio.delta` 与最终的 `audio.done` 不受影响。 |
 | `audio.done` | `final_sequence` | Barrier — client waits until it has seen every `0..final_sequence` before signalling playback complete. **回合终态**：一个回合有且只有一帧。 |
-| `task.state` | `task_id?`, `status` | **上游 `task.*` 生命周期的下发投影**（ESS-1097）。工具回合里 `tool_call_pending` 之后上游会发 `voice.state=idle`，而任务仍在 `running`——没有这一帧，客户端只能拿回合屏障当真相，就会提前回到「正在听」并开新 generation 把在跑的工具任务 supersede 掉（ESS-1095 真机取证）。`task_id` 缺席表示 `tool_call_pending` 这类还没有任务号的闩锁信号；`status` 原样透传，**客户端把未知取值一律当作非终态**。未实现的老客户端忽略该帧即可，其余事件不受影响。 |
+| `task.state` | `task_id?`, `status` | **上游 `task.*` 生命周期的下发投影**（ESS-1097）。工具回合里 `tool_call_pending` 之后上游会发 `voice.state=idle`，而任务仍在 `running`——没有这一帧，客户端只能拿回合屏障当真相，就会提前回到「正在听」并开新 generation 把在跑的工具任务 supersede 掉（ESS-1095 真机取证）。详细契约见下方「`task.state` 线格不变量」。 |
 | `cancel.ack` | echoes scope + `cancelled_response_id?` | Response to a `cancel` message. |
 | `error` | `code`, `retriable`, `detail?` | Structured failure; connection is closed with WebSocket code 1008 unless `retriable: true`. |
 | `pong` | echoes `nonce` | Heartbeat reply. |
+
+##### `task.state` 线格不变量（ESS-1097 / ESS-1098）
+
+两种形态，由 `task_id` 是否出现区分：
+
+| 形态 | 帧 | 客户端语义 |
+|---|---|---|
+| **任务帧** | `{task_id: "<id>", status: "<upstream status>"}` | `status` 原样透传，解释权在客户端。**未知取值一律当作非终态**——把没见过的状态当终态就是把 ESS-1095 装回去。 |
+| **工具调用闩锁** | `{status: "tool_call_pending"}` / `{status: "tool_call_resolved"}`（无 `task_id`） | 「有个任务要来但还没有号」的临时占位 / 其解除。 |
+
+客户端侧的解除规则（`Shared/ToolTurnAggregate.swift`）：
+
+1. **任何带 `task_id` 的帧都解除闩锁**——占位物被真身取代，此后由任务集合独占裁决权。真实工具回合走这条路，**服务端不需要额外发 resolved 帧**。
+2. **`tool_call_resolved` 帧**覆盖残余情形：宣告了工具调用却**从未**产生任何任务号。网关侧已有 `upstream_tool_call_resolved` 的判定（`qwen-agent-transport.mjs`），**这种情形下服务端必须补发该帧**，否则客户端只能等到回合绝对上限（180s）判失败。
+3. **客户端不会用「音频落定」解除闩锁**——那正是 ESS-1095 的故障形态（`tool_call_pending` 之后上游发 idle、任务帧尚未到达）。服务端不要指望靠 `audio.done` 帮客户端收口。
+
+`generation` 可缺省（按 0 处理）：本帧不进播放管线，代次只用于取证。未实现的老客户端忽略该帧即可，其余事件不受影响。
 
 Server-initiated `ping` frames from `ws.ping()` are honoured but the
 protocol also supports the JSON `ping`/`pong` pair for platforms that can't
