@@ -426,11 +426,62 @@ export class RealtimeSession {
       })
       return
     }
+    if (event.type === 'agent.task') {
+      return this._emitTaskState({
+        taskId: event.task?.id ?? null,
+        status: event.task?.status ?? null,
+      })
+    }
+    if (event.type === 'agent.tool_call_state') {
+      return this._emitTaskState({ taskId: null, status: event.status ?? null })
+    }
     if (event.type === 'agent.audio.delta') return this._emitDelta(event)
     if (event.type === 'agent.audio.segment_done') return this._emitSegmentDone(event)
     if (event.type === 'agent.audio.done') return this._emitDone(event)
     if (event.type === 'agent.error') return this.fail(event.code ?? 'ERR_UPSTREAM_UNAVAILABLE',
       { detail: event.detail ?? null, retriable: Boolean(event.retriable) })
+  }
+
+  // ESS-1097: project the upstream task lifecycle onto the client.
+  //
+  // Why the client needs it (ESS-1095 real-device evidence): until now the ONLY
+  // inputs a client had for「is this turn over」were audio-side — the
+  // `audio.done` barrier and its own playback endgame. Whether a tool was still
+  // running was known HERE and nowhere else, so the client had to trust this
+  // gateway's bounded idle window (ESS-1043 `toolCallWindowMs = 30_000`,
+  // calibrated on 8–16 s tool runs). One slower tool overshoots that window, the
+  // client relistens, the user speaks, and the new request supersedes the tool
+  // turn — the incident exactly. The contract this implements is the one the
+  // client documents in `AudioRealtimeGateway/README.md`
+  //「`task.state` 线格不变量」(ESS-1097 / ESS-1098).
+  //
+  // Two shapes, distinguished by whether `task_id` is present:
+  //   • task frame  `{task_id, status}` — status is passed through verbatim;
+  //     interpreting it is the client's business (an unknown status must be
+  //     read as NON-terminal there).
+  //   • latch frame `{status: 'tool_call_pending' | 'tool_call_resolved'}` —
+  //     「a task is coming but has no id yet」and its release.
+  //
+  // Deliberately NOT gated on `doneEmitted`: a task terminal that lands after
+  // the turn barrier is precisely what releases the client's hold. Dropping it
+  // there would build the deadlock this event exists to prevent. It carries no
+  // audio and touches no barrier, so it cannot reorder or delay playback.
+  _emitTaskState({ taskId, status }) {
+    if (taskId === null && !status) return
+    this._sendJson({
+      type: 'task.state',
+      session_id: this.scope.session_id, request_id: this.scope.request_id,
+      generation: this.scope.generation,
+      ...(taskId === null ? {} : { task_id: String(taskId) }),
+      status: String(status ?? 'unknown'),
+    })
+    this.log('downlink_task_state', {
+      request_id: this.scope.request_id, session_id: this.scope.session_id,
+      generation: this.scope.generation, response_id: this.responseId,
+      task_id: taskId === null ? null : String(taskId),
+      status: String(status ?? 'unknown'),
+      after_turn_done: this.doneEmitted,
+    })
   }
 
   _emitDelta(event) {

@@ -670,9 +670,31 @@ test('ESS-990 · 全栈：真实上游时序（每段 done 后立刻 idle）下�
   }))
   await waitFor(() => sent.some(frame => frame.type === 'audio.done'), 6_000)
 
+  // ESS-1097：`task.state` 现在也走下行（客户端需要它才知道「工具还在跑」）。
+  // 这里把它**显式**写进期望序列而不是过滤掉——它落在哪一步是契约的一部分：
+  // 任务事实必须在第二段音频之前到达客户端，否则客户端在段落间隙里仍然是
+  // 瞎的，本单等于没做。
+  // ESS-1097 服务端义务（PR #405）：`task.state` 投影的是**整个生命周期**，
+  // 不只是起点。上游脚本发了 `task.accepted`(queued) 与 `task.completed`(completed)
+  // 两条，所以下行必须有两条 `task.state`——**终态那条不能被吞掉**：
+  // 客户端只收到 queued 而收不到 completed，就会永远以为工具还在跑。
   assert.deepEqual(sent.map(f => f.type), [
-    'ready', 'audio.delta', 'audio.segment_done', 'audio.delta', 'audio.delta', 'audio.done',
+    'ready', 'audio.delta', 'task.state',
+    'audio.segment_done', 'audio.delta', 'audio.delta', 'task.state', 'audio.done',
   ])
+  const taskFrames = sent.filter(f => f.type === 'task.state')
+  assert.deepEqual(taskFrames.map(f => f.status), ['queued', 'completed'],
+    '生命周期必须完整投影：起点与终态各一条，顺序不能颠倒')
+  // 终态必须**先于** audio.done 到达：回合收口时客户端不该还挂着一个「在跑」的任务。
+  assert.ok(sent.findIndex(f => f.type === 'task.state' && f.status === 'completed')
+    < sent.findIndex(f => f.type === 'audio.done'),
+    '任务终态必须在 audio.done 之前送达')
+  for (const taskFrame of taskFrames) {
+    assert.equal(taskFrame.task_id, 'work_weather')
+    assert.equal(taskFrame.request_id, 'r10')
+    assert.equal(taskFrame.session_id, 's10')
+    assert.equal(taskFrame.generation, 1)
+  }
   assert.deepEqual(sent.filter(f => f.type === 'audio.delta').map(f => f.sequence), [0, 1, 2])
   assert.equal(sent.at(-1).final_sequence, 2)
   assert.equal(session.doneEmitted, true)
