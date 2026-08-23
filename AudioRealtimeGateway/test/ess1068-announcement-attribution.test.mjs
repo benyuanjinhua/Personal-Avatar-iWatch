@@ -14,7 +14,10 @@ import { QwenAgentTransport } from '../qwen-agent-transport.mjs'
 
 const servers = []
 afterEach(async () => {
-  await Promise.all(servers.splice(0).map(server => new Promise(resolve => server.close(resolve))))
+  await Promise.all(servers.splice(0).map(server => new Promise(resolve => {
+    for (const client of server.clients) client.terminate()
+    server.close(resolve)
+  })))
 })
 
 async function upstream(onMessage) {
@@ -161,6 +164,7 @@ test('ESS-1068 · task.* 事件建立的 taskId→session 映射用于归属', a
           taskId: 'work_z' })
         audioDelta(ws, 0, 'late-result', 'ann-z')
         send(ws, { type: 'audio.done', responseId: 'ann-z' })
+        send(ws, { type: 'task.completed', task: { id: 'work_z', status: 'completed' } })
       }, 20)
     }
   })
@@ -221,6 +225,7 @@ test('ESS-1068 · task 身份跨 turn 持久化：后一轮能归属前一轮任
       if (commits.length === 1) {
         // 第一轮：只建立 taskId→session 映射（task.accepted），回合随后关闭。
         send(ws, { type: 'task.accepted', task: { id: 'work_w', sessionId: 's', deviceId: 'd', status: 'accepted' } })
+        send(ws, { type: 'task.completed', task: { id: 'work_w', status: 'completed' } })
       } else {
         // 第二轮：迟到的播报只带 taskId，靠上一轮建立的映射归属。
         send(ws, { type: 'response.started', responseId: 'ann-w', origin: 'announcement',
