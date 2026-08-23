@@ -43,6 +43,12 @@ function toEpochMs(record) {
   return null
 }
 
+// ESS-1071 阻断 2：state 必须以 session + request + generation 复合键隔离。
+// 两个 session 复用同一个 request_id 时（既有测试已支持）互不污染。
+export function turnKey(requestId, sessionId, generation) {
+  return [sessionId ?? '', requestId ?? '', generation ?? ''].join('\u0000')
+}
+
 /**
  * Stream accumulator. Feed it `push(rawRecord)` for every structured-log line
  * across the chain (gateway + agent), then `summarize()` per turn.
@@ -50,7 +56,7 @@ function toEpochMs(record) {
 export class MetricsAccumulator {
   constructor({ now = () => Date.now() } = {}) {
     this.now = now
-    this.turns = new Map() // request_id → per-turn state
+    this.turns = new Map() // session \u0000 request \u0000 generation → per-turn state
     this.queueDepthSamples = []
     this.globalCounters = {
       merged_segments: 0,
@@ -59,12 +65,14 @@ export class MetricsAccumulator {
     }
   }
 
-  _turn(requestId, sessionId) {
-    let turn = this.turns.get(requestId)
+  _turn(requestId, sessionId, generation) {
+    const key = turnKey(requestId, sessionId, generation)
+    let turn = this.turns.get(key)
     if (!turn) {
       turn = {
         request_id: requestId,
         session_id: sessionId ?? null,
+        generation: generation ?? null,
         commitAt: null,
         codexFirstChunkAt: null,
         lastCodexChunkAt: null,
@@ -80,7 +88,7 @@ export class MetricsAccumulator {
         duplicateSequences: 0,
         staleGenerationDropped: 0,
       }
-      this.turns.set(requestId, turn)
+      this.turns.set(key, turn)
     }
     if (sessionId != null && turn.session_id == null) turn.session_id = sessionId
     return turn
@@ -91,7 +99,7 @@ export class MetricsAccumulator {
     const evt = canonicalEvent(record.evt)
     const t = toEpochMs(record)
     if (t == null) return // cannot place on the timeline; skip, don't throw
-    const turn = this._turn(record.request_id, record.session_id)
+    const turn = this._turn(record.request_id, record.session_id, record.generation)
 
     switch (evt) {
       case 'commit':
@@ -169,13 +177,16 @@ export class MetricsAccumulator {
   }
 
   /** Per-turn latency summary. `codex_first_chunk_ms` is null when the turn
-   *  produced no Codex chunk (direct answer). */
-  summarize(requestId) {
-    const turn = this.turns.get(requestId)
+   *  produced no Codex chunk (direct answer). `sessionId` disambiguates when
+   *  two sessions reuse the same request_id. */
+  summarize(requestId, sessionId = null) {
+    const turn = [...this.turns.values()].find(t =>
+      t.request_id === requestId && (sessionId == null || t.session_id === sessionId))
     if (!turn) return null
     return {
       request_id: turn.request_id,
       session_id: turn.session_id,
+      generation: turn.generation,
       codex_first_chunk_ms: turn.commitAt != null && turn.codexFirstChunkAt != null
         ? Math.max(0, turn.codexFirstChunkAt - turn.commitAt)
         : null,
@@ -195,7 +206,7 @@ export class MetricsAccumulator {
 
   /** All summarized turns plus the global counters. */
   summarizeAll() {
-    const turns = [...this.turns.keys()].map(id => this.summarize(id))
+    const turns = [...this.turns.values()].map(turn => this.summarize(turn.request_id, turn.session_id))
     return {
       turns,
       max_queue_depth: this.queueDepthSamples.reduce((a, b) => Math.max(a, b), 0),

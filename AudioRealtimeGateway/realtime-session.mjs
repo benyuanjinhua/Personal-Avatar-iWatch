@@ -383,6 +383,7 @@ export class RealtimeSession {
   _handlePlayback(message, phase) {
     this.log('playback_' + phase, {
       request_id: this.scope.request_id, session_id: this.scope.session_id,
+      generation: this.scope.generation,
       response_id: message.response_id,
     })
   }
@@ -400,6 +401,7 @@ export class RealtimeSession {
       this.staleGenerationDropped += 1
       this.log('stale_generation_dropped', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
         expected_response_id: this.responseId, got: event.response_id,
         total_dropped: this.staleGenerationDropped,
       })
@@ -412,6 +414,7 @@ export class RealtimeSession {
       this.staleGenerationDropped += 1
       this.log('stale_generation_dropped', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
         reason: 'post_cancel', event_type: event.type,
         total_dropped: this.staleGenerationDropped,
       })
@@ -430,11 +433,13 @@ export class RealtimeSession {
       this.postDoneAudioDropped += 1
       this.log('stale_generation_dropped', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
         reason: 'post_done', sequence: event.sequence,
         total_dropped: this.staleGenerationDropped,
       })
       this.log('post_done_audio_dropped', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
         response_id: this.responseId, code: 'ERR_UPSTREAM_AUDIO_AFTER_DONE',
         sequence: event.sequence, dropped_count: this.postDoneAudioDropped,
       })
@@ -465,6 +470,7 @@ export class RealtimeSession {
       && this.seenDownlinkSequences.size === 0) {
       this.log('premature_empty_done_withdrawn', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
         response_id: this.responseId, first_sequence: event.sequence,
       })
       this.pendingFinalSequence = null
@@ -478,6 +484,7 @@ export class RealtimeSession {
       this.staleGenerationDropped += 1
       this.log('stale_generation_dropped', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
         reason: 'past_pending_final_sequence',
         sequence: event.sequence, pending_final_sequence: this.pendingFinalSequence,
         total_dropped: this.staleGenerationDropped,
@@ -487,6 +494,7 @@ export class RealtimeSession {
     if (this.seenDownlinkSequences.has(event.sequence)) {
       this.log('duplicate_sequence', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
         response_id: this.responseId, sequence: event.sequence,
       })
       return
@@ -513,6 +521,7 @@ export class RealtimeSession {
       const pcm = pcm16Level(decodeAudio(event.audio))
       this.log('downlink_first_frame', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
         response_id: this.responseId, sequence: event.sequence,
       })
       if (pcm) {
@@ -520,6 +529,7 @@ export class RealtimeSession {
         // Gateway-side half of the source-vs-player RMS comparison.
         this.log('downlink_pcm_level', {
           request_id: this.scope.request_id, session_id: this.scope.session_id,
+          generation: this.scope.generation,
           response_id: this.responseId, sequence: event.sequence,
           ...pcm,
         })
@@ -532,6 +542,7 @@ export class RealtimeSession {
       this.expectSegmentFirstFrame = false
       this.log('segment_first_frame', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
         response_id: this.responseId, sequence: event.sequence,
         segment_index: this.segmentsEmitted - 1,
       })
@@ -561,6 +572,7 @@ export class RealtimeSession {
       // upstream contradicting its own terminal. Counted, not forwarded.
       this.log('segment_done_after_turn_done', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
         response_id: this.responseId, segment_index: event.segment_index ?? null,
       })
       return
@@ -583,6 +595,7 @@ export class RealtimeSession {
     }
     this.log('segment_done_pending', {
       request_id: this.scope.request_id, session_id: this.scope.session_id,
+      generation: this.scope.generation,
       response_id: this.responseId,
       segment_index: this.pendingSegmentDone.segment_index,
       segment_final_sequence: claimed,
@@ -610,6 +623,7 @@ export class RealtimeSession {
     })
     this.log('downlink_segment_done', {
       request_id: this.scope.request_id, session_id: this.scope.session_id,
+      generation: this.scope.generation,
       response_id: this.responseId,
       segment_index: pending.segment_index,
       segment_final_sequence: pending.final_sequence,
@@ -639,6 +653,7 @@ export class RealtimeSession {
       this.pendingFinalSequence = claimed
       this.log('done_barrier_pending', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
         response_id: this.responseId,
         pending_final_sequence: claimed,
         high_watermark: this.downlinkHighWatermark,
@@ -650,6 +665,7 @@ export class RealtimeSession {
       // and log the divergence for post-hoc reconciliation.
       this.log('done_barrier_conflicting_final_sequence', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
         response_id: this.responseId,
         pending_final_sequence: this.pendingFinalSequence,
         rejected_final_sequence: claimed,
@@ -686,6 +702,7 @@ export class RealtimeSession {
       })
       this.log('downlink_done', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
         response_id: this.responseId, final_sequence: this.finalSequence,
       })
       return
@@ -699,6 +716,7 @@ export class RealtimeSession {
   _failDownlinkBudget(reason, extra) {
     this.log('downlink_budget_exceeded', {
       request_id: this.scope.request_id, session_id: this.scope.session_id,
+      generation: this.scope.generation,
       response_id: this.responseId, reason, ...extra,
     })
     this.fail('ERR_DOWNLINK_BUDGET', { detail: reason, retriable: false, ...extra })
@@ -716,6 +734,7 @@ export class RealtimeSession {
         this._emptyDoneWindowElapsed = true
         this.log('empty_done_window_elapsed', {
           request_id: this.scope.request_id, session_id: this.scope.session_id,
+          generation: this.scope.generation,
           response_id: this.responseId,
           pending_final_sequence: this.pendingFinalSequence,
         })
@@ -726,6 +745,7 @@ export class RealtimeSession {
       // no double execution. Client falls back per turn to the legacy path.
       this.log('done_barrier_gap_timeout', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
         response_id: this.responseId,
         pending_final_sequence: this.pendingFinalSequence,
         dense_prefix: this._highestDensePrefix(),
@@ -796,6 +816,7 @@ export class RealtimeSession {
     catch (error) {
       this.log('send_failed', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
         code: error?.code ?? null, detail: String(error?.message ?? error).slice(0, 200),
       })
     }
@@ -818,6 +839,7 @@ export class RealtimeSession {
       if (this.state !== OPEN) return
       this.log('heartbeat_timeout', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
         idle_ms: this.idleDisconnectMs,
       })
       this.fail('ERR_IDLE_TIMEOUT')
@@ -834,6 +856,7 @@ export class RealtimeSession {
     if (this._eventsInWindow > this.maxEventsPerSecond) {
       this.log('rate_limit_tripped', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
         events_in_window: this._eventsInWindow, cap: this.maxEventsPerSecond,
       })
       return false
@@ -851,6 +874,7 @@ export class RealtimeSession {
     if (this._bytesInWindow > this.maxUplinkBytesPerSecond) {
       this.log('rate_limit_tripped', {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
         bytes_in_window: this._bytesInWindow, cap: this.maxUplinkBytesPerSecond,
       })
       return false

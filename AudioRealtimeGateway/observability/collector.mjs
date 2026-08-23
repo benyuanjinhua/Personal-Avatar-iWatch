@@ -19,15 +19,22 @@ import {
   canonicalEvent,
   normalize,
 } from './correlation.mjs'
-import { MetricsAccumulator } from './metrics.mjs'
+import { MetricsAccumulator, turnKey } from './metrics.mjs'
 
-/** Guess the correlation "kind" of a raw event for required-fields checks. */
+/** Guess the correlation "kind" of a normalized event for required-fields
+ *  checks. Events with no turn/session/task scope at all are service-level
+ *  (`gateway_ready`, `http_rejected`, …) and require no correlation fields. */
 function kindFor(record) {
   const evt = String(record.evt ?? record.event ?? '')
+  const scoped = record.request_id != null || record.session_id != null || record.task_id != null
+  if (!scoped) return 'service'
   if (/token|token_issued|token_rejected|token_consumed|token_expired|token_revoked/.test(evt)) return 'token'
   if (/ws_upgrade|session_ready|ready|handshake/.test(evt)) return 'handshake'
-  if (/delta|append|sequence|frame|audio\./.test(evt) && !/done/.test(evt)) return 'frame'
-  if (/task\.|task_|announcement|tool\.|tool_/.test(evt)) return 'task'
+  if (/delta|append|sequence|frame|audio\./.test(evt) && !/done|segment/.test(evt)) return 'frame'
+  // Genuine task/tool events must carry request + generation + task_id;
+  // `announcement_*` events carry the turn scope (request/session/generation)
+  // via scopeLog but not necessarily a task_id, so they stay 'turn'.
+  if (/task\.|tool\.|task_|tool_/.test(evt)) return 'task'
   return 'turn'
 }
 
@@ -38,19 +45,21 @@ export class ChainCollector {
     this.violations = []
     // task_id → owning session_id
     this.taskOwner = new Map()
-    // per-request turn state for the three invariants
+    // per-request turn state for the three invariants — keyed by
+    // session \u0000 request \u0000 generation so two sessions reusing a
+    // request_id never share committed/pendingSegments state.
     this.turns = new Map()
     // session_id → closed flag
     this.sessions = new Map()
   }
 
   _turn(record) {
-    const key = record.request_id
-    if (key == null) return null
+    if (record.request_id == null) return null
+    const key = turnKey(record.request_id, record.session_id, record.generation)
     let turn = this.turns.get(key)
     if (!turn) {
       turn = {
-        request_id: key,
+        request_id: record.request_id,
         session_id: record.session_id ?? null,
         committed: false,
         audioDone: false,
@@ -74,7 +83,7 @@ export class ChainCollector {
     if (!evt) return
 
     // ---- correlation-fields invariant -------------------------------
-    const kind = kindFor(rawRecord)
+    const kind = kindFor(record)
     const correlated = assertCorrelated(record, kind)
     if (!correlated.ok) {
       this.violations.push({

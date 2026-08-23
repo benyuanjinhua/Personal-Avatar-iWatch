@@ -78,10 +78,11 @@ export function normalize(record = {}) {
 export function requiredFields(kind) {
   switch (kind) {
     case 'token': return []
+    case 'service': return []
     case 'handshake': return ['session_id', 'request_id']
     case 'turn': return ['session_id', 'request_id', 'generation']
     case 'frame': return ['session_id', 'request_id', 'generation', 'sequence']
-    case 'task': return ['session_id', 'task_id']
+    case 'task': return ['session_id', 'request_id', 'generation', 'task_id']
     default: return ['session_id', 'request_id']
   }
 }

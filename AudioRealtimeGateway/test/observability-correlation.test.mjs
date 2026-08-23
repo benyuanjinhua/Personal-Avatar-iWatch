@@ -91,7 +91,7 @@ test('CORRELATION_FIELDS lists the six canonical fields', () => {
 test('requiredFields returns the documented shapes', () => {
   assert.deepEqual(requiredFields('token'), [])
   assert.deepEqual(requiredFields('handshake'), ['session_id', 'request_id'])
-  assert.deepEqual(requiredFields('task'), ['session_id', 'task_id'])
+  assert.deepEqual(requiredFields('task'), ['session_id', 'request_id', 'generation', 'task_id'])
 })
 
 test('GATEWAY_EVENT_MAP and AGENT_EVENT_MAP share the canonical vocabulary', () => {

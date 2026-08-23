@@ -3,12 +3,18 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { MetricsAccumulator } from '../observability/metrics.mjs'
+import { MetricsAccumulator, turnKey } from '../observability/metrics.mjs'
+
+test('turnKey is a composite of session + request + generation', () => {
+  assert.notEqual(turnKey('r-1', 's-1', 1), turnKey('r-1', 's-2', 1))
+  assert.notEqual(turnKey('r-1', 's-1', 1), turnKey('r-1', 's-1', 2))
+  assert.equal(turnKey('r-1', 's-1', 1), turnKey('r-1', 's-1', 1))
+})
 
 test('codex_first_chunk_ms = first Codex chunk − commit', () => {
   const acc = new MetricsAccumulator()
   acc.push({ evt: 'uplink_committed', request_id: 'r-1', session_id: 's-1', generation: 1, t: 100 })
-  acc.push({ evt: 'codex.first_chunk', turnId: 'r-1', sessionId: 's-1', t: 350 })
+  acc.push({ evt: 'codex.first_chunk', turnId: 'r-1', sessionId: 's-1', turnGeneration: 1, t: 350 })
   const summary = acc.summarize('r-1')
   assert.equal(summary.codex_first_chunk_ms, 250)
 })
@@ -16,12 +22,12 @@ test('codex_first_chunk_ms = first Codex chunk − commit', () => {
 test('chunk_to_segment_ms and segment_to_first_audio_ms accumulate per segment', () => {
   const acc = new MetricsAccumulator()
   acc.push({ evt: 'uplink_committed', request_id: 'r-1', session_id: 's-1', generation: 1, t: 0 })
-  acc.push({ evt: 'codex.first_chunk', request_id: 'r-1', session_id: 's-1', t: 100 })
-  acc.push({ evt: 'codex.chunk', request_id: 'r-1', session_id: 's-1', t: 200 })
-  acc.push({ evt: 'segment.flush', request_id: 'r-1', session_id: 's-1', t: 250 })
+  acc.push({ evt: 'codex.first_chunk', request_id: 'r-1', session_id: 's-1', generation: 1, t: 100 })
+  acc.push({ evt: 'codex.chunk', request_id: 'r-1', session_id: 's-1', generation: 1, t: 200 })
+  acc.push({ evt: 'segment.flush', request_id: 'r-1', session_id: 's-1', generation: 1, t: 250 })
   acc.push({ evt: 'downlink_first_frame', request_id: 'r-1', session_id: 's-1', generation: 1, sequence: 0, t: 400 })
-  acc.push({ evt: 'segment.flush', request_id: 'r-1', session_id: 's-1', t: 500 })
-  acc.push({ evt: 'downlink_first_frame', request_id: 'r-1', session_id: 's-1', generation: 1, sequence: 1, t: 620 })
+  acc.push({ evt: 'segment.flush', request_id: 'r-1', session_id: 's-1', generation: 1, t: 500 })
+  acc.push({ evt: 'segment_first_frame', request_id: 'r-1', session_id: 's-1', generation: 1, sequence: 1, t: 620 })
 
   const summary = acc.summarize('r-1')
   // segment 1: flush(250) − last chunk(200) = 50; audio(400) − flush(250) = 150
@@ -33,9 +39,9 @@ test('chunk_to_segment_ms and segment_to_first_audio_ms accumulate per segment',
 test('commit_to_first_tool_audio_ms measures from commit to first tool audio', () => {
   const acc = new MetricsAccumulator()
   acc.push({ evt: 'uplink_committed', request_id: 'r-1', session_id: 's-1', generation: 1, t: 1000 })
-  acc.push({ evt: 'tool.started', request_id: 'r-1', session_id: 's-1', task_id: 'task-1', t: 1200 })
-  acc.push({ evt: 'codex.first_chunk', request_id: 'r-1', session_id: 's-1', t: 1500 })
-  acc.push({ evt: 'segment.flush', request_id: 'r-1', session_id: 's-1', t: 1600 })
+  acc.push({ evt: 'tool.started', request_id: 'r-1', session_id: 's-1', generation: 1, task_id: 'task-1', t: 1200 })
+  acc.push({ evt: 'codex.first_chunk', request_id: 'r-1', session_id: 's-1', generation: 1, t: 1500 })
+  acc.push({ evt: 'segment.flush', request_id: 'r-1', session_id: 's-1', generation: 1, t: 1600 })
   acc.push({ evt: 'downlink_first_frame', request_id: 'r-1', session_id: 's-1', generation: 1, sequence: 0, t: 1900 })
   const summary = acc.summarize('r-1')
   assert.equal(summary.commit_to_first_tool_audio_ms, 900)
@@ -57,9 +63,9 @@ test('counters: dedup, stale-generation, merge accumulate per turn and globally'
   for (let i = 0; i < 3; i += 1) {
     acc.push({ evt: 'duplicate_sequence', request_id: 'r-1', session_id: 's-1', generation: 1, sequence: 0, t: i })
   }
-  acc.push({ evt: 'stale_generation_dropped', request_id: 'r-1', session_id: 's-1', t: 10 })
-  acc.push({ evt: 'stale_generation_dropped', request_id: 'r-1', session_id: 's-1', t: 11 })
-  acc.push({ evt: 'merged_segment', request_id: 'r-1', session_id: 's-1', t: 12 })
+  acc.push({ evt: 'stale_generation_dropped', request_id: 'r-1', session_id: 's-1', generation: 1, t: 10 })
+  acc.push({ evt: 'stale_generation_dropped', request_id: 'r-1', session_id: 's-1', generation: 1, t: 11 })
+  acc.push({ evt: 'merged_segment', request_id: 'r-1', session_id: 's-1', generation: 1, t: 12 })
 
   const summary = acc.summarize('r-1')
   assert.equal(summary.duplicate_sequences, 3)
@@ -74,9 +80,9 @@ test('counters: dedup, stale-generation, merge accumulate per turn and globally'
 
 test('queue depth tracks the max per turn and globally', () => {
   const acc = new MetricsAccumulator()
-  acc.push({ evt: 'queue_depth', request_id: 'r-1', session_id: 's-1', depth: 3, t: 0 })
-  acc.push({ evt: 'queue_depth', request_id: 'r-1', session_id: 's-1', depth: 7, t: 1 })
-  acc.push({ evt: 'queue_depth', request_id: 'r-2', session_id: 's-2', depth: 2, t: 2 })
+  acc.push({ evt: 'queue_depth', request_id: 'r-1', session_id: 's-1', generation: 1, depth: 3, t: 0 })
+  acc.push({ evt: 'queue_depth', request_id: 'r-1', session_id: 's-1', generation: 1, depth: 7, t: 1 })
+  acc.push({ evt: 'queue_depth', request_id: 'r-2', session_id: 's-2', generation: 1, depth: 2, t: 2 })
   assert.equal(acc.summarize('r-1').max_queue_depth, 7)
   assert.equal(acc.summarize('r-2').max_queue_depth, 2)
   assert.equal(acc.summarizeAll().max_queue_depth, 7)
@@ -85,7 +91,7 @@ test('queue depth tracks the max per turn and globally', () => {
 test('ISO ts is parsed when numeric t is absent', () => {
   const acc = new MetricsAccumulator()
   acc.push({ evt: 'uplink_committed', request_id: 'r-1', session_id: 's-1', generation: 1, ts: '2026-08-22T00:00:00.000Z' })
-  acc.push({ evt: 'codex.first_chunk', request_id: 'r-1', session_id: 's-1', ts: '2026-08-22T00:00:00.250Z' })
+  acc.push({ evt: 'codex.first_chunk', request_id: 'r-1', session_id: 's-1', generation: 1, ts: '2026-08-22T00:00:00.250Z' })
   assert.equal(acc.summarize('r-1').codex_first_chunk_ms, 250)
 })
 
@@ -93,4 +99,34 @@ test('records without a timeline are skipped, not thrown', () => {
   const acc = new MetricsAccumulator()
   acc.push({ evt: 'codex.first_chunk', request_id: 'r-1', session_id: 's-1' })
   assert.equal(acc.summarize('r-1'), null)
+})
+
+// ESS-1071 阻断 2 regression: two sessions sharing a request_id keep
+// independent turn state, metrics and terminal flags.
+test('two sessions sharing a request_id keep independent turns', () => {
+  const acc = new MetricsAccumulator()
+  // Session A commits and streams a tool answer.
+  acc.push({ evt: 'uplink_committed', request_id: 'r-1', session_id: 's-a', generation: 1, t: 0 })
+  acc.push({ evt: 'tool.started', request_id: 'r-1', session_id: 's-a', generation: 1, task_id: 'task-a', t: 10 })
+  acc.push({ evt: 'codex.first_chunk', request_id: 'r-1', session_id: 's-a', generation: 1, t: 20 })
+  acc.push({ evt: 'downlink_first_frame', request_id: 'r-1', session_id: 's-a', generation: 1, sequence: 0, t: 30 })
+  acc.push({ evt: 'downlink_done', request_id: 'r-1', session_id: 's-a', generation: 1, t: 40 })
+
+  // Session B reuses request_id but is a plain direct answer.
+  acc.push({ evt: 'uplink_committed', request_id: 'r-1', session_id: 's-b', generation: 1, t: 100 })
+  acc.push({ evt: 'downlink_first_frame', request_id: 'r-1', session_id: 's-b', generation: 1, sequence: 0, t: 110 })
+  acc.push({ evt: 'downlink_done', request_id: 'r-1', session_id: 's-b', generation: 1, t: 120 })
+
+  const a = acc.summarize('r-1', 's-a')
+  const b = acc.summarize('r-1', 's-b')
+
+  assert.equal(a.codex_first_chunk_ms, 20)
+  assert.equal(a.commit_to_first_tool_audio_ms, 30)
+  assert.equal(a.audio_done, true)
+
+  assert.equal(b.codex_first_chunk_ms, null)
+  assert.equal(b.commit_to_first_tool_audio_ms, null)
+  assert.equal(b.audio_done, true)
+
+  assert.equal(acc.summarizeAll().turns.length, 2)
 })

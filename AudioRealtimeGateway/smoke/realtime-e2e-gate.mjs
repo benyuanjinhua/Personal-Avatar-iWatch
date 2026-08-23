@@ -96,8 +96,10 @@ class Driver {
     this.port = null
   }
 
-  mark(requestId, sessionId, evt, extra = {}) {
-    this.injected.push({ evt, t: Date.now(), request_id: requestId, session_id: sessionId, ...extra })
+  mark(requestId, sessionId, generation, evt, extra = {}) {
+    this.injected.push({
+      evt, t: Date.now(), request_id: requestId, session_id: sessionId, generation, ...extra,
+    })
   }
 
   async mint(sessionId, requestId, generation) {
@@ -223,7 +225,7 @@ async function runScenario(driver, name) {
   const emit = driver.emitter(requestId, generation)
   await scripts[name]({
     emit,
-    mark: (evt, extra) => driver.mark(requestId, sessionId, evt, extra),
+    mark: (evt, extra) => driver.mark(requestId, sessionId, generation, evt, extra),
   })
   const terminal = await driver.waitFrame(frames, 'audio.done', 8_000)
   ws.send(JSON.stringify({ type: 'close', reason: 'gate_done' }))
@@ -243,9 +245,12 @@ function assertScenario(name, run, summary) {
   const segmentDoneFrames = frames.filter(f => f.type === 'audio.segment_done')
   const errorFrame = frames.find(f => f.type === 'error')
   const deltaFrames = frames.filter(f => f.type === 'audio.delta')
-  const turn = summary.metrics.turns.find(t => t.request_id === run.requestId) ?? {}
+  const turn = summary.metrics.turns.find(t =>
+    t.request_id === run.requestId && t.session_id === run.sessionId) ?? {}
 
   check('turn_terminated', Boolean(doneFrame || errorFrame), `done=${Boolean(doneFrame)} error=${Boolean(errorFrame)}`)
+  check('all_invariants_pass', summary.passed === true,
+    JSON.stringify(summary.violations))
   check('no_silent_end', !summary.violations.some(v => v.invariant === 'silent_end'))
   check('no_premature_done', !summary.violations.some(v => v.invariant === 'premature_done'))
 
@@ -317,8 +322,11 @@ function assertFault(name, run, summary) {
   const errorFrame = frames.find(f => f.type === 'error')
   const doneFrame = frames.find(f => f.type === 'audio.done')
   const cancelAck = frames.find(f => f.type === 'cancel.ack')
-  const turn = summary.metrics.turns.find(t => t.request_id === run.requestId) ?? {}
+  const turn = summary.metrics.turns.find(t =>
+    t.request_id === run.requestId && t.session_id === run.sessionId) ?? {}
 
+  check('all_invariants_pass', summary.passed === true,
+    JSON.stringify(summary.violations))
   check('no_silent_end', !summary.violations.some(v => v.invariant === 'silent_end'))
   check('no_cross_session_mixing', !summary.violations.some(v => v.invariant === 'cross_session_mixing'))
 
