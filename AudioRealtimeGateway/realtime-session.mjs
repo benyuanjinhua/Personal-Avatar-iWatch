@@ -381,6 +381,12 @@ export class RealtimeSession {
       request_id: this.scope.request_id, session_id: this.scope.session_id,
       response_id: message.response_id,
     })
+    // ESS-1068 复审第1点：把 Watch 的 playback 回执转发给上游
+    //（qwen-agent-transport → qwen），触发 qwen 的 announcement
+    // confirmMany（ack）。不回这个回执，qwen 会在 ack 超时后无限重投
+    // 已播报的后台任务结果。
+    if (phase === 'started') this.agentTurn?.playbackStarted?.(message.response_id)
+    else if (phase === 'ended') this.agentTurn?.playbackEnded?.(message.response_id)
   }
 
   // === Agent → client path ===============================================
