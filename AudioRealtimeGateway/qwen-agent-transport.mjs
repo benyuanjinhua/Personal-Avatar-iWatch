@@ -298,15 +298,24 @@ export class QwenAgentTransport {
     const deviceId = event.deviceId ?? task.deviceId ?? null
     if (sessionId != null || deviceId != null) {
       if (sessionId != null && String(sessionId) !== String(turn.sessionId)) return false
-      if (deviceId != null && turn.deviceId != null && String(deviceId) !== String(turn.deviceId)) return false
+      // ESS-1068 复审第2点（fail-closed）：当 turn 有 device 身份时，
+      // announcement 必须提供匹配的 deviceId 才能归属；缺 deviceId 的
+      // 广播不能靠 sessionId 单边放行——两个设备共享一个 sessionId 时会
+      // 双双接受同一广播。
+      if (turn.deviceId != null) {
+        if (deviceId == null) return false
+        if (String(deviceId) !== String(turn.deviceId)) return false
+      }
       return true
     }
     if (taskKey != null) {
       const identity = turn.taskIdentity.get(taskKey)
       if (identity) {
         if (identity.sessionId != null && String(identity.sessionId) !== String(turn.sessionId)) return false
-        if (identity.deviceId != null && turn.deviceId != null
-          && String(identity.deviceId) !== String(turn.deviceId)) return false
+        if (turn.deviceId != null) {
+          if (identity.deviceId == null) return false
+          if (String(identity.deviceId) !== String(turn.deviceId)) return false
+        }
         return true
       }
     }
@@ -389,6 +398,12 @@ export class QwenAgentTransport {
       // be forwarded rather than dropped.
       activeAnnouncements: new Set(),
       deliverAnnouncementIds: new Set(),
+      // ESS-1068 复审第3点：`deliveredAnnouncements` 是「已完整下发并消费」
+      // 的 dedup，只能在 audio.done 完整下发后记录，不能在 response.started
+      // 就记——否则 disconnect/cancel/截断会永久抑制后续 turn 的重投。
+      // 本映射记录 responseId → taskKey 的待交付关系，response.started 入，
+      // audio.done 下发后转 delivered 并出。
+      pendingAnnouncementTaskIds: new Map(),
       // ESS-849 announcement isolation book-keeping. `announcementDropped`
       // counts what the voice channel threw away per announcement response;
       // `forwardedResponseIds` is what makes a 「先 delta 后 started」 leak
@@ -1068,14 +1083,13 @@ export class QwenAgentTransport {
                   ...scopeLog, upstream_response_id: id, upstream_task_id: taskKeyStr,
                 })
               } else {
-                if (taskKeyStr !== null) {
-                  turn.deliveredAnnouncements.add(taskKeyStr)
-                  while (turn.deliveredAnnouncements.size > MAX_TASKS_PER_CONVERSATION) {
-                    turn.deliveredAnnouncements.delete(turn.deliveredAnnouncements.values().next().value)
-                  }
+                // ESS-1068 复审第3点：只记 pending，不在这里记 delivered。
+                // 完整下发（audio.done）后才转 delivered，避免过早 dedup。
+                if (id !== null) {
+                  if (taskKeyStr !== null) turn.pendingAnnouncementTaskIds.set(id, taskKeyStr)
+                  turn.deliverAnnouncementIds.add(id)
                 }
-                if (id !== null) turn.deliverAnnouncementIds.add(id)
-                this.log('upstream_announcement_delivered', {
+                this.log('upstream_announcement_pending', {
                   ...scopeLog, upstream_response_id: id, upstream_task_id: taskKeyStr,
                 })
               }
@@ -1236,8 +1250,19 @@ export class QwenAgentTransport {
             turn.announcementDropped.delete(doneAnnouncementId)
             if (deliver) {
               noteResponseProgress()
+              // ESS-1068 复审第3点：完整下发（audio.done）才算 consumed，
+              // 把 pending 转 delivered（exactly-once dedup 的落点后移）。
+              const taskKey = turn.pendingAnnouncementTaskIds.get(doneAnnouncementId)
+              if (taskKey !== undefined) {
+                turn.deliveredAnnouncements.add(taskKey)
+                while (turn.deliveredAnnouncements.size > MAX_TASKS_PER_CONVERSATION) {
+                  turn.deliveredAnnouncements.delete(turn.deliveredAnnouncements.values().next().value)
+                }
+              }
+              turn.pendingAnnouncementTaskIds.delete(doneAnnouncementId)
               this.log('upstream_announcement_audio_done_delivered', {
                 ...scopeLog, upstream_response_id: doneAnnouncementId,
+                upstream_task_id: taskKey ?? null,
                 final_sequence: turn.nextOutputSequence - 1,
               })
               // 与正常段落同构：park + settle，由后续新段落释放或空闲窗口收口。
