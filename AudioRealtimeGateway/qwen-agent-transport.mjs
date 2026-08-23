@@ -338,8 +338,35 @@ export class QwenAgentTransport {
     // one that reuses the same requestId with a new generation, which the old
     // `prior.requestId !== requestId` guard let survive as an orphan.  The new
     // turn is not in the map yet, so nothing here can supersede itself.
+    const blockingTurn = [...this.turns.values()].find(prior =>
+      prior.conversation === conversation && prior.toolGateActive?.())
+    if (blockingTurn) {
+      this.log('upstream_supersede_decision', {
+        request_id: requestId, session_id: sessionId, device_id: deviceId, generation,
+        decision: 'rejected_tool_turn_active',
+        blocking_request_id: blockingTurn.requestId,
+        blocking_generation: blockingTurn.generation,
+        outstanding_tasks: blockingTurn.outstandingTasks.size,
+        tool_call_pending: blockingTurn.pendingToolCall,
+      })
+      queueMicrotask(() => onEvent({
+        type: 'agent.error', response_id: responseId, code: 'ERR_TURN_BUSY',
+        detail: 'a tool turn is still active for this conversation', retriable: true,
+      }))
+      return {
+        appendAudio: () => {}, commit: () => {}, cancel: () => {}, close: () => {},
+        playbackStarted: () => {}, playbackEnded: () => {},
+      }
+    }
     for (const prior of this.turns.values()) {
-      if (prior.conversation === conversation) prior.supersede?.(requestId)
+      if (prior.conversation === conversation) {
+        this.log('upstream_supersede_decision', {
+          request_id: requestId, session_id: sessionId, device_id: deviceId, generation,
+          decision: 'supersede', blocking_request_id: prior.requestId,
+          blocking_generation: prior.generation,
+        })
+        prior.supersede?.(requestId)
+      }
     }
     const upstreamSessionId = `watch-direct-${sessionId}-${generation}`
     const url = new URL(this.gatewayUrl)
@@ -367,6 +394,7 @@ export class QwenAgentTransport {
       clientInstanceId, ownershipState: null, ownershipHolderLabel: null,
       ownershipHolderInstanceId: null, takeoverAttempted: false,
       responseTimer: null, responded: false, commitSentAt: null,
+      taskTerminalTimer: null,
       // ESS-969 segment book-keeping. `closedSegment` holds a segment whose
       // `audio.done` has settled but whose meaning is not decided yet: it is
       // a SEGMENT boundary if the turn goes on to produce more, and the TURN
@@ -417,7 +445,10 @@ export class QwenAgentTransport {
       // call, `endAfterDone` marks it so `flushDone` ends the turn as soon as
       // that segment's audio settles instead of waiting out the idle window.
       pendingToolCall: false, endAfterDone: false,
+      pendingToolTerminal: null,
     }
+    turn.toolGateActive = () => !turn.terminal && !turn.turnEnded
+      && (turn.pendingToolCall || turn.outstandingTasks.size > 0 || turn.pendingToolTerminal !== null)
     const scopeLog = { request_id: requestId, session_id: sessionId, device_id: deviceId, generation }
     turn.supersede = nextRequestId => {
       if (turn.terminal) return
@@ -428,6 +459,7 @@ export class QwenAgentTransport {
       clearTimeout(turn.gapTimer)
       clearTimeout(turn.responseTimer)
       clearTimeout(turn.segmentGapTimer)
+      clearTimeout(turn.taskTerminalTimer)
       this.log('upstream_turn_superseded', {
         ...scopeLog, superseded_by_request_id: nextRequestId,
       })
@@ -448,6 +480,7 @@ export class QwenAgentTransport {
       clearTimeout(turn.gapTimer)
       clearTimeout(turn.responseTimer)
       clearTimeout(turn.segmentGapTimer)
+      clearTimeout(turn.taskTerminalTimer)
       this.log('upstream_error', { ...scopeLog, code })
       onEvent({ type: 'agent.error', response_id: responseId, code, detail, retriable: true })
       try { turn.ws?.close() } catch { /* best effort */ }
@@ -594,7 +627,32 @@ export class QwenAgentTransport {
     // forwarded so far, which is exactly the last segment's endpoint.
     const endTurn = (reason, finalSequence = turn.nextOutputSequence - 1) => {
       if (turn.turnEnded) return
+      if (turn.outstandingTasks.size > 0 && reason !== 'tool_task_timeout') {
+        turn.pendingToolTerminal = { reason, finalSequence }
+        this.log('upstream_turn_terminal_deferred', {
+          ...scopeLog, reason: 'task_in_flight', candidate_reason: reason,
+          final_sequence: finalSequence, outstanding_tasks: turn.outstandingTasks.size,
+          ui_state: 'thinking', turn_state: 'busy',
+        })
+        if (!turn.taskTerminalTimer && this.toolCallWindowMs > 0) {
+          turn.taskTerminalTimer = setTimeout(() => {
+            turn.taskTerminalTimer = null
+            if (turn.turnEnded || !turn.pendingToolTerminal) return
+            this.log('upstream_task_terminal_timeout', {
+              ...scopeLog, task_id: turn.outstandingTasks.values().next().value ?? null,
+              outstanding_tasks: turn.outstandingTasks.size,
+              timeout_ms: this.toolCallWindowMs, ui_state: 'error', turn_state: 'terminal',
+            })
+            endTurn('tool_task_timeout', turn.pendingToolTerminal.finalSequence)
+          }, this.toolCallWindowMs)
+          turn.taskTerminalTimer.unref?.()
+        }
+        return
+      }
       turn.turnEnded = true
+      turn.pendingToolTerminal = null
+      clearTimeout(turn.taskTerminalTimer)
+      turn.taskTerminalTimer = null
       turn.closedSegment = null
       clearTimeout(turn.segmentGapTimer)
       turn.segmentGapTimer = null
@@ -1135,6 +1193,13 @@ export class QwenAgentTransport {
               reorder_pending: turn.reorderBuffer.size,
               segments_closed: turn.segmentsClosed,
               parked_segment: turn.closedSegment ? turn.closedSegment.segmentIndex : null,
+              suppressed: turn.toolGateActive(),
+              suppressed_reason: turn.toolGateActive() ? 'tool_turn_active' : null,
+              task_id: turn.outstandingTasks.values().next().value ?? null,
+              outstanding_tasks: turn.outstandingTasks.size,
+              tool_call_pending: turn.pendingToolCall,
+              ui_state: turn.toolGateActive() ? 'thinking' : 'idle',
+              turn_state: turn.toolGateActive() ? 'busy' : 'idle',
             })
           }
           return
@@ -1345,6 +1410,10 @@ export class QwenAgentTransport {
           if (terminal) {
             turn.outstandingTasks.delete(id)
             noteTurnIdle('task_terminal')
+            if (turn.outstandingTasks.size === 0 && turn.pendingToolTerminal) {
+              const candidate = turn.pendingToolTerminal
+              endTurn('task_terminal_audio_done', candidate.finalSequence)
+            }
           } else if (!TASK_NON_LIFECYCLE_EVENTS.has(event.type)) {
             turn.outstandingTasks.add(id)
             noteTurnBusy('task_in_flight')
@@ -1497,6 +1566,7 @@ export class QwenAgentTransport {
         clearTimeout(turn.gapTimer)
         clearTimeout(turn.responseTimer)
         clearTimeout(turn.segmentGapTimer)
+        clearTimeout(turn.taskTerminalTimer)
         turn.ws?.close()
         this.#release(turn)
       },
@@ -1508,6 +1578,7 @@ export class QwenAgentTransport {
         clearTimeout(turn.gapTimer)
         clearTimeout(turn.responseTimer)
         clearTimeout(turn.segmentGapTimer)
+        clearTimeout(turn.taskTerminalTimer)
         if (turn.ws?.readyState === WebSocket.OPEN) {
           turn.ws.send(JSON.stringify({ type: 'mute' }))
         }
