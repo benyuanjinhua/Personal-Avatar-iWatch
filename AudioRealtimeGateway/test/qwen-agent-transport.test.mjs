@@ -5,7 +5,10 @@ import { QwenAgentTransport } from '../qwen-agent-transport.mjs'
 
 const servers = []
 afterEach(async () => {
-  await Promise.all(servers.splice(0).map(server => new Promise(resolve => server.close(resolve))))
+  await Promise.all(servers.splice(0).map(server => new Promise(resolve => {
+    for (const client of server.clients) client.terminate()
+    server.close(resolve)
+  })))
 })
 
 async function upstream(onMessage) {

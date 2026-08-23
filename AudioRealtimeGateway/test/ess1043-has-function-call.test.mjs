@@ -19,7 +19,10 @@ import { QwenAgentTransport } from '../qwen-agent-transport.mjs'
 
 const servers = []
 afterEach(async () => {
-  await Promise.all(servers.splice(0).map(server => new Promise(resolve => server.close(resolve))))
+  await Promise.all(servers.splice(0).map(server => new Promise(resolve => {
+    for (const client of server.clients) client.terminate()
+    server.close(resolve)
+  })))
 })
 
 async function upstream(onMessage) {
@@ -264,4 +267,83 @@ test('ESS-1043 · 工具调用声明后若结果永不回来，tool-call 窗口�
   assert.equal(terminals[0].window_ms, 600)
   assert.ok(logs.some(l => l.evt === 'upstream_tool_call_pending'))
   turn.close()
+})
+
+test('ESS-1096 · task running 抑制 idle 与工具音频终态，task terminal 后才释放', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') send(ws, { type: 'voice.ready' })
+    if (message.type !== 'audio.commit') return
+    send(ws, { type: 'task.running', task: { id: 'task-1', status: 'running', sessionId: 's', deviceId: 'd' } })
+    send(ws, { type: 'response.done', responseId: 'model', origin: 'model', hasFunctionCall: true })
+    audioDelta(ws, 0, 'answer')
+    send(ws, { type: 'response.done', responseId: 'agent', origin: 'agent', hasFunctionCall: false })
+    send(ws, { type: 'audio.done' })
+    send(ws, { type: 'voice.state', state: 'idle', origin: 'agent' })
+    setTimeout(() => send(ws, { type: 'task.completed', task: { id: 'task-1', status: 'completed' } }), 300)
+  })
+  const events = []; const logs = []
+  const transport = transportFor(url, { logs, segmentGapMs: 50, segmentGapBusyMs: 80, toolCallWindowMs: 1_000 })
+  const turn = openTurn(transport, { requestId: 'r-gated', events })
+  turn.commit()
+  await new Promise(resolve => setTimeout(resolve, 200))
+  assert.equal(events.some(event => event.type === 'agent.audio.done'), false)
+  const idle = logs.find(log => log.evt === 'upstream_voice_state_idle')
+  assert.equal(idle.suppressed, true)
+  assert.equal(idle.suppressed_reason, 'tool_turn_active')
+  assert.equal(idle.task_id, 'task-1')
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  assert.equal(logs.find(log => log.evt === 'upstream_turn_terminal').reason, 'task_terminal_audio_done')
+  turn.close()
+})
+
+test('ESS-1096 · 普通新会话不能 supersede 活跃工具回合，显式 cancel 仍可解除', async () => {
+  const sockets = []
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') { sockets.push(ws); send(ws, { type: 'voice.ready' }) }
+    if (message.type === 'audio.commit') {
+      send(ws, { type: 'task.running', task: { id: 'task-busy', status: 'running' } })
+      send(ws, { type: 'response.done', responseId: 'model', origin: 'model', hasFunctionCall: true })
+    }
+  })
+  const events1 = []; const events2 = []; const events3 = []; const logs = []
+  const transport = transportFor(url, { logs, segmentGapMs: 50, segmentGapBusyMs: 80, toolCallWindowMs: 1_000 })
+  const first = openTurn(transport, { requestId: 'r-first', events: events1 })
+  first.commit()
+  await waitFor(() => logs.some(log => log.evt === 'upstream_task_state'))
+  openTurn(transport, { requestId: 'r-racing', events: events2 }).commit()
+  await waitFor(() => events2.some(event => event.code === 'ERR_TURN_BUSY'))
+  assert.equal(sockets.length, 1)
+  assert.ok(logs.some(log => log.evt === 'upstream_supersede_decision' && log.decision === 'rejected_tool_turn_active'))
+  first.cancel()
+  const third = openTurn(transport, { requestId: 'r-after-cancel', events: events3 })
+  third.commit()
+  await waitFor(() => sockets.length === 2)
+  third.close()
+})
+
+test('ESS-1096 · task failed 也是明确终态，task terminal 丢失则有界超时释放', async () => {
+  let connection = 0
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') { connection += 1; send(ws, { type: 'voice.ready' }) }
+    if (message.type !== 'audio.commit') return
+    const id = `task-${connection}`
+    send(ws, { type: 'task.running', task: { id, status: 'running' } })
+    send(ws, { type: 'response.done', responseId: 'model', origin: 'model', hasFunctionCall: true })
+    audioDelta(ws, 0, 'answer')
+    send(ws, { type: 'response.done', responseId: 'agent', origin: 'agent', hasFunctionCall: false })
+    send(ws, { type: 'audio.done' })
+    if (connection === 1) setTimeout(() => send(ws, { type: 'task.failed', task: { id, status: 'failed' } }), 100)
+  })
+  const logs = []; const failedEvents = []
+  const transport = transportFor(url, { logs, segmentGapMs: 20, segmentGapBusyMs: 20, toolCallWindowMs: 180 })
+  const failed = openTurn(transport, { requestId: 'r-failed', events: failedEvents }); failed.commit()
+  await waitFor(() => failedEvents.some(event => event.type === 'agent.audio.done'))
+  assert.ok(logs.some(log => log.evt === 'upstream_task_state' && log.status === 'failed'))
+  failed.close()
+  const timeoutEvents = []
+  const timed = openTurn(transport, { requestId: 'r-timeout', events: timeoutEvents }); timed.commit()
+  await waitFor(() => logs.some(log => log.evt === 'upstream_task_terminal_timeout'))
+  await waitFor(() => timeoutEvents.some(event => event.type === 'agent.audio.done'))
+  assert.ok(logs.some(log => log.evt === 'upstream_turn_terminal' && log.reason === 'tool_task_timeout'))
+  timed.close()
 })
