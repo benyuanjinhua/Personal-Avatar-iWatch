@@ -108,6 +108,7 @@ export const CANONICAL_EVENTS = {
   // ---- turn / audio lifecycle (gateway, live) ----
   commit: 'commit',                                     // uplink_committed
   first_audio: 'first_audio',                           // downlink_first_frame
+  segment_first_audio: 'segment_first_audio',           // segment_first_frame（后续段首帧）
   audio_done: 'audio_done',                             // downlink_done
   turn_error: 'turn_error',                             // session_error
   session_ended: 'session_ended',                       // session_ended / ws_close
@@ -134,7 +135,7 @@ export const CANONICAL_EVENTS = {
 export const GATEWAY_EVENT_MAP = {
   uplink_committed: 'commit',
   downlink_first_frame: 'first_audio',
-  segment_first_frame: 'first_audio',
+  segment_first_frame: 'segment_first_audio',
   downlink_done: 'audio_done',
   session_error: 'turn_error',
   session_ended: 'session_ended',

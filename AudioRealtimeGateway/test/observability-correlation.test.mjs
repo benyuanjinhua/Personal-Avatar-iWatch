@@ -96,7 +96,7 @@ test('requiredFields returns the documented shapes', () => {
 
 test('GATEWAY_EVENT_MAP and AGENT_EVENT_MAP share the canonical vocabulary', () => {
   for (const value of Object.values(GATEWAY_EVENT_MAP)) {
-    assert.ok(value in { commit: 1, first_audio: 1, audio_done: 1, turn_error: 1, session_ended: 1, cancel_received: 1, cancel_ack_sent: 1, stale_generation_dropped: 1, duplicate_sequence: 1, announcement_audio_dropped: 1 }, `unknown gateway canonical ${value}`)
+    assert.ok(value in { commit: 1, first_audio: 1, segment_first_audio: 1, audio_done: 1, turn_error: 1, session_ended: 1, cancel_received: 1, cancel_ack_sent: 1, stale_generation_dropped: 1, duplicate_sequence: 1, announcement_audio_dropped: 1 }, `unknown gateway canonical ${value}`)
   }
   for (const value of Object.values(AGENT_EVENT_MAP)) {
     assert.ok(value in { codex_first_chunk: 1, codex_chunk: 1, segment_flush: 1, tts_first_audio: 1, tool_start: 1, tool_result: 1, stale_generation_dropped: 1, duplicate_sequence: 1 }, `unknown agent canonical ${value}`)

@@ -87,6 +87,18 @@ test('premature_done is cleared when every flushed segment drains before done', 
   assert.equal(collector.violationsFor('premature_done').length, 0)
 })
 
+test('a follow-on segment draining via segment_first_audio clears the pending segment', () => {
+  const collector = new ChainCollector()
+  collector.ingest([
+    base({ evt: 'uplink_committed', request_id: 'r-1', generation: 1, t: 0 }),
+    base({ evt: 'downlink_first_frame', request_id: 'r-1', generation: 1, sequence: 0, t: 5 }),
+    base({ evt: 'segment.flush', request_id: 'r-1', generation: 1, t: 10 }),
+    base({ evt: 'segment_first_frame', request_id: 'r-1', generation: 1, sequence: 1, t: 40 }),
+    base({ evt: 'downlink_done', request_id: 'r-1', generation: 1, final_sequence: 1, t: 50 }),
+  ])
+  assert.equal(collector.violationsFor('premature_done').length, 0)
+})
+
 test('cross_session_mixing: task result observed under a different session', () => {
   const collector = new ChainCollector()
   collector.ingest([

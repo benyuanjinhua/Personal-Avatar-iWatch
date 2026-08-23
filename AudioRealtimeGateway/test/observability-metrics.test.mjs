@@ -36,15 +36,18 @@ test('chunk_to_segment_ms and segment_to_first_audio_ms accumulate per segment',
   assert.deepEqual(summary.segment_to_first_audio_ms, [150, 120])
 })
 
-test('commit_to_first_tool_audio_ms measures from commit to first tool audio', () => {
+test('commit_to_first_tool_audio_ms measures commit → first tool-answer audio, not the ack', () => {
   const acc = new MetricsAccumulator()
   acc.push({ evt: 'uplink_committed', request_id: 'r-1', session_id: 's-1', generation: 1, t: 1000 })
+  // acknowledgement segment: turn's first frame, before the tool starts.
+  acc.push({ evt: 'downlink_first_frame', request_id: 'r-1', session_id: 's-1', generation: 1, sequence: 0, t: 1050 })
   acc.push({ evt: 'tool.started', request_id: 'r-1', session_id: 's-1', generation: 1, task_id: 'task-1', t: 1200 })
   acc.push({ evt: 'codex.first_chunk', request_id: 'r-1', session_id: 's-1', generation: 1, t: 1500 })
   acc.push({ evt: 'segment.flush', request_id: 'r-1', session_id: 's-1', generation: 1, t: 1600 })
-  acc.push({ evt: 'downlink_first_frame', request_id: 'r-1', session_id: 's-1', generation: 1, sequence: 0, t: 1900 })
+  // tool answer's first frame (follow-on segment), not the acknowledgement.
+  acc.push({ evt: 'segment_first_frame', request_id: 'r-1', session_id: 's-1', generation: 1, sequence: 1, t: 1900 })
   const summary = acc.summarize('r-1')
-  assert.equal(summary.commit_to_first_tool_audio_ms, 900)
+  assert.equal(summary.commit_to_first_tool_audio_ms, 900) // 1900 − 1000
 })
 
 test('direct answer (no Codex) leaves codex_first_chunk_ms null', () => {
@@ -107,9 +110,10 @@ test('two sessions sharing a request_id keep independent turns', () => {
   const acc = new MetricsAccumulator()
   // Session A commits and streams a tool answer.
   acc.push({ evt: 'uplink_committed', request_id: 'r-1', session_id: 's-a', generation: 1, t: 0 })
+  acc.push({ evt: 'downlink_first_frame', request_id: 'r-1', session_id: 's-a', generation: 1, sequence: 0, t: 5 })
   acc.push({ evt: 'tool.started', request_id: 'r-1', session_id: 's-a', generation: 1, task_id: 'task-a', t: 10 })
   acc.push({ evt: 'codex.first_chunk', request_id: 'r-1', session_id: 's-a', generation: 1, t: 20 })
-  acc.push({ evt: 'downlink_first_frame', request_id: 'r-1', session_id: 's-a', generation: 1, sequence: 0, t: 30 })
+  acc.push({ evt: 'segment_first_frame', request_id: 'r-1', session_id: 's-a', generation: 1, sequence: 1, t: 30 })
   acc.push({ evt: 'downlink_done', request_id: 'r-1', session_id: 's-a', generation: 1, t: 40 })
 
   // Session B reuses request_id but is a plain direct answer.
@@ -129,4 +133,29 @@ test('two sessions sharing a request_id keep independent turns', () => {
   assert.equal(b.audio_done, true)
 
   assert.equal(acc.summarizeAll().turns.length, 2)
+})
+
+// ESS-1082 阻断 2（多代汇总）：同一 session/request 的多个 generation 各自独立，
+// summarizeAll 不得重复第一代、遗漏后续代次。
+test('multiple generations of the same session/request are summarized independently', () => {
+  const acc = new MetricsAccumulator()
+  acc.push({ evt: 'uplink_committed', request_id: 'r-1', session_id: 's-1', generation: 1, t: 0 })
+  acc.push({ evt: 'downlink_first_frame', request_id: 'r-1', session_id: 's-1', generation: 1, sequence: 0, t: 10 })
+  acc.push({ evt: 'downlink_done', request_id: 'r-1', session_id: 's-1', generation: 1, t: 20 })
+
+  acc.push({ evt: 'uplink_committed', request_id: 'r-1', session_id: 's-1', generation: 2, t: 100 })
+  acc.push({ evt: 'downlink_first_frame', request_id: 'r-1', session_id: 's-1', generation: 2, sequence: 0, t: 110 })
+  acc.push({ evt: 'downlink_done', request_id: 'r-1', session_id: 's-1', generation: 2, t: 120 })
+
+  const g1 = acc.summarize('r-1', 's-1', 1)
+  const g2 = acc.summarize('r-1', 's-1', 2)
+  assert.equal(g1.audio_done, true)
+  assert.equal(g2.audio_done, true)
+  assert.equal(g1.codex_first_chunk_ms, null)
+  assert.equal(g2.codex_first_chunk_ms, null)
+
+  const all = acc.summarizeAll()
+  assert.equal(all.turns.length, 2)
+  const gens = all.turns.map(t => t.generation).sort((a, b) => a - b)
+  assert.deepEqual(gens, [1, 2])
 })

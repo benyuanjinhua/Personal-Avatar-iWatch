@@ -78,6 +78,7 @@ export class MetricsAccumulator {
         lastCodexChunkAt: null,
         segmentFlushAt: null,
         firstAudioAt: null,
+        firstToolAudioAt: null,
         toolStartedAt: null,
         audioDone: false,
         errored: false,
@@ -131,6 +132,16 @@ export class MetricsAccumulator {
         }
         break
 
+      case 'segment_first_audio':
+        // First frame of a follow-on segment = the tool answer, NOT the
+        // opening acknowledgement (downlink_first_frame). ESS-1082 阻断 1。
+        if (turn.firstToolAudioAt == null) turn.firstToolAudioAt = t
+        if (turn.segmentFlushAt != null) {
+          turn.segment_to_first_audio_ms.push(Math.max(0, t - turn.segmentFlushAt))
+          turn.segmentFlushAt = null
+        }
+        break
+
       case 'tts_first_audio':
         if (turn.firstAudioAt == null) turn.firstAudioAt = t
         break
@@ -176,13 +187,9 @@ export class MetricsAccumulator {
     }
   }
 
-  /** Per-turn latency summary. `codex_first_chunk_ms` is null when the turn
-   *  produced no Codex chunk (direct answer). `sessionId` disambiguates when
-   *  two sessions reuse the same request_id. */
-  summarize(requestId, sessionId = null) {
-    const turn = [...this.turns.values()].find(t =>
-      t.request_id === requestId && (sessionId == null || t.session_id === sessionId))
-    if (!turn) return null
+  /** Internal: summarize a single turn object (no re-lookup, so multiple
+   *  generations of the same session/request each get their own row). */
+  _summarize(turn) {
     return {
       request_id: turn.request_id,
       session_id: turn.session_id,
@@ -192,8 +199,8 @@ export class MetricsAccumulator {
         : null,
       chunk_to_segment_ms: [...turn.chunk_to_segment_ms],
       segment_to_first_audio_ms: [...turn.segment_to_first_audio_ms],
-      commit_to_first_tool_audio_ms: turn.commitAt != null && turn.toolStartedAt != null && turn.firstAudioAt != null
-        ? Math.max(0, turn.firstAudioAt - turn.commitAt)
+      commit_to_first_tool_audio_ms: turn.commitAt != null && turn.firstToolAudioAt != null
+        ? Math.max(0, turn.firstToolAudioAt - turn.commitAt)
         : null,
       max_queue_depth: turn.maxQueueDepth,
       merged_segments: turn.mergedSegments,
@@ -204,9 +211,21 @@ export class MetricsAccumulator {
     }
   }
 
+  /** Per-turn latency summary. `codex_first_chunk_ms` is null when the turn
+   *  produced no Codex chunk (direct answer). `sessionId` / `generation`
+   *  disambiguate when the same request_id recurs across sessions or
+   *  barge-in generations. */
+  summarize(requestId, sessionId = null, generation = null) {
+    const turn = [...this.turns.values()].find(t =>
+      t.request_id === requestId
+      && (sessionId == null || t.session_id === sessionId)
+      && (generation == null || t.generation === generation))
+    return turn ? this._summarize(turn) : null
+  }
+
   /** All summarized turns plus the global counters. */
   summarizeAll() {
-    const turns = [...this.turns.values()].map(turn => this.summarize(turn.request_id, turn.session_id))
+    const turns = [...this.turns.values()].map(turn => this._summarize(turn))
     return {
       turns,
       max_queue_depth: this.queueDepthSamples.reduce((a, b) => Math.max(a, b), 0),

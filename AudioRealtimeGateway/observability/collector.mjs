@@ -145,6 +145,7 @@ export class ChainCollector {
         turn.pendingSegments += 1
         break
       case 'first_audio':
+      case 'segment_first_audio':
       case 'tts_first_audio':
         if (turn.pendingSegments > 0) turn.pendingSegments -= 1
         break
