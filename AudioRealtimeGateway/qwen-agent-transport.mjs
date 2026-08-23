@@ -1083,13 +1083,14 @@ export class QwenAgentTransport {
                   ...scopeLog, upstream_response_id: id, upstream_task_id: taskKeyStr,
                 })
               } else {
-                // ESS-1068 复审第3点：只记 pending，不在这里记 delivered。
-                // 完整下发（audio.done）后才转 delivered，避免过早 dedup。
+                // ESS-1068 复审第3点：只记 pending（responseId→taskKey），不在这里
+                // 写 deliveredAnnouncements。完整下发（audio.done）后才转 delivered，
+                // 避免 disconnect/cancel/截断导致过早 dedup、永久抑制后续重投。
                 if (id !== null) {
                   if (taskKeyStr !== null) turn.pendingAnnouncementTaskIds.set(id, taskKeyStr)
                   turn.deliverAnnouncementIds.add(id)
                 }
-                this.log('upstream_announcement_pending', {
+                this.log('upstream_announcement_delivered', {
                   ...scopeLog, upstream_response_id: id, upstream_task_id: taskKeyStr,
                 })
               }

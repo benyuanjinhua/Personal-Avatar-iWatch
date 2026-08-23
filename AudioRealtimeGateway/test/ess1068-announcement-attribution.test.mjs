@@ -68,7 +68,7 @@ test('ESS-1068 · 归属明确的播报音频与文本下发，不再命中 anno
     if (message.type === 'connect') send(ws, { type: 'voice.ready' })
     if (message.type === 'audio.commit') {
       send(ws, { type: 'response.started', responseId: 'ann-1', origin: 'announcement',
-        task: { id: 'work_x', sessionId: 's' } })
+        task: { id: 'work_x', sessionId: 's', deviceId: 'd' } })
       audioDelta(ws, 0, 'weather-result', 'ann-1')
       send(ws, { type: 'transcript.final', responseId: 'ann-1', role: 'assistant', content: '杭州今天晴' })
       send(ws, { type: 'audio.done', responseId: 'ann-1' })
@@ -98,7 +98,7 @@ test('ESS-1068 · 同一 taskId 的重复播报只消费一次', async () => {
     if (message.type === 'audio.commit') {
       const announce = responseId => {
         send(ws, { type: 'response.started', responseId, origin: 'announcement',
-          task: { id: 'work_x', sessionId: 's' } })
+          task: { id: 'work_x', sessionId: 's', deviceId: 'd' } })
         audioDelta(ws, 0, 'result', responseId)
         send(ws, { type: 'audio.done', responseId })
       }
@@ -155,7 +155,7 @@ test('ESS-1068 · task.* 事件建立的 taskId→session 映射用于归属', a
     if (message.type === 'connect') send(ws, { type: 'voice.ready' })
     if (message.type === 'audio.commit') {
       // 先到 task.accepted（带 sessionId），再迟到的播报只带 taskId。
-      send(ws, { type: 'task.accepted', task: { id: 'work_z', sessionId: 's', status: 'accepted' } })
+      send(ws, { type: 'task.accepted', task: { id: 'work_z', sessionId: 's', deviceId: 'd', status: 'accepted' } })
       setTimeout(() => {
         send(ws, { type: 'response.started', responseId: 'ann-z', origin: 'announcement',
           taskId: 'work_z' })
@@ -220,7 +220,7 @@ test('ESS-1068 · task 身份跨 turn 持久化：后一轮能归属前一轮任
       commits.push(ws)
       if (commits.length === 1) {
         // 第一轮：只建立 taskId→session 映射（task.accepted），回合随后关闭。
-        send(ws, { type: 'task.accepted', task: { id: 'work_w', sessionId: 's', status: 'accepted' } })
+        send(ws, { type: 'task.accepted', task: { id: 'work_w', sessionId: 's', deviceId: 'd', status: 'accepted' } })
       } else {
         // 第二轮：迟到的播报只带 taskId，靠上一轮建立的映射归属。
         send(ws, { type: 'response.started', responseId: 'ann-w', origin: 'announcement',
@@ -261,7 +261,7 @@ test('ESS-1068 · 跨 turn 去重：同一 taskId 的结果只消费一次', asy
       commits.push(ws)
       // 两轮都收到同一 taskId 的播报（重投）：第一轮投递，第二轮去重隔离。
       send(ws, { type: 'response.started', responseId: `ann-${commits.length}`, origin: 'announcement',
-        task: { id: 'work_d', sessionId: 's' } })
+        task: { id: 'work_d', sessionId: 's', deviceId: 'd' } })
       audioDelta(ws, 0, 'dup-result', `ann-${commits.length}`)
       send(ws, { type: 'audio.done', responseId: `ann-${commits.length}` })
     }
@@ -289,4 +289,98 @@ test('ESS-1068 · 跨 turn 去重：同一 taskId 的结果只消费一次', asy
   assert.ok(logs.some(l => l.evt === 'upstream_announcement_delivered' && l.upstream_task_id === 'work_d'))
   assert.ok(logs.some(l => l.evt === 'upstream_announcement_duplicate' && l.upstream_task_id === 'work_d'))
   turn2.close()
+})
+
+// ESS-1068 复审第2点：跨设备 fail-closed。同一 sessionId 但不同 deviceId 的
+// 播报必须被隔离——两个设备共享 sessionId 时不能双双接受同一广播。
+test('ESS-1068 · 复审：same-session/different-device 的播报被隔离', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') send(ws, { type: 'voice.ready' })
+    if (message.type === 'audio.commit') {
+      send(ws, { type: 'response.started', responseId: 'ann-x', origin: 'announcement',
+        task: { id: 'work_cross', sessionId: 's', deviceId: 'other-device' } })
+      audioDelta(ws, 0, 'cross-device', 'ann-x')
+      send(ws, { type: 'audio.done', responseId: 'ann-x' })
+    }
+  })
+  const events = []; const logs = []
+  const transport = transportFor(url, { logs })
+  const turn = openTurn(transport, { events })
+  turn.commit()
+  await waitFor(() => logs.some(l => l.evt === 'upstream_announcement_isolated'))
+
+  // deviceId 不匹配 → 隔离，不下发音频。
+  assert.equal(events.filter(e => e.type === 'agent.audio.delta').length, 0)
+  assert.ok(logs.some(l => l.evt === 'upstream_announcement_isolated'))
+  turn.close()
+})
+
+// ESS-1068 复审第2点：turn 有 deviceId 时，缺 deviceId 的播报不得靠 sessionId
+// 单边放行（fail-closed）。
+test('ESS-1068 · 复审：有 sessionId 但缺 deviceId 的播报被隔离', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') send(ws, { type: 'voice.ready' })
+    if (message.type === 'audio.commit') {
+      send(ws, { type: 'response.started', responseId: 'ann-y', origin: 'announcement',
+        task: { id: 'work_nodevice', sessionId: 's' } })
+      audioDelta(ws, 0, 'no-device', 'ann-y')
+      send(ws, { type: 'audio.done', responseId: 'ann-y' })
+    }
+  })
+  const events = []; const logs = []
+  const transport = transportFor(url, { logs })
+  const turn = openTurn(transport, { events })
+  turn.commit()
+  await waitFor(() => logs.some(l => l.evt === 'upstream_announcement_isolated'))
+
+  assert.equal(events.filter(e => e.type === 'agent.audio.delta').length, 0)
+  assert.ok(logs.some(l => l.evt === 'upstream_announcement_isolated'))
+  turn.close()
+})
+
+// ESS-1068 复审第4点：response.done without audio.done 的播报——activeAnnouncements
+// 必须被清理，否则 turnBusy 永不解除，后续直答回合被锁在忙档。
+test('ESS-1068 · 复审：response.done without audio.done 仍清除 busy', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') {
+      send(ws, { type: 'voice.ready' })
+      send(ws, { type: 'voice.state', state: 'listening', origin: 'model' })
+    }
+    if (message.type === 'audio.commit') {
+      send(ws, { type: 'response.started', responseId: 'ann-nodone', origin: 'announcement',
+        task: { id: 'work_nodone', sessionId: 's', deviceId: 'd' } })
+      // 只发 response.done，不发 audio.done。
+      send(ws, { type: 'response.done', responseId: 'ann-nodone', origin: 'announcement' })
+    }
+  })
+  const events = []; const logs = []
+  const transport = transportFor(url, { logs })
+  const turn = openTurn(transport, { events })
+  turn.commit()
+  // response.done 后，若清理逻辑正确，activeAnnouncements 被清，后续能收口。
+  await waitFor(() => logs.some(l => l.evt === 'upstream_turn_busy_cleared'))
+  turn.close()
+})
+
+// ESS-1068 复审第4点：断连（socket close）后 pending 播报不残留，busy 清理。
+test('ESS-1068 · 复审：socket close 清理 activeAnnouncements 与 pending', async () => {
+  let serverWs
+  const url = await upstream((ws, message) => {
+    serverWs = ws
+    if (message.type === 'connect') send(ws, { type: 'voice.ready' })
+    if (message.type === 'audio.commit') {
+      send(ws, { type: 'response.started', responseId: 'ann-close', origin: 'announcement',
+        task: { id: 'work_close', sessionId: 's', deviceId: 'd' } })
+      // 不发 audio.done，直接关闭 socket。
+      ws.close()
+    }
+  })
+  const events = []; const logs = []
+  const transport = transportFor(url, { logs })
+  const turn = openTurn(transport, { events })
+  turn.commit()
+  await waitFor(() => logs.some(l => l.evt === 'upstream_error'))
+  // 断连后 turn 终结，pending 播报不得残留为 consumed（dedup 未提前写）。
+  assert.ok(!logs.some(l => l.evt === 'upstream_announcement_audio_done_delivered'))
+  turn.close()
 })
