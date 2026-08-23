@@ -526,6 +526,16 @@ job admission while retaining the persisted Bridge/Gateway ledgers.
   cap, frame-size cap.
 - `structured-logs.test.mjs` — every stage of a turn produces the expected
   log entries with `request_id` / `session_id` and no secret material.
+- `observability-*.test.mjs` — ESS-1071: the unified correlation contract,
+  the four latency metrics + counters, and the three cross-component
+  invariants (no silent end / no cross-session mixing / no premature done).
+
+The one-command E2E gate lives at `smoke/realtime-e2e-gate.mjs` (ESS-1071):
+`node smoke/realtime-e2e-gate.mjs --faults` runs the three fixed scenarios
+（现在几点 / 杭州天气 / 我的分身知识库）plus six fault injections through the
+real Gateway surface with a scripted upstream — no live dependencies. See
+`Docs/realtime-ci-gate.md` and `Docs/realtime-device-gate.md` for the CI and
+real-device checklists.
 
 Integration with real device auth and real Agent upstream is deliberately
 out of scope of ESS-403 (integration lives in ESS-401 and downstream

@@ -127,6 +127,10 @@ export class RealtimeSession {
     // dropping the next segment's frames as "past the promised barrier".
     this.pendingSegmentDone = null
     this.segmentsEmitted = 0
+    // ESS-1071: after a segment boundary is released, the next delta is the
+    // first audio frame of the following segment — the marker that makes
+    // `segment_to_first_audio_ms` measurable end-to-end.
+    this.expectSegmentFirstFrame = false
     // `done(-1)` is ambiguous until a short bounded window elapses: it can
     // mean a genuinely empty response, or (as observed in ESS-526) an
     // upstream marker that races ahead of the first delta.  Do not commit it
@@ -521,6 +525,17 @@ export class RealtimeSession {
         })
       }
     }
+    if (this.expectSegmentFirstFrame) {
+      // ESS-1071: first audio frame of a follow-on segment. The first segment's
+      // first frame is `downlink_first_frame`; this is the per-segment marker
+      // that lets the observability collector measure `segment_to_first_audio_ms`.
+      this.expectSegmentFirstFrame = false
+      this.log('segment_first_frame', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        response_id: this.responseId, sequence: event.sequence,
+        segment_index: this.segmentsEmitted - 1,
+      })
+    }
     this._sendJson({
       type: 'audio.delta',
       session_id: this.scope.session_id, request_id: this.scope.request_id,
@@ -599,6 +614,7 @@ export class RealtimeSession {
       segment_index: pending.segment_index,
       segment_final_sequence: pending.final_sequence,
     })
+    this.expectSegmentFirstFrame = true
   }
 
   _emitDone(event) {

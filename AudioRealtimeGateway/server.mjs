@@ -86,7 +86,11 @@ export function createGateway(overrides = {}) {
     sweepIntervalMs: CONFIG.token_sweep_interval_ms,
     log: (evt, extra) => log(evt, extra),
   })
-  const agentTransport = createAgentTransport(CONFIG, { log, providerKey })
+  // Agent transport seam: tests and the E2E gate may inject a pre-built
+  // transport instance (ScriptedAgentTransport etc.) directly. Production
+  // config never carries this field, so `config.json` cannot sneak a mock
+  // into a deployed process.
+  const agentTransport = CONFIG.agentTransport ?? createAgentTransport(CONFIG, { log, providerKey })
   const realtimeTurns = new Map()
   // ESS-958: 同 scope（device/session/request/generation）只允许一个活跃
   // 会话。重复 upgrade 会导致新会话 nextUplinkSequence 归零，而客户端续发

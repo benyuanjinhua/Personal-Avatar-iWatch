@@ -9,7 +9,9 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test test/token-issuer.test.mjs test/token-issuer-soak.test.mjs test/realtime-session.test.mjs test/cancel-generation.test.mjs test/heartbeat-rate-limit.test.mjs test/structured-logs.test.mjs test/wss-e2e.test.mjs test/startup-failure.test.mjs test/qwen-agent-transport.test.mjs test/downlink-budget.test.mjs test/ess842-response-deadline.test.mjs test/ess949-fallback-job-queue.test.mjs test/ess949-fallback-http.test.mjs test/universal-token.test.mjs test/ess969-multi-segment-turn.test.mjs test/ess1004-turn-terminal.test.mjs test/ess849-announcement-isolation.test.mjs test/deploy-observability.test.mjs test/ess1043-has-function-call.test.mjs"
+    "test": "node --test test/token-issuer.test.mjs test/token-issuer-soak.test.mjs test/realtime-session.test.mjs test/cancel-generation.test.mjs test/heartbeat-rate-limit.test.mjs test/structured-logs.test.mjs test/wss-e2e.test.mjs test/startup-failure.test.mjs test/qwen-agent-transport.test.mjs test/downlink-budget.test.mjs test/ess842-response-deadline.test.mjs test/ess949-fallback-job-queue.test.mjs test/ess949-fallback-http.test.mjs test/universal-token.test.mjs test/ess969-multi-segment-turn.test.mjs test/ess1004-turn-terminal.test.mjs test/ess849-announcement-isolation.test.mjs test/deploy-observability.test.mjs test/ess1043-has-function-call.test.mjs test/observability-correlation.test.mjs test/observability-metrics.test.mjs test/observability-collector.test.mjs",
+    "test:e2e": "node smoke/realtime-e2e-gate.mjs --faults",
+    "test:gate": "npm test && npm run test:e2e"
   },
   "dependencies": {
     "ws": "^8.21.1"
