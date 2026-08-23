@@ -1513,6 +1513,17 @@ export class QwenAgentTransport {
         turn.ws?.close()
         this.#release(turn)
       },
+      // ESS-1068 复审第1点：把 Watch 的 playback 回执转发给 qwen，
+      // 触发 qwen 的 `startPlayback` → `announcements.confirmMany`（ack）。
+      // qwen 侧协议：`{ type: 'playback.started'|'playback.ended', responseId }`。
+      playbackStarted: responseId => {
+        if (turn.terminal || turn.ws?.readyState !== WebSocket.OPEN) return
+        turn.ws.send(JSON.stringify({ type: 'playback.started', responseId: String(responseId ?? '') }))
+      },
+      playbackEnded: responseId => {
+        if (turn.terminal || turn.ws?.readyState !== WebSocket.OPEN) return
+        turn.ws.send(JSON.stringify({ type: 'playback.ended', responseId: String(responseId ?? '') }))
+      },
     }
   }
 }
