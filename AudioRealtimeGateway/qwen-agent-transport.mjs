@@ -1475,6 +1475,14 @@ export class QwenAgentTransport {
             if (!turn.pendingToolCall) {
               turn.pendingToolCall = true
               this.log('upstream_tool_call_pending', { ...scopeLog, upstream_response_id: upstreamResponseId })
+              // ESS-1097: the client needs the latch too. Between here and the
+              // first `task.*` frame the upstream emits `voice.state=idle` while
+              // the tool is still being dispatched — a client that only sees
+              // audio-side facts reads that gap as「turn over」and relistens.
+              onEvent({
+                type: 'agent.tool_call_state', response_id: responseId,
+                status: 'tool_call_pending',
+              })
             }
             // A parked segment must not close the turn while the tool runs:
             // re-arm its window with the dedicated tool-call window (the
@@ -1485,6 +1493,14 @@ export class QwenAgentTransport {
             && responseOrigin === 'agent') {
             turn.pendingToolCall = false
             this.log('upstream_tool_call_resolved', { ...scopeLog, upstream_response_id: upstreamResponseId })
+            // ESS-1097: covers the residual case「a tool call was announced but
+            // no task id ever appeared」. A client that saw `tool_call_pending`
+            // has nothing else that can release its latch, so this frame is a
+            // server obligation, not an optimisation.
+            onEvent({
+              type: 'agent.tool_call_state', response_id: responseId,
+              status: 'tool_call_resolved',
+            })
             // The tool result is the final segment. End the turn as soon as its
             // audio settles — immediately if the segment already closed, or on
             // the pending `flushDone` otherwise.
