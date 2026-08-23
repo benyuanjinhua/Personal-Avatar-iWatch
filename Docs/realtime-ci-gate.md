@@ -6,6 +6,10 @@
 
 ## 1. 门禁总览
 
+> 卡点定位（白梦林 2026-08-23）：本文的机器门禁是 **PR 合入 main 的卡点**；
+> 真机门禁（`Docs/realtime-device-gate.md`）才是 **ESS-1071 验收收口的硬卡点**。
+> 两者分工沿用仓库 R-02.5：真机验收是 issue 收口卡点，不是 PR 合入卡点。
+
 | 行 | 门禁 | 位置 | 命令 | 判定 |
 |---|---|---|---|---|
 | 1 | AudioRealtimeGateway 单元/契约测试 | `AudioRealtimeGateway` | `npm test` | 全绿（0 fail） |
