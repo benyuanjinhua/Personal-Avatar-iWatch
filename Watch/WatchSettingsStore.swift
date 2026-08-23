@@ -335,6 +335,10 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         case .audioSegmentDone:
             sequenceDetail = " segment_index=\(envelope.sequence?.description ?? "nil")"
                 + " final_sequence=\(envelope.finalSequence?.description ?? "nil")"
+        case .turnTask:
+            sequenceDetail = " task_id=\(envelope.taskId ?? "nil")"
+                + " task_status=\(envelope.taskStatus ?? "nil")"
+                + " task_terminal=\(envelope.taskTerminal.map(String.init) ?? "nil")"
         case .ready, .playbackClear, .responseInterrupted, .bridgeFallback,
              .transcriptDelta, .transcriptFinal, .generationOpen, .bargeInFailed,
              .transportFailed,
@@ -398,6 +402,23 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             adapter.markBargeInFailed(reason: envelope.reason ?? "unspecified")
         case .transportFailed:
             adapter.markTransportFailed(reason: envelope.reason ?? "unspecified")
+        case .turnTask:
+            // ESS-1097：任务事实。没有 task_id 的信封什么都证明不了，丢弃留证——
+            // 静默 return 正是 ESS-971 「协议上线却毫无效果」的复发形态。
+            guard let taskId = envelope.taskId, !taskId.isEmpty else {
+                WatchLog.error(
+                    "turn", "turn_task_missing_id",
+                    requestId: envelope.requestId,
+                    detail: "session=\(envelope.sessionId)", code: "ERR_DECODE"
+                )
+                return
+            }
+            adapter.markTurnTaskState(
+                taskId: taskId,
+                status: envelope.taskStatus ?? "unknown",
+                terminal: envelope.taskTerminal ?? false,
+                requestId: envelope.requestId
+            )
         }
     }
 

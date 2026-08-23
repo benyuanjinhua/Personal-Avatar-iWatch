@@ -661,9 +661,21 @@ test('ESS-990 · 全栈：真实上游时序（每段 done 后立刻 idle）下�
   }))
   await waitFor(() => sent.some(frame => frame.type === 'audio.done'), 6_000)
 
+  // ESS-1097：`turn.task` 现在也走下行（客户端需要它才知道「工具还在跑」）。
+  // 这里把它**显式**写进期望序列而不是过滤掉——它落在哪一步是契约的一部分：
+  // 任务事实必须在第二段音频之前到达客户端，否则客户端在段落间隙里仍然是
+  // 瞎的，本单等于没做。
   assert.deepEqual(sent.map(f => f.type), [
-    'ready', 'audio.delta', 'audio.segment_done', 'audio.delta', 'audio.delta', 'audio.done',
+    'ready', 'audio.delta', 'turn.task',
+    'audio.segment_done', 'audio.delta', 'audio.delta', 'audio.done',
   ])
+  const taskFrame = sent.find(f => f.type === 'turn.task')
+  assert.equal(taskFrame.task_id, 'work_weather')
+  assert.equal(taskFrame.status, 'queued')
+  assert.equal(taskFrame.terminal, false)
+  assert.equal(taskFrame.request_id, 'r10')
+  assert.equal(taskFrame.session_id, 's10')
+  assert.equal(taskFrame.generation, 1)
   assert.deepEqual(sent.filter(f => f.type === 'audio.delta').map(f => f.sequence), [0, 1, 2])
   assert.equal(sent.at(-1).final_sequence, 2)
   assert.equal(session.doneEmitted, true)

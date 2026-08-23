@@ -125,6 +125,12 @@ final class WatchRealtimeMediaAdapter {
     /// ESS-971：**本段**播完，回合未完。上层应走 `markAnswerInterim`
     /// （退回等待态、重新武装有界超时、**不开下一轮**），而不是回合终态。
     var onAnswerPlaybackSegmentFinished: (@MainActor (RealtimeMediaSession.TurnHandle, _ bytesPlayed: Int) -> Void)?
+    /// ESS-1097：上游任务生命周期（`turn.task`）。只在**本回合**（requestId
+    /// 匹配 `currentTurn`）时上报——迟到的上一轮任务事件不得影响当前回合的
+    /// 聚合。本回调**不动任何播放屏障**，也不置位回合终态。
+    var onTurnTaskState: (@MainActor (RealtimeMediaSession.TurnHandle,
+                                      _ taskId: String, _ status: String,
+                                      _ terminal: Bool) -> Void)?
     /// ESS-600：realtime 播放失败。失败不得伪装成播完——会话层据此走
     /// `session_answer_failed` 的显式恢复路径。
     var onAnswerPlaybackFailed: (@MainActor (RealtimeMediaSession.TurnHandle, _ code: String) -> Void)?
@@ -791,6 +797,33 @@ final class WatchRealtimeMediaAdapter {
             responseId: responseId,
             generation: generation
         )
+    }
+
+    /// ESS-1097：上游任务生命周期到达。
+    ///
+    /// 刻意**不**经过 `RealtimeMediaSession`：那是播放/屏障协调器，任务事实
+    /// 与音频屏障正交，塞进去会让「回合终态」多出一个它管不了的输入。这里
+    /// 只做回合归属校验与取证，再原样交给会话层的回合聚合。
+    func markTurnTaskState(taskId: String, status: String, terminal: Bool, requestId: String?) {
+        guard let handle = currentTurn else {
+            WatchLog.info(
+                "realtime", "turn_task_no_active_turn", requestId: requestId,
+                detail: "task_id=\(taskId) status=\(status) terminal=\(terminal)"
+            )
+            return
+        }
+        if let requestId, requestId != handle.requestId {
+            WatchLog.info(
+                "realtime", "stale_turn_task_dropped", requestId: requestId,
+                detail: "task_id=\(taskId) status=\(status) active_request_id=\(handle.requestId)"
+            )
+            return
+        }
+        WatchLog.info(
+            "realtime", "turn_task_state", requestId: handle.requestId,
+            detail: "task_id=\(taskId) status=\(status) terminal=\(terminal)"
+        )
+        onTurnTaskState?(handle, taskId, status, terminal)
     }
 
     /// ESS-404 §3.5: iPhone confirmed the new generation after Watch's

@@ -136,6 +136,14 @@ final class AudioRealtimeAgentSession {
     /// 对着半句话干等。
     var onSegmentDropped: ((String, String?, Int, Int) -> Void)?
 
+    /// ESS-1097：上游任务生命周期（`turn.task`）。
+    /// Params: (requestId, responseId, generation, taskId, status, terminal)。
+    ///
+    /// **不改变任何播放屏障**，也不置位回合终态——它只是把「工具还在跑」
+    /// 这一事实交给会话层的回合聚合（`ToolTurnAggregate`），让客户端不必
+    /// 再用网关的有界空闲窗去猜回合有没有完。
+    var onTaskState: ((String, String?, Int, String, String, Bool) -> Void)?
+
     /// Emitted on Gateway `error`.
     /// Params: (code, requestId, generation, retriable, detail).
     var onError: ((String, String, Int, Bool, String?) -> Void)?
@@ -385,6 +393,24 @@ final class AudioRealtimeAgentSession {
                 code: "ERR_UPSTREAM_AUDIO_AFTER_DONE"
             )
             onSegmentDropped?(rid, respId, gen, droppedCount)
+
+        case .taskState(let sid, let rid, let respId, let gen,
+                        let taskId, let status, let isTerminal):
+            guard sid == sessionId, let turn = currentTurn,
+                  turn.requestId == rid else { return }
+            // 任务事件也证明「上游还活着、这一轮还在推进」，与音频/文本同权撤掉
+            // 「等首个响应」的预算——否则一个纯工具的慢回合会被响应超时误杀。
+            cancelResponseWait()
+            Self.logger.info(
+                "agent turn.task rid=\(rid.prefix(8), privacy: .public) gen=\(gen) task=\(taskId.prefix(8), privacy: .public) status=\(status, privacy: .public) terminal=\(isTerminal)"
+            )
+            PhoneAgentClientLog.info(
+                module: Self.logModule,
+                event: "downlink_turn_task",
+                requestId: rid, sessionId: sid,
+                detail: "task_id=\(taskId) status=\(status) terminal=\(isTerminal) gen=\(gen)"
+            )
+            onTaskState?(rid, respId, gen, taskId, status, isTerminal)
 
         case .cancelAck(let sid, let rid, let gen, let cancelledRespId):
             guard sid == sessionId else { return }

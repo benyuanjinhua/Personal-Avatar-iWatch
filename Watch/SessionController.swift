@@ -87,6 +87,18 @@ final class SessionController: ObservableObject {
     }
     /// ESS-600：当前回合相位。`state != .listening` 时恒为 `.idle`。
     @Published private(set) var turnPhase: TurnPhase = .idle
+    /// ESS-1097：本轮的**聚合事实**（提交 / 工具任务 / 起播 / 回合屏障 /
+    /// 播放终局 / 显式终态）。`turnPhase` 是 UI 相位的唯一持有者，本聚合
+    /// 是它的**依据**，不是第二份拷贝——`toolTurnUIState` 给出聚合导出的
+    /// 应有相位，测试据此钉死两者不漂移。
+    ///
+    /// 它存在的理由是 ESS-1095 的失败面：客户端此前判「这一轮完了没有」只有
+    /// 音频侧的输入，对「工具任务还在跑」一无所知，只能依赖网关的有界空闲窗
+    /// （ESS-1043 `toolCallWindowMs = 30_000`）。窗口被一次更慢的工具跑穿，
+    /// 手表就提前回「正在听」，用户一开口就把工具回合 supersede 掉。
+    private(set) var toolTurn = ToolTurnAggregate()
+    /// ESS-1097：被任务闸门扣住、等任务终结后再释放的回合终态。
+    private var heldAnswerFinish: (requestId: String, success: Bool, reason: String)?
     /// ESS-600：本地采集是否真的在跑。与「网络通道是否 ready」**独立呈现**——
     /// 建立期就已经在录音，用户必须能看到「表在听」，而不是只有一个
     /// 分不清死活的建立中动画（ESS-598 的「说话完全无反馈」正是这一条缺失）。
@@ -254,6 +266,8 @@ final class SessionController: ObservableObject {
     private var turnCapToken: SessionDelayToken?
     private var thinkingToken: SessionDelayToken?
     private var relistenToken: SessionDelayToken?
+    /// ESS-1097：任务闸门的上界计时器（`ToolTurnAggregate.maxTaskHoldSeconds`）。
+    private var toolHoldToken: SessionDelayToken?
     /// ESS-652: 思考慢提示 / 硬超时 / 静默 / P6 自动挂断计时器。
     private var thinkingSlowToken: SessionDelayToken?
     private var thinkingHardToken: SessionDelayToken?
@@ -319,6 +333,15 @@ final class SessionController: ObservableObject {
         turnIndex = 1
         activeTurnRequestId = onBeginChannel?() ?? nil
         turnPhase = .idle
+        resetToolTurn()
+    }
+
+    /// ESS-1097：跨回合重置聚合。聚合描述的是**这一轮**，跨轮保留会让上一轮
+    /// 的工具任务把新一轮扣住。
+    private func resetToolTurn() {
+        toolHoldToken?.cancel(); toolHoldToken = nil
+        heldAnswerFinish = nil
+        toolTurn = ToolTurnAggregate()
     }
 
     /// ESS-600：本地采集真的开始/停止了（AudioRecorder 层事实）。与网络
@@ -475,6 +498,7 @@ final class SessionController: ObservableObject {
         }
         turnCapToken?.cancel(); turnCapToken = nil
         turnPhase = .thinking
+        toolTurn.noteCommitted()
         WatchLog.info(
             "session", "session_turn_committed", requestId: requestId,
             detail: "turn_index=\(turnIndex) phase=thinking"
@@ -492,6 +516,14 @@ final class SessionController: ObservableObject {
     /// `session_thinking_slow` 的 `turn_index` 是 ESS-655 契约的必带字段，
     /// 另一版没带，落进日志就过不了 `PhoneModeTelemetry.validate`。
     private func armThinkingTimeout() {
+        // ESS-1097：45s 是「没有任何证据时」的预算。此刻若有任务在跑，我们
+        // 有明确证据说上游正在干活——让位给任务上界，否则两个计时器会互相
+        // 打架：任务事件先到（闸门武装、45s 取消）、提交后这里又把 45s 装
+        // 回来，一个 40s 的工具调用照样被判死。
+        if toolTurn.isHoldingForTask {
+            armToolHoldDeadlineIfNeeded()
+            return
+        }
         thinkingSlowToken?.cancel()
         thinkingSlowHint = false
         thinkingSlowToken = scheduleDelay(Self.thinkingSlowHintSeconds) { [weak self] in
@@ -503,7 +535,11 @@ final class SessionController: ObservableObject {
         thinkingHardToken?.cancel()
         thinkingHardToken = scheduleDelay(Self.thinkingHardTimeoutSeconds) { [weak self] in
             guard let self, self.isInSession, self.turnPhase == .thinking else { return }
-            WatchLog.info("session", "session_thinking_hard_timeout", requestId: self.activeTurnRequestId)
+            WatchLog.info(
+                "session", "session_thinking_hard_timeout", requestId: self.activeTurnRequestId,
+                detail: self.toolTurn.evidence
+            )
+            self.toolTurn.noteTerminal(.timedOut)
             self.enterFailed(reason: "回答超时，要再试一次吗？", retryable: true)
         }
     }
@@ -526,6 +562,7 @@ final class SessionController: ObservableObject {
         }
         let fromPhase = turnPhase
         turnPhase = .thinking
+        toolTurn.notePlaybackEnded()
         lowVolumeHint = false
         // ESS-650：interim 播完退回等待态，已不在 speaking，停采。
         stopBargeInListening(reason: "answer_interim")
@@ -549,6 +586,7 @@ final class SessionController: ObservableObject {
         }
         thinkingToken?.cancel(); thinkingToken = nil
         turnPhase = .speaking
+        toolTurn.noteAnswerAudioStarted()
         WatchLog.info(
             "session", "session_answer_started", requestId: requestId,
             detail: "turn_index=\(turnIndex) phase=speaking"
@@ -654,6 +692,18 @@ final class SessionController: ObservableObject {
             return
         }
         let fromPhase = turnPhase
+        // ESS-1097：回合终态屏障 + 播放终局，两条音频侧事实都成立了。
+        // 但「音频完了」不等于「这一轮完了」——工具任务仍在跑时，收口就是
+        // ESS-1095 的失败面本身（提前回聆听 → 用户开口 → supersede → 工具
+        // 结果丢失）。这里把终态扣住，等任务终结或上界到点再释放。
+        toolTurn.noteTurnBarrierDone()
+        toolTurn.notePlaybackEnded()
+        if toolTurn.isHoldingForTask {
+            holdTurnTerminalForTask(
+                requestId: requestId, success: success, reason: reason, fromPhase: fromPhase
+            )
+            return
+        }
         if success {
             // ESS-944：rounds 口径对齐 play_finished——只有回答真实播完才计一轮，
             // 失败/打断/中止不计数（验收标准 4）。
@@ -672,6 +722,141 @@ final class SessionController: ObservableObject {
         // ESS-650：离开 speaking 即停采（回答播完 / 失败都算）。
         stopBargeInListening(reason: success ? "answer_finished" : "answer_failed")
         startNextTurn(reason: success ? "answer_finished" : "answer_failed:\(reason)")
+    }
+
+    // MARK: - ESS-1097 工具任务闸门
+
+    /// 上游任务生命周期（`turn.task`，经网关 → iPhone → Watch）。
+    ///
+    /// 三重闸门与其它回合事件同构：会话存续 → request_id 归属 → 相位。
+    /// 相位这一层刻意宽松：任务事件可以在 `.thinking`（工具在跑）也可以在
+    /// `.speaking`（第一段在播、工具已经启动）到达，两者都是真事实。
+    func markTaskState(requestId: String, taskId: String, status: String, terminal: Bool) {
+        guard isInSession else { return }
+        guard let active = activeTurnRequestId, active == requestId else {
+            WatchLog.info(
+                "session", "session_stale_turn_event", requestId: requestId,
+                detail: "event=task_state task_id=\(taskId) status=\(status) "
+                    + "active_request_id=\(activeTurnRequestId ?? "nil") turn_index=\(turnIndex)"
+            )
+            return
+        }
+        let changed = toolTurn.noteTask(id: taskId, terminal: terminal, atMs: nowMs())
+        WatchLog.info(
+            "session", "session_turn_task", requestId: requestId,
+            detail: "task_id=\(taskId) status=\(status) terminal=\(terminal) "
+                + "changed=\(changed) turn_index=\(turnIndex) \(toolTurn.evidence)"
+        )
+        guard changed else { return }
+        if toolTurn.isHoldingForTask {
+            // 任务刚登记：如果这一轮还在等回答，把 45s 硬超时换成任务上界——
+            // 45s 是「没有任何证据时」的预算，此刻我们有明确证据说上游在干活。
+            armToolHoldDeadlineIfNeeded()
+            return
+        }
+        releaseHeldTurnTerminal(reason: "task_terminal")
+    }
+
+    /// 回合终态被任务闸门扣住：相位退回/保持 `.thinking`，行为与段落 interim
+    /// 完全同构（不开下一轮、不计一轮、停打断监听），差别只在**为什么等**。
+    private func holdTurnTerminalForTask(
+        requestId: String, success: Bool, reason: String, fromPhase: TurnPhase
+    ) {
+        heldAnswerFinish = (requestId: requestId, success: success, reason: reason)
+        turnPhase = .thinking
+        lowVolumeHint = false
+        stopBargeInListening(reason: "tool_task_pending")
+        WatchLog.info(
+            "session", "session_turn_terminal_held_by_task", requestId: requestId,
+            detail: "turn_index=\(turnIndex) from=\(fromPhase.logName) "
+                + "playback_reason=\(reason) success=\(success) \(toolTurn.evidence)"
+        )
+        armToolHoldDeadlineIfNeeded()
+    }
+
+    /// 任务闸门的**上界**。没有它，一个永远等不到 `task.completed` 的上游 bug
+    /// 会把手表钉死在「正在思考」，直到用户自己退出——那比提前回聆听更糟。
+    ///
+    /// 与既有 45s 硬思考超时的关系：两者是同一条时间线上的两个闸门。有任务
+    /// 证据时用本闸门（更长，因为我们知道上游在干活），到点**强制释放任务**
+    /// 而不是直接判失败——释放之后回合按既有路径收口：已经扣住的终态就地
+    /// 兑现，还没等到答案的就交回 45s 那条路。
+    private func armToolHoldDeadlineIfNeeded() {
+        guard toolTurn.isHoldingForTask else { return }
+        // 有任务证据 → 45s 硬超时让位给任务上界；否则两个计时器会互相打架。
+        thinkingSlowToken?.cancel(); thinkingSlowToken = nil
+        thinkingHardToken?.cancel(); thinkingHardToken = nil
+        guard toolHoldToken == nil else { return }
+        let elapsedMs = toolTurn.taskHoldElapsedMs(nowMs: nowMs()) ?? 0
+        let remaining = max(
+            0.5,
+            ToolTurnAggregate.maxTaskHoldSeconds - TimeInterval(elapsedMs) / 1000
+        )
+        WatchLog.info(
+            "session", "session_tool_hold_armed", requestId: activeTurnRequestId,
+            detail: "turn_index=\(turnIndex) budget_s=\(Int(remaining)) \(toolTurn.evidence)"
+        )
+        toolHoldToken = scheduleDelay(remaining) { [weak self] in
+            guard let self, self.isInSession else { return }
+            self.toolHoldToken = nil
+            guard self.toolTurn.forceReleaseTasks(reason: "tool_hold_deadline") else { return }
+            WatchLog.error(
+                "session", "session_tool_hold_deadline", requestId: self.activeTurnRequestId,
+                detail: "turn_index=\(self.turnIndex) "
+                    + "budget_s=\(Int(ToolTurnAggregate.maxTaskHoldSeconds)) \(self.toolTurn.evidence)",
+                code: "ERR_SESSION_TOOL_HOLD_TIMEOUT"
+            )
+            self.releaseHeldTurnTerminal(reason: "tool_hold_deadline")
+        }
+    }
+
+    /// 闸门解除。有被扣住的终态就地兑现；没有（答案还没来）则把这一轮交回
+    /// 既有的 45s 硬思考超时，不留下一个没人计时的等待。
+    private func releaseHeldTurnTerminal(reason: String) {
+        guard !toolTurn.isHoldingForTask else { return }
+        toolHoldToken?.cancel(); toolHoldToken = nil
+        guard let held = heldAnswerFinish else {
+            guard turnPhase == .thinking, toolTurn.sawTask else { return }
+            WatchLog.info(
+                "session", "session_tool_hold_released", requestId: activeTurnRequestId,
+                detail: "turn_index=\(turnIndex) reason=\(reason) disposition=await_answer"
+            )
+            armThinkingTimeout()
+            return
+        }
+        heldAnswerFinish = nil
+        WatchLog.info(
+            "session", "session_tool_hold_released", requestId: held.requestId,
+            detail: "turn_index=\(turnIndex) reason=\(reason) disposition=finish_turn "
+                + "\(toolTurn.evidence)"
+        )
+        if held.success {
+            markRoundCompleted()
+            WatchLog.info(
+                "session", "session_answer_finished", requestId: held.requestId,
+                detail: "turn_index=\(turnIndex) from=thinking reason=\(held.reason) "
+                    + "released_by=\(reason)"
+            )
+        } else {
+            WatchLog.error(
+                "session", "session_answer_failed", requestId: held.requestId,
+                detail: "turn_index=\(turnIndex) from=thinking reason=\(held.reason) "
+                    + "released_by=\(reason)",
+                code: "ERR_SESSION_ANSWER_FAILED"
+            )
+        }
+        startNextTurn(reason: held.success
+            ? "answer_finished:\(reason)"
+            : "answer_failed:\(held.reason)")
+    }
+
+    /// ESS-1097：聚合导出的应有相位。视图不直接读它（相位仍由 `turnPhase`
+    /// 承担），测试用它钉死「UI 由聚合驱动」这条验收——两者漂移即失败。
+    var toolTurnUIState: ToolTurnUIState { toolTurn.uiState }
+
+    /// 单调毫秒时钟。闸门只用它算「已经等了多久」，不参与任何回合归属判定。
+    private func nowMs() -> Int64 {
+        Int64(DispatchTime.now().uptimeNanoseconds / 1_000_000)
     }
 
     /// ESS-1044：本轮在服务端**判了终态失败**（relay `phase=failed` /
@@ -729,6 +914,9 @@ final class SessionController: ObservableObject {
         turnCapToken?.cancel(); turnCapToken = nil
         thinkingToken?.cancel(); thinkingToken = nil
         turnPhase = .idle
+        // ESS-1097：零提交回合没有答案也没有工具任务可等，聚合就地清空——
+        // 否则残留会把紧接着的重开采集挡在任务闸门外。
+        resetToolTurn()
         WatchLog.info(
             "session", "session_turn_aborted", requestId: requestId,
             detail: "turn_index=\(turnIndex) reason=\(reason) relisten_in_ms=\(Int(Self.abortedTurnRelistenDelaySeconds * 1000))"
@@ -777,7 +965,8 @@ final class SessionController: ObservableObject {
                 code: "ERR_SESSION_STOP_UNCONFIRMED"
             )
         }
-        startNextTurn(reason: "user_interrupt")
+        toolTurn.noteTerminal(.cancelled)
+        startNextTurn(reason: "user_interrupt", automatic: false)
     }
 
     /// 开启下一轮采集。`onStartTurn` 返回新一轮的 request_id——从这一刻起
@@ -813,8 +1002,23 @@ final class SessionController: ObservableObject {
         armTurnCap()
     }
 
-    private func startNextTurn(reason: String) {
+    /// - Parameter automatic: 是否是**自动**开下一轮（回答播完 / 零提交收场）。
+    ///   用户显式打断走 `false`——「不许自动开新 generation」与「不许用户主动
+    ///   开口」是两件事，ESS-1097 验收里明确后者不受限。
+    private func startNextTurn(reason: String, automatic: Bool = true) {
         guard state == .listening else { return }
+        // ESS-1097 纵深防御：正常路径上 `markAnswerFinished` 已经把带任务的
+        // 回合扣住了，走不到这里；万一将来新增一条边忘了过闸门，这条守卫
+        // 保证「工具回合未终结时不自动开新 generation」仍然成立。
+        if automatic, !toolTurn.mayAutoStartNextTurn {
+            WatchLog.info(
+                "session", "session_next_turn_blocked_by_task",
+                requestId: activeTurnRequestId,
+                detail: "turn_index=\(turnIndex) reason=\(reason) \(toolTurn.evidence)"
+            )
+            armToolHoldDeadlineIfNeeded()
+            return
+        }
         relistenToken?.cancel(); relistenToken = nil
         thinkingToken?.cancel(); thinkingToken = nil
         lowVolumeHint = false
@@ -833,6 +1037,7 @@ final class SessionController: ObservableObject {
         turnIndex += 1
         activeTurnRequestId = requestId
         turnPhase = .listening
+        resetToolTurn()
         didDetectSpeechThisTurn = false
         WatchLog.info(
             "session", "session_next_listening", requestId: requestId,
@@ -881,6 +1086,14 @@ final class SessionController: ObservableObject {
     func enterFailed(reason: String, retryable: Bool) {
         state = .failed
         failedReason = reason
+        // ESS-1097：显式终态必须**先**在聚合上留证再收束——否则真机复盘看不出
+        // 「失败时这一轮到底卡在哪一步」（有没有工具任务在跑、屏障来没来）。
+        if toolTurn.noteTerminal(.failed) {
+            WatchLog.info(
+                "session", "session_turn_terminal_marked", requestId: activeTurnRequestId,
+                detail: "kind=failed turn_index=\(turnIndex) \(toolTurn.evidence)"
+            )
+        }
         // 同 enterHungup：失败也必须收束回合状态与采集。
         resetTurnStateOnExit()
         failedRetryable = retryable
@@ -917,6 +1130,13 @@ final class SessionController: ObservableObject {
     /// 进入 P7 挂断态。显示摘要，1.2s 后回 idle。
     func enterHungup(rounds: Int, reason: String) {
         lastExitReasonCode = Self.exitReasonCode(for: reason)
+        // ESS-1097：用户挂断 / 静默挂断是显式终态，同样先留证再收束。
+        if toolTurn.noteTerminal(.cancelled) {
+            WatchLog.info(
+                "session", "session_turn_terminal_marked", requestId: activeTurnRequestId,
+                detail: "kind=cancelled turn_index=\(turnIndex) reason=\(reason) \(toolTurn.evidence)"
+            )
+        }
         state = .hungup
         failedReason = nil
         failedRetryable = false
@@ -1019,6 +1239,7 @@ final class SessionController: ObservableObject {
         stopBargeInListeningOnTeardown()
         let turns = turnIndex
         state = .disconnecting
+        resetToolTurn()
         turnPhase = .idle
         activeTurnRequestId = nil
         turnIndex = 0
@@ -1037,6 +1258,7 @@ final class SessionController: ObservableObject {
     private func resetTurnStateOnExit() {
         cancelTurnTimers()
         stopBargeInListening(reason: "session_exit")
+        resetToolTurn()
         turnPhase = .idle
         activeTurnRequestId = nil
         turnIndex = 0
@@ -1051,6 +1273,10 @@ final class SessionController: ObservableObject {
         turnCapToken?.cancel(); turnCapToken = nil
         thinkingToken?.cancel(); thinkingToken = nil
         relistenToken?.cancel(); relistenToken = nil
+        // ESS-1097：任务闸门与被它扣住的终态一并清掉。留着会让退出后的
+        // 迟到任务事件把一个已经不存在的回合“释放”出去。
+        toolHoldToken?.cancel(); toolHoldToken = nil
+        heldAnswerFinish = nil
         // ESS-652: cancel thinking slow/hard timers on turn reset.
         thinkingSlowToken?.cancel(); thinkingSlowToken = nil
         thinkingHardToken?.cancel(); thinkingHardToken = nil
@@ -1260,6 +1486,14 @@ enum SessionTurnWiring {
         // ESS-1044：服务端判本轮终态失败 → 立刻收口，不等 45s 硬超时。
         pushToTalk.onSessionTurnFailed = { [weak session] requestId, errorCode in
             session?.markTurnFailed(requestId: requestId, errorCode: errorCode)
+        }
+        // ESS-1097：上游任务生命周期 → 回合聚合。这条接线本身就是本单的
+        // 核心交付：没有它，客户端对「工具还在跑」永远一无所知（ESS-600 的
+        // 教训——接线没接上等于核心闭环没接通）。
+        pushToTalk.onSessionTaskState = { [weak session] requestId, taskId, status, terminal in
+            session?.markTaskState(
+                requestId: requestId, taskId: taskId, status: status, terminal: terminal
+            )
         }
         pushToTalk.onLocalCaptureChanged = { [weak session] active in
             session?.markLocalCapture(active: active)

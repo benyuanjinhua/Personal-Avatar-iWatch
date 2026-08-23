@@ -293,6 +293,12 @@ enum RealtimeDownlinkKind: String, Codable, Sendable {
     /// ESS-969 / ESS-971：**本段结束，回合未结束**。屏障语义与 `audioDone`
     /// 一致，但客户端必须保持本轮打开（`markAnswerInterim`），不开下一轮。
     case audioSegmentDone = "audio.segment_done"
+    /// ESS-1097：上游任务生命周期（`task.accepted/running/completed/…`）。
+    /// 客户端此前对「工具任务还在跑」完全不知情，只能靠网关的有界空闲窗
+    /// 猜回合终态；窗口被一次更慢的工具跑穿，手表就提前回「正在听」，用户
+    /// 一开口就把工具回合 supersede 掉。本事件把任务事实交到客户端手里。
+    /// 纯取证 + 门禁，不携带音频，也不改变任何播放屏障。
+    case turnTask = "turn.task"
 
     /// 未知 kind 不得让**整个信封**解码失败。
     ///
@@ -353,6 +359,20 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
     var conversationId: String?
     /// ESS-571: optional turn-level identity (Phase 0 dual-write).
     var turnId: String?
+    /// ESS-1097: `turn.task` 的任务 id。只在该 kind 上出现。
+    ///
+    /// 这里**没有**复用 `transcript` / `reason` 之类的既有字段（ESS-971 给
+    /// `segmentIndex` 借 `sequence` 是权衡后的例外）：任务 id 会进入分发层的
+    /// 路由与日志，借道 `transcript` 会让「文本事件」这条路由拿到一个不是文本
+    /// 的值，是下一个 ESS-971 式的隐藏坑。三个可选字段对未升级的一侧完全透明
+    /// （解码 `decodeIfPresent`，编码 nil 即不写键）。
+    var taskId: String?
+    /// ESS-1097: 任务状态原文（`accepted` / `running` / `completed` / …）。取证用；
+    /// 门禁只看 `taskTerminal`——终态口径由网关按上游事件判定后下发，客户端不
+    /// 自己维护一份 status 白名单，避免两侧口径漂移。
+    var taskStatus: String?
+    /// ESS-1097: 该任务是否已达终态。
+    var taskTerminal: Bool?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
@@ -368,6 +388,9 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         case finalSequence = "final_sequence"
         case conversationId = "conversation_id"
         case turnId = "turn_id"
+        case taskId = "task_id"
+        case taskStatus = "task_status"
+        case taskTerminal = "task_terminal"
     }
 
     init(
@@ -383,7 +406,10 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         generation: Int? = nil,
         finalSequence: Int? = nil,
         conversationId: String? = nil,
-        turnId: String? = nil
+        turnId: String? = nil,
+        taskId: String? = nil,
+        taskStatus: String? = nil,
+        taskTerminal: Bool? = nil
     ) {
         self.protocolVersion = protocolVersion
         self.kind = kind
@@ -398,6 +424,9 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         self.finalSequence = finalSequence
         self.conversationId = conversationId
         self.turnId = turnId
+        self.taskId = taskId
+        self.taskStatus = taskStatus
+        self.taskTerminal = taskTerminal
     }
 
     /// Explicit decoder so pre-ESS-404 messages (no `generation`, no
@@ -418,6 +447,9 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         self.finalSequence = try c.decodeIfPresent(Int.self, forKey: .finalSequence)
         self.conversationId = try c.decodeIfPresent(String.self, forKey: .conversationId)
         self.turnId = try c.decodeIfPresent(String.self, forKey: .turnId)
+        self.taskId = try c.decodeIfPresent(String.self, forKey: .taskId)
+        self.taskStatus = try c.decodeIfPresent(String.self, forKey: .taskStatus)
+        self.taskTerminal = try c.decodeIfPresent(Bool.self, forKey: .taskTerminal)
     }
 
     /// Bridge PR #113 handshake ack. Carries no payload. Adapter treats this
@@ -490,6 +522,28 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
             kind: .audioSegmentDone, requestId: requestId, sessionId: sessionId,
             sequence: segmentIndex, audio: nil, transcript: nil, reason: nil,
             responseId: responseId, generation: generation, finalSequence: finalSequence
+        )
+    }
+
+    /// ESS-1097：上游任务生命周期。不携带音频，不动任何播放屏障——它唯一的
+    /// 作用是让 Watch 的回合聚合知道「工具还在跑」，从而不提前回聆听、不自动
+    /// 开下一轮。`generation` 照常带上，陈旧代的任务事件在 iPhone 侧就被
+    /// 既有的 generation 门禁挡掉。
+    static func turnTask(
+        requestId: String,
+        sessionId: String,
+        responseId: String? = nil,
+        generation: Int? = nil,
+        taskId: String,
+        status: String,
+        terminal: Bool
+    ) -> Self {
+        RealtimeDownlinkEnvelope(
+            protocolVersion: RealtimeWireVersion.downlink,
+            kind: .turnTask, requestId: requestId, sessionId: sessionId,
+            sequence: nil, audio: nil, transcript: nil, reason: nil,
+            responseId: responseId, generation: generation,
+            taskId: taskId, taskStatus: status, taskTerminal: terminal
         )
     }
 

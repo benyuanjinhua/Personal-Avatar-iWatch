@@ -426,11 +426,47 @@ export class RealtimeSession {
       })
       return
     }
+    if (event.type === 'agent.task') return this._emitTaskState(event)
     if (event.type === 'agent.audio.delta') return this._emitDelta(event)
     if (event.type === 'agent.audio.segment_done') return this._emitSegmentDone(event)
     if (event.type === 'agent.audio.done') return this._emitDone(event)
     if (event.type === 'agent.error') return this.fail(event.code ?? 'ERR_UPSTREAM_UNAVAILABLE',
       { detail: event.detail ?? null, retriable: Boolean(event.retriable) })
+  }
+
+  // ESS-1097: forward the upstream task lifecycle to the client.
+  //
+  // Why the client needs it: until now the ONLY inputs a client had for「is
+  // this turn over」were audio-side (the `audio.done` barrier and its own
+  // playback endgame). Whether a tool was still running was known here and
+  // nowhere else, so the client had to trust this gateway's bounded idle
+  // window (ESS-1043 `toolCallWindowMs = 30_000`, calibrated on 8–16 s tool
+  // runs). One slower tool run overshoots that window, the client relistens,
+  // the user speaks, and the new request supersedes the tool turn — the
+  // ESS-1095 incident exactly.
+  //
+  // Deliberately NOT gated on `doneEmitted`: a task terminal that lands after
+  // the turn barrier is precisely what releases the client's hold. Dropping
+  // it there would reintroduce the deadlock this event exists to prevent.
+  // It carries no audio and touches no barrier — it cannot reorder or delay
+  // anything on the playback path.
+  _emitTaskState(event) {
+    const taskId = event.task?.id ?? null
+    if (taskId === null) return
+    const status = String(event.task?.status ?? 'unknown')
+    const terminal = Boolean(event.task?.terminal)
+    this._sendJson({
+      type: 'turn.task',
+      session_id: this.scope.session_id, request_id: this.scope.request_id,
+      response_id: this.responseId, generation: this.scope.generation,
+      task_id: String(taskId), status, terminal,
+    })
+    this.log('downlink_turn_task', {
+      request_id: this.scope.request_id, session_id: this.scope.session_id,
+      generation: this.scope.generation, response_id: this.responseId,
+      task_id: String(taskId), status, terminal,
+      after_turn_done: this.doneEmitted,
+    })
   }
 
   _emitDelta(event) {

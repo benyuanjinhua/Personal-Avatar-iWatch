@@ -199,6 +199,16 @@ enum AudioRealtimeAgentCodec {
         case segmentDropped(sessionId: String, requestId: String, responseId: String,
                             generation: Int, sequence: Int, droppedCount: Int,
                             reason: String?)
+        /// Gateway `turn.task`（ESS-1097）——上游任务生命周期。
+        ///
+        /// 客户端此前对「工具任务还在跑」完全不知情，判回合终态只有音频侧的
+        /// 两个输入（回合屏障 + 播放终局），于是只能依赖网关的有界空闲窗
+        /// （ESS-1043 `toolCallWindowMs = 30_000`）猜。窗口被一次更慢的工具
+        /// 跑穿，手表就提前回「正在听」，用户一开口就把工具回合 supersede 掉。
+        /// 本事件把任务事实交到客户端手里；`terminal` 由网关按上游 `task.*`
+        /// 判定后下发，客户端不自己维护 status 白名单（两侧口径不许漂移）。
+        case taskState(sessionId: String, requestId: String, responseId: String?,
+                       generation: Int, taskId: String, status: String, terminal: Bool)
         /// Gateway `cancel.ack` — server-authoritative cancel confirmation.
         case cancelAck(sessionId: String, requestId: String, generation: Int,
                        cancelledResponseId: String)
@@ -290,6 +300,23 @@ enum AudioRealtimeAgentCodec {
                 sessionId: sid, requestId: rid, responseId: respId,
                 generation: gen, sequence: sequence,
                 droppedCount: droppedCount, reason: reason
+            ))
+
+        case "turn.task":
+            guard let sid = raw["session_id"] as? String,
+                  let rid = raw["request_id"] as? String,
+                  let gen = raw["generation"] as? Int,
+                  let taskId = raw["task_id"] as? String,
+                  !taskId.isEmpty else { return .malformed }
+            // `status` / `terminal` 缺省不把整帧判死：一个没有 status 的任务事件
+            // 仍然证明「有任务在跑」，那正是本事件要传达的事实；缺 `terminal`
+            // 按非终态处理（fail-closed：宁可多等一个有界的窗口，也不要提前收口）。
+            let status = (raw["status"] as? String) ?? "unknown"
+            let terminal = (raw["terminal"] as? Bool) ?? false
+            return .event(.taskState(
+                sessionId: sid, requestId: rid,
+                responseId: raw["response_id"] as? String,
+                generation: gen, taskId: taskId, status: status, terminal: terminal
             ))
 
         case "cancel.ack":

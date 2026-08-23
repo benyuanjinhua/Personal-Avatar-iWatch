@@ -280,6 +280,33 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
             )
             self.onDownlink?(envelope)
         }
+        // ESS-1097：上游任务生命周期。与音频事件共用同一套 generation 门禁
+        // （陈旧代的任务事件不得影响当前回合的聚合），但**不**触发任何播放
+        // 屏障或回合终态——它只是把「工具还在跑」这一事实转发给 Watch。
+        agentSession.onTaskState = { [weak self] rid, respId, gen, taskId, status, terminal in
+            guard let self else { return }
+            guard self.gate.shouldForwardDownlink(generation: gen) else {
+                PhoneAgentClientLog.info(
+                    module: Self.logModule,
+                    event: "downlink_turn_task_stale_generation",
+                    requestId: rid, sessionId: self.sessionId,
+                    detail: "task_id=\(taskId) status=\(status) frame_gen=\(gen) current_gen=\(self.gate.generation)"
+                )
+                return
+            }
+            let envelope = RealtimeDownlinkEnvelope.turnTask(
+                requestId: rid, sessionId: self.sessionId,
+                responseId: respId, generation: gen,
+                taskId: taskId, status: status, terminal: terminal
+            )
+            PhoneAgentClientLog.info(
+                module: Self.logModule,
+                event: "downlink_enqueued",
+                requestId: rid, sessionId: self.sessionId,
+                detail: "type=turn.task task_id=\(taskId) status=\(status) terminal=\(terminal) gen=\(gen)"
+            )
+            self.onDownlink?(envelope)
+        }
         agentSession.onError = { [weak self] code, rid, gen, retriable, detail in
             guard let self else { return }
             Self.logger.error(

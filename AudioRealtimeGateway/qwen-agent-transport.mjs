@@ -1354,7 +1354,12 @@ export class QwenAgentTransport {
             ...scopeLog, task_id: id, status,
             outstanding: turn.outstandingTasks.size,
           })
-          onEvent({ type: 'agent.task', response_id: responseId, task: { id, status } })
+          // ESS-1097: `terminal` travels with the event so the CLIENT does not
+          // have to keep its own copy of the terminal-status whitelist. Two
+          // copies of that list is two chances to drift, and a client that
+          // guesses「completed」wrong either relistens while the tool runs
+          // (the ESS-1095 failure) or holds the turn open forever.
+          onEvent({ type: 'agent.task', response_id: responseId, task: { id, status, terminal } })
           return
         }
         // ESS-1043: qwen `response.done` is the response-level metadata that
