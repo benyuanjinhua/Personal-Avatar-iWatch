@@ -79,6 +79,22 @@ jobs:
         working-directory: MacRemoteFrontendBridge
         run: node projection/test/mock-tests.mjs
 
+      # R-02.5 关卡一 · 第 7 行（ESS-1071）：AudioRealtimeGateway 单元/契约
+      # 测试 + 单命令 E2E 门禁（三场景 + 六故障注入，无外部依赖）。
+      - name: Gateway — npm install
+        working-directory: AudioRealtimeGateway
+        run: npm install --no-audit --no-fund
+
+      - name: Gateway — npm test
+        working-directory: AudioRealtimeGateway
+        timeout-minutes: 10
+        run: npm test
+
+      - name: Gateway — realtime E2E gate
+        working-directory: AudioRealtimeGateway
+        timeout-minutes: 10
+        run: npm run test:e2e
+
       # R-02.5 关卡一 · 第 1 行：swift test 全绿
       - name: swift test
         run: swift test

@@ -65,6 +65,8 @@ describe('universal token reaches the allow branch through the real entry point 
       port: 0, bind: '127.0.0.1', state_dir: mkdtempSync(join(tmpdir(), 'gw-ess886-')),
       dev_allow_plain_ws: true, dev_universal_token: UNIVERSAL_TOKEN,
       heartbeat_interval_ms: 0, idle_disconnect_ms: 0,
+      // Hermetic on CI: no qwen-audio-agent on 127.0.0.1:3101.
+      agent_transport: 'mock',
     })
     const server = await gateway.start()
     port = server.address().port
