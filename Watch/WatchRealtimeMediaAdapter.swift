@@ -132,7 +132,11 @@ final class WatchRealtimeMediaAdapter {
     /// 它唯一的作用是喂会话层的回合聚合状态机：任务未终结时 UI 保持
     /// 「正在思考」，且禁止自动开下一轮 generation。
     /// `taskId == nil` = `tool_call_pending`（上游还没有任务号）。
-    var onAgentTaskState: (@MainActor (RealtimeMediaSession.TurnHandle, _ taskId: String?, _ status: String) -> Void)?
+    /// ESS-1100：同一帧可选携带的**阶段性进展文字**，只走展示面。
+    var onAgentTaskState: (@MainActor (
+        RealtimeMediaSession.TurnHandle, _ taskId: String?, _ status: String,
+        _ progress: AgentTaskProgress?
+    ) -> Void)?
 
     /// ESS-573: 真实通道就绪事件——本回合**首个被对端接受的 uplink ack**
     /// 到达时触发一次。该 ack 由 iPhone 在 WSS 实际发出音频后回发
@@ -790,19 +794,24 @@ final class WatchRealtimeMediaAdapter {
     ///
     /// 归属校验只认 `currentTurn`——上一轮的迟到 `task.state` 不得把当前回合
     /// 按在思考态上（那是另一种形式的卡死）。没有活跃回合时只留证。
-    func markAgentTaskState(taskId: String?, status: String) {
+    func markAgentTaskState(
+        taskId: String?, status: String, progress: AgentTaskProgress? = nil
+    ) {
         guard let handle = currentTurn else {
             WatchLog.info(
                 "realtime", "task_state_no_active_turn",
-                detail: "task_id=\(taskId ?? "nil") status=\(status)"
+                detail: "task_id=\(taskId ?? "nil") status=\(status) "
+                    + "progress_seq=\(progress?.sequence?.description ?? "nil")"
             )
             return
         }
         WatchLog.info(
             "realtime", "task_state", requestId: handle.requestId,
-            detail: "task_id=\(taskId ?? "nil") status=\(status) turn_id=\(handle.turnId)"
+            detail: "task_id=\(taskId ?? "nil") status=\(status) turn_id=\(handle.turnId) "
+                + "progress_seq=\(progress?.sequence?.description ?? "nil") "
+                + "progress_category=\(progress?.category ?? "nil")"
         )
-        onAgentTaskState?(handle, taskId, status)
+        onAgentTaskState?(handle, taskId, status, progress)
     }
 
     func markDownlinkComplete(

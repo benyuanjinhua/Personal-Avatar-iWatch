@@ -284,17 +284,22 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
         // 工具任务恰恰是「不许换代」的理由，用换代后的门禁把它滤掉，等于让
         // Watch 永远看不到那个把它拦在思考态的信号。陈旧性由 Watch 侧的
         // request_id 归属闸门（`SessionController.acceptsTurnEvent`）承担。
-        agentSession.onTaskState = { [weak self] rid, gen, taskId, status in
+        agentSession.onTaskState = { [weak self] rid, gen, taskId, status, progress in
             guard let self else { return }
             let envelope = RealtimeDownlinkEnvelope.taskState(
                 requestId: rid, sessionId: self.sessionId,
-                generation: gen, taskId: taskId, status: status
+                generation: gen, taskId: taskId, status: status, progress: progress
             )
+            // ESS-1100：进展文本本身**不落日志**——它是上游自由文本，可能带
+            // 用户内容（计划 detail / 授权 summary）。只记序号与类目，真机复盘
+            // 靠它们把「UI 显示的第几条」与网关的 `downlink_task_state` 对上。
             PhoneAgentClientLog.info(
                 module: Self.logModule,
                 event: "downlink_enqueued",
                 requestId: rid, sessionId: self.sessionId,
-                detail: "type=task.state task_id=\(taskId ?? "nil") status=\(status) gen=\(gen)"
+                detail: "type=task.state task_id=\(taskId ?? "nil") status=\(status) gen=\(gen) "
+                    + "progress_seq=\(progress?.sequence?.description ?? "nil") "
+                    + "progress_category=\(progress?.category ?? "nil")"
             )
             self.onDownlink?(envelope)
         }

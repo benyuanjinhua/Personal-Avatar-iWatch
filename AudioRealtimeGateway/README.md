@@ -147,7 +147,7 @@ verifiable).
 | `audio.delta` | `sequence`, `sample_rate`, `codec`, `audio` (base64 PCM16LE 24 kHz) | Sequences are monotone and dense per `response_id`. |
 | `audio.segment_done` | `segment_index`, `final_sequence` | **本段结束，回合未结束**（ESS-969）。同一屏障语义，但客户端应保持本轮打开、退回等待态（Watch：`SessionController.markAnswerInterim`），不得开下一轮。未实现的老客户端忽略该帧即可——后续 `audio.delta` 与最终的 `audio.done` 不受影响。 |
 | `audio.done` | `final_sequence` | Barrier — client waits until it has seen every `0..final_sequence` before signalling playback complete. **回合终态**：一个回合有且只有一帧。 |
-| `task.state` | `task_id?`, `status` | **上游 `task.*` 生命周期的下发投影**（ESS-1097）。工具回合里 `tool_call_pending` 之后上游会发 `voice.state=idle`，而任务仍在 `running`——没有这一帧，客户端只能拿回合屏障当真相，就会提前回到「正在听」并开新 generation 把在跑的工具任务 supersede 掉（ESS-1095 真机取证）。详细契约见下方「`task.state` 线格不变量」。 |
+| `task.state` | `task_id?`, `status`, `progress_text?`, `progress_category?`, `progress_seq?` | **上游 `task.*` 生命周期的下发投影**（ESS-1097）+ **阶段性进展文字**（ESS-1100）。工具回合里 `tool_call_pending` 之后上游会发 `voice.state=idle`，而任务仍在 `running`——没有这一帧，客户端只能拿回合屏障当真相，就会提前回到「正在听」并开新 generation 把在跑的工具任务 supersede 掉（ESS-1095 真机取证）。详细契约见下方「`task.state` 线格不变量」。 |
 | `cancel.ack` | echoes scope + `cancelled_response_id?` | Response to a `cancel` message. |
 | `error` | `code`, `retriable`, `detail?` | Structured failure; connection is closed with WebSocket code 1008 unless `retriable: true`. |
 | `pong` | echoes `nonce` | Heartbeat reply. |
@@ -168,6 +168,31 @@ verifiable).
 3. **客户端不会用「音频落定」解除闩锁**——那正是 ESS-1095 的故障形态（`tool_call_pending` 之后上游发 idle、任务帧尚未到达）。服务端不要指望靠 `audio.done` 帮客户端收口。
 
 `generation` 可缺省（按 0 处理）：本帧不进播放管线，代次只用于取证。未实现的老客户端忽略该帧即可，其余事件不受影响。
+
+##### 进展文字切面（ESS-1100）
+
+同一帧可选携带**一行可展示的阶段性进展**。上游（qwen-audio-agent）的
+`sendTaskEvent` 本来就把完整 `publicTask` 发下来——`activity[]`（工具/计划/
+文本三类，带 `category`/`label`/`detail`/`status`）、`objective`、`delegation`、
+`authorization` 都在里面。ESS-1100 之前本网关把它压成 `{id, status}`，进展文字
+**在这一跳被整段丢弃**，手表于是只能显示笼统的「正在思考」。投影规则在
+`task-progress.mjs`（H5 `qwen-audio-agent/web/src/task-view.js` 的手表适配版）。
+
+| 字段 | 语义 |
+|---|---|
+| `progress_text` | 要显示的那一行（如「正在查询相关信息」），已按 24 字符截断。**没有它就没有这个切面**——三个键要么一起出现，要么一个都不出现。 |
+| `progress_category` | 取证类目：`search` / `read` / `write` / `image` / `plan` / `text` / `session` / `authorization` / `queued` / `finalizing` / `cancelling` / `delegated` / `run`。 |
+| `progress_seq` | **每会话单调递增**的展示序号，只在真的带了 `progress_text` 时才递增。客户端据此丢弃迟到与重复：`iPhone → Watch` 那一跳走 WCSession，不保证顺序，只按到达顺序渲染会让旧进展盖回新进展。 |
+
+三条服务端义务：
+
+1. **终态帧不带进展**。完成/失败/取消/超时由 `status` 独占表达；在终态帧上再塞
+   一句「进展」，只会让「还在做」与「做完了」在同一行里打架。
+2. **进展只是展示面**。它不参与任何屏障、不改变任务集合的裁决——客户端的收口
+   条件与 ESS-1097 逐字相同。
+3. **缺席即老帧**。不带这三个键的 `task.state` 与 ESS-1097 时代的帧逐字节相同，
+   老客户端忽略即可；反过来，新客户端遇到不发 `progress_seq` 的老网关时照常显示
+   进展（只是失去乱序保护），不会因为缺字段而把功能整个关掉。
 
 Server-initiated `ping` frames from `ws.ping()` are honoured but the
 protocol also supports the JSON `ping`/`pong` pair for platforms that can't

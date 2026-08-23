@@ -1,6 +1,8 @@
 import WebSocket from 'ws'
 import { createHash, randomUUID } from 'node:crypto'
 
+import { projectTaskProgress } from './task-progress.mjs'
+
 // ESS-745: `request_id` is client-supplied and only validated as a string
 // (token-issuer.mjs `#assertScope`); nothing makes it unique beyond the
 // device/session that minted it, and one QwenAgentTransport instance is
@@ -1418,12 +1420,22 @@ export class QwenAgentTransport {
             turn.outstandingTasks.add(id)
             noteTurnBusy('task_in_flight')
           }
+          // ESS-1100：上游在同一帧里带着**阶段性进展**（`task.activity` /
+          // `authorization` / 生命周期子状态）。此前这里只取 {id, status}，
+          // 进展文字在这一跳被整段丢弃，客户端于是只能显示笼统的「正在思考」。
+          // 投影规则见 `task-progress.mjs`（H5 `task-view.js` 的手表适配版）。
+          const progress = projectTaskProgress(event.task, event.type)
           // ESS-1004 取证线，保留：真机日志靠它才看得出后台工作的起止。
           this.log('upstream_task_state', {
             ...scopeLog, task_id: id, status,
             outstanding: turn.outstandingTasks.size,
+            progress_text: progress?.text ?? null,
+            progress_category: progress?.category ?? null,
           })
-          onEvent({ type: 'agent.task', response_id: responseId, task: { id, status } })
+          onEvent({
+            type: 'agent.task', response_id: responseId, task: { id, status },
+            ...(progress ? { progress } : {}),
+          })
           return
         }
         // ESS-1043: qwen `response.done` is the response-level metadata that
