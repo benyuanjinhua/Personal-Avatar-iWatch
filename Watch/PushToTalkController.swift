@@ -110,6 +110,10 @@ final class PushToTalkController: ObservableObject {
     /// （且只在状态机接受转移时触发）；本条**无论转移是否被接受都触发**，
     /// 因为「服务端说这一轮失败了」对会话层是同一个事实。幂等归会话层。
     var onSessionTurnFailed: ((_ requestId: String, _ errorCode: String?) -> Void)?
+    /// ESS-1097：上游任务生命周期（`task.state`）。工具回合期间它是「还在干活」
+    /// 的唯一客户端可见事实——没有它，UI 只能拿回合屏障当真相，正是本单要修的
+    /// 误判入口。`taskId == nil` = `tool_call_pending`（上游还没有任务号）。
+    var onSessionTaskState: ((_ requestId: String, _ taskId: String?, _ status: String) -> Void)?
     /// 本地采集起停（与网络 ready 独立呈现）。
     var onLocalCaptureChanged: ((_ active: Bool) -> Void)?
     /// ESS-865 复审整改：本轮**本地 VAD 真的听到人说话了**。
@@ -1285,6 +1289,10 @@ final class PushToTalkController: ObservableObject {
         }
         adapter.onAnswerPlaybackFailed = { [weak self] handle, code in
             self?.onSessionAnswerFinished?(handle.requestId, false, "realtime_\(code)")
+        }
+        // ESS-1097：任务生命周期直通会话层的回合聚合状态机。
+        adapter.onAgentTaskState = { [weak self] handle, taskId, status in
+            self?.onSessionTaskState?(handle.requestId, taskId, status)
         }
         // ESS-650 F2-3：语音打断命中，透传 detect_ms 给会话层。会话层负责
         // 就地量 stop_ms 并落 source=voice 的 session_speaking_interrupted。

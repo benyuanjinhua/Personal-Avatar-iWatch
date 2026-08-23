@@ -335,6 +335,9 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         case .audioSegmentDone:
             sequenceDetail = " segment_index=\(envelope.sequence?.description ?? "nil")"
                 + " final_sequence=\(envelope.finalSequence?.description ?? "nil")"
+        case .taskState:
+            sequenceDetail = " task_id=\(envelope.taskId ?? "nil")"
+                + " task_status=\(envelope.taskStatus ?? "nil")"
         case .ready, .playbackClear, .responseInterrupted, .bridgeFallback,
              .transcriptDelta, .transcriptFinal, .generationOpen, .bargeInFailed,
              .transportFailed,
@@ -398,6 +401,19 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             adapter.markBargeInFailed(reason: envelope.reason ?? "unspecified")
         case .transportFailed:
             adapter.markTransportFailed(reason: envelope.reason ?? "unspecified")
+        case .taskState:
+            // ESS-1097：任务生命周期不进播放管线，只喂回合聚合状态机。
+            // `task_status` 缺席时不猜——猜成终态正是本 issue 要修的 bug。
+            guard let status = envelope.taskStatus, !status.isEmpty else {
+                WatchLog.error(
+                    "turn", "realtime_task_state_missing_status",
+                    requestId: envelope.requestId,
+                    detail: "session=\(envelope.sessionId) task_id=\(envelope.taskId ?? "nil")",
+                    code: "ERR_TASK_STATE_MISSING_STATUS"
+                )
+                break
+            }
+            adapter.markAgentTaskState(taskId: envelope.taskId, status: status)
         }
     }
 
