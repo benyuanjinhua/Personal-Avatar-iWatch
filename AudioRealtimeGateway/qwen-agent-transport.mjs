@@ -42,6 +42,13 @@ const TASK_NON_LIFECYCLE_EVENTS = new Set([
 ])
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/
 
+// ESS-1068: bound on the per-conversation task identity / delivered tables.
+// A conversation's background tasks are a small working set (measured n=10
+// turns produced at most a couple of tasks each); the cap is a memory backstop
+// against a misbehaving upstream, trimming the OLDEST entry (a long-finished
+// task no longer needs attribution).
+const MAX_TASKS_PER_CONVERSATION = 256
+
 // ESS-849: cap on the per-turn responseId → announcement book-keeping. A turn
 // lives seconds and the biggest real capture held 2 announcements, so this is a
 // memory backstop against a misbehaving upstream, not a functional limit —
@@ -207,6 +214,36 @@ export class QwenAgentTransport {
     // The queue bounds process-lifetime memory without relying on timers.
     this.retiredClientInstanceIds = new Set()
     this.retiredClientInstanceOrder = []
+    // ESS-1068: cross-turn task book-keeping, keyed by conversation (device +
+    // session) so a background task spawned by a closed turn can still have its
+    // result attributed and consumed-once on a LATER turn of the same
+    // conversation. Per-turn state alone loses the taskId→identity mapping when
+    // the acceptance turn closes before the task terminal (measured 30–70 s).
+    // Bounded per conversation to keep process-lifetime memory flat.
+    this.conversationTaskIdentity = new Map() // conversationKey → Map<taskId, identity>
+    this.conversationDelivered = new Map()    // conversationKey → Set<taskId>
+  }
+
+  // ESS-1068: shared per-conversation task identity / delivered dedup tables,
+  // created lazily and bounded (oldest conversation evicted on overflow).
+  #conversationTaskTables(conversation) {
+    let identity = this.conversationTaskIdentity.get(conversation)
+    if (!identity) {
+      identity = new Map()
+      this.conversationTaskIdentity.set(conversation, identity)
+      while (this.conversationTaskIdentity.size > 256) {
+        this.conversationTaskIdentity.delete(this.conversationTaskIdentity.keys().next().value)
+      }
+    }
+    let delivered = this.conversationDelivered.get(conversation)
+    if (!delivered) {
+      delivered = new Set()
+      this.conversationDelivered.set(conversation, delivered)
+      while (this.conversationDelivered.size > 256) {
+        this.conversationDelivered.delete(this.conversationDelivered.keys().next().value)
+      }
+    }
+    return { identity, delivered }
   }
 
   #retireClientInstance(clientInstanceId) {
@@ -247,6 +284,44 @@ export class QwenAgentTransport {
     return this.takeover === true
   }
 
+  // ESS-1068: attribute a background announcement to THIS turn's conversation.
+  // A background task result (origin=announcement) belongs to the same user/device
+  // as this turn, not to whoever happens to share the WSS. Attribution is
+  // decided by the task's session/device identity, read in this order:
+  //   1. the announcement's own `task` object / top-level sessionId/deviceId;
+  //   2. the taskId → identity table built from `task.*` events on this turn.
+  // No identity evidence ⇒ unattributed ⇒ isolated (the ESS-849 safe default),
+  // because a cross-session broadcast must never be spoken as this user's answer.
+  #attributeAnnouncement(turn, event, taskKey) {
+    const task = event.task ?? {}
+    const sessionId = event.sessionId ?? task.sessionId ?? null
+    const deviceId = event.deviceId ?? task.deviceId ?? null
+    if (sessionId != null || deviceId != null) {
+      if (sessionId != null && String(sessionId) !== String(turn.sessionId)) return false
+      // ESS-1068 复审第2点（fail-closed）：当 turn 有 device 身份时，
+      // announcement 必须提供匹配的 deviceId 才能归属；缺 deviceId 的
+      // 广播不能靠 sessionId 单边放行——两个设备共享一个 sessionId 时会
+      // 双双接受同一广播。
+      if (turn.deviceId != null) {
+        if (deviceId == null) return false
+        if (String(deviceId) !== String(turn.deviceId)) return false
+      }
+      return true
+    }
+    if (taskKey != null) {
+      const identity = turn.taskIdentity.get(taskKey)
+      if (identity) {
+        if (identity.sessionId != null && String(identity.sessionId) !== String(turn.sessionId)) return false
+        if (turn.deviceId != null) {
+          if (identity.deviceId == null) return false
+          if (String(identity.deviceId) !== String(turn.deviceId)) return false
+        }
+        return true
+      }
+    }
+    return false
+  }
+
   openTurn({ requestId, sessionId, deviceId = null, generation, responseId, onEvent }) {
     const key = scopeKey({ deviceId, sessionId, generation, requestId })
     const conversation = conversationKey({ deviceId, sessionId })
@@ -274,9 +349,15 @@ export class QwenAgentTransport {
     // holder of the single voice slot; without knowing who WE are, a `busy`
     // frame cannot be told apart from an echo of our own ownership.
     const clientInstanceId = `gateway_${randomUUID()}`
+    // ESS-1068: task identity and delivered dedup are per-CONVERSATION, not
+    // per-turn — a background task spawned by a closed turn still resolves on
+    // a later turn of the same conversation.
+    const taskTables = this.#conversationTaskTables(conversation)
     const turn = {
       key, conversation,
       requestId, sessionId, deviceId, generation, responseId, onEvent,
+      taskIdentity: taskTables.identity,
+      deliveredAnnouncements: taskTables.delivered,
       ws: null, ready: false, terminal: false, committed: false,
       pending: [], pendingBytes: 0, nextOutputSequence: 0,
       downlinkFrames: 0, downlinkBytes: 0,
@@ -306,6 +387,23 @@ export class QwenAgentTransport {
       // own (see `noteTurnBusy`), they only widen the window.
       outstandingTasks: new Set(), announcementResponseIds: new Set(),
       turnBusy: false,
+      // ESS-1068: `activeAnnouncements` tracks announcement responses that
+      // have started but not finished — they are the busy cause that must be
+      // cleared when the announcement ends. `taskIdentity` maps a taskId to
+      // its source session/device (built from `task.*` events) so a background
+      // announcement can be attributed to this conversation instead of being
+      // isolated as a cross-session leak. `deliveredAnnouncements` is the
+      // exactly-once book-keeping keyed by taskId; `deliverAnnouncementIds`
+      // marks the responseIds whose audio/transcript is attributed and must
+      // be forwarded rather than dropped.
+      activeAnnouncements: new Set(),
+      deliverAnnouncementIds: new Set(),
+      // ESS-1068 复审第3点：`deliveredAnnouncements` 是「已完整下发并消费」
+      // 的 dedup，只能在 audio.done 完整下发后记录，不能在 response.started
+      // 就记——否则 disconnect/cancel/截断会永久抑制后续 turn 的重投。
+      // 本映射记录 responseId → taskKey 的待交付关系，response.started 入，
+      // audio.done 下发后转 delivered 并出。
+      pendingAnnouncementTaskIds: new Map(),
       // ESS-849 announcement isolation book-keeping. `announcementDropped`
       // counts what the voice channel threw away per announcement response;
       // `forwardedResponseIds` is what makes a 「先 delta 后 started」 leak
@@ -527,7 +625,12 @@ export class QwenAgentTransport {
         : turn.turnBusy ? this.segmentGapBusyMs
         : this.segmentGapMs
       if (window <= 0) return endTurn('segment_gap_disabled', turn.closedSegment.finalSequence)
-      if (turn.segmentGapWindowMs >= window) return
+      // Re-arms only ever widen — except when a busy cause clears
+      // (`turn_busy_cleared`), which may legitimately narrow the window back
+      // to the base value so a direct-answer turn is not held open by a
+      // background announcement that has already finished (ESS-1068).
+      const mayShrink = cause === 'turn_busy_cleared'
+      if (turn.segmentGapWindowMs >= window && !mayShrink) return
       clearTimeout(turn.segmentGapTimer)
       turn.segmentGapWindowMs = window
       const remaining = Math.max(0, turn.segmentClosedAt + window - Date.now())
@@ -561,6 +664,24 @@ export class QwenAgentTransport {
       turn.turnBusy = true
       this.log('upstream_turn_busy', { ...scopeLog, cause })
       armSegmentGap(cause)
+    }
+
+    // ESS-1068: the busy flag was a latch — set by an announcement or task but
+    // never cleared, so a direct-answer turn that follows a finished background
+    // announcement keeps the 12 s busy window instead of falling back to the
+    // 2.5 s base window, delaying `agent.audio.done` for no reason. Clear it
+    // once every busy cause has ended, and re-arm the parked segment with the
+    // (possibly narrower) base window.
+    const noteTurnIdle = cause => {
+      if (!turn.turnBusy) return
+      if (turn.activeAnnouncements.size > 0 || turn.outstandingTasks.size > 0) return
+      turn.turnBusy = false
+      this.log('upstream_turn_busy_cleared', {
+        ...scopeLog, cause,
+        active_announcements: turn.activeAnnouncements.size,
+        outstanding_tasks: turn.outstandingTasks.size,
+      })
+      armSegmentGap('turn_busy_cleared')
     }
 
     // ESS-849 announcement isolation. 上游把「后台任务播报」和「本回合的回答」
@@ -624,8 +745,27 @@ export class QwenAgentTransport {
       // `drainContiguous` 消费掉了（连续性因此不断）。到此为止：不下发、不占
       // 下行契约序号、不释放已关闭的段落（播报不是「本回合又出声了」的证据）、
       // 不延长 `pendingDone` 的收口窗口。
+      //
+      // ESS-1068 例外：归属明确的播报（`deliverAnnouncementIds`）是「本用户的
+      // 后台任务结果」，必须下发而不是丢弃——它占用上游序号、也占下行契约序号，
+      // 并作为新段落释放已关闭的段落（它就是用户该听到的最终答案）。
       if (frame.announcementId != null) {
-        dropAnnouncementAudio(frame.announcementId, frame)
+        if (!turn.deliverAnnouncementIds.has(frame.announcementId)) {
+          dropAnnouncementAudio(frame.announcementId, frame)
+          return
+        }
+        releaseClosedSegment('announcement_delta')
+        const sequence = turn.nextOutputSequence++
+        this.log('upstream_event_received', {
+          ...scopeLog, upstream_event_type: 'audio.delta', sequence,
+          upstream_sequence: frame.upstreamSequence,
+          announcement_delivered: true,
+        })
+        this.log('upstream_audio_delta', { ...scopeLog, sequence })
+        onEvent({
+          type: 'agent.audio.delta', response_id: responseId, sequence,
+          sample_rate: frame.sampleRate, codec: 'pcm_s16le', audio: frame.audio,
+        })
         return
       }
       // ESS-969: audio after a closed segment proves the turn went on. The
@@ -909,6 +1049,8 @@ export class QwenAgentTransport {
         if (event.type === 'response.started') {
           if (event.origin === 'announcement') {
             const id = event.responseId == null ? null : String(event.responseId)
+            const taskKey = event.taskId ?? event.task?.id ?? event.task?.workId ?? null
+            const taskKeyStr = taskKey == null ? null : String(taskKey)
             if (id !== null) {
               turn.announcementResponseIds.add(id)
               while (turn.announcementResponseIds.size > MAX_ANNOUNCEMENT_RESPONSES) {
@@ -917,7 +1059,7 @@ export class QwenAgentTransport {
             }
             this.log('upstream_announcement_response_started', {
               ...scopeLog, upstream_response_id: event.responseId ?? null,
-              upstream_task_id: event.taskId ?? event.task?.id ?? null,
+              upstream_task_id: taskKey,
             })
             // ESS-849 兜底口径的留证点：这条 `response.started` 来晚了，它的音频
             // 已经按「映射缺失默认放行」进了本回合。目前没有实测到这种乱序，
@@ -925,6 +1067,37 @@ export class QwenAgentTransport {
             if (id !== null && turn.forwardedResponseIds.has(id)) {
               this.log('upstream_announcement_started_late', {
                 ...scopeLog, upstream_response_id: id,
+              })
+            }
+            // ESS-1068: an attributed background result must reach this user,
+            // not be dropped as a cross-session leak. Attributed ⇒ mark for
+            // delivery and consume-once by taskId; unattributed ⇒ isolate.
+            // Every announcement is tracked in `activeAnnouncements` so its
+            // busy cause is cleared when it ends, attributed or not.
+            if (id !== null) turn.activeAnnouncements.add(id)
+            const attributed = this.#attributeAnnouncement(turn, event, taskKeyStr)
+            if (attributed) {
+              if (taskKeyStr !== null && turn.deliveredAnnouncements.has(taskKeyStr)) {
+                // Duplicate delivery of an already-consumed result: isolate.
+                this.log('upstream_announcement_duplicate', {
+                  ...scopeLog, upstream_response_id: id, upstream_task_id: taskKeyStr,
+                })
+              } else {
+                // ESS-1068 复审第3点：只记 pending（responseId→taskKey），不在这里
+                // 写 deliveredAnnouncements。完整下发（audio.done）后才转 delivered，
+                // 避免 disconnect/cancel/截断导致过早 dedup、永久抑制后续重投。
+                if (id !== null) {
+                  if (taskKeyStr !== null) turn.pendingAnnouncementTaskIds.set(id, taskKeyStr)
+                  turn.deliverAnnouncementIds.add(id)
+                }
+                this.log('upstream_announcement_delivered', {
+                  ...scopeLog, upstream_response_id: id, upstream_task_id: taskKeyStr,
+                })
+              }
+            } else {
+              this.log('upstream_announcement_isolated', {
+                ...scopeLog, upstream_response_id: id, upstream_task_id: taskKeyStr,
+                reason: 'unattributed',
               })
             }
             noteTurnBusy('announcement_response')
@@ -1068,12 +1241,41 @@ export class QwenAgentTransport {
           // 「映射缺失默认放行」处理——它落到下面的正常收口路径。
           const doneAnnouncementId = announcementResponseIdOf(event)
           if (doneAnnouncementId !== null) {
+            // ESS-1068: 归属明确的播报是「本用户的后台任务最终结果」，其 audio.done
+            // 是一个真实段落收口（下发 segment 边界），且结束后要清除 busy 让后续
+            // 直答回落到基础窗口。未归属的播报维持 ESS-849 隔离。
+            const deliver = turn.deliverAnnouncementIds.has(doneAnnouncementId)
+            turn.deliverAnnouncementIds.delete(doneAnnouncementId)
+            turn.activeAnnouncements.delete(doneAnnouncementId)
             const stat = turn.announcementDropped.get(doneAnnouncementId) ?? { frames: 0, bytes: 0 }
             turn.announcementDropped.delete(doneAnnouncementId)
-            this.log('upstream_announcement_audio_done_dropped', {
-              ...scopeLog, upstream_response_id: doneAnnouncementId,
-              dropped_frames: stat.frames, dropped_bytes: stat.bytes,
-            })
+            if (deliver) {
+              noteResponseProgress()
+              // ESS-1068 复审第3点：完整下发（audio.done）才算 consumed，
+              // 把 pending 转 delivered（exactly-once dedup 的落点后移）。
+              const taskKey = turn.pendingAnnouncementTaskIds.get(doneAnnouncementId)
+              if (taskKey !== undefined) {
+                turn.deliveredAnnouncements.add(taskKey)
+                while (turn.deliveredAnnouncements.size > MAX_TASKS_PER_CONVERSATION) {
+                  turn.deliveredAnnouncements.delete(turn.deliveredAnnouncements.values().next().value)
+                }
+              }
+              turn.pendingAnnouncementTaskIds.delete(doneAnnouncementId)
+              this.log('upstream_announcement_audio_done_delivered', {
+                ...scopeLog, upstream_response_id: doneAnnouncementId,
+                upstream_task_id: taskKey ?? null,
+                final_sequence: turn.nextOutputSequence - 1,
+              })
+              // 与正常段落同构：park + settle，由后续新段落释放或空闲窗口收口。
+              turn.pendingDone = true
+              scheduleDone()
+            } else {
+              this.log('upstream_announcement_audio_done_dropped', {
+                ...scopeLog, upstream_response_id: doneAnnouncementId,
+                dropped_frames: stat.frames, dropped_bytes: stat.bytes,
+              })
+            }
+            noteTurnIdle('announcement_done')
             return
           }
           noteResponseProgress()
@@ -1093,6 +1295,14 @@ export class QwenAgentTransport {
           // 下行里出现「刚才查询的是杭州今天的天气情况，不是深圳的」。
           const transcriptAnnouncementId = announcementResponseIdOf(event)
           if (transcriptAnnouncementId !== null) {
+            // ESS-1068：归属明确的播报文本是用户后台任务的结果，必须下发而不是
+            // 丢弃；只有未归属的播报文本才继续隔离（防跨会话串台）。
+            if (turn.deliverAnnouncementIds.has(transcriptAnnouncementId)) {
+              noteResponseProgress()
+              onEvent({ type: 'agent.transcript.final', response_id: responseId,
+                role: event.role, content: typeof event.content === 'string' ? event.content : '' })
+              return
+            }
             this.log('upstream_announcement_transcript_dropped', {
               ...scopeLog, upstream_response_id: transcriptAnnouncementId,
               content_length: typeof event.content === 'string' ? event.content.length : 0,
@@ -1118,8 +1328,24 @@ export class QwenAgentTransport {
           const id = String(taskId)
           const status = String(event.task?.status ?? event.type.slice(5))
           const terminal = TASK_TERMINAL_EVENTS.has(event.type) || TASK_TERMINAL_STATUSES.has(status)
-          if (terminal) turn.outstandingTasks.delete(id)
-          else if (!TASK_NON_LIFECYCLE_EVENTS.has(event.type)) {
+          // ESS-1068: remember each task's source identity (session/device/turn)
+          // so a later background announcement carrying only a taskId can be
+          // attributed to this conversation instead of isolated as a leak.
+          if (event.task?.sessionId != null || event.task?.deviceId != null || event.task?.turnId != null) {
+            const prior = turn.taskIdentity.get(id)
+            turn.taskIdentity.set(id, {
+              sessionId: event.task?.sessionId ?? prior?.sessionId ?? null,
+              deviceId: event.task?.deviceId ?? prior?.deviceId ?? null,
+              turnId: event.task?.turnId ?? prior?.turnId ?? null,
+            })
+            while (turn.taskIdentity.size > MAX_TASKS_PER_CONVERSATION) {
+              turn.taskIdentity.delete(turn.taskIdentity.keys().next().value)
+            }
+          }
+          if (terminal) {
+            turn.outstandingTasks.delete(id)
+            noteTurnIdle('task_terminal')
+          } else if (!TASK_NON_LIFECYCLE_EVENTS.has(event.type)) {
             turn.outstandingTasks.add(id)
             noteTurnBusy('task_in_flight')
           }
@@ -1169,6 +1395,10 @@ export class QwenAgentTransport {
               upstream_response_id: responseAnnouncementId,
               has_function_call: rawHasFunctionCall,
             })
+            // ESS-1068: the announcement finished; drop the busy cause it held.
+            turn.deliverAnnouncementIds.delete(responseAnnouncementId)
+            turn.activeAnnouncements.delete(responseAnnouncementId)
+            noteTurnIdle('announcement_response_done')
             return
           }
           noteResponseProgress()
@@ -1283,6 +1513,17 @@ export class QwenAgentTransport {
         }
         turn.ws?.close()
         this.#release(turn)
+      },
+      // ESS-1068 复审第1点：把 Watch 的 playback 回执转发给 qwen，
+      // 触发 qwen 的 `startPlayback` → `announcements.confirmMany`（ack）。
+      // qwen 侧协议：`{ type: 'playback.started'|'playback.ended', responseId }`。
+      playbackStarted: responseId => {
+        if (turn.terminal || turn.ws?.readyState !== WebSocket.OPEN) return
+        turn.ws.send(JSON.stringify({ type: 'playback.started', responseId: String(responseId ?? '') }))
+      },
+      playbackEnded: responseId => {
+        if (turn.terminal || turn.ws?.readyState !== WebSocket.OPEN) return
+        turn.ws.send(JSON.stringify({ type: 'playback.ended', responseId: String(responseId ?? '') }))
       },
     }
   }
