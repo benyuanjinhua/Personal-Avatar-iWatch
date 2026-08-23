@@ -40,6 +40,9 @@ describe('Gateway end-to-end', () => {
       dev_universal_token: 'rtk_dev_universal',
       heartbeat_interval_ms: 0, idle_disconnect_ms: 0,
       max_token_ttl_ms: 60_000, default_token_ttl_ms: 30_000,
+      // Hermetic on CI: no qwen-audio-agent on 127.0.0.1:3101, and the real
+      // `agent` transport would keep the process alive on a failed connect.
+      agent_transport: 'mock',
     })
     // Register a device with a known secret (bootstrap flow).
     deviceId = 'jackson-iphone'

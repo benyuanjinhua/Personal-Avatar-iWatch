@@ -87,10 +87,12 @@ jobs:
 
       - name: Gateway — npm test
         working-directory: AudioRealtimeGateway
+        timeout-minutes: 10
         run: npm test
 
       - name: Gateway — realtime E2E gate
         working-directory: AudioRealtimeGateway
+        timeout-minutes: 10
         run: npm run test:e2e
 
       # R-02.5 关卡一 · 第 1 行：swift test 全绿
