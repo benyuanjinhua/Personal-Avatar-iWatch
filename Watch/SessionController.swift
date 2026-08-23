@@ -575,11 +575,44 @@ final class SessionController: ObservableObject {
             // 首次观测到工具工作：撤掉 45s 硬超时，改挂一次性的绝对上限。
             armToolTurnDeadlineIfNeeded()
             thinkingHardToken?.cancel(); thinkingHardToken = nil
+        } else if resumeListeningIfToolTurnClosed(reason: "task_state:\(status)") {
+            // 已经收口并开了下一轮，不必再武装「等回答」的预算。
         } else if hadOutstandingWork, !toolTurn.hasOutstandingWork, turnPhase == .thinking {
             // 工具活干完了、答案还没播：把 45s 的「等回答」预算重新接上。
             // 绝对上限仍然挂着，两条都有界。
             armThinkingTimeout()
         }
+    }
+
+    /// 聚合体收口后，把**用户看到的那一面**也真正带回聆听。
+    ///
+    /// 复审阻断（毕玄 2026-08-23）：`markAnswerFinished` 被闸门拦下时相位停在
+    /// `.thinking`，此后清掉最后一个 hold reason 的是 `task.state`（任务终态或
+    /// `tool_call_resolved`）。原实现在那里只重新武装了 45s 预算——聚合体已经
+    /// `isClosed`，而 UI 继续显示「正在思考」、麦克风一直关着，直到超时判失败。
+    /// 答案明明已经播完了，用户看到的却是转圈然后报错，比原 bug 更难解释。
+    ///
+    /// 三重闸门，缺一不可：
+    /// - `state == .listening` + `turnPhase == .thinking`：只有「被拦在等待态」
+    ///   才有恢复可言。speaking 说明还在播（此时聚合体也不会收口）；
+    /// - `hasToolEvidence`：无工具证据的回合走原路径，本方法一步都不插手——
+    ///   尤其是 ESS-971 的普通多段 interim，那条边**必须**停在 thinking；
+    /// - `isClosed`：四面都齐了才动。
+    ///
+    /// **不补计轮次**：成功播完那一次已由 `markAnswerFinished` 记过
+    /// （`markRoundCompleted`），这里再记一次会让通话摘要凭空多出几轮。
+    ///
+    /// - Returns: 是否真的收口并开了下一轮。
+    @discardableResult
+    private func resumeListeningIfToolTurnClosed(reason: String) -> Bool {
+        guard state == .listening, turnPhase == .thinking else { return false }
+        guard toolTurn.hasToolEvidence, toolTurn.isClosed else { return false }
+        WatchLog.info(
+            "session", "session_tool_turn_settled", requestId: activeTurnRequestId,
+            detail: "turn_index=\(turnIndex) reason=\(reason) \(toolTurn.logDetail)"
+        )
+        startNextTurn(reason: "tool_turn_settled:\(reason)")
+        return true
     }
 
     /// 一轮之内只武装一次的工具绝对上限。到点走与 45s 硬超时完全同构的收口。
@@ -644,6 +677,10 @@ final class SessionController: ObservableObject {
             "session", "session_answer_interim", requestId: requestId,
             detail: "turn_index=\(turnIndex) from=\(fromPhase.logName) phase=thinking \(toolTurn.logDetail)"
         )
+        // 段落播完清掉的是播放面。若它恰好是**最后一个** hold reason（工具早已
+        // 终结、回合屏障也早已落定），本轮就此收口，同样要真的回到聆听——
+        // 与 `markTaskState` 共用同一条收口路径，不另立第二套判定。
+        guard !resumeListeningIfToolTurnClosed(reason: "answer_interim") else { return }
         armThinkingTimeout()
     }
 

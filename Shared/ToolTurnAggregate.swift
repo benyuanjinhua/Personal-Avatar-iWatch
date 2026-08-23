@@ -169,6 +169,14 @@ public struct ToolTurnAggregate: Equatable, Sendable {
     public private(set) var outstandingTasks: Set<String> = []
     /// 本回合见过的全部 taskId（取证用；终态到达后不从这里删）。
     public private(set) var seenTasks: Set<String> = []
+    /// 本回合**是否宣告过**工具调用。与 `toolCallPending` 的区别是关键的：
+    /// 那是「此刻还挂着吗」（会被解除），这是「这一轮是不是工具回合」（历史事实，
+    /// 一轮之内只会从 false 变 true）。
+    ///
+    /// 分开记的理由：闩锁解除后 `toolCallPending` 归 false，若证据判定读的是它，
+    /// 一个「只有闩锁、从未产生任务号」的工具回合在 resolved 之后就会被当成普通
+    /// 回合——收口路径不再认领它，UI 停在「正在思考」等超时。
+    public private(set) var didObserveToolCall = false
     /// `tool_call_pending` 闩锁。
     ///
     /// **不变量（ESS-1098 复审阻断 1 的收口口径）**：闩锁是「有个任务要来但还
@@ -234,7 +242,7 @@ public struct ToolTurnAggregate: Equatable, Sendable {
     /// 与本 issue 之前**逐字节相同**的路径（`audio.done` + 播完 → 开下一轮）。
     /// 把闸门无差别套到所有回合上，等于用一个未验证的新状态机替换掉一条
     /// 已被 ESS-600/ESS-971 真机验证过的主链路——那是拿主干换一个 bug 修。
-    public var hasToolEvidence: Bool { toolCallPending || !seenTasks.isEmpty }
+    public var hasToolEvidence: Bool { didObserveToolCall || !seenTasks.isEmpty }
 
     /// 是否还有工具侧未完成的工作（在跑的任务 / 未解除的 `tool_call_pending`）。
     /// 会话层据此把「等回答」的有界预算从 45s 切到工具预算。
@@ -270,6 +278,7 @@ public struct ToolTurnAggregate: Equatable, Sendable {
         switch event {
         case .toolCallPending:
             toolCallPending = true
+            didObserveToolCall = true
 
         case .toolCallResolved:
             toolCallPending = false

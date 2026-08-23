@@ -71,18 +71,27 @@ final class Ess1097ToolTurnGateTests: XCTestCase {
     }
 
     /// 验收 3：任务终态 + 回合屏障 + 播放结束都满足后才恢复聆听。
+    ///
+    /// 时序按**真实线格**写：第一段「我正在查询…」走段落屏障
+    /// （`audio.segment_done` → `markAnswerInterim`），回合级 `audio.done`
+    /// （→ `markAnswerFinished`）一个回合只有一帧、且是最后一帧。
+    /// 早先这条用例先发 `markAnswerFinished` 再等第二段，那是线格上不可能出现的
+    /// 顺序——它掩盖了「收口后没真的回聆听」这个缺陷。
     func testRelistensOnlyAfterTaskTerminalAndPlaybackEnd() {
         let requestId = beginTurn()
         controller.markTaskState(requestId: requestId, taskId: "task-77", status: "running")
+        // 段 0：「我正在查询…」播完，回合未完。
         controller.markAnswerStarted(requestId: requestId)
-        controller.markAnswerFinished(requestId: requestId)
+        controller.markAnswerInterim(requestId: requestId)
+        XCTAssertEqual(controller.turnPhase, .thinking)
         XCTAssertEqual(startTurnCount, 0)
 
-        // 工具跑完，真答案这一段来了。
+        // 工具跑完，但真答案还没播。
         controller.markTaskState(requestId: requestId, taskId: "task-77", status: "completed")
         XCTAssertEqual(controller.turnPhase, .thinking, "任务终态本身不是回答")
-        XCTAssertEqual(startTurnCount, 0, "答案还没播完，仍不许开下一轮")
+        XCTAssertEqual(startTurnCount, 0, "回合屏障还没到，仍不许开下一轮")
 
+        // 段 1：真答案起播并播完（带回合屏障）。
         controller.markAnswerStarted(requestId: requestId)
         XCTAssertEqual(controller.turnPhase, .speaking)
         controller.markAnswerFinished(requestId: requestId)
@@ -100,9 +109,12 @@ final class Ess1097ToolTurnGateTests: XCTestCase {
         XCTAssertEqual(startTurnCount, 0)
 
         controller.markTaskState(requestId: requestId, taskId: "task-77", status: "completed")
-        // 任务终态到达时回合已经答完过一次：屏障与播放都已入账，聚合体收口。
-        XCTAssertTrue(controller.toolTurn.isClosed)
-        XCTAssertFalse(controller.toolTurn.blocksAutomaticNextTurn)
+
+        // 屏障与播放都已入账，任务终态清掉最后一个 hold —— 断言落在**用户看到的
+        // 那一面**，而不是内部聚合体：收口后 `toolTurn` 已被重置成下一轮的空账，
+        // 读它只会读到新一轮的状态，看不出这一轮到底有没有真的回到聆听。
+        XCTAssertEqual(controller.turnPhase, .listening)
+        XCTAssertEqual(startTurnCount, 1)
     }
 
     /// 未知任务状态按非终态处理——猜成终态就等于把 bug 装回去。
@@ -132,8 +144,8 @@ final class Ess1097ToolTurnGateTests: XCTestCase {
 
         controller.markTaskState(requestId: requestId, taskId: "task-77", status: "completed")
 
-        XCTAssertTrue(controller.toolTurn.isClosed, "成功的工具回合必须收口，不能挂到超时")
-        XCTAssertFalse(controller.toolTurn.blocksAutomaticNextTurn)
+        XCTAssertEqual(controller.turnPhase, .listening, "成功的工具回合必须回到聆听，不能挂到超时")
+        XCTAssertEqual(startTurnCount, 1)
     }
 
     /// 另一种乱序：`pending → running → completed → audio.done/播完`。
@@ -164,8 +176,89 @@ final class Ess1097ToolTurnGateTests: XCTestCase {
 
         controller.markTaskState(requestId: requestId, taskId: nil, status: "tool_call_resolved")
 
-        XCTAssertTrue(controller.toolTurn.isClosed)
-        XCTAssertFalse(controller.toolTurn.blocksAutomaticNextTurn)
+        XCTAssertEqual(controller.turnPhase, .listening)
+        XCTAssertEqual(startTurnCount, 1)
+    }
+
+    // MARK: - 复审阻断（毕玄 2026-08-23）：收口后必须真的回到聆听
+
+    /// **回归钉**：`running → audio.done/播完 → completed`。最后一帧任务终态清掉
+    /// 最后一个 hold reason，聚合体收口——但会话必须**同时**把用户看到的那一面
+    /// 带回「正在听」并开下一轮。原实现只重新武装了 thinking 超时，UI 会继续显示
+    /// 「正在思考」直到 45s 超时判失败：答案已经播完了，表还在转圈然后报错。
+    func testTaskTerminalClearingLastHoldActuallyResumesListening() {
+        let requestId = beginTurn()
+        controller.markTaskState(requestId: requestId, taskId: "task-77", status: "running")
+        controller.markAnswerStarted(requestId: requestId)
+        controller.markAnswerFinished(requestId: requestId)
+        XCTAssertEqual(controller.turnPhase, .thinking, "任务还在跑，先留在思考态")
+        XCTAssertEqual(startTurnCount, 0)
+
+        controller.markTaskState(requestId: requestId, taskId: "task-77", status: "completed")
+
+        XCTAssertEqual(controller.turnPhase, .listening, "收口后必须回到聆听，不能停在思考")
+        XCTAssertEqual(startTurnCount, 1, "必须开下一轮，否则麦克风一直关着")
+        XCTAssertNotEqual(controller.activeTurnRequestId, requestId, "已经换到新一轮")
+    }
+
+    /// 同一条边的闩锁版本：最后到达的是 `tool_call_resolved`。
+    func testResolvedFrameClearingLastHoldActuallyResumesListening() {
+        let requestId = beginTurn()
+        controller.markTaskState(requestId: requestId, taskId: nil, status: "tool_call_pending")
+        controller.markAnswerStarted(requestId: requestId)
+        controller.markAnswerFinished(requestId: requestId)
+        XCTAssertEqual(controller.turnPhase, .thinking)
+        XCTAssertEqual(startTurnCount, 0)
+
+        controller.markTaskState(requestId: requestId, taskId: nil, status: "tool_call_resolved")
+
+        XCTAssertEqual(controller.turnPhase, .listening)
+        XCTAssertEqual(startTurnCount, 1)
+    }
+
+    /// 恢复聆听**不得**把这一轮重复计数——`markAnswerFinished` 成功时已经计过一次。
+    /// 复审点名的风险点：收口路径再计一次会让通话摘要凭空多出几轮。
+    func testResumingAfterToolTurnCloseDoesNotDoubleCountTheRound() {
+        let requestId = beginTurn()
+        controller.markTaskState(requestId: requestId, taskId: "task-77", status: "running")
+        controller.markAnswerStarted(requestId: requestId)
+        controller.markAnswerFinished(requestId: requestId)
+        controller.markTaskState(requestId: requestId, taskId: "task-77", status: "completed")
+        XCTAssertEqual(controller.turnPhase, .listening)
+
+        controller.exitSession()
+
+        let summary = controller.hungupSummary ?? ""
+        XCTAssertTrue(summary.contains("· 1 轮"), "这一轮只该计一次，实际摘要：\(summary)")
+    }
+
+    /// 段落 interim 之后任务才终结：同样必须真的回到聆听。
+    /// （interim 清掉的是播放面，任务终态清掉最后一个 hold，两条边共用同一收口。）
+    func testSegmentInterimThenTaskTerminalResumesListening() {
+        let requestId = beginTurn()
+        controller.markTaskState(requestId: requestId, taskId: "task-77", status: "running")
+        controller.markAnswerStarted(requestId: requestId)
+        controller.markAnswerFinished(requestId: requestId)
+        // 工具结果的最后一段：起播 → 段落播完。
+        controller.markAnswerStarted(requestId: requestId)
+        controller.markAnswerInterim(requestId: requestId)
+        XCTAssertEqual(startTurnCount, 0, "任务还在跑，段落播完不算答完")
+
+        controller.markTaskState(requestId: requestId, taskId: "task-77", status: "completed")
+
+        XCTAssertEqual(controller.turnPhase, .listening)
+        XCTAssertEqual(startTurnCount, 1)
+    }
+
+    /// 反向保护：普通多段回合（无任何工具证据）的 interim **仍然不许**开下一轮——
+    /// ESS-971 的契约不能被本次整改顺手破坏。
+    func testPlainSegmentInterimStillNeverStartsNextTurn() {
+        let requestId = beginTurn()
+        controller.markAnswerStarted(requestId: requestId)
+        controller.markAnswerInterim(requestId: requestId)
+
+        XCTAssertEqual(controller.turnPhase, .thinking)
+        XCTAssertEqual(startTurnCount, 0, "第二段会落进下一轮——ESS-971 已钉死")
     }
 
     // MARK: - 无工具信号的普通回合：行为与本单之前**逐字节相同**
