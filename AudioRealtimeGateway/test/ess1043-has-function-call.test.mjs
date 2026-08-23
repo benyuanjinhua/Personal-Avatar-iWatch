@@ -231,8 +231,8 @@ test('ESS-1043 · 上游不发 response.done 时保持 ESS-990 之前的行为�
   turn.close()
 })
 
-test('ESS-1043 · 工具调用声明后若结果永不回来，tool-call 窗口仍兜底收口（有界）', async () => {
-  // hasFunctionCall=true 之后什么都不发：回合只能靠 tool-call 窗口收口，
+test('ESS-1096 · 工具调用声明后若结果永不回来，tool-call 窗口显式失败（有界）', async () => {
+  // hasFunctionCall=true 之后什么都不发：回合只能靠 tool-call 窗口失败退出，
   // 不能永远挂着。toolCallWindowMs=600 在用例时长内。
   const url = await upstream((ws, message) => {
     if (message.type === 'connect') {
@@ -255,13 +255,11 @@ test('ESS-1043 · 工具调用声明后若结果永不回来，tool-call 窗口�
   })
   const turn = openTurn(transport, { requestId: 'r4', events })
   turn.commit()
-  await waitFor(() => events.some(event => event.type === 'agent.audio.done'), 4_000)
+  await waitFor(() => events.some(event => event.code === 'ERR_TOOL_TASK_TIMEOUT'), 4_000)
 
   const terminals = logs.filter(l => l.evt === 'upstream_turn_terminal')
-  assert.equal(terminals.length, 1)
-  // 有界收口：tool-call 窗口到期按 segment_gap 收口，而不是永远挂起。
-  assert.equal(terminals[0].reason, 'segment_gap')
-  assert.equal(terminals[0].window_ms, 600)
+  assert.equal(terminals.length, 0)
+  assert.ok(logs.some(l => l.evt === 'upstream_tool_turn_timeout'))
   assert.ok(logs.some(l => l.evt === 'upstream_tool_call_pending'))
   turn.close()
 })

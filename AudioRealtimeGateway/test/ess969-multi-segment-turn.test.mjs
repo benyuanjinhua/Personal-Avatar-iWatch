@@ -360,7 +360,7 @@ test('ESS-990 · 单段回合：窗口到期收口，不产生多余的段落边
   turn.close()
 })
 
-test('ESS-990 · 未终结 task 把窗口从基础档抬到延长档（只延长，不否决收口）', async () => {
+test('ESS-1096 · 未终结 task 否决正常收口，延长档到期显式失败', async () => {
   const url = await upstream((ws, message) => {
     if (message.type === 'connect') {
       send(ws, { type: 'voice.ready' })
@@ -398,13 +398,9 @@ test('ESS-990 · 未终结 task 把窗口从基础档抬到延长档（只延长
   await new Promise(resolve => setTimeout(resolve, 500))
   assert.ok(!events.some(e => e.type === 'agent.audio.done'),
     '未终结 task 在途时不得按基础档收口')
-  // 但它是延长，不是否决：延长档到期照样收口（实测 task 会比回合多活 30–70 s，
-  // 一律不收口等于把每个工具回合挂到客户端 45 s 硬超时）。
-  await waitFor(() => events.some(e => e.type === 'agent.audio.done'), 4_000)
-  const terminal = logs.find(l => l.evt === 'upstream_turn_terminal')
-  assert.equal(terminal.reason, 'segment_gap')
-  assert.equal(terminal.window_ms, 1_400)
-  assert.equal(terminal.outstanding_tasks, 1)
+  await waitFor(() => events.some(e => e.code === 'ERR_TOOL_TASK_TIMEOUT'), 4_000)
+  assert.ok(!events.some(e => e.type === 'agent.audio.done'))
+  assert.ok(logs.some(l => l.evt === 'upstream_tool_turn_timeout' && l.outstanding_tasks === 1))
   assert.ok(logs.some(l => l.evt === 'upstream_turn_busy' && l.cause === 'task_in_flight'))
   turn.close()
 })
@@ -426,6 +422,7 @@ test('ESS-990 · task 终态把它移出未终结集合；真实帧的三种 id 
       setTimeout(() => {
         send(ws, { type: 'task.completed', task: { id: 'work_a', status: 'completed' } })
         send(ws, { type: 'task.failed', task: { id: 'work_b', status: 'failed' } })
+        send(ws, { type: 'task.cancelled', taskId: 'work_c' })
       }, 100)
     }
   })
@@ -443,12 +440,11 @@ test('ESS-990 · task 终态把它移出未终结集合；真实帧的三种 id 
   // 三种形状都被认成 lifecycle，并原样转发给下游。
   assert.deepEqual(
     events.filter(e => e.type === 'agent.task').map(e => e.task.id),
-    ['work_a', 'work_b', 'work_c', 'work_a', 'work_b'],
+    ['work_a', 'work_b', 'work_c', 'work_a', 'work_b', 'work_c'],
   )
   const terminal = logs.find(l => l.evt === 'upstream_turn_terminal')
-  assert.equal(terminal.outstanding_tasks, 1, '只剩 work_c 未终结')
-  // 忙档一旦抬起就保持到回合结束——降档会在最需要等的时候提前收口。
-  assert.equal(terminal.window_ms, 700)
+  assert.equal(terminal.outstanding_tasks, 0)
+  assert.equal(terminal.reason, 'task_terminal_and_audio_done')
   turn.close()
 })
 
@@ -635,6 +631,9 @@ test('ESS-990 · 全栈：真实上游时序（每段 done 后立刻 idle）下�
         audioDelta(ws, 2, '晴，28 度')
         send(ws, { type: 'audio.done' })
         send(ws, { type: 'voice.state', state: 'idle', origin: 'agent' })
+        setTimeout(() => send(ws, {
+          type: 'task.completed', task: { id: 'work_weather', status: 'completed' },
+        }), 50)
       }, 600)
     }
   })

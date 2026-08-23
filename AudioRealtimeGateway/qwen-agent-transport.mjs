@@ -331,7 +331,8 @@ export class QwenAgentTransport {
     // deliver a late prior response on the newly-taken-over connection.  At
     // that point this adapter would (incorrectly) stamp those bytes with the
     // new request's responseId.  Enforce one active request per session and
-    // cancel/close the old upstream socket before opening the replacement.
+    // cancel/close the old upstream socket before opening the replacement,
+    // except while that old turn owns an in-flight tool task (ESS-1096).
     //
     // ESS-745: match on the conversation (device + session), not on session
     // alone, and supersede every prior turn of that conversation — including
@@ -339,7 +340,30 @@ export class QwenAgentTransport {
     // `prior.requestId !== requestId` guard let survive as an orphan.  The new
     // turn is not in the map yet, so nothing here can supersede itself.
     for (const prior of this.turns.values()) {
-      if (prior.conversation === conversation) prior.supersede?.(requestId)
+      if (prior.conversation !== conversation) continue
+      const protectedToolTurn = prior.pendingToolCall || prior.outstandingTasks.size > 0
+      if (protectedToolTurn) {
+        this.log('upstream_supersede_suppressed', {
+          request_id: prior.requestId, session_id: prior.sessionId,
+          device_id: prior.deviceId, generation: prior.generation,
+          superseded_by_request_id: requestId,
+          pending_tool_call: prior.pendingToolCall,
+          outstanding_tasks: prior.outstandingTasks.size,
+          decision: 'reject_new_turn', reason: 'tool_turn_in_flight',
+        })
+        queueMicrotask(() => onEvent({
+          type: 'agent.error', response_id: responseId,
+          code: 'ERR_TOOL_TURN_BUSY',
+          detail: 'a tool turn is still running for this conversation',
+          retriable: true,
+        }))
+        const noop = () => {}
+        return {
+          appendAudio: noop, commit: noop, cancel: noop, close: noop,
+          playbackStarted: noop, playbackEnded: noop,
+        }
+      }
+      prior.supersede?.(requestId)
     }
     const upstreamSessionId = `watch-direct-${sessionId}-${generation}`
     const url = new URL(this.gatewayUrl)
@@ -382,9 +406,9 @@ export class QwenAgentTransport {
       // supersede). `segmentGapWindowMs` records which of the two calibrated
       // windows is armed so a late piece of evidence can widen it once.
       segmentGapTimer: null, segmentGapWindowMs: 0, segmentClosedAt: 0,
-      // ESS-990 corroborating signals (`outstandingTasks` first added by
-      // ESS-1004 as evidence-only). Neither can decide the terminal on its
-      // own (see `noteTurnBusy`), they only widen the window.
+      // ESS-1096: tool task lifecycle is a hard terminal gate. A response-level
+      // idle or audio.done may close a segment, but cannot close/supersede the
+      // turn while one of these tasks is queued/running.
       outstandingTasks: new Set(), announcementResponseIds: new Set(),
       turnBusy: false,
       // ESS-1068: `activeAnnouncements` tracks announcement responses that
@@ -553,6 +577,8 @@ export class QwenAgentTransport {
       if (turn.endAfterDone) {
         turn.endAfterDone = false
         turn.segmentsClosed += 1
+        turn.closedSegment = { segmentIndex: turn.segmentIndex, finalSequence }
+        turn.segmentClosedAt = Date.now()
         return endTurn('tool_result_done', finalSequence)
       }
       turn.closedSegment = { segmentIndex: turn.segmentIndex, finalSequence }
@@ -594,6 +620,15 @@ export class QwenAgentTransport {
     // forwarded so far, which is exactly the last segment's endpoint.
     const endTurn = (reason, finalSequence = turn.nextOutputSequence - 1) => {
       if (turn.turnEnded) return
+      if (turn.pendingToolCall || turn.outstandingTasks.size > 0) {
+        this.log('upstream_turn_terminal_suppressed', {
+          ...scopeLog, reason, derived_state: 'thinking',
+          pending_tool_call: turn.pendingToolCall,
+          outstanding_tasks: turn.outstandingTasks.size,
+        })
+        armSegmentGap('task_terminal_gate')
+        return
+      }
       turn.turnEnded = true
       turn.closedSegment = null
       clearTimeout(turn.segmentGapTimer)
@@ -642,6 +677,14 @@ export class QwenAgentTransport {
       turn.segmentGapTimer = setTimeout(() => {
         turn.segmentGapTimer = null
         if (turn.terminal || turn.turnEnded || !turn.closedSegment) return
+        if (turn.pendingToolCall || turn.outstandingTasks.size > 0) {
+          this.log('upstream_tool_turn_timeout', {
+            ...scopeLog, pending_tool_call: turn.pendingToolCall,
+            outstanding_tasks: turn.outstandingTasks.size,
+          })
+          fail('ERR_TOOL_TASK_TIMEOUT', 'tool task did not reach a terminal state before the deadline')
+          return
+        }
         endTurn('segment_gap', turn.closedSegment.finalSequence)
       }, remaining)
       turn.segmentGapTimer.unref?.()
@@ -1135,6 +1178,11 @@ export class QwenAgentTransport {
               reorder_pending: turn.reorderBuffer.size,
               segments_closed: turn.segmentsClosed,
               parked_segment: turn.closedSegment ? turn.closedSegment.segmentIndex : null,
+              derived_state: turn.pendingToolCall || turn.outstandingTasks.size > 0 ? 'thinking' : 'idle_candidate',
+              suppressed: turn.pendingToolCall || turn.outstandingTasks.size > 0,
+              suppress_reason: turn.pendingToolCall || turn.outstandingTasks.size > 0
+                ? 'tool_turn_in_flight' : null,
+              outstanding_tasks: turn.outstandingTasks.size,
             })
           }
           return
@@ -1345,6 +1393,9 @@ export class QwenAgentTransport {
           if (terminal) {
             turn.outstandingTasks.delete(id)
             noteTurnIdle('task_terminal')
+            if (!turn.pendingToolCall && turn.outstandingTasks.size === 0 && turn.closedSegment) {
+              endTurn('task_terminal_and_audio_done', turn.closedSegment.finalSequence)
+            }
           } else if (!TASK_NON_LIFECYCLE_EVENTS.has(event.type)) {
             turn.outstandingTasks.add(id)
             noteTurnBusy('task_in_flight')
