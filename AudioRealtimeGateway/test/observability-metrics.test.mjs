@@ -50,6 +50,16 @@ test('commit_to_first_tool_audio_ms measures commit → first tool-answer audio,
   assert.equal(summary.commit_to_first_tool_audio_ms, 900) // 1900 − 1000
 })
 
+// ESS-1082 阻断 1 反例：普通多段回答（无 tool.started）不得产出工具首音频指标。
+test('a non-tool multi-segment answer leaves commit_to_first_tool_audio_ms null', () => {
+  const acc = new MetricsAccumulator()
+  acc.push({ evt: 'uplink_committed', request_id: 'r-1', session_id: 's-1', generation: 1, t: 0 })
+  acc.push({ evt: 'downlink_first_frame', request_id: 'r-1', session_id: 's-1', generation: 1, sequence: 0, t: 20 })
+  acc.push({ evt: 'segment_first_frame', request_id: 'r-1', session_id: 's-1', generation: 1, sequence: 1, t: 80 })
+  const summary = acc.summarize('r-1')
+  assert.equal(summary.commit_to_first_tool_audio_ms, null)
+})
+
 test('direct answer (no Codex) leaves codex_first_chunk_ms null', () => {
   const acc = new MetricsAccumulator()
   acc.push({ evt: 'uplink_committed', request_id: 'r-1', session_id: 's-1', generation: 1, t: 0 })

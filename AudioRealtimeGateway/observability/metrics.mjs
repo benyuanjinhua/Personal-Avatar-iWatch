@@ -133,9 +133,10 @@ export class MetricsAccumulator {
         break
 
       case 'segment_first_audio':
-        // First frame of a follow-on segment = the tool answer, NOT the
-        // opening acknowledgement (downlink_first_frame). ESS-1082 阻断 1。
-        if (turn.firstToolAudioAt == null) turn.firstToolAudioAt = t
+        // First frame of a follow-on segment is only the *tool answer* when the
+        // turn has actually started a tool. A plain multi-segment answer (no
+        // tool.started) must not record firstToolAudioAt (ESS-1082 阻断 1)。
+        if (turn.toolStartedAt != null && turn.firstToolAudioAt == null) turn.firstToolAudioAt = t
         if (turn.segmentFlushAt != null) {
           turn.segment_to_first_audio_ms.push(Math.max(0, t - turn.segmentFlushAt))
           turn.segmentFlushAt = null
@@ -199,7 +200,7 @@ export class MetricsAccumulator {
         : null,
       chunk_to_segment_ms: [...turn.chunk_to_segment_ms],
       segment_to_first_audio_ms: [...turn.segment_to_first_audio_ms],
-      commit_to_first_tool_audio_ms: turn.commitAt != null && turn.firstToolAudioAt != null
+      commit_to_first_tool_audio_ms: turn.commitAt != null && turn.toolStartedAt != null && turn.firstToolAudioAt != null
         ? Math.max(0, turn.firstToolAudioAt - turn.commitAt)
         : null,
       max_queue_depth: turn.maxQueueDepth,
