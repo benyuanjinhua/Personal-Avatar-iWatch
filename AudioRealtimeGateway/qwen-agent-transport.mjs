@@ -394,7 +394,7 @@ export class QwenAgentTransport {
       clientInstanceId, ownershipState: null, ownershipHolderLabel: null,
       ownershipHolderInstanceId: null, takeoverAttempted: false,
       responseTimer: null, responded: false, commitSentAt: null,
-      taskTerminalTimer: null,
+      taskTerminalTimer: null, toolAudioTimer: null,
       // ESS-969 segment book-keeping. `closedSegment` holds a segment whose
       // `audio.done` has settled but whose meaning is not decided yet: it is
       // a SEGMENT boundary if the turn goes on to produce more, and the TURN
@@ -445,10 +445,11 @@ export class QwenAgentTransport {
       // call, `endAfterDone` marks it so `flushDone` ends the turn as soon as
       // that segment's audio settles instead of waiting out the idle window.
       pendingToolCall: false, endAfterDone: false,
-      pendingToolTerminal: null,
+      pendingToolTerminal: null, awaitingToolAudioTerminal: false,
     }
     turn.toolGateActive = () => !turn.terminal && !turn.turnEnded
-      && (turn.pendingToolCall || turn.outstandingTasks.size > 0 || turn.pendingToolTerminal !== null)
+      && (turn.pendingToolCall || turn.outstandingTasks.size > 0
+        || turn.pendingToolTerminal !== null || turn.awaitingToolAudioTerminal)
     const scopeLog = { request_id: requestId, session_id: sessionId, device_id: deviceId, generation }
     turn.supersede = nextRequestId => {
       if (turn.terminal) return
@@ -460,6 +461,7 @@ export class QwenAgentTransport {
       clearTimeout(turn.responseTimer)
       clearTimeout(turn.segmentGapTimer)
       clearTimeout(turn.taskTerminalTimer)
+      clearTimeout(turn.toolAudioTimer)
       this.log('upstream_turn_superseded', {
         ...scopeLog, superseded_by_request_id: nextRequestId,
       })
@@ -487,6 +489,7 @@ export class QwenAgentTransport {
       clearTimeout(turn.responseTimer)
       clearTimeout(turn.segmentGapTimer)
       clearTimeout(turn.taskTerminalTimer)
+      clearTimeout(turn.toolAudioTimer)
       this.log('upstream_error', { ...scopeLog, code })
       onEvent({ type: 'agent.error', response_id: responseId, code, detail, retriable: true })
       try { turn.ws?.close() } catch { /* best effort */ }
@@ -611,7 +614,36 @@ export class QwenAgentTransport {
     // The turn produced more output after a segment closed: that closed
     // segment was a boundary, not the end. Release it downstream before the
     // new segment's frames so the client sees them in order.
+    const invalidateDeferredTerminal = cause => {
+      if (!turn.pendingToolTerminal) return
+      const stale = turn.pendingToolTerminal
+      turn.pendingToolTerminal = null
+      turn.awaitingToolAudioTerminal = true
+      clearTimeout(turn.taskTerminalTimer)
+      turn.taskTerminalTimer = null
+      this.log('upstream_turn_terminal_invalidated', {
+        ...scopeLog, cause, stale_final_sequence: stale.finalSequence,
+        current_final_sequence: turn.nextOutputSequence - 1,
+        ui_state: 'thinking', turn_state: 'busy',
+      })
+      clearTimeout(turn.toolAudioTimer)
+      if (this.toolCallWindowMs > 0) {
+        turn.toolAudioTimer = setTimeout(() => {
+          turn.toolAudioTimer = null
+          if (turn.turnEnded || !turn.awaitingToolAudioTerminal) return
+          this.log('upstream_tool_audio_terminal_timeout', {
+            ...scopeLog, timeout_ms: this.toolCallWindowMs,
+            final_sequence: turn.nextOutputSequence - 1,
+          })
+          fail('ERR_UPSTREAM_TOOL_AUDIO_TIMEOUT',
+            `tool output did not reach audio.done within ${this.toolCallWindowMs}ms`)
+        }, this.toolCallWindowMs)
+        turn.toolAudioTimer.unref?.()
+      }
+    }
+
     const releaseClosedSegment = cause => {
+      invalidateDeferredTerminal(cause)
       const closed = turn.closedSegment
       if (!closed) return
       turn.closedSegment = null
@@ -634,6 +666,9 @@ export class QwenAgentTransport {
     const endTurn = (reason, finalSequence = turn.nextOutputSequence - 1) => {
       if (turn.turnEnded) return
       if (turn.outstandingTasks.size > 0 && reason !== 'tool_task_timeout') {
+        turn.awaitingToolAudioTerminal = false
+        clearTimeout(turn.toolAudioTimer)
+        turn.toolAudioTimer = null
         turn.pendingToolTerminal = { reason, finalSequence }
         this.log('upstream_turn_terminal_deferred', {
           ...scopeLog, reason: 'task_in_flight', candidate_reason: reason,
@@ -657,8 +692,11 @@ export class QwenAgentTransport {
       }
       turn.turnEnded = true
       turn.pendingToolTerminal = null
+      turn.awaitingToolAudioTerminal = false
       clearTimeout(turn.taskTerminalTimer)
       turn.taskTerminalTimer = null
+      clearTimeout(turn.toolAudioTimer)
+      turn.toolAudioTimer = null
       turn.closedSegment = null
       clearTimeout(turn.segmentGapTimer)
       turn.segmentGapTimer = null
@@ -1558,6 +1596,8 @@ export class QwenAgentTransport {
           clearTimeout(turn.connectTimer)
           clearTimeout(turn.responseTimer)
           clearTimeout(turn.segmentGapTimer)
+          clearTimeout(turn.taskTerminalTimer)
+          clearTimeout(turn.toolAudioTimer)
           this.#release(turn)
           return
         }
@@ -1589,11 +1629,16 @@ export class QwenAgentTransport {
         clearTimeout(turn.responseTimer)
         clearTimeout(turn.segmentGapTimer)
         clearTimeout(turn.taskTerminalTimer)
+        clearTimeout(turn.toolAudioTimer)
         turn.ws?.close()
         this.#release(turn)
       },
       close: () => {
-        if (turn.terminal) return
+        // A completed turn can still own an open upstream socket. Session
+        // teardown must close that handle even after endTurn marked the turn
+        // terminal. Terminate after the best-effort mute instead of starting a
+        // graceful close handshake: this is already final session teardown,
+        // and an unresponsive peer otherwise keeps ws's 30 s close timer alive.
         turn.terminal = true
         clearTimeout(turn.connectTimer)
         clearTimeout(turn.doneTimer)
@@ -1601,10 +1646,11 @@ export class QwenAgentTransport {
         clearTimeout(turn.responseTimer)
         clearTimeout(turn.segmentGapTimer)
         clearTimeout(turn.taskTerminalTimer)
+        clearTimeout(turn.toolAudioTimer)
         if (turn.ws?.readyState === WebSocket.OPEN) {
           turn.ws.send(JSON.stringify({ type: 'mute' }))
         }
-        turn.ws?.close()
+        turn.ws?.terminate()
         this.#release(turn)
       },
       // ESS-1068 复审第1点：把 Watch 的 playback 回执转发给 qwen，
