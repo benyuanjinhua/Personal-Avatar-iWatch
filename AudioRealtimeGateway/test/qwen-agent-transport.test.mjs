@@ -149,6 +149,55 @@ test('late close of a superseded same-requestId turn does not evict its replacem
   newTurn.close()
 })
 
+// ESS-1101: the qwen-audio-agent websocket accepts the client-level
+// `interrupt` event. `response.cancel` belongs to its provider connection and
+// is ignored on this socket, which left the old tool response alive after a
+// Watch barge-in.
+test('superseding a turn sends interrupt before opening the replacement', async () => {
+  const received = []
+  const url = await upstream((ws, message) => {
+    received.push(message)
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+  })
+  const transport = new QwenAgentTransport({ gatewayUrl: url })
+  transport.openTurn({
+    requestId: 'old', sessionId: 's1101', deviceId: 'd1101', generation: 1,
+    responseId: 'old:gen1', onEvent: () => {},
+  })
+  await waitFor(() => received.some(event => event.type === 'connect'))
+
+  const replacement = transport.openTurn({
+    requestId: 'new', sessionId: 's1101', deviceId: 'd1101', generation: 2,
+    responseId: 'new:gen2', onEvent: () => {},
+  })
+  await waitFor(() => received.some(event => event.type === 'interrupt'))
+
+  assert.equal(received.filter(event => event.type === 'interrupt').length, 1)
+  assert.equal(received.some(event => event.type === 'response.cancel'), false)
+  replacement.close()
+})
+
+test('cancel is idempotent and sends one upstream interrupt', async () => {
+  const received = []
+  const url = await upstream((ws, message) => {
+    received.push(message)
+    if (message.type === 'connect') ws.send(JSON.stringify({ type: 'voice.ready' }))
+  })
+  const transport = new QwenAgentTransport({ gatewayUrl: url })
+  const turn = transport.openTurn({
+    requestId: 'weather', sessionId: 's1101', deviceId: 'd1101', generation: 1,
+    responseId: 'weather:gen1', onEvent: () => {},
+  })
+  await waitFor(() => received.some(event => event.type === 'connect'))
+
+  turn.cancel()
+  turn.cancel()
+  await waitFor(() => received.some(event => event.type === 'interrupt'))
+
+  assert.equal(received.filter(event => event.type === 'interrupt').length, 1)
+  assert.equal(transport.turns.size, 0)
+})
+
 // ESS-974: the provider broadcasts ownership state globally. A superseded
 // instance's delayed deactivate can therefore arrive on the replacement
 // socket; socket-local current-turn checks alone cannot distinguish it.

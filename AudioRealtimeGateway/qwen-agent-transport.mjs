@@ -464,7 +464,13 @@ export class QwenAgentTransport {
         ...scopeLog, superseded_by_request_id: nextRequestId,
       })
       if (turn.ws?.readyState === WebSocket.OPEN) {
-        try { turn.ws.send(JSON.stringify({ type: 'response.cancel' })) } catch { /* closing */ }
+        // qwen-audio-agent's client-facing realtime contract calls this
+        // `interrupt`. `response.cancel` is the provider-facing OpenAI frame
+        // and is intentionally not accepted by the gateway websocket. Sending
+        // it here used to be a silent no-op: the old tool turn survived a
+        // barge-in and could race the replacement turn with late task/audio
+        // events.
+        try { turn.ws.send(JSON.stringify({ type: 'interrupt' })) } catch { /* closing */ }
       }
       try { turn.ws?.close(1000, 'superseded') } catch { /* best effort */ }
       this.#release(turn)
@@ -1574,7 +1580,7 @@ export class QwenAgentTransport {
       cancel: () => {
         if (turn.terminal) return
         if (turn.ws?.readyState === WebSocket.OPEN) {
-          turn.ws.send(JSON.stringify({ type: 'response.cancel' }))
+          turn.ws.send(JSON.stringify({ type: 'interrupt' }))
         }
         turn.terminal = true
         clearTimeout(turn.connectTimer)
