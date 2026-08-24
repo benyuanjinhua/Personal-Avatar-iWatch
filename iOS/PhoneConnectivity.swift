@@ -418,7 +418,10 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         )
     }
 
-    private static func turnIdentity(for envelope: RealtimeUplinkEnvelope) -> (requestId: String, sessionId: String)? {
+    /// ESS-753：将 turnIdentity 从 private 提为内部可见，以便 iOS 单测
+    /// target 验证直连/降级路由的分发入口。方法本身是纯静态，不依赖
+    /// WCSession 或任何实例状态，提权不改变行为。
+    static func turnIdentity(for envelope: RealtimeUplinkEnvelope) -> (requestId: String, sessionId: String)? {
         switch envelope.kind {
         case .streamStart:
             return envelope.start.map { ($0.requestId, $0.sessionId) }

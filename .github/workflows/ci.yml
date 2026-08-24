@@ -188,12 +188,81 @@ jobs:
             exit "$xcode_exit"
           fi
 
+      # R-02.5 关卡一 · 第 7 行：iOS 模拟器 xctest（ESS-753 新增）。
+      # PhoneRealtimeSession / PhoneConnectivity / WristAgentPhoneRelay 等
+      # iPhone 实时链路的行为回归。无需 Watch 配对 —— 全部通过 Transport
+      # 协议注入内存传输。
+      - name: Pick iOS simulator
+        id: pick-ios-sim
+        run: |
+          set -euo pipefail
+          ios_sim_id=$(xcrun simctl list devices -j iPhone \
+            | node -e '
+                const data = JSON.parse(require("fs").readFileSync(0, "utf8"));
+                const runtimes = data.devices || {};
+                const all = [];
+                for (const [rt, list] of Object.entries(runtimes)) {
+                  if (!rt.includes("iOS")) continue;
+                  for (const d of list) if (d.isAvailable !== false) all.push(d);
+                }
+                const booted = all.find(d => d.state === "Booted");
+                const pick = booted || all[0];
+                if (!pick) { process.exit(2); }
+                process.stdout.write(pick.udid);
+              ')
+          if [ -z "$ios_sim_id" ]; then
+            echo "::error::No iOS Simulator available on this runner"
+            exit 1
+          fi
+          echo "id=$ios_sim_id" >> "$GITHUB_OUTPUT"
+          echo "Picked iOS sim: $ios_sim_id"
+
+      - name: xcodebuild test — WristAgent iOSTests
+        timeout-minutes: 15
+        run: |
+          set -uo pipefail
+          xcodebuild test \
+            -project WristAgent.xcodeproj \
+            -scheme WristAgent \
+            -destination "id=${{ steps.pick-ios-sim.outputs.id }}" \
+            -derivedDataPath .build/DerivedData-iOSTest \
+            -only-testing:WristAgent\ iOSTests \
+            WRISTAGENT_BUNDLE_ID=com.benyuan.wristagent.ci.WristAgent \
+            CODE_SIGNING_ALLOWED=NO \
+            | tee xcodebuild-ios-test.log
+          xcode_exit=${PIPESTATUS[0]}
+          if grep -qE '^\*\* TEST FAILED \*\*' xcodebuild-ios-test.log; then
+            echo "::error::iOS xctest failed: '** TEST FAILED **' marker present"
+            exit 1
+          fi
+          if awk '
+              /^Failing tests:$/ { in_block = 1; next }
+              in_block && /^[[:space:]]*$/ { in_block = 0; next }
+              in_block { print }
+            ' xcodebuild-ios-test.log | grep -qE '\S'; then
+            echo "::error::iOS xctest failed: 'Failing tests:' section is non-empty"
+            exit 1
+          fi
+          if [ "$xcode_exit" -ne 0 ]; then
+            echo "::error::xcodebuild test exited with code $xcode_exit"
+            exit "$xcode_exit"
+          fi
+
       - name: Upload xcodebuild logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: xcodebuild-watch-test-log
           path: xcodebuild-watch-test.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload xcodebuild iOS logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-ios-test-log
+          path: xcodebuild-ios-test.log
           if-no-files-found: ignore
           retention-days: 14
 
