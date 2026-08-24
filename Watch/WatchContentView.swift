@@ -288,11 +288,19 @@ struct WatchContentView: View {
 
                 // ESS-598：球体动画不能成为唯一反馈。真机强光、抬腕与连接
                 // 建立期都可能让动画差异不可辨，明确显示当前主链路阶段。
+                // ESS-1100：工具长任务期间这一行会持续换成真实进展文字
+                // （「正在查询相关信息」…）。小屏三条硬约束都落在这里：
+                // 单行、尾部截断、切换用 0.25s 淡入淡出而不是硬跳。
+                // 高频抖动在会话层已按 0.8s 节流（`progressUpdateMinIntervalSeconds`）。
                 Text(sessionStatusText)
                     .font(.caption2.bold())
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .truncationMode(.tail)
+                    .padding(.horizontal, 8)
+                    .frame(maxWidth: proxy.size.width)
                     .position(x: proxy.size.width / 2, y: 18)
+                    .animation(.easeInOut(duration: 0.25), value: sessionStatusText)
 
                 // 建立中 >800ms 未就绪 → 三点渐显（PRD §3.5.1 第 3 步）。
                 if session.showConnectingDots {
@@ -441,7 +449,10 @@ struct WatchContentView: View {
         case .listening:
             switch session.turnPhase {
             case .listening: return "正在听…"
-            case .thinking: return "正在思考…"
+            // ESS-1100：工具回合把这一行让给真实进展（无进展文本时为稳定的
+            // 「正在处理」）。`toolProcessingText == nil` = 本回合没有任何
+            // 工具证据，普通直接回答走的还是**逐字相同**的那句「正在思考…」。
+            case .thinking: return session.toolProcessingText ?? "正在思考…"
             // ESS-650 F2-4：gate 决定这句话。OFF 时说「点球」就只能点球；
             // ON 时必须把语音这条路说出来，否则用户不知道可以直接开口——
             // 一个不被告知的交互等于不存在。读的是 gate 的同一个真相源

@@ -368,6 +368,18 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
     /// string — `ToolTaskStatus` does the interpretation and treats anything
     /// unknown as **non-terminal**.
     var taskStatus: String?
+    /// ESS-1100: one line of upstream-authored progress on `task.state`
+    /// (e.g. 「正在查询相关信息」). Display-only — it touches no barrier and no
+    /// turn gate. Absent for every other kind and for task frames that carry
+    /// no progress.
+    var progressText: String?
+    /// ESS-1100: forensic category behind `progressText` (search/read/plan/…).
+    var progressCategory: String?
+    /// ESS-1100: gateway-assigned monotone display sequence. **This hop is the
+    /// reason it exists**: WCSession does not guarantee ordering, so without a
+    /// server-assigned number a late frame would overwrite a newer progress
+    /// line. Watch drops anything that is not strictly newer.
+    var progressSequence: Int?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
@@ -385,6 +397,9 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         case turnId = "turn_id"
         case taskId = "task_id"
         case taskStatus = "task_status"
+        case progressText = "progress_text"
+        case progressCategory = "progress_category"
+        case progressSequence = "progress_seq"
     }
 
     init(
@@ -402,7 +417,10 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         conversationId: String? = nil,
         turnId: String? = nil,
         taskId: String? = nil,
-        taskStatus: String? = nil
+        taskStatus: String? = nil,
+        progressText: String? = nil,
+        progressCategory: String? = nil,
+        progressSequence: Int? = nil
     ) {
         self.protocolVersion = protocolVersion
         self.kind = kind
@@ -419,6 +437,9 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         self.turnId = turnId
         self.taskId = taskId
         self.taskStatus = taskStatus
+        self.progressText = progressText
+        self.progressCategory = progressCategory
+        self.progressSequence = progressSequence
     }
 
     /// Explicit decoder so pre-ESS-404 messages (no `generation`, no
@@ -441,6 +462,11 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         self.turnId = try c.decodeIfPresent(String.self, forKey: .turnId)
         self.taskId = try c.decodeIfPresent(String.self, forKey: .taskId)
         self.taskStatus = try c.decodeIfPresent(String.self, forKey: .taskStatus)
+        // ESS-1100：展示面三件套全部宽松解码。一个缺席的进展字段绝不能让整条
+        // 下行报废——那会把本帧真正关键的 `task_status` 一起丢掉。
+        self.progressText = try c.decodeIfPresent(String.self, forKey: .progressText)
+        self.progressCategory = try c.decodeIfPresent(String.self, forKey: .progressCategory)
+        self.progressSequence = try c.decodeIfPresent(Int.self, forKey: .progressSequence)
     }
 
     /// Bridge PR #113 handshake ack. Carries no payload. Adapter treats this
@@ -523,14 +549,18 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         sessionId: String,
         generation: Int? = nil,
         taskId: String?,
-        status: String
+        status: String,
+        progress: AgentTaskProgress? = nil
     ) -> Self {
         RealtimeDownlinkEnvelope(
             protocolVersion: RealtimeWireVersion.downlink,
             kind: .taskState, requestId: requestId, sessionId: sessionId,
             sequence: nil, audio: nil, transcript: nil, reason: nil,
             responseId: nil, generation: generation,
-            taskId: taskId, taskStatus: status
+            taskId: taskId, taskStatus: status,
+            progressText: progress?.text,
+            progressCategory: progress?.category,
+            progressSequence: progress?.sequence
         )
     }
 

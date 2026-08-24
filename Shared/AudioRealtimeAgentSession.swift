@@ -137,13 +137,18 @@ final class AudioRealtimeAgentSession {
     var onSegmentDropped: ((String, String?, Int, Int) -> Void)?
 
     /// ESS-1097：上游 `task.*` 生命周期。
-    /// Params: (requestId, generation, taskId, status)。`taskId == nil` 表示
-    /// `tool_call_pending` 这类还没有任务号的「工具要开跑」信号。
+    /// Params: (requestId, generation, taskId, status, progress)。
+    /// `taskId == nil` 表示 `tool_call_pending` 这类还没有任务号的
+    /// 「工具要开跑」信号。
     ///
     /// 这条回调**不进播放管线**，它只喂客户端的回合聚合状态机
     /// （`ToolTurnAggregate`）：任务未终结时 UI 必须保持「正在思考」，
     /// 并禁止自动开下一轮 generation 把在跑的工具回合 supersede 掉。
-    var onTaskState: ((String, Int, String?, String) -> Void)?
+    ///
+    /// ESS-1100：`progress` 是同一帧上的**阶段性进展文字**（可缺席）。它只走
+    /// 展示面，不参与闸门判定——把展示面塞进闸门，等于让一句文案能决定回合
+    /// 什么时候收口。
+    var onTaskState: ((String, Int, String?, String, AgentTaskProgress?) -> Void)?
 
     /// Emitted on Gateway `error`.
     /// Params: (code, requestId, generation, retriable, detail).
@@ -395,7 +400,7 @@ final class AudioRealtimeAgentSession {
             )
             onSegmentDropped?(rid, respId, gen, droppedCount)
 
-        case .taskState(let sid, let rid, let gen, let taskId, let status):
+        case .taskState(let sid, let rid, let gen, let taskId, let status, let progress):
             guard sid == sessionId, let turn = currentTurn,
                   turn.requestId == rid else { return }
             // 任务在跑 = 上游确实在干活。撤掉「等首个响应」的预算，否则一个
@@ -408,9 +413,11 @@ final class AudioRealtimeAgentSession {
                 module: Self.logModule,
                 event: "downlink_task_state_accepted",
                 requestId: rid, sessionId: sid,
-                detail: "task_id=\(taskId ?? "nil") status=\(status) gen=\(gen)"
+                detail: "task_id=\(taskId ?? "nil") status=\(status) gen=\(gen) "
+                    + "progress_seq=\(progress?.sequence?.description ?? "nil") "
+                    + "progress_category=\(progress?.category ?? "nil")"
             )
-            onTaskState?(rid, gen, taskId, status)
+            onTaskState?(rid, gen, taskId, status, progress)
 
         case .cancelAck(let sid, let rid, let gen, let cancelledRespId):
             guard sid == sessionId else { return }
