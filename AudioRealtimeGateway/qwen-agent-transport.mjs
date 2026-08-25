@@ -427,6 +427,11 @@ export class QwenAgentTransport {
       // marks the responseIds whose audio/transcript is attributed and must
       // be forwarded rather than dropped.
       activeAnnouncements: new Set(),
+      // ESS-1107: stale/unattributed announcements may be replayed as soon as
+      // a fresh Watch socket opens. They are not a busy cause for this turn;
+      // retain their ids only long enough to acknowledge and preempt them.
+      isolatedAnnouncements: new Set(),
+      preemptedAnnouncements: new Set(),
       deliverAnnouncementIds: new Set(),
       // ESS-1068 复审第3点：`deliveredAnnouncements` 是「已完整下发并消费」
       // 的 dedup，只能在 audio.done 完整下发后记录，不能在 response.started
@@ -538,6 +543,13 @@ export class QwenAgentTransport {
     // Any frame that belongs to the response (delta, done, or an upstream
     // error) proves the upstream is answering; the deadline has done its job.
     const noteResponseProgress = () => {
+      // A frame observed before THIS turn's audio.commit cannot satisfy THIS
+      // turn's response deadline. Persisted startup announcements used to set
+      // `responded=true` here and silently disabled the fail-closed timeout.
+      if (!turn.committed || turn.commitSentAt === null) {
+        this.log('upstream_precommit_response_ignored', scopeLog)
+        return
+      }
       if (turn.responded) return
       turn.responded = true
       clearTimeout(turn.responseTimer)
@@ -1135,6 +1147,21 @@ export class QwenAgentTransport {
                 })
               }
             } else {
+              if (id !== null) {
+                turn.isolatedAnnouncements.add(id)
+                if (!turn.committed && ws.readyState === WebSocket.OPEN) {
+                  // Upstream confirms notification delivery on playback start.
+                  // A following interrupt cancels the stale response occupying
+                  // the realtime output slot, without deleting task history.
+                  ws.send(JSON.stringify({ type: 'playback.started', responseId: id }))
+                  ws.send(JSON.stringify({ type: 'interrupt' }))
+                  turn.preemptedAnnouncements.add(id)
+                  this.log('upstream_announcement_preempted', {
+                    ...scopeLog, upstream_response_id: id,
+                    reason: 'unattributed_before_commit',
+                  })
+                }
+              }
               this.log('upstream_announcement_isolated', {
                 ...scopeLog, upstream_response_id: id, upstream_task_id: taskKeyStr,
                 reason: 'unattributed',
@@ -1296,6 +1323,8 @@ export class QwenAgentTransport {
             const deliver = turn.deliverAnnouncementIds.has(doneAnnouncementId)
             turn.deliverAnnouncementIds.delete(doneAnnouncementId)
             turn.activeAnnouncements.delete(doneAnnouncementId)
+            turn.isolatedAnnouncements.delete(doneAnnouncementId)
+            turn.preemptedAnnouncements.delete(doneAnnouncementId)
             const stat = turn.announcementDropped.get(doneAnnouncementId) ?? { frames: 0, bytes: 0 }
             turn.announcementDropped.delete(doneAnnouncementId)
             if (deliver) {
@@ -1452,6 +1481,8 @@ export class QwenAgentTransport {
             // ESS-1068: the announcement finished; drop the busy cause it held.
             turn.deliverAnnouncementIds.delete(responseAnnouncementId)
             turn.activeAnnouncements.delete(responseAnnouncementId)
+            turn.isolatedAnnouncements.delete(responseAnnouncementId)
+            turn.preemptedAnnouncements.delete(responseAnnouncementId)
             noteTurnIdle('announcement_response_done')
             return
           }
@@ -1554,6 +1585,20 @@ export class QwenAgentTransport {
       commit: () => {
         if (turn.committed || turn.terminal) return
         turn.committed = true
+        // Cover the narrow case where an isolated response was registered
+        // while the socket was not writable. Already-preempted responses are
+        // deliberately excluded: upstream interrupt advances a generation, so
+        // emitting it twice would be a second state transition, not idempotency.
+        const pendingPreemption = [...turn.isolatedAnnouncements]
+          .filter(id => !turn.preemptedAnnouncements.has(id))
+        if (pendingPreemption.length > 0 && turn.ws?.readyState === WebSocket.OPEN) {
+          turn.ws.send(JSON.stringify({ type: 'interrupt' }))
+          this.log('upstream_announcement_preempted_at_commit', {
+            ...scopeLog, count: pendingPreemption.length,
+          })
+        }
+        turn.responded = false
+        turn.commitSentAt = null
         if (sendOrQueue({ type: 'audio.commit' })) armResponseDeadline()
       },
       cancel: () => {

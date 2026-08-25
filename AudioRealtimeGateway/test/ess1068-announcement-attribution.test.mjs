@@ -182,10 +182,10 @@ test('ESS-1107 · 播报从不设置 turnBusy，直答回合在基础窗口内�
       send(ws, { type: 'response.started', responseId: 'ans-1', origin: 'model' })
       audioDelta(ws, 0, 'prompt', 'ans-1')
       send(ws, { type: 'audio.done', responseId: 'ans-1' })
-      // 一段无归属的后台播报插入：不得触碰 turnBusy。
+      // 一段归属当前会话的后台播报插入：不得触碰 turnBusy。
       setTimeout(() => {
         send(ws, { type: 'response.started', responseId: 'ann-1', origin: 'announcement',
-          taskId: 'work_x' })
+          task: { id: 'work_x', sessionId: 's', deviceId: 'd' } })
         audioDelta(ws, 1, 'bg', 'ann-1')
         send(ws, { type: 'audio.done', responseId: 'ann-1' })
       }, 30)
@@ -209,6 +209,63 @@ test('ESS-1107 · 播报从不设置 turnBusy，直答回合在基础窗口内�
   assert.equal(events.some(event => event.type === 'agent.audio.segment_done'), false,
     'announcement must not release the parked foreground segment')
   turn.close()
+})
+
+test('ESS-1107 · 新会话的无归属历史播报被确认并抢占，不占 busy，随后用户输入正常回答', async () => {
+  const wire = []
+  const url = await upstream((ws, message) => {
+    wire.push(message)
+    if (message.type === 'connect') {
+      send(ws, { type: 'voice.ready' })
+      setTimeout(() => {
+        send(ws, { type: 'response.started', responseId: 'stale-ann', origin: 'announcement',
+          taskIds: ['old-work-1', 'old-work-2'] })
+        audioDelta(ws, 0, 'stale-result', 'stale-ann')
+      }, 10)
+    }
+    if (message.type === 'audio.commit') {
+      send(ws, { type: 'response.started', responseId: 'answer', origin: 'model' })
+      audioDelta(ws, 1, 'fresh-answer', 'answer')
+      send(ws, { type: 'audio.done', responseId: 'answer' })
+    }
+  })
+  const events = []; const logs = []
+  const transport = transportFor(url, { logs })
+  const turn = openTurn(transport, { events })
+  await waitFor(() => logs.some(l => l.evt === 'upstream_announcement_preempted'))
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+
+  assert.deepEqual(spoken(events), ['fresh-answer'])
+  assert.ok(!logs.some(l => l.evt === 'upstream_turn_busy' && l.cause === 'announcement_response'))
+  const types = wire.map(message => message.type)
+  assert.ok(types.indexOf('playback.started') < types.indexOf('interrupt'))
+  assert.ok(types.indexOf('interrupt') < types.indexOf('audio.commit'))
+  assert.equal(types.filter(type => type === 'interrupt').length, 1)
+  turn.close()
+})
+
+test('ESS-1107 · commit 前的响应帧不能满足本次输入的应答死线', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') {
+      send(ws, { type: 'voice.ready' })
+      send(ws, { type: 'response.started', responseId: 'precommit', origin: 'model' })
+      send(ws, { type: 'transcript.final', responseId: 'precommit', role: 'assistant', content: '旧响应' })
+    }
+    // audio.commit intentionally produces no response.
+  })
+  const events = []; const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, responseTimeoutMs: 120,
+    log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  const turn = openTurn(transport, { events })
+  await waitFor(() => logs.some(l => l.evt === 'upstream_precommit_response_ignored'))
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.error'))
+
+  assert.equal(events.at(-1).code, 'ERR_UPSTREAM_NO_RESPONSE')
+  assert.ok(logs.some(l => l.evt === 'upstream_response_timeout'))
 })
 
 test('ESS-1068 · task 身份跨 turn 持久化：后一轮能归属前一轮任务的结果', async () => {
