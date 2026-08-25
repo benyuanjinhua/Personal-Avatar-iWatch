@@ -423,7 +423,11 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
                     sequence: envelope.progressSequence,
                     text: envelope.progressText,
                     category: envelope.progressCategory
-                )
+                ),
+                // ESS-1111：代际随帧上送。缺席（老网关 / 老 iPhone 进程）时
+                // 传 nil，会话层按「本帧没有代际信息」放行，行为与本单之前
+                // 逐字相同——滚动升级窗口内不许因为缺一个字段就丢掉整帧。
+                generation: envelope.generation
             )
         }
     }

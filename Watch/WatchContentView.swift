@@ -302,6 +302,26 @@ struct WatchContentView: View {
                     .position(x: proxy.size.width / 2, y: 18)
                     .animation(.easeInOut(duration: 0.25), value: sessionStatusText)
 
+                // ESS-1111：答案正文的实时流。与顶部那行进展刻意分开——进展是
+                // 「覆盖」（只看最新一句），答案是「追加」（每一片都是内容）。
+                // 小屏三条硬约束都落在这里：至多两行、尾窗滚动（长度上限与
+                // 头部截断由 `LongTaskAnswerTranscript` 在值类型里保证）、
+                // 切换用淡入淡出而不是硬跳。渲染的是一个已经有界的字符串，
+                // 不做任何解析——音频线程与本视图之间没有共享的可变状态。
+                if let answer = session.answerStreamText {
+                    Text(answer)
+                        .font(.caption2)
+                        .foregroundStyle(.primary.opacity(0.85))
+                        .multilineTextAlignment(.center)
+                        .lineLimit(2)
+                        .truncationMode(.head)
+                        .padding(.horizontal, 10)
+                        .frame(maxWidth: proxy.size.width)
+                        .position(x: proxy.size.width / 2, y: 40)
+                        .animation(.easeInOut(duration: 0.2), value: answer)
+                        .transition(.opacity)
+                }
+
                 // 建立中 >800ms 未就绪 → 三点渐显（PRD §3.5.1 第 3 步）。
                 if session.showConnectingDots {
                     connectingDots
