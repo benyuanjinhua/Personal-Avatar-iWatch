@@ -472,9 +472,14 @@ test('ESS-1107 · 后台播报不产生段落边界，也不把窗口抬到延�
       send(ws, { type: 'audio.done' })
       send(ws, { type: 'voice.state', state: 'idle', origin: 'model' })
       setTimeout(() => {
-        // 无关后台播报：不是本回合的段落，也不是终态（实测在第一段 done 之后
+        // 归属本会话的后台播报：不是本回合的段落，也不是终态（实测在第一段 done 之后
         // 237–361 ms 到达，并且它一到，本回合的下一段就会晚 2.7–7.3 s）。
-        send(ws, { type: 'response.started', responseId: 'ann-1', origin: 'announcement', taskId: 'work_x' })
+        send(ws, {
+          type: 'response.started',
+          responseId: 'ann-1',
+          origin: 'announcement',
+          task: { id: 'work_x', sessionId: 's6', deviceId: 'd6' },
+        })
         send(ws, { type: 'voice.state', state: 'idle', origin: 'announcement' })
         setTimeout(() => {
           send(ws, { type: 'response.started', responseId: 'up-2', origin: 'agent' })
