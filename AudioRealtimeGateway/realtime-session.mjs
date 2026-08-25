@@ -139,6 +139,10 @@ export class RealtimeSession {
     this.finalSequence = null       // set when the downstream done is released
     this.staleGenerationDropped = 0
     this.postDoneAudioDropped = 0
+    // ESS-1100: per-session monotone display sequence for `task.state`
+    // progress. Only bumped when a frame actually carries progress text, so
+    // the client's「drop anything not newer」rule has no holes to fall into.
+    this.progressSequence = 0
     this._barrierTimer = null
 
     this.agentTurn = null
@@ -430,6 +434,7 @@ export class RealtimeSession {
       return this._emitTaskState({
         taskId: event.task?.id ?? null,
         status: event.task?.status ?? null,
+        progress: event.progress ?? null,
       })
     }
     if (event.type === 'agent.tool_call_state') {
@@ -466,20 +471,45 @@ export class RealtimeSession {
   // the turn barrier is precisely what releases the client's hold. Dropping it
   // there would build the deadlock this event exists to prevent. It carries no
   // audio and touches no barrier, so it cannot reorder or delay playback.
-  _emitTaskState({ taskId, status }) {
+  //
+  // ESS-1100 追加的第三个可选切面 `progress`：`{progress_text,
+  // progress_category, progress_seq}`。它**只是展示面**——不参与任何屏障、
+  // 不改变任务集合的裁决，缺席时这一帧与 ESS-1097 的老帧逐字节相同，所以
+  // 未升级的客户端忽略这三个键即可。
+  //
+  // `progress_seq` 是**每会话单调递增**的展示序号：客户端据此丢弃迟到与重复
+  // 的进展帧。它必须由服务端发，因为客户端那一侧（iPhone → Watch 的
+  // WCSession 跳）不保证顺序，只靠到达顺序会把旧进展盖回新进展上。
+  _emitTaskState({ taskId, status, progress = null }) {
     if (taskId === null && !status) return
+    const progressText = typeof progress?.text === 'string' && progress.text.trim()
+      ? progress.text.trim()
+      : null
+    let progressSeq = null
+    if (progressText !== null) {
+      this.progressSequence = (this.progressSequence ?? 0) + 1
+      progressSeq = this.progressSequence
+    }
     this._sendJson({
       type: 'task.state',
       session_id: this.scope.session_id, request_id: this.scope.request_id,
       generation: this.scope.generation,
       ...(taskId === null ? {} : { task_id: String(taskId) }),
       status: String(status ?? 'unknown'),
+      ...(progressText === null ? {} : {
+        progress_text: progressText,
+        progress_seq: progressSeq,
+        ...(progress?.category ? { progress_category: String(progress.category) } : {}),
+      }),
     })
     this.log('downlink_task_state', {
       request_id: this.scope.request_id, session_id: this.scope.session_id,
       generation: this.scope.generation, response_id: this.responseId,
       task_id: taskId === null ? null : String(taskId),
       status: String(status ?? 'unknown'),
+      progress_text: progressText,
+      progress_category: progress?.category ?? null,
+      progress_seq: progressSeq,
       after_turn_done: this.doneEmitted,
     })
   }

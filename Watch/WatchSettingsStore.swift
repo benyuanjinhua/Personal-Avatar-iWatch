@@ -336,8 +336,12 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
             sequenceDetail = " segment_index=\(envelope.sequence?.description ?? "nil")"
                 + " final_sequence=\(envelope.finalSequence?.description ?? "nil")"
         case .taskState:
+            // ESS-1100：只记进展的序号与类目，**不记进展文本**——它是上游
+            // 自由文本，可能带用户内容。
             sequenceDetail = " task_id=\(envelope.taskId ?? "nil")"
                 + " task_status=\(envelope.taskStatus ?? "nil")"
+                + " progress_seq=\(envelope.progressSequence?.description ?? "nil")"
+                + " progress_category=\(envelope.progressCategory ?? "nil")"
         case .ready, .playbackClear, .responseInterrupted, .bridgeFallback,
              .transcriptDelta, .transcriptFinal, .generationOpen, .bargeInFailed,
              .transportFailed,
@@ -413,7 +417,14 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
                 )
                 break
             }
-            adapter.markAgentTaskState(taskId: envelope.taskId, status: status)
+            adapter.markAgentTaskState(
+                taskId: envelope.taskId, status: status,
+                progress: AgentTaskProgress(
+                    sequence: envelope.progressSequence,
+                    text: envelope.progressText,
+                    category: envelope.progressCategory
+                )
+            )
         }
     }
 
