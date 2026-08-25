@@ -284,11 +284,12 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
         // 工具任务恰恰是「不许换代」的理由，用换代后的门禁把它滤掉，等于让
         // Watch 永远看不到那个把它拦在思考态的信号。陈旧性由 Watch 侧的
         // request_id 归属闸门（`SessionController.acceptsTurnEvent`）承担。
-        agentSession.onTaskState = { [weak self] rid, gen, taskId, status, progress in
+        agentSession.onTaskState = { [weak self] rid, gen, taskId, status, progress, answer in
             guard let self else { return }
             let envelope = RealtimeDownlinkEnvelope.taskState(
                 requestId: rid, sessionId: self.sessionId,
-                generation: gen, taskId: taskId, status: status, progress: progress
+                generation: gen, taskId: taskId, status: status,
+                progress: progress, answer: answer
             )
             // ESS-1100：进展文本本身**不落日志**——它是上游自由文本，可能带
             // 用户内容（计划 detail / 授权 summary）。只记序号与类目，真机复盘
@@ -299,7 +300,10 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
                 requestId: rid, sessionId: self.sessionId,
                 detail: "type=task.state task_id=\(taskId ?? "nil") status=\(status) gen=\(gen) "
                     + "progress_seq=\(progress?.sequence?.description ?? "nil") "
-                    + "progress_category=\(progress?.category ?? "nil")"
+                    + "progress_category=\(progress?.category ?? "nil") "
+                    // ESS-1111：答案增量同理只记序号与长度，不落原文。
+                    + "answer_seq=\(answer?.sequence?.description ?? "nil") "
+                    + "answer_len=\(answer?.delta.count ?? 0)"
             )
             self.onDownlink?(envelope)
         }

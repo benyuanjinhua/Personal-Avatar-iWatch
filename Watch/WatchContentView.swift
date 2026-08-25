@@ -302,24 +302,29 @@ struct WatchContentView: View {
                     .position(x: proxy.size.width / 2, y: 18)
                     .animation(.easeInOut(duration: 0.25), value: sessionStatusText)
 
-                // ESS-1111：答案正文的实时流。与顶部那行进展刻意分开——进展是
-                // 「覆盖」（只看最新一句），答案是「追加」（每一片都是内容）。
-                // 小屏三条硬约束都落在这里：至多两行、尾窗滚动（长度上限与
-                // 头部截断由 `LongTaskAnswerTranscript` 在值类型里保证）、
-                // 切换用淡入淡出而不是硬跳。渲染的是一个已经有界的字符串，
-                // 不做任何解析——音频线程与本视图之间没有共享的可变状态。
-                if let answer = session.answerStreamText {
-                    Text(answer)
-                        .font(.caption2)
-                        .foregroundStyle(.primary.opacity(0.85))
-                        .multilineTextAlignment(.center)
-                        .lineLimit(2)
-                        .truncationMode(.head)
-                        .padding(.horizontal, 10)
-                        .frame(maxWidth: proxy.size.width)
-                        .position(x: proxy.size.width / 2, y: 40)
-                        .animation(.easeInOut(duration: 0.2), value: answer)
-                        .transition(.opacity)
+                // ESS-1111：Codex 长任务的答案是**流出来**的，不是一次性到达
+                // 的。上游第一个 token 一到就往这里贴，用户在语音播出之前就能
+                // 读到答案开头，而不是对着一句「正在思考」等 24 秒。
+                //
+                // 三条小屏约束：只在思考/回答相位显示；滚动区域高度有上限，
+                // 不去挤球和状态行；文本本身在会话层已按尾部保留裁到
+                // `AnswerStreamAssembly.maxRetainedCharacters`，视图不再自己截。
+                if let answer = session.streamingAnswerText,
+                   session.turnPhase == .thinking || session.turnPhase == .speaking {
+                    ScrollView(.vertical, showsIndicators: false) {
+                        Text(answer)
+                            .font(.caption2)
+                            .foregroundStyle(.primary)
+                            .multilineTextAlignment(.leading)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(
+                        width: proxy.size.width - 16,
+                        height: min(52, proxy.size.height * 0.28)
+                    )
+                    .position(x: proxy.size.width / 2, y: proxy.size.height - 34)
+                    .transition(.opacity)
+                    .accessibilityLabel("正在生成的回答")
                 }
 
                 // 建立中 >800ms 未就绪 → 三点渐显（PRD §3.5.1 第 3 步）。

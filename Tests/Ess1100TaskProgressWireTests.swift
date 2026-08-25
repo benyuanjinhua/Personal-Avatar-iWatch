@@ -21,7 +21,7 @@ final class Ess1100TaskProgressWireTests: XCTestCase {
             "progress_seq": 4,
         ])
 
-        guard case .event(.taskState(_, _, _, let taskId, let status, let progress)) =
+        guard case .event(.taskState(_, _, _, let taskId, let status, let progress, _)) =
                 AudioRealtimeAgentCodec.decodeOutcome(json) else {
             return XCTFail("task.state 必须是一等事件")
         }
@@ -40,7 +40,7 @@ final class Ess1100TaskProgressWireTests: XCTestCase {
             "generation": 3, "task_id": "task-77", "status": "running",
         ])
 
-        guard case .event(.taskState(_, _, _, let taskId, let status, let progress)) =
+        guard case .event(.taskState(_, _, _, let taskId, let status, let progress, _)) =
                 AudioRealtimeAgentCodec.decodeOutcome(json) else {
             return XCTFail("缺进展字段不该让整帧解码失败")
         }
@@ -56,7 +56,7 @@ final class Ess1100TaskProgressWireTests: XCTestCase {
             "progress_text": "", "progress_seq": 2,
         ])
 
-        guard case .event(.taskState(_, _, _, _, _, let progress)) =
+        guard case .event(.taskState(_, _, _, _, _, let progress, _)) =
                 AudioRealtimeAgentCodec.decodeOutcome(json) else {
             return XCTFail("空进展文本不该让整帧解码失败")
         }
@@ -72,7 +72,7 @@ final class Ess1100TaskProgressWireTests: XCTestCase {
             "progress_text": "正在处理", "progress_seq": 1,
         ])
 
-        guard case .event(.taskState(_, _, _, let taskId, _, let progress)) =
+        guard case .event(.taskState(_, _, _, let taskId, _, let progress, _)) =
                 AudioRealtimeAgentCodec.decodeOutcome(json) else {
             return XCTFail("闩锁帧必须解得出来")
         }
@@ -151,7 +151,7 @@ final class Ess1100TaskProgressWireTests: XCTestCase {
             ]
             payload.merge(frame) { _, new in new }
             let json = try JSONSerialization.data(withJSONObject: payload)
-            guard case .event(.taskState(_, _, _, _, _, let progress)) =
+            guard case .event(.taskState(_, _, _, _, _, let progress, _)) =
                     AudioRealtimeAgentCodec.decodeOutcome(json),
                   let progress else {
                 return XCTFail("每一帧都必须解出进展")

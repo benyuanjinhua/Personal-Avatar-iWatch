@@ -135,13 +135,24 @@ final class SessionController: ObservableObject {
     /// 不是第二个真相源。
     @Published private(set) var toolProcessingText: String?
 
-    /// ESS-1111：**答案正文**的实时流在手表上的渲染值（尾窗，已按长度上限
-    /// 滚动截断）。`nil` = 本回合还没有任何答案增量。
+    /// ESS-1111：本回合**正在流出的答案文本**（`nil` = 本回合还没有任何答案
+    /// 增量）。它与 `toolProcessingText` 是两件事，刻意分开：前者说的是「系统
+    /// 在做什么」，后者是「答案本身」。把答案挤进那一行状态字，等于用一行 14
+    /// 字的预算去装一段回答。视图只读不写；音频播放不依赖它，它也不阻塞音频线程。
     ///
-    /// 与 `toolProcessingText` 刻意分成两条：进展行的语义是「覆盖」，答案的
-    /// 语义是「追加」。挤进同一行会让最新那半句答案被下一条进展抹掉。
-    /// 值由 `answerTranscript` 独占推导，不是第二个真相源。
-    @Published private(set) var answerStreamText: String?
+    /// **屏幕上只有这一处答案**，但喂它的上游有两条，合并 #412 / #413 时按
+    /// 下面的优先级收敛（`refreshStreamingAnswerText`）：
+    ///
+    /// 1. `answerStream`（`AnswerStreamAssembly`，按 `answer_seq`）——网关
+    ///    升级后真正的答案流，未经截断，是**权威**来源；
+    /// 2. `answerTranscript`（`LongTaskAnswerTranscript`，按 `progress_seq`
+    ///    且 `progress_category == "answer"`）——网关尚未升级时的兼容入口。
+    ///
+    /// 两条**各自独立的序号空间**，因此各留一套闸门：把 `answer_seq` 与
+    /// `progress_seq` 塞进同一个单调闸门，会让交替到达的两条流互判「乱序」
+    /// 而彼此丢弃。一旦权威流出过内容，本回合此后只认它——`progress_text`
+    /// 在网关侧已按 24 字截断，让一段截断文本去覆盖完整答案是纯粹的退化。
+    @Published private(set) var streamingAnswerText: String?
 
     /// 会话是否存续（连接中/聆听中）。视图据此切换双模 UI 与手势集。
     var isInSession: Bool {
@@ -375,6 +386,10 @@ final class SessionController: ObservableObject {
     /// 节流后**真正显示**的那句进展。与 `toolProgress.text`（最新被接受的那句）
     /// 刻意分开：前者是 UI 事实，后者是协议事实，混成一个就没法既防闪烁又不丢帧。
     private(set) var visibleProgressText: String?
+    /// ESS-1111：当前回合的答案增量装配。**回合级**——与 `toolTurn` /
+    /// `toolProgress` 同生共死，换 `activeTurnRequestId` 时整体重建，
+    /// 上一轮的半句答案不得挂到新一轮。
+    private(set) var answerStream = AnswerStreamAssembly()
     /// 节流窗口内到达、等着窗口一到就补显的那句。
     private var pendingProgressText: String?
     private var progressThrottleToken: SessionDelayToken?
@@ -656,6 +671,7 @@ final class SessionController: ObservableObject {
     func markTaskState(
         requestId: String, taskId: String?, status: String,
         progress: AgentTaskProgress? = nil,
+        answer: AgentTaskAnswerDelta? = nil,
         generation: Int? = nil
     ) {
         guard acceptsTurnEvent(requestId, event: "task_state") else { return }
@@ -688,14 +704,19 @@ final class SessionController: ObservableObject {
         let phaseChanged = toolTurn.apply(event)
         // ESS-1100 / ESS-1111：同一帧的展示面。**先记闸门、后记展示**是有意的
         // 顺序——展示不参与任何裁决，它读的是闸门已经落定的事实。
-        // 答案增量走累积器（追加），其余类目走进展行（覆盖）。
+        // 三条流各走各的闸门：进展行（覆盖）、兼容答案（追加，按 progress_seq）、
+        // 权威答案流（追加，按 answer_seq）。
         let displayOutcome = applyActivityDisplay(progress, kind: kind, requestId: requestId)
+        let answerOutcome = applyAnswerDelta(answer, requestId: requestId)
+        refreshStreamingAnswerText()
         WatchLog.info(
             "session", "session_task_state", requestId: requestId,
             detail: "turn_index=\(turnIndex) task_id=\(taskId ?? "nil") status=\(status) "
                 + "generation=\(generation?.description ?? "nil") kind=\(kind.logName) "
                 + "phase_changed=\(phaseChanged) progress=\(displayOutcome) "
-                + "\(toolTurn.logDetail) \(toolProgress.logDetail) \(answerTranscript.logDetail)"
+                + "answer=\(answerOutcome?.logName ?? "absent") "
+                + "\(toolTurn.logDetail) \(toolProgress.logDetail) "
+                + "\(answerTranscript.logDetail) \(answerStream.logDetail)"
         )
         refreshToolProcessingText()
         if !hadOutstandingWork, toolTurn.hasOutstandingWork {
@@ -762,6 +783,48 @@ final class SessionController: ObservableObject {
         enterFailed(reason: notice, retryable: parsed != .cancelled)
     }
 
+    // MARK: - ESS-1111 答案文本增量
+
+    /// 把一帧答案增量喂给回合级装配。返回处置结果（`nil` = 本帧没带答案）。
+    ///
+    /// 与进展文字**不共用节流**：进展是同一行字被反复覆盖，抖动才需要压；
+    /// 答案是逐段追加，压掉一帧就是少一段话。装配本身是纯字符串拼接，
+    /// 没有 I/O，也不触碰播放管线。
+    @discardableResult
+    private func applyAnswerDelta(
+        _ answer: AgentTaskAnswerDelta?, requestId: String
+    ) -> AnswerStreamAssembly.Outcome? {
+        guard let answer else { return nil }
+        let outcome = answerStream.apply(sequence: answer.sequence, delta: answer.delta)
+        if outcome.changesDisplay {
+            // 只更新装配体；屏幕上那一处由 `refreshStreamingAnswerText` 统一推导。
+            refreshStreamingAnswerText()
+        } else if outcome == .duplicate || outcome == .outOfOrder {
+            // 迟到与重复必须可判定：真机上「答案为什么少了一段 / 串了一段」
+            // 只能靠这条。答案原文不入日志（用户内容），只记序号与计数。
+            WatchLog.info(
+                "session", "session_answer_delta_dropped", requestId: requestId,
+                detail: "turn_index=\(turnIndex) reason=\(outcome.logName) "
+                    + "incoming_seq=\(answer.sequence?.description ?? "nil") "
+                    + "\(answerStream.logDetail)"
+            )
+        }
+        return outcome
+    }
+
+    /// ESS-1111（#412 / #413 合并收口）：屏幕上那一处答案文本的**唯一推导点**。
+    ///
+    /// 优先级见 `streamingAnswerText` 的注释：权威答案流（`answer_seq`）一旦
+    /// 出过内容，本回合此后只认它；否则退到兼容入口（`progress_category ==
+    /// "answer"`）。两条来源各自保留独立的序号闸门，这里只做选择、不做装配。
+    private func refreshStreamingAnswerText() {
+        let next = answerStream.hasAnswer
+            ? answerStream.text
+            : answerTranscript.displayText
+        guard next != streamingAnswerText else { return }
+        streamingAnswerText = next
+    }
+
     // MARK: - ESS-1100 进展文字
 
     /// ESS-1111：一帧增量的展示分流。答案正文走累积器（追加 + 尾窗滚动），
@@ -782,7 +845,7 @@ final class SessionController: ObservableObject {
             // 只搬运一个已经有界的字符串（`displayText` 恒 ≤ 尾窗 + 1）。
             // 没有解码、没有 I/O、没有锁——本单「不阻塞音频线程」的要求在
             // 这里是结构性的，而不是靠调度承诺。
-            answerStreamText = answerTranscript.displayText
+            refreshStreamingAnswerText()
         } else if outcome == .duplicate || outcome == .outOfOrder {
             WatchLog.info(
                 "session", "session_answer_delta_dropped", requestId: requestId,
@@ -1036,11 +1099,14 @@ final class SessionController: ObservableObject {
         toolProgress = ToolProgressNarration()
         visibleProgressText = nil
         pendingProgressText = nil
+        // ESS-1111：答案装配同生共死。上一轮的半句答案留在屏幕上，
+        // 比不显示更糟——用户会把它当成这一轮的回答。
+        answerStream.clear()
         progressThrottleToken?.cancel(); progressThrottleToken = nil
         // ESS-1111：答案流、类目、代际游标与断线宽限同样是**回合级**的。
         // 任何一样留到下一轮，就是本单点名禁止的「旧 generation 污染新回合」。
         answerTranscript = LongTaskAnswerTranscript()
-        answerStreamText = nil
+        streamingAnswerText = nil
         latestActivityKind = nil
         latestTaskGeneration = nil
         isDownlinkInterrupted = false
@@ -1864,10 +1930,10 @@ enum SessionTurnWiring {
             session?.markTurnFailed(requestId: requestId, errorCode: errorCode)
         }
         // ESS-1097：上游任务生命周期 → 会话层回合聚合状态机。
-        pushToTalk.onSessionTaskState = { [weak session] requestId, taskId, status, progress, generation in
+        pushToTalk.onSessionTaskState = { [weak session] requestId, taskId, status, progress, answer, generation in
             session?.markTaskState(
-                requestId: requestId, taskId: taskId, status: status, progress: progress,
-                generation: generation
+                requestId: requestId, taskId: taskId, status: status,
+                progress: progress, answer: answer, generation: generation
             )
         }
         // ESS-1111：长任务在跑期间的断线 → 有界重连宽限，而不是当场判失败。

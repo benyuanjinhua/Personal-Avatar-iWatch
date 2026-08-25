@@ -114,10 +114,13 @@ final class PushToTalkController: ObservableObject {
     /// 的唯一客户端可见事实——没有它，UI 只能拿回合屏障当真相，正是本单要修的
     /// 误判入口。`taskId == nil` = `tool_call_pending`（上游还没有任务号）。
     /// ESS-1100：`progress` 是同一帧上的阶段性进展文字（可缺席），只走展示面。
+    /// ESS-1111：`answer` 是同一帧上的答案文本增量（可缺席），只走展示面——
+    /// 它不占音频序号，也不满足任何终态屏障。
     /// ESS-1111：`generation` 一并透传，代际闸门在会话层裁决。
     var onSessionTaskState: ((
         _ requestId: String, _ taskId: String?, _ status: String,
-        _ progress: AgentTaskProgress?, _ generation: Int?
+        _ progress: AgentTaskProgress?, _ answer: AgentTaskAnswerDelta?,
+        _ generation: Int?
     ) -> Void)?
     /// ESS-1111：下行断了但长任务还在跑。会话层据此进入有界的重连宽限，
     /// 保留 task identity 而不是当场判这一轮失败。
@@ -1301,8 +1304,10 @@ final class PushToTalkController: ObservableObject {
             self?.onSessionAnswerFinished?(handle.requestId, false, "realtime_\(code)")
         }
         // ESS-1097：任务生命周期直通会话层的回合聚合状态机。
-        adapter.onAgentTaskState = { [weak self] handle, taskId, status, progress, generation in
-            self?.onSessionTaskState?(handle.requestId, taskId, status, progress, generation)
+        adapter.onAgentTaskState = { [weak self] handle, taskId, status, progress, answer, generation in
+            self?.onSessionTaskState?(
+                handle.requestId, taskId, status, progress, answer, generation
+            )
         }
         // ESS-1111：断线不等于任务结束。适配器先问会话层「还有长任务在跑吗」，
         // 有就推迟收口并把断线如实报上去，由会话层的重连宽限裁决。

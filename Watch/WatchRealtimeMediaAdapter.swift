@@ -133,11 +133,14 @@ final class WatchRealtimeMediaAdapter {
     /// 「正在思考」，且禁止自动开下一轮 generation。
     /// `taskId == nil` = `tool_call_pending`（上游还没有任务号）。
     /// ESS-1100：同一帧可选携带的**阶段性进展文字**，只走展示面。
+    /// ESS-1111：同一帧可选携带的**答案文本增量**，同样只走展示面——它不占
+    /// 音频序号，也不满足任何终态屏障。
     /// ESS-1111：`generation` 一并上送。打断之后上一代任务仍会继续下发进展，
     /// requestId 相同的情况下只有代际能把它们挡在新一轮之外。
     var onAgentTaskState: (@MainActor (
         RealtimeMediaSession.TurnHandle, _ taskId: String?, _ status: String,
-        _ progress: AgentTaskProgress?, _ generation: Int?
+        _ progress: AgentTaskProgress?, _ answer: AgentTaskAnswerDelta?,
+        _ generation: Int?
     ) -> Void)?
 
     /// ESS-1111：本回合是否有**仍在上游跑着的长任务**。由会话层的回合聚合体
@@ -826,6 +829,7 @@ final class WatchRealtimeMediaAdapter {
     /// 按在思考态上（那是另一种形式的卡死）。没有活跃回合时只留证。
     func markAgentTaskState(
         taskId: String?, status: String, progress: AgentTaskProgress? = nil,
+        answer: AgentTaskAnswerDelta? = nil,
         generation: Int? = nil
     ) {
         guard let handle = currentTurn else {
@@ -841,13 +845,16 @@ final class WatchRealtimeMediaAdapter {
             detail: "task_id=\(taskId ?? "nil") status=\(status) turn_id=\(handle.turnId) "
                 + "generation=\(generation?.description ?? "nil") "
                 + "progress_seq=\(progress?.sequence?.description ?? "nil") "
-                + "progress_category=\(progress?.category ?? "nil")"
+                + "progress_category=\(progress?.category ?? "nil") "
+                // 答案原文是用户内容：只记序号与长度。
+                + "answer_seq=\(answer?.sequence?.description ?? "nil") "
+                + "answer_len=\(answer?.delta.count ?? 0)"
         )
         // ESS-1111 复审整改（阻断 2）：**这里不再自己判「恢复了没有」**。
         // 恢复与否由会话层 `markDownlinkResumed` 独占裁决，再经
         // `clearDeferredTransportFailure` 回调回来撤销推迟——单一判据，
         // 两层不会分叉。
-        onAgentTaskState?(handle, taskId, status, progress, generation)
+        onAgentTaskState?(handle, taskId, status, progress, answer, generation)
     }
 
     func markDownlinkComplete(

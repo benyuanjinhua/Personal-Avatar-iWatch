@@ -148,7 +148,13 @@ final class AudioRealtimeAgentSession {
     /// ESS-1100：`progress` 是同一帧上的**阶段性进展文字**（可缺席）。它只走
     /// 展示面，不参与闸门判定——把展示面塞进闸门，等于让一句文案能决定回合
     /// 什么时候收口。
-    var onTaskState: ((String, Int, String?, String, AgentTaskProgress?) -> Void)?
+    ///
+    /// ESS-1111：`answer` 是同一帧上的**答案文本增量**（可缺席）。同样只走
+    /// 展示面：它不占用音频 sequence，也不满足任何终态屏障——最终答案的收口
+    /// 仍然由 task terminal + 播放 barrier 共同裁决。
+    var onTaskState: ((
+        String, Int, String?, String, AgentTaskProgress?, AgentTaskAnswerDelta?
+    ) -> Void)?
 
     /// Emitted on Gateway `error`.
     /// Params: (code, requestId, generation, retriable, detail).
@@ -400,7 +406,8 @@ final class AudioRealtimeAgentSession {
             )
             onSegmentDropped?(rid, respId, gen, droppedCount)
 
-        case .taskState(let sid, let rid, let gen, let taskId, let status, let progress):
+        case .taskState(let sid, let rid, let gen, let taskId, let status,
+                        let progress, let answer):
             guard sid == sessionId, let turn = currentTurn,
                   turn.requestId == rid else { return }
             // 任务在跑 = 上游确实在干活。撤掉「等首个响应」的预算，否则一个
@@ -415,9 +422,12 @@ final class AudioRealtimeAgentSession {
                 requestId: rid, sessionId: sid,
                 detail: "task_id=\(taskId ?? "nil") status=\(status) gen=\(gen) "
                     + "progress_seq=\(progress?.sequence?.description ?? "nil") "
-                    + "progress_category=\(progress?.category ?? "nil")"
+                    + "progress_category=\(progress?.category ?? "nil") "
+                    // 答案原文是用户内容，只记序号与长度。
+                    + "answer_seq=\(answer?.sequence?.description ?? "nil") "
+                    + "answer_len=\(answer?.delta.count ?? 0)"
             )
-            onTaskState?(rid, gen, taskId, status, progress)
+            onTaskState?(rid, gen, taskId, status, progress, answer)
 
         case .cancelAck(let sid, let rid, let gen, let cancelledRespId):
             guard sid == sessionId else { return }

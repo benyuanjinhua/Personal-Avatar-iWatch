@@ -94,7 +94,17 @@ public enum LongTaskActivityKind: Equatable, Sendable {
             return .tool
         case "result", "finalizing", "summary", "summarizing":
             return .result
-        case "answer", "answer_delta", "message", "text", "output":
+        // ESS-1111（#412 / #413 合并收口）：**只认显式的 answer 类目**。
+        //
+        // #412 写这条时网关还没有真正的答案线格，`text` / `message` / `output`
+        // 是当时的兜底猜测。#413 之后网关把 `task.stream{category:'text'}`
+        // 直接投影成 `answer_delta` / `answer_seq`（见
+        // `AudioRealtimeGateway/qwen-agent-transport.mjs`），而
+        // `progress_category` 只承载**进展**类目。此时再把 `text` 当答案，
+        // 就会把一条正常的进展帧劫持进答案流、同时让进展行退回「正在处理」
+        // ——`WatchTests/Ess1111AnswerStreamDisplayTests` 的
+        // `testSingleFrameCarryingBothIsFullyApplied` 正是钉这个的。
+        case "answer", "answer_delta":
             return .answer
         default:
             return nil
