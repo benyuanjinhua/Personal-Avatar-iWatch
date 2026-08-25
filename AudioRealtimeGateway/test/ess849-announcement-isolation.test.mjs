@@ -233,6 +233,42 @@ test('ESS-849 · 只有播报音频时，应答死线照常到期（播报不算
   assert.ok(logs.some(l => l.evt === 'upstream_announcement_response_done_dropped'))
 })
 
+test('ESS-1107 · 已归属播报也不改变 busy 或满足 commit 后应答死线', async () => {
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') send(ws, { type: 'voice.ready' })
+    if (message.type === 'audio.commit') {
+      send(ws, {
+        type: 'response.started', responseId: 'ann-owned', origin: 'announcement',
+        taskId: 'task-owned',
+        task: { id: 'task-owned', sessionId: 's-owned', deviceId: 'd-owned' },
+      })
+      send(ws, {
+        type: 'transcript.final', responseId: 'ann-owned', role: 'assistant',
+        content: '历史任务已经完成',
+      })
+      audioDelta(ws, 0, '历史播报', 'ann-owned')
+      send(ws, { type: 'audio.done', responseId: 'ann-owned' })
+    }
+  })
+  const events = []; const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, responseTimeoutMs: 200,
+    log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  const turn = transport.openTurn({
+    requestId: 'r-owned', sessionId: 's-owned', deviceId: 'd-owned',
+    generation: 1, responseId: 'r-owned:gen1', onEvent: event => events.push(event),
+  })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.error'))
+
+  assert.equal(events.at(-1).code, 'ERR_UPSTREAM_NO_RESPONSE')
+  assert.ok(logs.some(log => log.evt === 'upstream_announcement_delivered'))
+  assert.equal(logs.some(log => log.evt === 'upstream_turn_busy'
+    && log.cause === 'announcement_response'), false)
+  assert.ok(logs.some(log => log.evt === 'upstream_response_timeout'))
+})
+
 test('ESS-849 · 映射缺失默认放行：先 delta 后 started 的乱序漏网，但留证', async () => {
   const url = await upstream((ws, message) => {
     if (message.type === 'connect') send(ws, { type: 'voice.ready' })

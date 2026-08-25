@@ -711,10 +711,9 @@ export class QwenAgentTransport {
       turn.segmentGapTimer.unref?.()
     }
 
-    // ESS-990 corroborating evidence that this turn is NOT over: the upstream
-    // voice slot is busy with other output for this session (an announcement
-    // response), or a background task spawned by this turn has not reached a
-    // terminal status. Both only WIDEN the window, never end or block a turn:
+    // ESS-990 corroborating evidence that this turn is NOT over: a background
+    // task spawned by this turn has not reached a terminal status. It only
+    // WIDENS the window, never ends or blocks a turn:
     //   • as a veto they are refuted by measurement — `task.accepted` lands
     //     795–8689 ms AFTER the first segment's `audio.done` (n=10), so it
     //     cannot protect the first segment, and tasks stay un-terminated 30–70 s
@@ -730,15 +729,11 @@ export class QwenAgentTransport {
       armSegmentGap(cause)
     }
 
-    // ESS-1068: the busy flag was a latch — set by an announcement or task but
-    // never cleared, so a direct-answer turn that follows a finished background
-    // announcement keeps the 12 s busy window instead of falling back to the
-    // 2.5 s base window, delaying `agent.audio.done` for no reason. Clear it
-    // once every busy cause has ended, and re-arm the parked segment with the
-    // (possibly narrower) base window.
+    // Clear the task-derived busy flag once every task has ended, and re-arm
+    // the parked segment with the (possibly narrower) base window.
     const noteTurnIdle = cause => {
       if (!turn.turnBusy) return
-      if (turn.activeAnnouncements.size > 0 || turn.outstandingTasks.size > 0) return
+      if (turn.outstandingTasks.size > 0) return
       turn.turnBusy = false
       this.log('upstream_turn_busy_cleared', {
         ...scopeLog, cause,
@@ -1164,7 +1159,9 @@ export class QwenAgentTransport {
                 reason: 'unattributed',
               })
             }
-            noteTurnBusy('announcement_response')
+            // An announcement is a background delivery stream, never evidence
+            // about the foreground user turn. It must not occupy or widen the
+            // turn's busy/terminal window.
             return
           }
           this.log('upstream_response_started', {
@@ -1321,7 +1318,9 @@ export class QwenAgentTransport {
             const stat = turn.announcementDropped.get(doneAnnouncementId) ?? { frames: 0, bytes: 0 }
             turn.announcementDropped.delete(doneAnnouncementId)
             if (deliver) {
-              noteResponseProgress()
+              // Delivery may be attributed to this conversation, but it is
+              // still not a response to this commit and cannot satisfy its
+              // response deadline.
               // ESS-1068 复审第3点：完整下发（audio.done）才算 consumed，
               // 把 pending 转 delivered（exactly-once dedup 的落点后移）。
               const taskKey = turn.pendingAnnouncementTaskIds.get(doneAnnouncementId)
@@ -1369,7 +1368,6 @@ export class QwenAgentTransport {
             // ESS-1068：归属明确的播报文本是用户后台任务的结果，必须下发而不是
             // 丢弃；只有未归属的播报文本才继续隔离（防跨会话串台）。
             if (turn.deliverAnnouncementIds.has(transcriptAnnouncementId)) {
-              noteResponseProgress()
               onEvent({ type: 'agent.transcript.final', response_id: responseId,
                 role: event.role, content: typeof event.content === 'string' ? event.content : '' })
               return
