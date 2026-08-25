@@ -114,10 +114,16 @@ final class PushToTalkController: ObservableObject {
     /// 的唯一客户端可见事实——没有它，UI 只能拿回合屏障当真相，正是本单要修的
     /// 误判入口。`taskId == nil` = `tool_call_pending`（上游还没有任务号）。
     /// ESS-1100：`progress` 是同一帧上的阶段性进展文字（可缺席），只走展示面。
+    /// ESS-1111：`generation` 一并透传，代际闸门在会话层裁决。
     var onSessionTaskState: ((
         _ requestId: String, _ taskId: String?, _ status: String,
-        _ progress: AgentTaskProgress?
+        _ progress: AgentTaskProgress?, _ generation: Int?
     ) -> Void)?
+    /// ESS-1111：下行断了但长任务还在跑。会话层据此进入有界的重连宽限，
+    /// 保留 task identity 而不是当场判这一轮失败。
+    var onSessionDownlinkInterrupted: ((_ requestId: String, _ reason: String) -> Void)?
+    /// ESS-1111：会话层查询「本回合是否有仍在上游跑着的长任务」。
+    var sessionHasLongTaskInFlight: (() -> Bool)?
     /// 本地采集起停（与网络 ready 独立呈现）。
     var onLocalCaptureChanged: ((_ active: Bool) -> Void)?
     /// ESS-865 复审整改：本轮**本地 VAD 真的听到人说话了**。
@@ -1295,14 +1301,32 @@ final class PushToTalkController: ObservableObject {
             self?.onSessionAnswerFinished?(handle.requestId, false, "realtime_\(code)")
         }
         // ESS-1097：任务生命周期直通会话层的回合聚合状态机。
-        adapter.onAgentTaskState = { [weak self] handle, taskId, status, progress in
-            self?.onSessionTaskState?(handle.requestId, taskId, status, progress)
+        adapter.onAgentTaskState = { [weak self] handle, taskId, status, progress, generation in
+            self?.onSessionTaskState?(handle.requestId, taskId, status, progress, generation)
+        }
+        // ESS-1111：断线不等于任务结束。适配器先问会话层「还有长任务在跑吗」，
+        // 有就推迟收口并把断线如实报上去，由会话层的重连宽限裁决。
+        adapter.longTaskInFlight = { [weak self] in
+            self?.sessionHasLongTaskInFlight?() ?? false
+        }
+        adapter.onDownlinkInterrupted = { [weak self] handle, reason in
+            self?.onSessionDownlinkInterrupted?(handle.requestId, reason)
         }
         // ESS-650 F2-3：语音打断命中，透传 detect_ms 给会话层。会话层负责
         // 就地量 stop_ms 并落 source=voice 的 session_speaking_interrupted。
         adapter.onVoiceBargeInDetected = { [weak self] detectMs in
             self?.onSessionVoiceBargeIn?(detectMs)
         }
+    }
+
+    /// ESS-1111：会话层重连宽限到点 —— 让适配器把那次被推迟的传输失败收口。
+    func finishDeferredTransportFailure(reason: String) {
+        realtimeAdapter?.finishDeferredTransportFailure(reason: reason)
+    }
+
+    /// ESS-1111 复审整改（阻断 2）：会话层判定下行已恢复 —— 撤销那次推迟。
+    func clearDeferredTransportFailure(reason: String) {
+        realtimeAdapter?.clearDeferredTransportFailure(reason: reason)
     }
 
     // MARK: - ESS-650 语音打断监听（F2-2 / F2-4）

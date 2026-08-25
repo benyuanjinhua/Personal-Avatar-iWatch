@@ -73,6 +73,27 @@ public enum ToolTaskStatus: Equatable, Sendable {
         case .queued, .accepted, .running, .unknown: return false
         }
     }
+
+    /// ESS-1111：**失败类**终态。与 `.completed` 的区别在客户端是刚性的——
+    /// 完成意味着答案随后就到（继续等回合屏障），失败/取消/超时意味着**再也
+    /// 不会有答案**，此时把回合静默收口回「正在听」，用户得到的是一次无法
+    /// 解释的沉默。本单验收 3 要求这三类给出明确终态。
+    public var isFailureTerminal: Bool {
+        switch self {
+        case .failed, .cancelled, .timedOut: return true
+        case .completed, .queued, .accepted, .running, .unknown: return false
+        }
+    }
+
+    /// 明确终态在手表上的一行说法。非失败终态返回 `nil`。
+    public var failureNoticeText: String? {
+        switch self {
+        case .failed: return "这件事没能完成，要再试一次吗？"
+        case .cancelled: return "这件事已取消。"
+        case .timedOut: return "这件事做得有点久，要再试一次吗？"
+        case .completed, .queued, .accepted, .running, .unknown: return nil
+        }
+    }
 }
 
 // MARK: - 聚合体
@@ -127,6 +148,10 @@ public struct ToolTurnAggregate: Equatable, Sendable {
         case awaitingAudioDone = "awaiting_audio_done"
         /// 音频还在播。
         case playbackInFlight = "playback_in_flight"
+        /// ESS-1111：下行断了但任务仍被认领，正在等重连。**断线期间回合绝不
+        /// 收口**——收口就等于在连接恢复、答案随后到达之前先开了下一轮，
+        /// 那正是本单禁止的「旧 generation 污染新回合」的制造方式。
+        case awaitingReconnect = "awaiting_reconnect"
     }
 
     // MARK: 输入事件
@@ -154,6 +179,17 @@ public struct ToolTurnAggregate: Equatable, Sendable {
         /// 下行通道在回合结束前关闭 / 传输失败。之后不会再有任何上游事实：
         /// 屏障视同落定、未结任务视同放弃，但**在播的音频要放完**。
         case downlinkClosed(reason: String)
+        /// ESS-1111：下行**暂时**断了，但任务仍在上游跑着。
+        ///
+        /// 与 `downlinkClosed` 的分工是本单的核心区分：`closed` 说的是「不会再
+        /// 有上游事实了」，`interrupted` 说的是「这一跳断了，任务还在」。真机
+        /// 取证里 24s 的 Codex 任务在 12s 被客户端断开，任务本身此后仍跑了
+        /// 11.9s 并产出了答案——把这种情况当成 `closed` 处理，等于用一个传输
+        /// 层事件去宣判一个业务层事实。本事件**保留** `outstandingTasks`
+        /// （task identity 不丢）、保留屏障状态，只多挂一条 hold 原因。
+        case downlinkInterrupted(reason: String)
+        /// ESS-1111：下行恢复，可以继续接收同一 task 的增量。
+        case downlinkResumed
         /// 用户显式取消（点球打断 / 退出会话）。
         case userCancelled(reason: String)
         /// 服务端判本回合终态失败。
@@ -192,6 +228,16 @@ public struct ToolTurnAggregate: Equatable, Sendable {
     public private(set) var didPlayAnyAudio = false
     /// 下行是否已被通道关闭提前收口（区别于正常 `audio.done`）。
     public private(set) var downlinkClosedReason: String?
+    /// ESS-1111：下行断开但任务保留时的原因；`nil` = 通道正常。
+    public private(set) var downlinkInterruptedReason: String?
+    /// ESS-1111：本回合下行断开过几次、恢复过几次（取证用）。
+    public private(set) var interruptCount = 0
+    public private(set) var resumeCount = 0
+    /// ESS-1111：本回合累计收到过多少帧**合法的任务活动**（`task.state` /
+    /// `tool_call_pending` / `tool_call_resolved`）。会话层据此判断「上游到底
+    /// 有没有在说话」——这正是把有界性从「固定时长」改判为「静默时长」的
+    /// 事实来源。
+    public private(set) var activityFrameCount = 0
     /// 终态一旦落定即**吸收**：后续事件只留证不改相位。
     public private(set) var terminal: Phase?
 
@@ -213,6 +259,7 @@ public struct ToolTurnAggregate: Equatable, Sendable {
         if !outstandingTasks.isEmpty { reasons.append(.taskOutstanding) }
         if !audioDoneSettled { reasons.append(.awaitingAudioDone) }
         if playbackInFlight { reasons.append(.playbackInFlight) }
+        if downlinkInterruptedReason != nil { reasons.append(.awaitingReconnect) }
         return reasons
     }
 
@@ -227,6 +274,9 @@ public struct ToolTurnAggregate: Equatable, Sendable {
         if playbackInFlight { return .answering }
         return isClosed ? .listening : .thinking
     }
+
+    /// ESS-1111：下行是否正处在「断了但任务保留」的状态。
+    public var awaitingReconnect: Bool { downlinkInterruptedReason != nil }
 
     /// 本回合是否出现过**工具证据**（`tool_call_pending` 或任何 `task.*`）。
     ///
@@ -269,12 +319,15 @@ public struct ToolTurnAggregate: Equatable, Sendable {
 
         switch event {
         case .toolCallPending:
+            activityFrameCount += 1
             toolCallPending = true
 
         case .toolCallResolved:
+            activityFrameCount += 1
             toolCallPending = false
 
         case .taskState(let taskId, let status):
+            activityFrameCount += 1
             seenTasks.insert(taskId)
             // ESS-1098 阻断 1：任务号一出现，闩锁就完成了它的全部使命。
             // 不清它的话，`pending → running(t1) → completed(t1) → audio.done
@@ -302,10 +355,22 @@ public struct ToolTurnAggregate: Equatable, Sendable {
         case .audioDoneBarrier:
             audioDoneSettled = true
 
+        case .downlinkInterrupted(let reason):
+            // 只记「这一跳断了」。未结任务、屏障、播放面**一个字都不动**——
+            // task identity 必须原样活过断线，重连后才能继续认领同一个任务。
+            interruptCount += 1
+            downlinkInterruptedReason = reason
+
+        case .downlinkResumed:
+            guard downlinkInterruptedReason != nil else { break }
+            resumeCount += 1
+            downlinkInterruptedReason = nil
+
         case .downlinkClosed(let reason):
             // 通道没了就不会再有 `audio.done`、也不会再有 `task.*` 终态。
             // 继续等 = 永久卡死；这里如实放弃这两面，只保留「音频要放完」。
             downlinkClosedReason = reason
+            downlinkInterruptedReason = nil
             audioDoneSettled = true
             toolCallPending = false
             outstandingTasks.removeAll()
@@ -336,6 +401,9 @@ public struct ToolTurnAggregate: Equatable, Sendable {
             + " audio_done=\(audioDoneSettled)"
             + " playing=\(playbackInFlight)"
             + " played_any=\(didPlayAnyAudio)"
+            + " activity_frames=\(activityFrameCount)"
+            + " interrupts=\(interruptCount)/\(resumeCount)"
+            + (downlinkInterruptedReason.map { " downlink_interrupted=\($0)" } ?? "")
             + (downlinkClosedReason.map { " downlink_closed=\($0)" } ?? "")
     }
 }
