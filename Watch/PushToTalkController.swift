@@ -1324,6 +1324,11 @@ final class PushToTalkController: ObservableObject {
         realtimeAdapter?.finishDeferredTransportFailure(reason: reason)
     }
 
+    /// ESS-1111 复审整改（阻断 2）：会话层判定下行已恢复 —— 撤销那次推迟。
+    func clearDeferredTransportFailure(reason: String) {
+        realtimeAdapter?.clearDeferredTransportFailure(reason: reason)
+    }
+
     // MARK: - ESS-650 语音打断监听（F2-2 / F2-4）
 
     /// 进入 speaking 时开启「只听不传」的打断监听。

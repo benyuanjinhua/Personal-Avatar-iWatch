@@ -28,7 +28,14 @@ final class Ess1111LongTaskSessionTests: XCTestCase {
     private var clock: VirtualSessionClock!
     private var startTurnCount = 0
     private var graceExpiredCount = 0
+    private var resumedCount = 0
+    private var teardownCount = 0
     private var defaults: UserDefaults!
+    /// 本回合的 requestId。生产链路上适配器把它作为 `handle` 捕获住，宽限到点
+    /// 时用的是**它**而不是会话当时的 `activeTurnRequestId`（后者在
+    /// `enterFailed` 之后已被清空）。测试接线必须照抄这一点，否则闭包会因为
+    /// 拿到 nil 而提前 return，等于什么都没验。
+    private var wiredTurnRequestId: String?
 
     override func setUp() {
         super.setUp()
@@ -42,13 +49,33 @@ final class Ess1111LongTaskSessionTests: XCTestCase {
             clock!.schedule(delay: delay, fire: fire)
         }
         controller.onBeginChannel = { "req-1111-turn-1" }
-        controller.onTeardownChannel = {}
+        controller.onTeardownChannel = { [weak self] in
+            self?.teardownCount += 1
+        }
         controller.onStartTurn = { [weak self] in
             self?.startTurnCount += 1
             return "req-1111-turn-2"
         }
-        controller.onDownlinkGraceExpired = { [weak self] _ in
-            self?.graceExpiredCount += 1
+        // ESS-1111 复审整改（阻断 1）：这里**必须接真链路**，不能只记个数。
+        //
+        // 上一版把本回调替换成计数器，于是
+        //   onDownlinkGraceExpired → finishDeferredTransportFailure
+        //   → onAnswerPlaybackFailed → onSessionAnswerFinished
+        //   → markAnswerFinished(success: false)
+        // 这一整段在测试里根本不存在，绿灯覆盖不到宽限到点这条**主失败路径**，
+        // 真实缺陷（失败路径上开新录音）就这么漏了过去。下面照抄生产接线的
+        // 最后一跳：适配器收口一定会回打一次 `markAnswerFinished(success:false)`。
+        controller.onDownlinkGraceExpired = { [weak self] reason in
+            guard let self else { return }
+            self.graceExpiredCount += 1
+            guard let requestId = self.wiredTurnRequestId else { return }
+            self.controller.markAnswerFinished(
+                requestId: requestId, success: false,
+                reason: "transport_failed:\(reason)"
+            )
+        }
+        controller.onDownlinkResumed = { [weak self] _ in
+            self?.resumedCount += 1
         }
     }
 
@@ -56,6 +83,7 @@ final class Ess1111LongTaskSessionTests: XCTestCase {
         controller = nil
         clock = nil
         defaults = nil
+        wiredTurnRequestId = nil
         super.tearDown()
     }
 
@@ -286,6 +314,85 @@ final class Ess1111LongTaskSessionTests: XCTestCase {
                        "宽限到点必须把那次被推迟的传输失败交回适配器收口")
     }
 
+    /// **复审阻断 1 的回归**：宽限到点走的是一条**失败**路径，它绝不能在半路
+    /// 开出一轮新录音来。
+    ///
+    /// 这个用例之所以能抓住缺陷，全靠 `setUp` 里把 `onDownlinkGraceExpired`
+    /// 接成真链路（会回打 `markAnswerFinished(success: false)`）。修复前：
+    /// 闭包先通知适配器，`.downlinkClosed` 已让回合 `isClosed`，于是
+    /// `markAnswerFinished` 一路落到 `startNextTurn`，`startTurnCount` 会变成
+    /// 1、麦克风在失败页上继续采集。修复后：先 `enterFailed`，迟到的
+    /// `answer_finished` 被 `acceptsTurnEvent` 挡掉。
+    func testGraceExpiryEndsInASingleTerminalAndNeverStartsANewRecording() {
+        let requestId = beginTurn()
+        emit(requestId, status: "running", seq: 1, text: "正在查询相关信息", category: "search")
+        controller.markDownlinkInterrupted(requestId: requestId, reason: "socket_1006")
+
+        clock.advance(to: SessionController.downlinkReconnectGraceSeconds + 0.5)
+
+        XCTAssertEqual(graceExpiredCount, 1, "适配器收口只应被通知一次")
+        XCTAssertEqual(
+            startTurnCount, 0,
+            "宽限到点是失败路径：绝不允许在这里开一轮新录音（新 requestId / 新 generation）"
+        )
+        XCTAssertEqual(controller.state, .failed, "唯一终态是失败页")
+        XCTAssertNotNil(controller.failedReason)
+        XCTAssertEqual(
+            teardownCount, 1,
+            "下行已判死，通道必须真的拆掉——否则失败页上采集与传输都还挂着"
+        )
+        XCTAssertEqual(controller.turnPhase, .idle)
+        XCTAssertNil(controller.activeTurnRequestId, "回合已收束，不留悬挂的 request")
+    }
+
+    /// 宽限到点之后**迟到**的播放失败回执同样不得复活会话。
+    func testLateAnswerFailureAfterTerminalIsDropped() {
+        let requestId = beginTurn()
+        emit(requestId, status: "running", seq: 1, text: nil, category: nil)
+        controller.markDownlinkInterrupted(requestId: requestId, reason: "socket_1006")
+        clock.advance(to: SessionController.downlinkReconnectGraceSeconds + 0.5)
+        XCTAssertEqual(controller.state, .failed)
+
+        controller.markAnswerFinished(requestId: requestId, success: false,
+                                      reason: "transport_failed:late")
+
+        XCTAssertEqual(controller.state, .failed, "终态已落定，迟到回执不得改写")
+        XCTAssertEqual(startTurnCount, 0)
+    }
+
+    /// **复审阻断 2 的回归**：恢复判据只有一个，且在会话层。会话认定恢复时
+    /// 必须**恰好**通知适配器一次，让它撤销那次被推迟的收口——两层各判一次
+    /// 就会分叉（音频先于首帧 task 渲染时，适配器会留下陈旧的推迟原因，
+    /// 把一次已答完的回合误判成传输失败）。
+    func testResumeIsDecidedOnlyBySessionAndNotifiesTheAdapterExactlyOnce() {
+        let requestId = beginTurn()
+        emit(requestId, status: "running", seq: 1, text: nil, category: nil)
+        controller.markDownlinkInterrupted(requestId: requestId, reason: "socket_1006")
+        XCTAssertEqual(resumedCount, 0)
+
+        // 播放先于第一帧 task 起播——正是复审点名的那个时序。
+        controller.markAnswerStarted(requestId: requestId)
+        controller.markAnswerInterim(requestId: requestId)
+        XCTAssertEqual(resumedCount, 0, "起播本身不是恢复判据，会话没认它")
+
+        emit(requestId, status: "running", seq: 2, text: "正在整理结果", category: "finalizing")
+
+        XCTAssertEqual(resumedCount, 1, "会话认定恢复 ⇒ 恰好通知适配器一次")
+        XCTAssertFalse(controller.isDownlinkInterrupted)
+
+        // 再来一帧不得重复通知（恢复是一次性事件）。
+        emit(requestId, status: "running", seq: 3, text: nil, category: nil)
+        XCTAssertEqual(resumedCount, 1)
+
+        // 恢复之后这一轮照常答完，不被任何陈旧的推迟收口吞掉。
+        emit(requestId, status: "completed", seq: 4, text: nil, category: nil)
+        controller.markAnswerStarted(requestId: requestId)
+        controller.markAnswerFinished(requestId: requestId)
+        XCTAssertEqual(controller.turnPhase, .listening)
+        XCTAssertEqual(graceExpiredCount, 0, "恢复了就绝不该再触发宽限收口")
+        XCTAssertEqual(controller.state, .listening)
+    }
+
     /// 断线期间**不得**因为任何单一事实（屏障早到、任务终态早到）而收口。
     func testTurnCannotCloseWhileDisconnected() {
         let requestId = beginTurn()
@@ -394,6 +501,8 @@ final class Ess1111LongTaskSessionTests: XCTestCase {
         let requestId = controller.activeTurnRequestId!
         controller.markTurnCommitted(requestId: requestId)
         XCTAssertEqual(controller.turnPhase, .thinking)
+        // 适配器在生产里就是这样把 handle 捏在手里的。
+        wiredTurnRequestId = requestId
         return requestId
     }
 

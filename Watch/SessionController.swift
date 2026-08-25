@@ -210,6 +210,9 @@ final class SessionController: ObservableObject {
     /// ESS-1111：重连宽限到点。会话层不直接持有适配器，由本回调把「不用再等了」
     /// 交回给推迟着传输失败的那一层。
     var onDownlinkGraceExpired: ((_ reason: String) -> Void)?
+    /// ESS-1111 复审整改（阻断 2）：下行**恢复**的唯一裁决点在会话层，
+    /// 经本回调通知适配器撤销那次被推迟的收口。适配器不再自己判一次。
+    var onDownlinkResumed: ((_ reason: String) -> Void)?
     /// ESS-600：就绪超时的**抢救**出口——把已经录到的语音经可靠通道
     /// （完整文件 / WCSession transferFile）提交，而不是连人带话一起丢。
     /// 生产接 `PushToTalkController.endSessionTurn()`。
@@ -972,8 +975,28 @@ final class SessionController: ObservableObject {
             self.isDownlinkInterrupted = false
             self.toolTurn.apply(.downlinkClosed(reason: "resume_timeout:\(reason)"))
             self.refreshToolProcessingText()
-            self.onDownlinkGraceExpired?(reason)
+            // ESS-1111 复审整改（阻断 1）——**顺序是这条路径的正确性本身**。
+            //
+            // 之前的顺序是「先通知适配器、后 enterFailed」，那条链是：
+            //   onDownlinkGraceExpired → finishDeferredTransportFailure
+            //   → onAnswerPlaybackFailed → markAnswerFinished(success: false)
+            // 而上一行的 `.downlinkClosed` 已经让聚合体 `isClosed == true`，
+            // 于是 `blocksAutomaticNextTurn == false`，`markAnswerFinished`
+            // 一路落到 `startNextTurn` —— 在一条**失败**路径上真实开了一轮新
+            // 录音（新 requestId / 新 generation / `recorder.start()`），随后
+            // 才被 `enterFailed` 打到 `.failed`：失败页面上麦克风还在采集，
+            // 且 `resetToolTurn("next_turn")` 把断线现场的取证一起清掉了。
+            //
+            // 先落会话终态即可结构性地关掉这条边：`state == .failed` 之后
+            // `acceptsTurnEvent` 会挡掉迟到的 `answer_finished`，
+            // `finishTransportFailure` 只剩 `markDownlinkBridgeFallback()`
+            // 这条应有的清理。
             self.enterFailed(reason: "连接没能恢复，要再试一次吗？", retryable: true)
+            self.onDownlinkGraceExpired?(reason)
+            // 下行已判死，通道要真的拆掉——与 `markChannelFailed` 同一口径。
+            // `enterFailed` 只收束回合状态，不拆通道；少了这一行，失败页上
+            // 采集与传输都还挂着。
+            self.onTeardownChannel?()
         }
     }
 
@@ -997,6 +1020,8 @@ final class SessionController: ObservableObject {
             "session", "session_downlink_resumed", requestId: requestId,
             detail: "turn_index=\(turnIndex) reason=\(reason) " + toolTurn.logDetail
         )
+        // 单一判据：会话认定恢复 ⇒ 适配器撤销推迟中的收口。
+        onDownlinkResumed?(reason)
         renewTaskActivityDeadline(reason: "downlink_resumed")
     }
 
@@ -1854,6 +1879,9 @@ enum SessionTurnWiring {
         }
         session.onDownlinkGraceExpired = { [weak pushToTalk] reason in
             pushToTalk?.finishDeferredTransportFailure(reason: reason)
+        }
+        session.onDownlinkResumed = { [weak pushToTalk] reason in
+            pushToTalk?.clearDeferredTransportFailure(reason: reason)
         }
         pushToTalk.onLocalCaptureChanged = { [weak session] active in
             session?.markLocalCapture(active: active)
