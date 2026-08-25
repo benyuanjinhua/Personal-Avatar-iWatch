@@ -460,7 +460,7 @@ test('ESS-990 · task 终态把它移出未终结集合；真实帧的三种 id 
   turn.close()
 })
 
-test('ESS-990 · 后台播报占着声道：不产生段落边界，但把窗口抬到延长档（ESS-36）', async () => {
+test('ESS-1107 · 后台播报不产生段落边界，也不把窗口抬到延长档', async () => {
   const url = await upstream((ws, message) => {
     if (message.type === 'connect') {
       send(ws, { type: 'voice.ready' })
@@ -487,7 +487,7 @@ test('ESS-990 · 后台播报占着声道：不产生段落边界，但把窗口
   })
   const events = []; const logs = []
   const transport = new QwenAgentTransport({
-    // 基础档 200 ms 远小于 600 ms 的段落间隔：没有播报证据这条用例必红。
+    // 基础档 200 ms 远小于 600 ms 的段落间隔：announcement 不得延长它。
     gatewayUrl: url, segmentGapMs: 200, segmentGapBusyMs: 1_500,
     log: (evt, extra) => logs.push({ evt, ...extra }),
   })
@@ -497,13 +497,12 @@ test('ESS-990 · 后台播报占着声道：不产生段落边界，但把窗口
   })
   turn.commit()
   await waitFor(() => events.some(event => event.type === 'agent.audio.done'), 5_000)
-  assert.deepEqual(events.map(e => e.type), [
-    'agent.audio.delta', 'agent.audio.segment_done', 'agent.audio.delta', 'agent.audio.done',
-  ])
-  assert.equal(events.at(-1).final_sequence, 1)
-  assert.equal(events.filter(e => e.type === 'agent.audio.segment_done').length, 1,
+  assert.deepEqual(events.map(e => e.type), ['agent.audio.delta', 'agent.audio.done'])
+  assert.equal(events.at(-1).final_sequence, 0)
+  assert.equal(events.filter(e => e.type === 'agent.audio.segment_done').length, 0,
     '播报不得制造段落边界')
-  assert.ok(logs.some(l => l.evt === 'upstream_turn_busy' && l.cause === 'announcement_response'))
+  assert.equal(logs.some(l => l.evt === 'upstream_turn_busy'
+    && l.cause === 'announcement_response'), false)
   turn.close()
 })
 
