@@ -807,26 +807,8 @@ export class QwenAgentTransport {
       // 下行契约序号、不释放已关闭的段落（播报不是「本回合又出声了」的证据）、
       // 不延长 `pendingDone` 的收口窗口。
       //
-      // ESS-1068 例外：归属明确的播报（`deliverAnnouncementIds`）是「本用户的
-      // 后台任务结果」，必须下发而不是丢弃——它占用上游序号、也占下行契约序号，
-      // 并作为新段落释放已关闭的段落（它就是用户该听到的最终答案）。
       if (frame.announcementId != null) {
-        if (!turn.deliverAnnouncementIds.has(frame.announcementId)) {
-          dropAnnouncementAudio(frame.announcementId, frame)
-          return
-        }
-        releaseClosedSegment('announcement_delta')
-        const sequence = turn.nextOutputSequence++
-        this.log('upstream_event_received', {
-          ...scopeLog, upstream_event_type: 'audio.delta', sequence,
-          upstream_sequence: frame.upstreamSequence,
-          announcement_delivered: true,
-        })
-        this.log('upstream_audio_delta', { ...scopeLog, sequence })
-        onEvent({
-          type: 'agent.audio.delta', response_id: responseId, sequence,
-          sample_rate: frame.sampleRate, codec: 'pcm_s16le', audio: frame.audio,
-        })
+        dropAnnouncementAudio(frame.announcementId, frame)
         return
       }
       // ESS-969: audio after a closed segment proves the turn went on. The
@@ -1130,9 +1112,9 @@ export class QwenAgentTransport {
                 ...scopeLog, upstream_response_id: id,
               })
             }
-            // ESS-1068: an attributed background result must reach this user,
-            // not be dropped as a cross-session leak. Attributed ⇒ mark for
-            // delivery and consume-once by taskId; unattributed ⇒ isolate.
+            // Attribution is retained for audit, but an announcement is never
+            // projected onto the foreground response stream. That stream owns
+            // one request/generation-scoped sequence and done barrier.
             // Every announcement is tracked in `activeAnnouncements` so its
             // busy cause is cleared when it ends, attributed or not.
             if (id !== null) turn.activeAnnouncements.add(id)
@@ -1144,15 +1126,12 @@ export class QwenAgentTransport {
                   ...scopeLog, upstream_response_id: id, upstream_task_id: taskKeyStr,
                 })
               } else {
-                // ESS-1068 复审第3点：只记 pending（responseId→taskKey），不在这里
-                // 写 deliveredAnnouncements。完整下发（audio.done）后才转 delivered，
-                // 避免 disconnect/cancel/截断导致过早 dedup、永久抑制后续重投。
-                if (id !== null) {
-                  if (taskKeyStr !== null) turn.pendingAnnouncementTaskIds.set(id, taskKeyStr)
-                  turn.deliverAnnouncementIds.add(id)
-                }
-                this.log('upstream_announcement_delivered', {
+                this.log('upstream_announcement_correlated', {
                   ...scopeLog, upstream_response_id: id, upstream_task_id: taskKeyStr,
+                })
+                this.log('upstream_announcement_isolated', {
+                  ...scopeLog, upstream_response_id: id, upstream_task_id: taskKeyStr,
+                  reason: 'foreground_turn_isolation',
                 })
               }
             } else {
@@ -1338,9 +1317,6 @@ export class QwenAgentTransport {
                 upstream_task_id: taskKey ?? null,
                 final_sequence: turn.nextOutputSequence - 1,
               })
-              // 与正常段落同构：park + settle，由后续新段落释放或空闲窗口收口。
-              turn.pendingDone = true
-              scheduleDone()
             } else {
               this.log('upstream_announcement_audio_done_dropped', {
                 ...scopeLog, upstream_response_id: doneAnnouncementId,
@@ -1367,13 +1343,6 @@ export class QwenAgentTransport {
           // 下行里出现「刚才查询的是杭州今天的天气情况，不是深圳的」。
           const transcriptAnnouncementId = announcementResponseIdOf(event)
           if (transcriptAnnouncementId !== null) {
-            // ESS-1068：归属明确的播报文本是用户后台任务的结果，必须下发而不是
-            // 丢弃；只有未归属的播报文本才继续隔离（防跨会话串台）。
-            if (turn.deliverAnnouncementIds.has(transcriptAnnouncementId)) {
-              onEvent({ type: 'agent.transcript.final', response_id: responseId,
-                role: event.role, content: typeof event.content === 'string' ? event.content : '' })
-              return
-            }
             this.log('upstream_announcement_transcript_dropped', {
               ...scopeLog, upstream_response_id: transcriptAnnouncementId,
               content_length: typeof event.content === 'string' ? event.content.length : 0,

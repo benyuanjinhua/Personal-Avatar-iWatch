@@ -66,7 +66,7 @@ function openTurn(transport, { requestId = 'r', sessionId = 's', events }) {
 }
 
 // 归属明确的播报：response.started 的 task.sessionId 与当前 turn 一致。
-test('ESS-1068 · 归属明确的播报音频与文本下发，不再命中 announcement_audio_dropped', async () => {
+test('ESS-1107 · 归属明确的后台播报也不进入前台响应流', async () => {
   const url = await upstream((ws, message) => {
     if (message.type === 'connect') send(ws, { type: 'voice.ready' })
     if (message.type === 'audio.commit') {
@@ -81,21 +81,16 @@ test('ESS-1068 · 归属明确的播报音频与文本下发，不再命中 anno
   const transport = transportFor(url, { logs })
   const turn = openTurn(transport, { events })
   turn.commit()
-  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  await waitFor(() => logs.some(l => l.evt === 'upstream_announcement_audio_done_dropped'))
 
-  // 音频与文本都下发，而不是被丢弃。
-  assert.deepEqual(spoken(events), ['weather-result'])
-  assert.ok(events.some(e => e.type === 'agent.transcript.final' && e.content === '杭州今天晴'))
-  // 不再命中隔离丢弃线。
-  assert.ok(!logs.some(l => l.evt === 'upstream_announcement_audio_dropped'))
-  assert.ok(!logs.some(l => l.evt === 'upstream_announcement_transcript_dropped'))
-  // 归属 + 投递留证。
-  assert.ok(logs.some(l => l.evt === 'upstream_announcement_delivered' && l.upstream_task_id === 'work_x'))
-  assert.ok(logs.some(l => l.evt === 'upstream_announcement_audio_done_delivered'))
+  assert.deepEqual(spoken(events), [])
+  assert.ok(!events.some(e => e.type === 'agent.transcript.final'))
+  assert.ok(logs.some(l => l.evt === 'upstream_announcement_correlated' && l.upstream_task_id === 'work_x'))
+  assert.ok(logs.some(l => l.evt === 'upstream_announcement_transcript_dropped'))
   turn.close()
 })
 
-test('ESS-1068 · 同一 taskId 的重复播报只消费一次', async () => {
+test('ESS-1107 · 同一 taskId 的重放始终隔离在前台响应流外', async () => {
   const url = await upstream((ws, message) => {
     if (message.type === 'connect') send(ws, { type: 'voice.ready' })
     if (message.type === 'audio.commit') {
@@ -113,12 +108,9 @@ test('ESS-1068 · 同一 taskId 的重复播报只消费一次', async () => {
   const transport = transportFor(url, { logs })
   const turn = openTurn(transport, { events })
   turn.commit()
-  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
-
-  // 第一次投递，第二次命中重复隔离线：音频只有一帧。
-  assert.deepEqual(spoken(events), ['result'])
-  assert.ok(logs.some(l => l.evt === 'upstream_announcement_delivered'))
-  assert.ok(logs.some(l => l.evt === 'upstream_announcement_duplicate' && l.upstream_task_id === 'work_x'))
+  await waitFor(() => logs.filter(l => l.evt === 'upstream_announcement_audio_done_dropped').length === 2)
+  assert.deepEqual(spoken(events), [])
+  assert.equal(logs.filter(l => l.evt === 'upstream_announcement_correlated').length, 2)
   turn.close()
 })
 
@@ -172,10 +164,10 @@ test('ESS-1068 · task.* 事件建立的 taskId→session 映射用于归属', a
   const transport = transportFor(url, { logs })
   const turn = openTurn(transport, { events })
   turn.commit()
-  await waitFor(() => events.some(event => event.type === 'agent.audio.done'))
+  await waitFor(() => logs.some(l => l.evt === 'upstream_announcement_audio_done_dropped'))
 
-  assert.deepEqual(spoken(events), ['late-result'])
-  assert.ok(logs.some(l => l.evt === 'upstream_announcement_delivered' && l.upstream_task_id === 'work_z'))
+  assert.deepEqual(spoken(events), [])
+  assert.ok(logs.some(l => l.evt === 'upstream_announcement_correlated' && l.upstream_task_id === 'work_z'))
   turn.close()
 })
 
@@ -213,6 +205,9 @@ test('ESS-1107 · 播报从不设置 turnBusy，直答回合在基础窗口内�
   assert.equal(terminal.reason, 'segment_gap')
   // 回落基础窗口，而不是停在忙档 500ms。
   assert.equal(terminal.window_ms, 100)
+  assert.deepEqual(spoken(events), ['prompt'])
+  assert.equal(events.some(event => event.type === 'agent.audio.segment_done'), false,
+    'announcement must not release the parked foreground segment')
   turn.close()
 })
 
@@ -250,15 +245,14 @@ test('ESS-1068 · task 身份跨 turn 持久化：后一轮能归属前一轮任
     onEvent: e => events2.push(e),
   })
   turn2.commit()
-  await waitFor(() => events2.some(e => e.type === 'agent.audio.done'))
+  await waitFor(() => logs.some(l => l.evt === 'upstream_announcement_audio_done_dropped'))
 
-  assert.deepEqual(events2.filter(e => e.type === 'agent.audio.delta')
-    .map(e => Buffer.from(e.audio, 'base64').toString()), ['cross-turn-result'])
-  assert.ok(logs.some(l => l.evt === 'upstream_announcement_delivered' && l.upstream_task_id === 'work_w'))
+  assert.equal(events2.filter(e => e.type === 'agent.audio.delta').length, 0)
+  assert.ok(logs.some(l => l.evt === 'upstream_announcement_correlated' && l.upstream_task_id === 'work_w'))
   turn2.close()
 })
 
-test('ESS-1068 · 跨 turn 去重：同一 taskId 的结果只消费一次', async () => {
+test('ESS-1107 · 跨 turn 重放不进入任一前台响应流', async () => {
   const commits = []
   const url = await upstream((ws, message) => {
     if (message.type === 'connect') send(ws, { type: 'voice.ready' })
@@ -279,20 +273,18 @@ test('ESS-1068 · 跨 turn 去重：同一 taskId 的结果只消费一次', asy
     onEvent: e => events1.push(e),
   })
   turn1.commit()
-  await waitFor(() => events1.some(e => e.type === 'agent.audio.done'))
+  await waitFor(() => logs.some(l => l.evt === 'upstream_announcement_audio_done_dropped'))
 
   const turn2 = transport.openTurn({
     requestId: 'r2', sessionId: 's', deviceId: 'd', generation: 2, responseId: 'r2:gen2',
     onEvent: e => events2.push(e),
   })
   turn2.commit()
-  await waitFor(() => logs.some(l => l.evt === 'upstream_announcement_duplicate' && l.upstream_task_id === 'work_d'))
+  await waitFor(() => logs.filter(l => l.evt === 'upstream_announcement_audio_done_dropped').length === 2)
 
-  // 第一轮投递一帧，第二轮一帧都没有（跨 turn 去重）。
-  assert.equal(events1.filter(e => e.type === 'agent.audio.delta').length, 1)
+  assert.equal(events1.filter(e => e.type === 'agent.audio.delta').length, 0)
   assert.equal(events2.filter(e => e.type === 'agent.audio.delta').length, 0)
-  assert.ok(logs.some(l => l.evt === 'upstream_announcement_delivered' && l.upstream_task_id === 'work_d'))
-  assert.ok(logs.some(l => l.evt === 'upstream_announcement_duplicate' && l.upstream_task_id === 'work_d'))
+  assert.equal(logs.filter(l => l.evt === 'upstream_announcement_correlated').length, 2)
   turn2.close()
 })
 

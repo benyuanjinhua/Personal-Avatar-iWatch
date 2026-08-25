@@ -263,7 +263,7 @@ test('ESS-1107 · 已归属播报也不改变 busy 或满足 commit 后应答死
   await waitFor(() => events.some(event => event.type === 'agent.error'))
 
   assert.equal(events.at(-1).code, 'ERR_UPSTREAM_NO_RESPONSE')
-  assert.ok(logs.some(log => log.evt === 'upstream_announcement_delivered'))
+  assert.ok(logs.some(log => log.evt === 'upstream_announcement_correlated'))
   assert.equal(logs.some(log => log.evt === 'upstream_turn_busy'
     && log.cause === 'announcement_response'), false)
   assert.ok(logs.some(log => log.evt === 'upstream_response_timeout'))
