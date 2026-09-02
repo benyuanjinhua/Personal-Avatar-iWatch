@@ -874,6 +874,10 @@ export class RealtimeSession {
         retriable: false,
       })
     }, this.doneBarrierGapMs)
+    // The socket/session owns this watchdog's lifecycle. It must not keep the
+    // process alive after explicit session teardown while Node retires a
+    // cleared Timeout resource on a later loop turn.
+    this._barrierTimer.unref?.()
   }
 
   _clearBarrierTimer() {
