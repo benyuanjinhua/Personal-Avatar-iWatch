@@ -220,12 +220,12 @@ final class Ess1111LongTaskSessionTests: XCTestCase {
     func testAnswerDeltasStreamIntoTheirOwnLineAndNeverOverwriteProgress() {
         let requestId = beginTurn()
         emit(requestId, status: "running", seq: 1, text: "正在查询相关信息", category: "search")
-        XCTAssertNil(controller.answerStreamText)
+        XCTAssertNil(controller.streamingAnswerText)
 
         emit(requestId, status: "running", seq: 2, text: "上海明天", category: "answer")
         emit(requestId, status: "running", seq: 3, text: "多云转晴。", category: "answer")
 
-        XCTAssertEqual(controller.answerStreamText, "上海明天多云转晴。")
+        XCTAssertEqual(controller.streamingAnswerText, "上海明天多云转晴。")
         XCTAssertEqual(controller.toolProcessingText, "正在查询相关信息",
                        "答案增量绝不能把进展那一行盖掉——两条流各占一行")
     }
@@ -238,7 +238,7 @@ final class Ess1111LongTaskSessionTests: XCTestCase {
         emit(requestId, status: "running", seq: 6, text: "第二片", category: "answer")
         emit(requestId, status: "running", seq: 4, text: "迟到的旧片", category: "answer")
 
-        XCTAssertEqual(controller.answerStreamText, "第一片第二片")
+        XCTAssertEqual(controller.streamingAnswerText, "第一片第二片")
     }
 
     func testLongAnswerIsBoundedOnScreen() {
@@ -247,7 +247,7 @@ final class Ess1111LongTaskSessionTests: XCTestCase {
             emit(requestId, status: "running", seq: seq,
                  text: String(repeating: "字", count: 50), category: "answer")
         }
-        let shown = controller.answerStreamText ?? ""
+        let shown = controller.streamingAnswerText ?? ""
         XCTAssertEqual(shown.count, LongTaskAnswerTranscript.displayWindowCharacters + 1,
                        "500 字的答案在表盘上必须仍然只渲染有界的一小段")
     }
@@ -260,8 +260,49 @@ final class Ess1111LongTaskSessionTests: XCTestCase {
         controller.markAnswerFinished(requestId: requestId)
 
         XCTAssertEqual(startTurnCount, 1)
-        XCTAssertNil(controller.answerStreamText, "新一轮不得挂着上一轮的答案")
+        XCTAssertNil(controller.streamingAnswerText, "新一轮不得挂着上一轮的答案")
         XCTAssertNil(controller.toolProcessingText)
+    }
+
+    /// **#412 / #413 合并收口**：屏幕上只有一处答案文本，但喂它的上游有两条。
+    /// 权威流（`answer_seq`）一旦出过内容，本回合此后只认它——`progress_text`
+    /// 在网关侧已按 24 字截断，让截断文本覆盖完整答案是纯粹的退化。
+    func testAuthoritativeAnswerStreamWinsOverTheTruncatedCompatibilityEntry() {
+        let requestId = beginTurn()
+
+        // 兼容入口先到（未升级网关：category=answer 的 progress_text）。
+        emit(requestId, status: "running", seq: 1, text: "上海明天多云", category: "answer")
+        XCTAssertEqual(controller.streamingAnswerText, "上海明天多云",
+                       "网关没升级时，兼容入口仍要把答案显示出来")
+
+        // 权威答案流到达 ⇒ 立刻接管。
+        emitAnswer(requestId, answerSeq: 1, delta: "上海明天多云转晴，最高 28 度，")
+        XCTAssertEqual(controller.streamingAnswerText, "上海明天多云转晴，最高 28 度，")
+
+        // 此后兼容入口的截断文本不得再把权威内容盖回去。
+        emit(requestId, status: "running", seq: 2, text: "上海明天多云", category: "answer")
+        XCTAssertEqual(controller.streamingAnswerText, "上海明天多云转晴，最高 28 度，",
+                       "截断的兼容文本绝不能覆盖完整答案")
+
+        emitAnswer(requestId, answerSeq: 2, delta: "夜间转阴。")
+        XCTAssertEqual(controller.streamingAnswerText, "上海明天多云转晴，最高 28 度，夜间转阴。")
+    }
+
+    /// 两条来源是**各自独立的序号空间**，各留一套闸门。若共用一个单调闸门，
+    /// 交替到达的两条流会互判「乱序」而彼此丢弃。
+    func testAnswerAndProgressSequenceSpacesDoNotStarveEachOther() {
+        let requestId = beginTurn()
+
+        emitAnswer(requestId, answerSeq: 7, delta: "答案第一段。")
+        // progress_seq 远小于 answer_seq —— 不得因此被判成乱序丢掉。
+        emit(requestId, status: "running", seq: 1, text: "正在查询相关信息", category: "search")
+
+        XCTAssertEqual(controller.toolProcessingText, "正在查询相关信息",
+                       "进展闸门不受答案序号影响")
+        XCTAssertEqual(controller.streamingAnswerText, "答案第一段。")
+
+        emitAnswer(requestId, answerSeq: 8, delta: "答案第二段。")
+        XCTAssertEqual(controller.streamingAnswerText, "答案第一段。答案第二段。")
     }
 
     // MARK: - 断线重连（实现要求 4）
@@ -515,6 +556,18 @@ final class Ess1111LongTaskSessionTests: XCTestCase {
             requestId: requestId, taskId: taskId, status: status,
             progress: AgentTaskProgress(sequence: seq, text: text, category: category),
             generation: generation
+        )
+    }
+
+    /// #413 的权威答案流：`answer_delta` / `answer_seq`。
+    private func emitAnswer(
+        _ requestId: String, answerSeq: Int?, delta: String,
+        taskId: String? = Ess1111LongTaskSessionTests.taskId,
+        status: String = "running"
+    ) {
+        controller.markTaskState(
+            requestId: requestId, taskId: taskId, status: status,
+            answer: AgentTaskAnswerDelta(sequence: answerSeq, delta: delta)
         )
     }
 }

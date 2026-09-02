@@ -163,3 +163,47 @@ export function projectTaskProgress(task, eventType = '') {
       : '正在执行任务')
   return { text, category }
 }
+
+// MARK: - ESS-1111 `task.stream` 增量帧的投影
+//
+// 上游 ESS-1110 增加了**加性**的 `task.stream` 契约（`server/src/voice/
+// task-stream-protocol.mjs`）：同一个 task 的 progress / text / audio /
+// terminal 各有独立的 `seq`，`category:'progress'` 帧带 `message`（以及
+// `task.running` 投影出来的 `status:'running'`），`category:'text'` 帧带
+// 答案增量 `delta`。
+//
+// 它与上面的 `projectTaskProgress` 是**两条不同的输入**，不能共用一张状态表：
+// 老路径的输入是完整 `publicTask`（有 `activity[]`），`running` 必须继续落到
+// 活动文字上；新路径的输入只有一句 `message`，`task.running` 投影下来的那句
+// 字面量就是 `'running'`——把它原样显示在手表上是英文协议词，不是给人看的。
+// 所以这里单独一张表，只覆盖 `task.stream` 这一种输入，绝不回头改老表的口径。
+const STREAM_STATUS_TEXT = Object.freeze({
+  running: '正在处理',
+  queued: '正在排队',
+  pending: '正在排队',
+  thinking: '正在思考',
+  finalizing: '正在整理结果',
+  cancelling: '正在取消',
+  delegated: '正在处理',
+})
+
+/**
+ * 把一帧 `task.stream{category:'progress'}` 投影成 `{text, category}`。
+ *
+ * 终态帧不产出进展文字（与 `projectTaskProgress` 同一条理由：终态由 status
+ * 独占表达）。`status` 已知时用状态短语，否则显示上游那句 `message`——它是
+ * 上游明确标为可展示的文本，客户端一个字都不自己编。
+ *
+ * @param {object|null} frame `{message, status, category}`
+ */
+export function projectStreamProgress(frame) {
+  if (!frame || typeof frame !== 'object') return null
+  const status = String(frame.status ?? '').toLowerCase()
+  if (TERMINAL_STATUSES.has(status)) return null
+  if (STREAM_STATUS_TEXT[status]) {
+    return { text: STREAM_STATUS_TEXT[status], category: status }
+  }
+  const text = bounded(frame.message)
+  if (!text) return null
+  return { text, category: 'progress' }
+}

@@ -342,6 +342,9 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
                 + " task_status=\(envelope.taskStatus ?? "nil")"
                 + " progress_seq=\(envelope.progressSequence?.description ?? "nil")"
                 + " progress_category=\(envelope.progressCategory ?? "nil")"
+                // ESS-1111：答案原文同理不记，只记序号与长度。
+                + " answer_seq=\(envelope.answerSequence?.description ?? "nil")"
+                + " answer_len=\(envelope.answerDelta?.count ?? 0)"
         case .ready, .playbackClear, .responseInterrupted, .bridgeFallback,
              .transcriptDelta, .transcriptFinal, .generationOpen, .bargeInFailed,
              .transportFailed,
@@ -423,6 +426,11 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
                     sequence: envelope.progressSequence,
                     text: envelope.progressText,
                     category: envelope.progressCategory
+                ),
+                // ESS-1111：答案增量与进展同一条通道、同一套归属规则。
+                answer: AgentTaskAnswerDelta(
+                    sequence: envelope.answerSequence,
+                    delta: envelope.answerDelta
                 ),
                 // ESS-1111：代际随帧上送。缺席（老网关 / 老 iPhone 进程）时
                 // 传 nil，会话层按「本帧没有代际信息」放行，行为与本单之前

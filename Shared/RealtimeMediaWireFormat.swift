@@ -380,6 +380,15 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
     /// server-assigned number a late frame would overwrite a newer progress
     /// line. Watch drops anything that is not strictly newer.
     var progressSequence: Int?
+    /// ESS-1111: one slice of the streaming answer on `task.state`. Display-only,
+    /// exactly like `progressText`: it consumes no audio sequence and satisfies
+    /// no barrier. Absent for every other kind and for task frames that carry
+    /// no answer delta.
+    var answerDelta: String?
+    /// ESS-1111: gateway-assigned monotone answer sequence. Same reason as
+    /// `progressSequence` — this WCSession hop does not preserve ordering, and
+    /// appending a late slice after a newer one produces a scrambled sentence.
+    var answerSequence: Int?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
@@ -397,6 +406,8 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         case turnId = "turn_id"
         case taskId = "task_id"
         case taskStatus = "task_status"
+        case answerDelta = "answer_delta"
+        case answerSequence = "answer_seq"
         case progressText = "progress_text"
         case progressCategory = "progress_category"
         case progressSequence = "progress_seq"
@@ -420,7 +431,9 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         taskStatus: String? = nil,
         progressText: String? = nil,
         progressCategory: String? = nil,
-        progressSequence: Int? = nil
+        progressSequence: Int? = nil,
+        answerDelta: String? = nil,
+        answerSequence: Int? = nil
     ) {
         self.protocolVersion = protocolVersion
         self.kind = kind
@@ -440,6 +453,8 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         self.progressText = progressText
         self.progressCategory = progressCategory
         self.progressSequence = progressSequence
+        self.answerDelta = answerDelta
+        self.answerSequence = answerSequence
     }
 
     /// Explicit decoder so pre-ESS-404 messages (no `generation`, no
@@ -467,6 +482,9 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         self.progressText = try c.decodeIfPresent(String.self, forKey: .progressText)
         self.progressCategory = try c.decodeIfPresent(String.self, forKey: .progressCategory)
         self.progressSequence = try c.decodeIfPresent(Int.self, forKey: .progressSequence)
+        // ESS-1111：答案增量同样宽松解码，理由与上面逐字相同。
+        self.answerDelta = try c.decodeIfPresent(String.self, forKey: .answerDelta)
+        self.answerSequence = try c.decodeIfPresent(Int.self, forKey: .answerSequence)
     }
 
     /// Bridge PR #113 handshake ack. Carries no payload. Adapter treats this
@@ -550,7 +568,8 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         generation: Int? = nil,
         taskId: String?,
         status: String,
-        progress: AgentTaskProgress? = nil
+        progress: AgentTaskProgress? = nil,
+        answer: AgentTaskAnswerDelta? = nil
     ) -> Self {
         RealtimeDownlinkEnvelope(
             protocolVersion: RealtimeWireVersion.downlink,
@@ -560,7 +579,9 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
             taskId: taskId, taskStatus: status,
             progressText: progress?.text,
             progressCategory: progress?.category,
-            progressSequence: progress?.sequence
+            progressSequence: progress?.sequence,
+            answerDelta: answer?.delta,
+            answerSequence: answer?.sequence
         )
     }
 

@@ -213,8 +213,13 @@ enum AudioRealtimeAgentCodec {
         /// ESS-1100：同一帧可选携带**阶段性进展文字**（`progress`）。它只是
         /// 展示面，不参与任何屏障与闸门判定；缺席时本事件与 ESS-1097 的老帧
         /// 行为逐字相同。
+        ///
+        /// ESS-1111：同一帧可选携带**答案文本增量**（`answer`）。与 `progress`
+        /// 一样是展示面，不参与任何屏障、不占用音频序号；缺席时本事件与
+        /// ESS-1100 的帧行为逐字相同。
         case taskState(sessionId: String, requestId: String, generation: Int,
-                       taskId: String?, status: String, progress: AgentTaskProgress?)
+                       taskId: String?, status: String, progress: AgentTaskProgress?,
+                       answer: AgentTaskAnswerDelta?)
         /// Gateway `cancel.ack` — server-authoritative cancel confirmation.
         case cancelAck(sessionId: String, requestId: String, generation: Int,
                        cancelledResponseId: String)
@@ -326,9 +331,16 @@ enum AudioRealtimeAgentCodec {
                 text: (raw["progress_text"] as? String).flatMap { $0.isEmpty ? nil : $0 },
                 category: (raw["progress_category"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             )
+            // ESS-1111：答案增量同样全部可缺席（老网关 / 无答案的帧）。缺了
+            // 只是「这一帧没有新答案」，与进展三件套同一条理由：绝不因为一个
+            // 展示面字段缺席就把整帧判死。
+            let answer = AgentTaskAnswerDelta(
+                sequence: raw["answer_seq"] as? Int,
+                delta: raw["answer_delta"] as? String
+            )
             return .event(.taskState(
                 sessionId: sid, requestId: rid, generation: gen,
-                taskId: taskId, status: status, progress: progress
+                taskId: taskId, status: status, progress: progress, answer: answer
             ))
 
         case "cancel.ack":

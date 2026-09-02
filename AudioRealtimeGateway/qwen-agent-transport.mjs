@@ -1,7 +1,7 @@
 import WebSocket from 'ws'
 import { createHash, randomUUID } from 'node:crypto'
 
-import { projectTaskProgress } from './task-progress.mjs'
+import { projectStreamProgress, projectTaskProgress } from './task-progress.mjs'
 
 // ESS-745: `request_id` is client-supplied and only validated as a string
 // (token-issuer.mjs `#assertScope`); nothing makes it unique beyond the
@@ -417,6 +417,12 @@ export class QwenAgentTransport {
       // own (see `noteTurnBusy`), they only widen the window.
       outstandingTasks: new Set(), announcementResponseIds: new Set(),
       turnBusy: false,
+      // ESS-1111: 最近一次**上游任务活动**的时刻（生命周期帧、进展帧、答案
+      // 增量帧都算）。ESS-1109 的验收把「不得按固定 12 s / 30 s 退出」写成了
+      // 硬约束：一个 24 s 的 Codex 任务每秒都在报进展，却因为窗口从段落收口
+      // 那一刻起表而被判成「没动静」。有了这条时间戳，两个窗口量的都是
+      // **静默时长**而不是总时长——任务还在说话就不收口，任务真的哑了才收。
+      lastTaskActivityAt: 0,
       // ESS-1068: `activeAnnouncements` tracks announcement responses that
       // have started but not finished — they are the busy cause that must be
       // cleared when the announcement ends. `taskIdentity` maps a taskId to
@@ -643,6 +649,43 @@ export class QwenAgentTransport {
       })
     }
 
+    // ESS-1097 的「任务在飞，终态先挂起」兜底窗口，ESS-1111 把它从**一次性
+    // 总预算**改成**静默预算**：每收到一帧真实的上游任务活动就重新起表。
+    //
+    // 为什么必须改：原来的写法是 `if (!turn.taskTerminalTimer)` ——第一次挂起
+    // 时武装 30 s，之后无论上游报多少进展都不顺延。ESS-1109 的真机取证里
+    // Codex 任务跑 24 s、每秒都有 `task.running`，首个有内容的进展在 9.48 s，
+    // 而窗口早在第一次挂起时就开始烧；任务越长越容易在**明明还在推进**的时候
+    // 被判成超时。静默预算量的是「上游多久没说话」，这才是这条兜底真正想防的
+    // 失败面（上游任务事件整段丢失 ⇒ 回合永远收不了口）。
+    //
+    // 上限没有消失，只是换了位置：客户端仍有 `SessionController.
+    // toolTurnHardTimeoutSeconds = 180` 这条一轮只武装一次的绝对上限，
+    // 所以「续期」在任何情况下都不会变成「永久锁死」。
+    const armTaskTerminalTimer = cause => {
+      if (turn.turnEnded || !turn.pendingToolTerminal) return
+      if (!(this.toolCallWindowMs > 0)) return
+      clearTimeout(turn.taskTerminalTimer)
+      this.log('upstream_task_terminal_window_armed', {
+        ...scopeLog, cause, timeout_ms: this.toolCallWindowMs,
+        outstanding_tasks: turn.outstandingTasks.size,
+        task_id: turn.outstandingTasks.values().next().value ?? null,
+      })
+      turn.taskTerminalTimer = setTimeout(() => {
+        turn.taskTerminalTimer = null
+        if (turn.turnEnded || !turn.pendingToolTerminal) return
+        this.log('upstream_task_terminal_timeout', {
+          ...scopeLog, task_id: turn.outstandingTasks.values().next().value ?? null,
+          outstanding_tasks: turn.outstandingTasks.size,
+          timeout_ms: this.toolCallWindowMs,
+          idle_ms: turn.lastTaskActivityAt ? Date.now() - turn.lastTaskActivityAt : null,
+          ui_state: 'error', turn_state: 'terminal',
+        })
+        endTurn('tool_task_timeout', turn.pendingToolTerminal.finalSequence)
+      }, this.toolCallWindowMs)
+      turn.taskTerminalTimer.unref?.()
+    }
+
     // The one place a turn ends. `finalSequence` defaults to everything
     // forwarded so far, which is exactly the last segment's endpoint.
     const endTurn = (reason, finalSequence = turn.nextOutputSequence - 1) => {
@@ -654,19 +697,7 @@ export class QwenAgentTransport {
           final_sequence: finalSequence, outstanding_tasks: turn.outstandingTasks.size,
           ui_state: 'thinking', turn_state: 'busy',
         })
-        if (!turn.taskTerminalTimer && this.toolCallWindowMs > 0) {
-          turn.taskTerminalTimer = setTimeout(() => {
-            turn.taskTerminalTimer = null
-            if (turn.turnEnded || !turn.pendingToolTerminal) return
-            this.log('upstream_task_terminal_timeout', {
-              ...scopeLog, task_id: turn.outstandingTasks.values().next().value ?? null,
-              outstanding_tasks: turn.outstandingTasks.size,
-              timeout_ms: this.toolCallWindowMs, ui_state: 'error', turn_state: 'terminal',
-            })
-            endTurn('tool_task_timeout', turn.pendingToolTerminal.finalSequence)
-          }, this.toolCallWindowMs)
-          turn.taskTerminalTimer.unref?.()
-        }
+        armTaskTerminalTimer('turn_terminal_deferred')
         return
       }
       turn.turnEnded = true
@@ -708,14 +739,25 @@ export class QwenAgentTransport {
       // to the base value so a direct-answer turn is not held open by a
       // background announcement that has already finished (ESS-1068).
       const mayShrink = cause === 'turn_busy_cleared'
-      if (turn.segmentGapWindowMs >= window && !mayShrink) return
+      // ESS-1111: 一帧真实的上游任务活动**重新起表**，即使窗口宽度没变。
+      // 这是本单验收「收到任何合法 task/progress/answer 帧都刷新活动时间」
+      // 在网关侧的落点，也是唯一允许重启时钟的原因——其余 cause 仍然只能
+      // 加宽、不能顺延（ESS-969 B1 的结论没有被推翻）。
+      const mayRestart = cause === 'task_activity'
+      if (turn.segmentGapWindowMs >= window && !mayShrink && !mayRestart) return
       clearTimeout(turn.segmentGapTimer)
       turn.segmentGapWindowMs = window
-      const remaining = Math.max(0, turn.segmentClosedAt + window - Date.now())
+      // 起表基准：任务在飞时取「段落收口」与「最近一次任务活动」里更晚的那个。
+      // 没有任务在飞时逐字节保持 ESS-990 的老口径（从段落收口起表）。
+      const base = turn.outstandingTasks.size > 0
+        ? Math.max(turn.segmentClosedAt, turn.lastTaskActivityAt)
+        : turn.segmentClosedAt
+      const remaining = Math.max(0, base + window - Date.now())
       this.log('upstream_segment_gap_armed', {
         ...scopeLog, cause, window_ms: window, remaining_ms: remaining,
         segment_index: turn.closedSegment.segmentIndex,
         outstanding_tasks: turn.outstandingTasks.size,
+        base: base === turn.segmentClosedAt ? 'segment_closed' : 'task_activity',
       })
       turn.segmentGapTimer = setTimeout(() => {
         turn.segmentGapTimer = null
@@ -736,6 +778,16 @@ export class QwenAgentTransport {
     //     tool-calling turn open until the client's own 45 s hard timeout;
     //   • as a widener they are exactly right: every measured segment gap
     //     longer than 1194.7 ms had one of these two in flight.
+    // ESS-1111: 上游任务确实在推进的**证据帧**。生命周期帧、`task.stream` 的
+    // 进展与答案增量都算，通知类事件（`task.notification.*`）不算——那是关于
+    // 任务的通知，不是任务自己在动。收到即续期：挂起的终态窗口重新起表，
+    // 停放的段落窗口从这一刻重算。
+    const noteTaskActivity = cause => {
+      turn.lastTaskActivityAt = Date.now()
+      armTaskTerminalTimer(cause)
+      armSegmentGap('task_activity')
+    }
+
     const noteTurnBusy = cause => {
       if (turn.turnBusy) return
       turn.turnBusy = true
@@ -1383,6 +1435,61 @@ export class QwenAgentTransport {
             role: event.role, content: typeof event.content === 'string' ? event.content : '' })
           return
         }
+        // ESS-1111（消费上游 ESS-1110 的加性契约）：`task.stream` 是上游按
+        // **产生顺序**发的增量流，`server/src/voice/task-stream-protocol.mjs`
+        // 定义。一帧的形状是
+        //   `{type:'task.stream', protocolVersion, taskId, requestId, sessionId,
+        //     generation, category:'progress'|'text'|'audio'|'terminal', seq, …}`
+        // progress 带 `message`（+ 可选 `status`），text 带答案增量 `delta`。
+        // 每个 category 有**独立**的 `seq`，同一 task 内单调。
+        //
+        // 必须在下面的通用 `task.` 分支之前拦截：那条分支会把 `task.stream`
+        // 的 `event.type.slice(5)` 当成状态，客户端会收到一个字面量为
+        // `'stream'` 的任务状态——既不是真实状态，也不在任何一侧的枚举里。
+        //
+        // 未知 category 一律忽略而不是报错：这条契约是加性的，上游加新 category
+        // 时旧网关必须继续工作（本单验收「未知字段向前兼容」的网关侧落点）。
+        if (event.type === 'task.stream') {
+          const streamTaskId = String(event.taskId ?? event.requestId ?? '')
+          if (!streamTaskId) return
+          noteResponseProgress()
+          const category = String(event.category ?? '')
+          const streamStatus = typeof event.status === 'string' && event.status
+            ? event.status : 'running'
+          this.log('upstream_task_stream', {
+            ...scopeLog, task_id: streamTaskId, category,
+            seq: Number.isInteger(event.seq) ? event.seq : null,
+            protocol_version: event.protocolVersion ?? null,
+            status: streamStatus,
+            // 增量文本本身不落日志：它是用户可见的答案内容，日志里只留长度。
+            delta_length: typeof event.delta === 'string' ? event.delta.length : 0,
+          })
+          if (category !== 'progress' && category !== 'text') return
+          if (TASK_TERMINAL_STATUSES.has(streamStatus)) return
+          // 终态仍然只由 `task.completed/failed/cancelled` 裁决（`category:
+          // 'terminal'` 帧上面已经被过滤掉）：两套终态真相并存，就等于给
+          // 「终态只发一次」开了第二个入口。
+          turn.outstandingTasks.add(streamTaskId)
+          noteTurnBusy('task_in_flight')
+          noteTaskActivity(`task_stream_${category}`)
+          if (category === 'progress') {
+            const progress = projectStreamProgress(event)
+            if (!progress) return
+            onEvent({
+              type: 'agent.task', response_id: responseId,
+              task: { id: streamTaskId, status: streamStatus }, progress,
+            })
+            return
+          }
+          const delta = typeof event.delta === 'string' ? event.delta : ''
+          if (!delta) return
+          onEvent({
+            type: 'agent.task', response_id: responseId,
+            task: { id: streamTaskId, status: streamStatus },
+            answer: { delta },
+          })
+          return
+        }
         // ESS-990 task lifecycle. Real captured frames carry the id on
         // `event.task.id` (`{type:'task.accepted', task:{id, workId, status,
         // sessionId, turnId, …}}`, 2026-08-22 capture) — `event.taskId` and
@@ -1421,6 +1528,11 @@ export class QwenAgentTransport {
           } else if (!TASK_NON_LIFECYCLE_EVENTS.has(event.type)) {
             turn.outstandingTasks.add(id)
             noteTurnBusy('task_in_flight')
+            noteTaskActivity('task_lifecycle')
+          } else if (event.type === 'task.progress.check') {
+            // ESS-1111: 进展检查不改变生命周期集合（它是通知，不是状态迁移），
+            // 但它是上游「我还在推进」的**一等证据**，必须续期。
+            noteTaskActivity('task_progress')
           }
           // ESS-1100：上游在同一帧里带着**阶段性进展**（`task.activity` /
           // `authorization` / 生命周期子状态）。此前这里只取 {id, status}，

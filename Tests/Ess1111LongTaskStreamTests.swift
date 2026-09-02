@@ -21,6 +21,21 @@ final class Ess1111LongTaskStreamTests: XCTestCase {
         XCTAssertEqual(LongTaskActivityKind(category: "image"), .tool)
         XCTAssertEqual(LongTaskActivityKind(category: "finalizing"), .result)
         XCTAssertEqual(LongTaskActivityKind(category: "answer"), .answer)
+        XCTAssertEqual(LongTaskActivityKind(category: "answer_delta"), .answer)
+    }
+
+    /// #412 / #413 合并收口：`text` / `message` / `output` **不再**被当成答案。
+    ///
+    /// #413 之后网关把 `task.stream{category:'text'}` 直接投影成
+    /// `answer_delta` / `answer_seq`，`progress_category` 只承载进展类目。
+    /// 继续把 `text` 认成答案，会把一条正常进展帧劫持进答案流，同时让进展行
+    /// 退回通用兜底。
+    func testProgressCategoriesAreNoLongerMistakenForAnswerContent() {
+        for raw in ["text", "message", "output"] {
+            let kind = LongTaskActivityKind(category: raw, status: "running")
+            XCTAssertFalse(kind.isAnswerStream, "\(raw) 不得再被当成答案类目")
+            XCTAssertEqual(kind, .other(raw), "认不出来就按 .other 原样留住上游措辞")
+        }
     }
 
     /// 类目缺席（老网关只发 `task_status`）时退到状态，而不是丢掉这一帧。
