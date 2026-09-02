@@ -590,6 +590,17 @@ export class QwenAgentTransport {
       turn.pendingDone = false
       clearTimeout(turn.doneTimer)
       turn.doneTimer = null
+      // A settled audio.done is the positive terminal signal guarded by the
+      // tool-audio silence watchdog. Disarm it before either ending this turn
+      // or handing the endpoint decision to the segment-gap window; otherwise
+      // the two timers race and a complete answer can fail as a false
+      // ERR_UPSTREAM_TOOL_AUDIO_TIMEOUT.
+      if (turn.awaitingToolAudioTerminal) {
+        turn.awaitingToolAudioTerminal = false
+        clearTimeout(turn.toolAudioTimer)
+        turn.toolAudioTimer = null
+        this.log('upstream_tool_audio_terminal_satisfied', { ...scopeLog })
+      }
       const finalSequence = turn.nextOutputSequence - 1
       this.log('upstream_audio_done', { ...scopeLog, final_sequence: finalSequence })
       if (turn.multiSegment === null) {

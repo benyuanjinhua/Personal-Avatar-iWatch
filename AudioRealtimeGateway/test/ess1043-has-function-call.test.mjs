@@ -465,5 +465,7 @@ test('ESS-1096 · 工具音频持续流动时续期静默窗口，不按总时�
   assert.equal(events.find(event => event.type === 'agent.audio.done').final_sequence, frameCount)
   assert.equal(events.some(event => event.code === 'ERR_UPSTREAM_TOOL_AUDIO_TIMEOUT'), false)
   assert.ok(logs.filter(log => log.evt === 'upstream_tool_audio_terminal_window_armed').length > 2)
+  assert.ok(logs.some(log => log.evt === 'upstream_tool_audio_terminal_satisfied'))
+  assert.ok(logs.some(log => log.evt === 'upstream_turn_terminal' && log.reason === 'segment_gap'))
   turn.close()
 })
