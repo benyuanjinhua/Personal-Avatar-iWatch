@@ -242,6 +242,19 @@ final class ToolTurnAggregateTests: XCTestCase {
         XCTAssertTrue(agg.blocksAutomaticNextTurn, "任务帧还没到，此刻收口就是 ESS-1095 复发")
     }
 
+    /// 「只有闩锁、从未出现任务号」的回合，在 `tool_call_resolved` 之后**仍然**
+    /// 是工具回合。证据读 `toolCallPending` 会在这里归 false，于是收口路径不再
+    /// 认领这一轮，UI 停在「正在思考」等超时——所以证据必须是历史事实。
+    func testEvidenceSurvivesResolvedWithoutAnyTask() {
+        var agg = ToolTurnAggregate()
+        agg.apply(.toolCallPending)
+        agg.apply(.toolCallResolved)
+        XCTAssertFalse(agg.toolCallPending)
+        XCTAssertTrue(agg.didObserveToolCall)
+        XCTAssertTrue(agg.hasToolEvidence, "解除的是闩锁，不是「这是工具回合」这个事实")
+        XCTAssertTrue(agg.seenTasks.isEmpty)
+    }
+
     // MARK: - 两段音频
 
     /// 两段音频（「我正在查询…」+ 真答案）之间必须回到思考态，
