@@ -429,3 +429,41 @@ test('ESS-1096 · defer 后新输出缺少 audio.done 时显式超时失败', as
   assert.equal(events.some(event => event.type === 'agent.audio.done'), false)
   turn.close()
 })
+
+test('ESS-1096 · 工具音频持续流动时续期静默窗口，不按总时长中断', async () => {
+  const frameCount = 12
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') send(ws, { type: 'voice.ready' })
+    if (message.type !== 'audio.commit') return
+    send(ws, { type: 'voice.state', state: 'listening', origin: 'model' })
+    send(ws, { type: 'task.running', task: { id: 'task-streaming', status: 'running' } })
+    audioDelta(ws, 0, 'prompt')
+    send(ws, { type: 'audio.done' })
+    setTimeout(() => {
+      send(ws, { type: 'response.started', responseId: 'answer', origin: 'agent' })
+      let sequence = 1
+      const timer = setInterval(() => {
+        audioDelta(ws, sequence, `answer-${sequence}`)
+        sequence += 1
+        if (sequence > frameCount) {
+          clearInterval(timer)
+          send(ws, { type: 'task.completed', task: { id: 'task-streaming', status: 'completed' } })
+          send(ws, { type: 'audio.done' })
+        }
+      }, 30)
+    }, 180)
+  })
+  const events = []; const logs = []
+  const transport = transportFor(url, {
+    logs, segmentGapMs: 10, segmentGapBusyMs: 20, toolCallWindowMs: 180,
+  })
+  const turn = openTurn(transport, { requestId: 'r-streaming-answer', events })
+  turn.commit()
+  await waitFor(() => events.some(event => event.type === 'agent.audio.done')
+    || logs.some(log => log.evt === 'upstream_tool_audio_terminal_timeout'))
+  assert.equal(events.filter(event => event.type === 'agent.audio.delta').length, frameCount + 1)
+  assert.equal(events.find(event => event.type === 'agent.audio.done').final_sequence, frameCount)
+  assert.equal(events.some(event => event.code === 'ERR_UPSTREAM_TOOL_AUDIO_TIMEOUT'), false)
+  assert.ok(logs.filter(log => log.evt === 'upstream_tool_audio_terminal_window_armed').length > 2)
+  turn.close()
+})

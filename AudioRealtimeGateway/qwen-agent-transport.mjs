@@ -634,20 +634,14 @@ export class QwenAgentTransport {
     // The turn produced more output after a segment closed: that closed
     // segment was a boundary, not the end. Release it downstream before the
     // new segment's frames so the client sees them in order.
-    const invalidateDeferredTerminal = cause => {
-      if (!turn.pendingToolTerminal) return
-      const stale = turn.pendingToolTerminal
-      turn.pendingToolTerminal = null
-      turn.awaitingToolAudioTerminal = true
-      clearTimeout(turn.taskTerminalTimer)
-      turn.taskTerminalTimer = null
-      this.log('upstream_turn_terminal_invalidated', {
-        ...scopeLog, cause, stale_final_sequence: stale.finalSequence,
-        current_final_sequence: turn.nextOutputSequence - 1,
-        ui_state: 'thinking', turn_state: 'busy',
-      })
+    const armToolAudioTimer = cause => {
+      if (turn.turnEnded || !turn.awaitingToolAudioTerminal) return
       clearTimeout(turn.toolAudioTimer)
       if (this.toolCallWindowMs > 0) {
+        this.log('upstream_tool_audio_terminal_window_armed', {
+          ...scopeLog, cause, timeout_ms: this.toolCallWindowMs,
+          final_sequence: turn.nextOutputSequence - 1,
+        })
         turn.toolAudioTimer = setTimeout(() => {
           turn.toolAudioTimer = null
           if (turn.turnEnded || !turn.awaitingToolAudioTerminal) return
@@ -660,6 +654,25 @@ export class QwenAgentTransport {
         }, this.toolCallWindowMs)
         turn.toolAudioTimer.unref?.()
       }
+    }
+
+    const invalidateDeferredTerminal = cause => {
+      if (turn.pendingToolTerminal) {
+        const stale = turn.pendingToolTerminal
+        turn.pendingToolTerminal = null
+        turn.awaitingToolAudioTerminal = true
+        clearTimeout(turn.taskTerminalTimer)
+        turn.taskTerminalTimer = null
+        this.log('upstream_turn_terminal_invalidated', {
+          ...scopeLog, cause, stale_final_sequence: stale.finalSequence,
+          current_final_sequence: turn.nextOutputSequence - 1,
+          ui_state: 'thinking', turn_state: 'busy',
+        })
+      }
+      // This is a silence watchdog, not a cap on total answer duration. Every
+      // accepted response-start or audio frame proves the upstream is healthy,
+      // so renew the window until the fresh audio.done arrives.
+      armToolAudioTimer(cause)
     }
 
     const releaseClosedSegment = cause => {
