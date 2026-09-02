@@ -139,6 +139,15 @@ export class RealtimeSession {
     this.finalSequence = null       // set when the downstream done is released
     this.staleGenerationDropped = 0
     this.postDoneAudioDropped = 0
+    // ESS-1100: per-session monotone display sequence for `task.state`
+    // progress. Only bumped when a frame actually carries progress text, so
+    // the client's「drop anything not newer」rule has no holes to fall into.
+    this.progressSequence = 0
+    // ESS-1111: per-session monotone display sequence for `task.state`
+    // answer deltas. Independent of `progressSequence` and of the audio
+    // sequence space — a progress frame must never renumber the answer
+    // stream, and an answer delta must never consume an audio sequence.
+    this.answerSequence = 0
     this._barrierTimer = null
 
     this.agentTurn = null
@@ -430,6 +439,8 @@ export class RealtimeSession {
       return this._emitTaskState({
         taskId: event.task?.id ?? null,
         status: event.task?.status ?? null,
+        progress: event.progress ?? null,
+        answer: event.answer ?? null,
       })
     }
     if (event.type === 'agent.tool_call_state') {
@@ -466,20 +477,68 @@ export class RealtimeSession {
   // the turn barrier is precisely what releases the client's hold. Dropping it
   // there would build the deadlock this event exists to prevent. It carries no
   // audio and touches no barrier, so it cannot reorder or delay playback.
-  _emitTaskState({ taskId, status }) {
+  //
+  // ESS-1100 追加的第三个可选切面 `progress`：`{progress_text,
+  // progress_category, progress_seq}`。它**只是展示面**——不参与任何屏障、
+  // 不改变任务集合的裁决，缺席时这一帧与 ESS-1097 的老帧逐字节相同，所以
+  // 未升级的客户端忽略这三个键即可。
+  //
+  // `progress_seq` 是**每会话单调递增**的展示序号：客户端据此丢弃迟到与重复
+  // 的进展帧。它必须由服务端发，因为客户端那一侧（iPhone → Watch 的
+  // WCSession 跳）不保证顺序，只靠到达顺序会把旧进展盖回新进展上。
+  _emitTaskState({ taskId, status, progress = null, answer = null }) {
     if (taskId === null && !status) return
+    const progressText = typeof progress?.text === 'string' && progress.text.trim()
+      ? progress.text.trim()
+      : null
+    let progressSeq = null
+    if (progressText !== null) {
+      this.progressSequence = (this.progressSequence ?? 0) + 1
+      progressSeq = this.progressSequence
+    }
+    // ESS-1111 的第四个可选切面 `answer_delta` / `answer_seq`：最终答案的
+    // **文本增量**。与 `progress_*` 一样是纯展示面，不参与任何屏障，也不占用
+    // 音频的 sequence 空间——音频仍按既有序列与 barrier 保序，两者互不阻塞。
+    // 缺席时这一帧与 ESS-1100 的帧逐字节相同，老客户端忽略这两个键即可。
+    //
+    // 与 `progress_seq` 同理，序号由服务端发：iPhone → Watch 那一跳走
+    // WCSession，不保证顺序，客户端只有拿着单调序号才能把迟到的增量丢掉，
+    // 而不是把一段旧文本追加到新答案后面。
+    const answerDelta = typeof answer?.delta === 'string' && answer.delta !== ''
+      ? answer.delta
+      : null
+    let answerSeq = null
+    if (answerDelta !== null) {
+      this.answerSequence = (this.answerSequence ?? 0) + 1
+      answerSeq = this.answerSequence
+    }
     this._sendJson({
       type: 'task.state',
       session_id: this.scope.session_id, request_id: this.scope.request_id,
       generation: this.scope.generation,
       ...(taskId === null ? {} : { task_id: String(taskId) }),
       status: String(status ?? 'unknown'),
+      ...(progressText === null ? {} : {
+        progress_text: progressText,
+        progress_seq: progressSeq,
+        ...(progress?.category ? { progress_category: String(progress.category) } : {}),
+      }),
+      ...(answerDelta === null ? {} : {
+        answer_delta: answerDelta,
+        answer_seq: answerSeq,
+      }),
     })
     this.log('downlink_task_state', {
       request_id: this.scope.request_id, session_id: this.scope.session_id,
       generation: this.scope.generation, response_id: this.responseId,
       task_id: taskId === null ? null : String(taskId),
       status: String(status ?? 'unknown'),
+      progress_text: progressText,
+      progress_category: progress?.category ?? null,
+      progress_seq: progressSeq,
+      // 答案文本是用户内容，只记长度与序号，不落原文。
+      answer_seq: answerSeq,
+      answer_delta_length: answerDelta === null ? null : answerDelta.length,
       after_turn_done: this.doneEmitted,
     })
   }

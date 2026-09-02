@@ -132,7 +132,44 @@ final class WatchRealtimeMediaAdapter {
     /// 它唯一的作用是喂会话层的回合聚合状态机：任务未终结时 UI 保持
     /// 「正在思考」，且禁止自动开下一轮 generation。
     /// `taskId == nil` = `tool_call_pending`（上游还没有任务号）。
-    var onAgentTaskState: (@MainActor (RealtimeMediaSession.TurnHandle, _ taskId: String?, _ status: String) -> Void)?
+    /// ESS-1100：同一帧可选携带的**阶段性进展文字**，只走展示面。
+    /// ESS-1111：同一帧可选携带的**答案文本增量**，同样只走展示面——它不占
+    /// 音频序号，也不满足任何终态屏障。
+    /// ESS-1111：`generation` 一并上送。打断之后上一代任务仍会继续下发进展，
+    /// requestId 相同的情况下只有代际能把它们挡在新一轮之外。
+    var onAgentTaskState: (@MainActor (
+        RealtimeMediaSession.TurnHandle, _ taskId: String?, _ status: String,
+        _ progress: AgentTaskProgress?, _ answer: AgentTaskAnswerDelta?,
+        _ generation: Int?
+    ) -> Void)?
+
+    /// ESS-1111：本回合是否有**仍在上游跑着的长任务**。由会话层的回合聚合体
+    /// 独占回答（`ToolTurnAggregate.hasOutstandingWork`），适配器不另存一份
+    /// 投影——两处各判一次必然分叉。
+    var longTaskInFlight: (@MainActor () -> Bool)?
+
+    /// ESS-1111：下行断了、但长任务还在跑。适配器据此**推迟**（而不是执行）
+    /// 传输失败收口，把「还要不要等」的裁决权交给会话层的重连宽限。
+    var onDownlinkInterrupted: (@MainActor (
+        RealtimeMediaSession.TurnHandle, _ reason: String
+    ) -> Void)?
+
+    /// ESS-1111 复审整改（阻断 2）：长任务断线的推迟原因**与既有的
+    /// `pendingTransportFailureReason` 分开存**。
+    ///
+    /// 两者语义完全不同，共用一个字段会串味：
+    /// - `pendingTransportFailureReason` = 「传输真的失败了，只是缓冲里还有
+    ///   音频要放完」。`handle(.ended)` 里的 `after_buffer_drained` 分支**消费
+    ///   它**，把这一轮判成传输失败。
+    /// - `longTaskInterruptReason` = 「这一跳断了，任务还在上游跑」。此时回合
+    ///   完全可能正常答完，绝不能被 `.ended` 顺手判成失败。
+    ///
+    /// 复审指出的故障形态正是共用字段造成的：宽限期内若音频先于第一条 task 帧
+    /// 开始渲染，适配器会留下一个陈旧的 pending 原因，等 `.ended` 到达时把一次
+    /// **已经答完**的回合误判成传输失败、吞掉 `onAnswerPlaybackFinished`，回合
+    /// 退回 thinking 去等一个永不到来的 `audio.done`。分开存之后，`.ended`
+    /// 那条分支结构上就看不见长任务断线，这个形态不复存在。
+    private var longTaskInterruptReason: String?
 
     /// ESS-573: 真实通道就绪事件——本回合**首个被对端接受的 uplink ack**
     /// 到达时触发一次。该 ack 由 iPhone 在 WSS 实际发出音频后回发
@@ -790,19 +827,34 @@ final class WatchRealtimeMediaAdapter {
     ///
     /// 归属校验只认 `currentTurn`——上一轮的迟到 `task.state` 不得把当前回合
     /// 按在思考态上（那是另一种形式的卡死）。没有活跃回合时只留证。
-    func markAgentTaskState(taskId: String?, status: String) {
+    func markAgentTaskState(
+        taskId: String?, status: String, progress: AgentTaskProgress? = nil,
+        answer: AgentTaskAnswerDelta? = nil,
+        generation: Int? = nil
+    ) {
         guard let handle = currentTurn else {
             WatchLog.info(
                 "realtime", "task_state_no_active_turn",
-                detail: "task_id=\(taskId ?? "nil") status=\(status)"
+                detail: "task_id=\(taskId ?? "nil") status=\(status) "
+                    + "progress_seq=\(progress?.sequence?.description ?? "nil")"
             )
             return
         }
         WatchLog.info(
             "realtime", "task_state", requestId: handle.requestId,
-            detail: "task_id=\(taskId ?? "nil") status=\(status) turn_id=\(handle.turnId)"
+            detail: "task_id=\(taskId ?? "nil") status=\(status) turn_id=\(handle.turnId) "
+                + "generation=\(generation?.description ?? "nil") "
+                + "progress_seq=\(progress?.sequence?.description ?? "nil") "
+                + "progress_category=\(progress?.category ?? "nil") "
+                // 答案原文是用户内容：只记序号与长度。
+                + "answer_seq=\(answer?.sequence?.description ?? "nil") "
+                + "answer_len=\(answer?.delta.count ?? 0)"
         )
-        onAgentTaskState?(handle, taskId, status)
+        // ESS-1111 复审整改（阻断 2）：**这里不再自己判「恢复了没有」**。
+        // 恢复与否由会话层 `markDownlinkResumed` 独占裁决，再经
+        // `clearDeferredTransportFailure` 回调回来撤销推迟——单一判据，
+        // 两层不会分叉。
+        onAgentTaskState?(handle, taskId, status, progress, answer, generation)
     }
 
     func markDownlinkComplete(
@@ -872,6 +924,22 @@ final class WatchRealtimeMediaAdapter {
             )
             return
         }
+        // ESS-1111：长任务还在上游跑着 ⇒ 传输层的一次断开**不足以**宣判这一轮
+        // 失败。真机取证：客户端 12.107s 断开时任务还要再跑 11.9s 才产出答案，
+        // 当场收口等于把那个答案连同任务一起丢掉。这里只推迟收口并把裁决权交给
+        // 会话层的重连宽限（`SessionController.downlinkReconnectGraceSeconds`）；
+        // 宽限到点或用户退出时由 `finishDeferredTransportFailure` 如实收场。
+        if longTaskInFlight?() == true {
+            longTaskInterruptReason = reason
+            transportFailureDrainTimer.cancel()
+            WatchLog.info(
+                "realtime", "transport_failure_deferred",
+                requestId: handle.requestId,
+                detail: "reason=\(reason) disposition=long_task_in_flight"
+            )
+            onDownlinkInterrupted?(handle, reason)
+            return
+        }
         finishTransportFailure(
             handle: handle,
             reason: reason,
@@ -886,6 +954,7 @@ final class WatchRealtimeMediaAdapter {
     ) {
         transportFailureDrainTimer.cancel()
         pendingTransportFailureReason = nil
+        longTaskInterruptReason = nil
         WatchLog.info(
             "realtime", "transport_failure_terminal",
             requestId: handle.requestId,
@@ -893,6 +962,37 @@ final class WatchRealtimeMediaAdapter {
         )
         onAnswerPlaybackFailed?(handle, "transport_failed:\(reason)")
         session.markDownlinkBridgeFallback()
+    }
+
+    /// ESS-1111：会话层的重连宽限到点 —— 现在（也只有现在）把那次被推迟的
+    /// 传输失败如实收口。没有待收口的失败时是幂等的 no-op。
+    func finishDeferredTransportFailure(reason: String) {
+        guard let handle = currentTurn,
+              let pending = longTaskInterruptReason else { return }
+        longTaskInterruptReason = nil
+        pendingSegmentBoundary = false
+        finishTransportFailure(
+            handle: handle,
+            reason: pending,
+            disposition: "long_task_grace_expired:\(reason)"
+        )
+    }
+
+    /// ESS-1111 复审整改（阻断 2）：下行恢复 —— 撤掉那次被推迟的长任务收口。
+    ///
+    /// **判据只有一个，且只在会话层**：`SessionController.markDownlinkResumed`
+    /// 认定恢复之后回调到这里。适配器不再自己判一次（原先那条
+    /// `!player.isRenderingDownlink` 就是第二个判据，两层各判一次必然分叉，
+    /// 正是复审指出的缺陷）。没有待撤的推迟时是幂等 no-op。
+    func clearDeferredTransportFailure(reason: String) {
+        guard let pending = longTaskInterruptReason else { return }
+        longTaskInterruptReason = nil
+        transportFailureDrainTimer.cancel()
+        WatchLog.info(
+            "realtime", "transport_failure_resumed",
+            requestId: currentTurn?.requestId,
+            detail: "reason=\(pending) resumed_by=\(reason)"
+        )
     }
 
     private func transportFailureDrainDeadlineReached(

@@ -209,8 +209,17 @@ enum AudioRealtimeAgentCodec {
         /// `status` 原样透传（不在解码层做白名单）：未知取值由
         /// `ToolTaskStatus` 按**非终态**处理，把没见过的状态当终态等于重演本 bug。
         /// `tool_call_pending`（无 taskId）用 `taskId == nil` 表达。
+        ///
+        /// ESS-1100：同一帧可选携带**阶段性进展文字**（`progress`）。它只是
+        /// 展示面，不参与任何屏障与闸门判定；缺席时本事件与 ESS-1097 的老帧
+        /// 行为逐字相同。
+        ///
+        /// ESS-1111：同一帧可选携带**答案文本增量**（`answer`）。与 `progress`
+        /// 一样是展示面，不参与任何屏障、不占用音频序号；缺席时本事件与
+        /// ESS-1100 的帧行为逐字相同。
         case taskState(sessionId: String, requestId: String, generation: Int,
-                       taskId: String?, status: String)
+                       taskId: String?, status: String, progress: AgentTaskProgress?,
+                       answer: AgentTaskAnswerDelta?)
         /// Gateway `cancel.ack` — server-authoritative cancel confirmation.
         case cancelAck(sessionId: String, requestId: String, generation: Int,
                        cancelledResponseId: String)
@@ -314,9 +323,24 @@ enum AudioRealtimeAgentCodec {
             // `task_id` 允许缺席：`tool_call_pending` 阶段上游还没有 taskId。
             let taskId = (raw["task_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             guard let status = raw["status"] as? String, !status.isEmpty else { return .malformed }
+            // ESS-1100：进展三件套全部可缺席（老网关 / 无进展的帧）。缺了
+            // 只是「这一帧没话说」，绝不把整帧判死——那会连带丢掉本帧真正
+            // 关键的 `status`，把 ESS-1095 装回去。
+            let progress = AgentTaskProgress(
+                sequence: raw["progress_seq"] as? Int,
+                text: (raw["progress_text"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                category: (raw["progress_category"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            )
+            // ESS-1111：答案增量同样全部可缺席（老网关 / 无答案的帧）。缺了
+            // 只是「这一帧没有新答案」，与进展三件套同一条理由：绝不因为一个
+            // 展示面字段缺席就把整帧判死。
+            let answer = AgentTaskAnswerDelta(
+                sequence: raw["answer_seq"] as? Int,
+                delta: raw["answer_delta"] as? String
+            )
             return .event(.taskState(
                 sessionId: sid, requestId: rid, generation: gen,
-                taskId: taskId, status: status
+                taskId: taskId, status: status, progress: progress, answer: answer
             ))
 
         case "cancel.ack":

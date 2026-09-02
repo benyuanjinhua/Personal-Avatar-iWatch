@@ -86,7 +86,15 @@ final class SessionController: ObservableObject {
         }
     }
     /// ESS-600：当前回合相位。`state != .listening` 时恒为 `.idle`。
-    @Published private(set) var turnPhase: TurnPhase = .idle
+    @Published private(set) var turnPhase: TurnPhase = .idle {
+        didSet {
+            // ESS-1100：处理中文案只在 thinking 相位可见。相位是它的唯一
+            // 门闩，挂在 didSet 上是为了不漏掉任何一条相位边——漏一条就意味着
+            // 一句「正在查询相关信息」挂在回答态上不走。
+            guard turnPhase != oldValue else { return }
+            refreshToolProcessingText()
+        }
+    }
     /// ESS-600：本地采集是否真的在跑。与「网络通道是否 ready」**独立呈现**——
     /// 建立期就已经在录音，用户必须能看到「表在听」，而不是只有一个
     /// 分不清死活的建立中动画（ESS-598 的「说话完全无反馈」正是这一条缺失）。
@@ -114,6 +122,37 @@ final class SessionController: ObservableObject {
     /// 无法编程式改系统音量（`AVAudioSession.outputVolume` 只读），这是唯一
     /// 可行动的应用侧手段。仅 speaking 期间有效，离开 speaking 即清除。
     @Published private(set) var lowVolumeHint = false
+    /// ESS-1100：**工具回合**思考期该显示的那一行处理中文案。
+    ///
+    /// - `nil` = 本回合没有任何工具证据（普通直接回答）。视图沿用既有的
+    ///   「正在思考…」，一个字都不变——这是验收 3「普通直接回答不产生多余的
+    ///   处理中跳转」的结构性保证：没有工具信号就走不进这条分支。
+    /// - 有工具证据但还没收到进展文字 → 稳定兜底「正在处理」（ESS-1100 §5）。
+    /// - 收到真实进展 → 上游那句话（如「正在查询相关信息」）。
+    ///
+    /// 值本身由 `refreshToolProcessingText()` 从
+    /// `turnPhase` + `toolTurn.hasToolEvidence` + 节流后的进展文本推导，
+    /// 不是第二个真相源。
+    @Published private(set) var toolProcessingText: String?
+
+    /// ESS-1111：本回合**正在流出的答案文本**（`nil` = 本回合还没有任何答案
+    /// 增量）。它与 `toolProcessingText` 是两件事，刻意分开：前者说的是「系统
+    /// 在做什么」，后者是「答案本身」。把答案挤进那一行状态字，等于用一行 14
+    /// 字的预算去装一段回答。视图只读不写；音频播放不依赖它，它也不阻塞音频线程。
+    ///
+    /// **屏幕上只有这一处答案**，但喂它的上游有两条，合并 #412 / #413 时按
+    /// 下面的优先级收敛（`refreshStreamingAnswerText`）：
+    ///
+    /// 1. `answerStream`（`AnswerStreamAssembly`，按 `answer_seq`）——网关
+    ///    升级后真正的答案流，未经截断，是**权威**来源；
+    /// 2. `answerTranscript`（`LongTaskAnswerTranscript`，按 `progress_seq`
+    ///    且 `progress_category == "answer"`）——网关尚未升级时的兼容入口。
+    ///
+    /// 两条**各自独立的序号空间**，因此各留一套闸门：把 `answer_seq` 与
+    /// `progress_seq` 塞进同一个单调闸门，会让交替到达的两条流互判「乱序」
+    /// 而彼此丢弃。一旦权威流出过内容，本回合此后只认它——`progress_text`
+    /// 在网关侧已按 24 字截断，让一段截断文本去覆盖完整答案是纯粹的退化。
+    @Published private(set) var streamingAnswerText: String?
 
     /// 会话是否存续（连接中/聆听中）。视图据此切换双模 UI 与手势集。
     var isInSession: Bool {
@@ -179,6 +218,12 @@ final class SessionController: ObservableObject {
     var onEndBargeInListening: ((_ reason: String) -> WatchRealtimeMediaAdapter.BargeInRoundSummary?)?    /// ESS-650（F2-4）：语音打断开关，**默认 OFF**。生产接
     /// `WatchDebugSettings.voiceBargeInEnabled`；F2-5 未通过不得默认 ON。
     var voiceBargeInEnabled: () -> Bool = { false }
+    /// ESS-1111：重连宽限到点。会话层不直接持有适配器，由本回调把「不用再等了」
+    /// 交回给推迟着传输失败的那一层。
+    var onDownlinkGraceExpired: ((_ reason: String) -> Void)?
+    /// ESS-1111 复审整改（阻断 2）：下行**恢复**的唯一裁决点在会话层，
+    /// 经本回调通知适配器撤销那次被推迟的收口。适配器不再自己判一次。
+    var onDownlinkResumed: ((_ reason: String) -> Void)?
     /// ESS-600：就绪超时的**抢救**出口——把已经录到的语音经可靠通道
     /// （完整文件 / WCSession transferFile）提交，而不是连人带话一起丢。
     /// 生产接 `PushToTalkController.endSessionTurn()`。
@@ -221,6 +266,45 @@ final class SessionController: ObservableObject {
     /// 「UI 提前放弃」。180s【待调】≈ 观测到的最长工具回合的三倍余量；
     /// 到点仍走与 45s 完全同构的 `enterFailed` 收口路径，不新造终态。
     static let toolTurnHardTimeoutSeconds: TimeInterval = 180.0
+    /// ESS-1111：长任务的**静默**预算 —— 从最后一帧合法任务活动
+    /// （`task.state` / 进展 / 答案增量）起算，到点仍无任何上游音讯即判失败。
+    ///
+    /// **它替代的是什么**：ESS-1109 真机取证里，任务在跑、网关每秒都在下发
+    /// `task.running`，客户端却在 12.107s 断了连接。任何以「固定时长」或
+    /// 「没有音频」为判据的退出，在长任务上都必然误杀——上游正在说话，只是
+    /// 说的不是音频。本预算的判据换成了唯一正确的那一个：**上游有没有在说话**。
+    /// 收到任何合法帧即整体重置。
+    ///
+    /// **它与 `toolTurnHardTimeoutSeconds` 的分工**（ESS-1097 的一次只武装、
+    /// 绝不顺延的绝对上限**原样保留**，本单一个字没动）：绝对上限保证「不会
+    /// 永久锁死」，本预算保证「上游真死了的时候不用干等到绝对上限」。两条都
+    /// 有界，且本预算恒紧于绝对上限，因此加它只会让失败**更快**被判定，不会
+    /// 让任何一个还在推进的任务被提前杀掉。
+    ///
+    /// 60s【待调】：真机观测到的帧间隔是**每秒一帧**，60s 因此是它的六十倍
+    /// 余量，足以吸收上游一次长工具调用期间的下发空档。
+    ///
+    /// 取值刻意**避开 45s**（`thinkingHardTimeoutSeconds`）：两条语义不同的
+    /// 预算共用同一个数字，日志里的「45s 到点」与测试里的「45s 被武装」就
+    /// 再也分不出是哪一条，可判定性当场消失。
+    static let taskActivityTimeoutSeconds: TimeInterval = 60.0
+    /// ESS-1111：下行断开后等待**重连并继续接收同一 task** 的有界宽限。
+    ///
+    /// 断线不等于任务结束（真机：客户端 12s 断开时任务还要再跑 11.9s 才出
+    /// 答案）。宽限期内 task identity 原样保留、回合不收口、不开下一轮；
+    /// 到点仍未恢复才按明确终态收口。20s 与
+    /// `WatchRealtimeMediaAdapter.transportFailureDrainDeadlineSeconds` 同阶，
+    /// 两者共同覆盖「音频还在放」与「任务还在跑」两种断线形态。
+    static let downlinkReconnectGraceSeconds: TimeInterval = 20.0
+    /// ESS-1100：两次进展文字刷新之间的最小间隔（防高频闪烁，§5）。
+    ///
+    /// 上游 `task.progress` 是按 `backend.activity` 逐条发的，一次工具密集的
+    /// 回合能在一秒内连发好几条。手表那一行字如果跟着逐条重画，读到的是闪烁
+    /// 而不是信息。0.8s【待调】≈ 一眼读完一句四到八字短语的时间。
+    ///
+    /// 节流**不丢最后一条**：窗口内到达的新文本存为 pending，窗口一到就补上。
+    /// 丢掉最后一条等于让手表停在一句过期的进展上，比闪烁更糟。
+    static let progressUpdateMinIntervalSeconds: TimeInterval = 0.8
     /// ESS-600：一轮没产生任何提交（说得太短 / 收尾抛错）后重开采集的
     /// 退避。Watch 无 AEC，错误提示语音正在外放时立刻开麦会被自己的
     /// 声音再次触发 VAD，形成「太短 → 报错 → 又太短」的自激循环。
@@ -269,6 +353,11 @@ final class SessionController: ObservableObject {
     private var thinkingHardToken: SessionDelayToken?
     /// ESS-1097：工具回合的绝对上限计时器。每轮至多武装一次。
     private var toolTurnHardToken: SessionDelayToken?
+    /// ESS-1111：长任务静默预算计时器。与绝对上限相反，它**每收到一帧合法
+    /// 活动就整体重置**。
+    private var taskActivityToken: SessionDelayToken?
+    /// ESS-1111：断线后等待重连的宽限计时器。
+    private var downlinkResumeToken: SessionDelayToken?
     private var silenceToken: SessionDelayToken?
     private var failedAutoToken: SessionDelayToken?
     private var hungupDismissToken: SessionDelayToken?
@@ -291,6 +380,35 @@ final class SessionController: ObservableObject {
     /// 本轮是否已经为工具工作武装过绝对上限。只武装一次（见
     /// `toolTurnHardTimeoutSeconds` 的注释）。
     private var toolTurnDeadlineArmed = false
+    /// ESS-1100：当前回合的进展叙述。**回合级**——与 `toolTurn` 同生共死，
+    /// 换 `activeTurnRequestId` 时整体重建，上一轮的「正在查询」不得挂到新一轮。
+    private(set) var toolProgress = ToolProgressNarration()
+    /// 节流后**真正显示**的那句进展。与 `toolProgress.text`（最新被接受的那句）
+    /// 刻意分开：前者是 UI 事实，后者是协议事实，混成一个就没法既防闪烁又不丢帧。
+    private(set) var visibleProgressText: String?
+    /// ESS-1111：当前回合的答案增量装配。**回合级**——与 `toolTurn` /
+    /// `toolProgress` 同生共死，换 `activeTurnRequestId` 时整体重建，
+    /// 上一轮的半句答案不得挂到新一轮。
+    private(set) var answerStream = AnswerStreamAssembly()
+    /// 节流窗口内到达、等着窗口一到就补显的那句。
+    private var pendingProgressText: String?
+    private var progressThrottleToken: SessionDelayToken?
+    /// ESS-1111：本回合的答案增量累积器。**回合级**，与 `toolTurn` 同生共死。
+    private(set) var answerTranscript = LongTaskAnswerTranscript()
+    /// ESS-1111：最近一帧增量的展示类目。决定「没有文字时那一行说什么」——
+    /// queued 说「正在排队」、result 说「正在整理结果」、其余退到通用兜底。
+    private(set) var latestActivityKind: LongTaskActivityKind?
+    /// ESS-1111：本回合已观测到的最高 generation。**旧 generation 的迟到帧
+    /// 一律丢弃**——打断之后上一代任务的进展绝不能盖到新一轮头上。
+    private(set) var latestTaskGeneration: Int?
+    /// ESS-1111：下行是否正处在「断了但任务还在」的宽限期。
+    private(set) var isDownlinkInterrupted = false
+
+    /// ESS-1111：本回合是否有仍在上游跑着的长任务。适配器据此决定断线要不要
+    /// 当场收口。唯一真相源是回合聚合体，不另存投影。
+    var hasLongTaskInFlight: Bool {
+        isInSession && toolTurn.terminal == nil && toolTurn.hasOutstandingWork
+    }
 
     /// ESS-843：最近一次会话结束的原因码（默认 user_exit）。keep-alive 层
     /// （WorkoutSessionKeeper）据此在释放 owner 时落明确 reason。
@@ -538,6 +656,7 @@ final class SessionController: ObservableObject {
             guard let self, self.isInSession, self.turnPhase == .thinking else { return }
             WatchLog.info("session", "session_thinking_hard_timeout", requestId: self.activeTurnRequestId)
             self.toolTurn.apply(.timedOut(reason: "thinking_hard_timeout"))
+            self.refreshToolProcessingText()
             self.enterFailed(reason: "回答超时，要再试一次吗？", retryable: true)
         }
     }
@@ -549,8 +668,25 @@ final class SessionController: ObservableObject {
     /// `taskId == nil` 表示 `tool_call_pending` 那一类「工具要开跑但还没有任务号」
     /// 的信号；`status` 原样来自上游，解释权在 `ToolTaskStatus`——**未知状态一律
     /// 按非终态处理**，把没见过的状态当终态正是本单要修的 bug。
-    func markTaskState(requestId: String, taskId: String?, status: String) {
+    func markTaskState(
+        requestId: String, taskId: String?, status: String,
+        progress: AgentTaskProgress? = nil,
+        answer: AgentTaskAnswerDelta? = nil,
+        generation: Int? = nil
+    ) {
         guard acceptsTurnEvent(requestId, event: "task_state") else { return }
+        // ESS-1111：代际闸门。打断（barge-in）之后上一代仍在跑的任务会继续
+        // 下发进展；requestId 相同的情况下 `acceptsTurnEvent` 拦不住它们，
+        // 只有 generation 能。缺席（老网关 / 老 iPhone 进程）时不猜、不丢——
+        // 按「本帧没有代际信息」处理，退回 ESS-1097 之前逐字相同的行为。
+        guard acceptsTaskGeneration(generation, requestId: requestId) else { return }
+        // ESS-1111：断线宽限期内收到任何合法帧 = 这一跳已经恢复。
+        // 「重连后可继续接收」在客户端就是这一行：不需要新协议帧，收到就算。
+        if isDownlinkInterrupted {
+            markDownlinkResumed(requestId: requestId, reason: "task_state")
+        }
+        let kind = LongTaskActivityKind(category: progress?.category, status: status)
+        latestActivityKind = kind
         let event: ToolTurnAggregate.Event
         if let taskId {
             event = .taskState(taskId: taskId, status: ToolTaskStatus(rawValue: status))
@@ -566,11 +702,23 @@ final class SessionController: ObservableObject {
         }
         let hadOutstandingWork = toolTurn.hasOutstandingWork
         let phaseChanged = toolTurn.apply(event)
+        // ESS-1100 / ESS-1111：同一帧的展示面。**先记闸门、后记展示**是有意的
+        // 顺序——展示不参与任何裁决，它读的是闸门已经落定的事实。
+        // 三条流各走各的闸门：进展行（覆盖）、兼容答案（追加，按 progress_seq）、
+        // 权威答案流（追加，按 answer_seq）。
+        let displayOutcome = applyActivityDisplay(progress, kind: kind, requestId: requestId)
+        let answerOutcome = applyAnswerDelta(answer, requestId: requestId)
+        refreshStreamingAnswerText()
         WatchLog.info(
             "session", "session_task_state", requestId: requestId,
             detail: "turn_index=\(turnIndex) task_id=\(taskId ?? "nil") status=\(status) "
-                + "phase_changed=\(phaseChanged) \(toolTurn.logDetail)"
+                + "generation=\(generation?.description ?? "nil") kind=\(kind.logName) "
+                + "phase_changed=\(phaseChanged) progress=\(displayOutcome) "
+                + "answer=\(answerOutcome?.logName ?? "absent") "
+                + "\(toolTurn.logDetail) \(toolProgress.logDetail) "
+                + "\(answerTranscript.logDetail) \(answerStream.logDetail)"
         )
+        refreshToolProcessingText()
         if !hadOutstandingWork, toolTurn.hasOutstandingWork {
             // 首次观测到工具工作：撤掉 45s 硬超时，改挂一次性的绝对上限。
             armToolTurnDeadlineIfNeeded()
@@ -580,7 +728,223 @@ final class SessionController: ObservableObject {
             // 绝对上限仍然挂着，两条都有界。
             armThinkingTimeout()
         }
+        // ESS-1111：**任何**合法帧都刷新静默预算——这条必须在闸门分支之外、
+        // 无条件执行。放进分支里就等于「只有状态变化才算活动」，而真机上
+        // 24s 长任务的绝大多数帧是同一个 running 的重复下发。
+        renewTaskActivityDeadline(reason: "task_state")
+        // ESS-1111：上游明确判失败/取消/超时 ⇒ 再也不会有答案。此时静默收口
+        // 回「正在听」，用户得到的是一次无法解释的沉默（比报错更糟，
+        // ESS-600 的同一条教训）。给明确终态。
+        surfaceTaskFailureTerminalIfNeeded(
+            taskId: taskId, status: status, requestId: requestId
+        )
     }
+
+    /// ESS-1111：代际闸门。返回 false = 本帧属于更老的一代，丢弃并留证。
+    private func acceptsTaskGeneration(_ generation: Int?, requestId: String) -> Bool {
+        guard let generation else { return true }
+        if let latest = latestTaskGeneration, generation < latest {
+            WatchLog.info(
+                "session", "session_task_state_stale_generation", requestId: requestId,
+                detail: "turn_index=\(turnIndex) incoming_generation=\(generation) "
+                    + "active_generation=\(latest)"
+            )
+            return false
+        }
+        latestTaskGeneration = generation
+        return true
+    }
+
+    /// ESS-1111：上游任务的失败类终态 ⇒ 明确终态收口。
+    ///
+    /// 三条前置都必要：
+    /// - 只在**没有任何未结任务**时收口，否则并发的第二个任务还在跑；
+    /// - 只在**本回合没播出过任何音频**时收口——答案已经说出口之后再报
+    ///   「没能完成」是撒谎，那种情况按正常回合屏障收口；
+    /// - 只在回合还没有终态时收口（终态吸收，不重复判死）。
+    private func surfaceTaskFailureTerminalIfNeeded(
+        taskId: String?, status: String, requestId: String
+    ) {
+        guard taskId != nil else { return }
+        let parsed = ToolTaskStatus(rawValue: status)
+        guard parsed.isFailureTerminal,
+              let notice = parsed.failureNoticeText,
+              toolTurn.terminal == nil,
+              !toolTurn.hasOutstandingWork,
+              !toolTurn.didPlayAnyAudio else { return }
+        WatchLog.error(
+            "session", "session_task_failed_terminal", requestId: requestId,
+            detail: "turn_index=\(turnIndex) task_id=\(taskId ?? "nil") status=\(status) "
+                + toolTurn.logDetail,
+            code: "ERR_SESSION_TASK_TERMINAL_\(parsed.rawValue.uppercased())"
+        )
+        toolTurn.apply(.turnFailed(code: "task_\(parsed.rawValue)"))
+        refreshToolProcessingText()
+        enterFailed(reason: notice, retryable: parsed != .cancelled)
+    }
+
+    // MARK: - ESS-1111 答案文本增量
+
+    /// 把一帧答案增量喂给回合级装配。返回处置结果（`nil` = 本帧没带答案）。
+    ///
+    /// 与进展文字**不共用节流**：进展是同一行字被反复覆盖，抖动才需要压；
+    /// 答案是逐段追加，压掉一帧就是少一段话。装配本身是纯字符串拼接，
+    /// 没有 I/O，也不触碰播放管线。
+    @discardableResult
+    private func applyAnswerDelta(
+        _ answer: AgentTaskAnswerDelta?, requestId: String
+    ) -> AnswerStreamAssembly.Outcome? {
+        guard let answer else { return nil }
+        let outcome = answerStream.apply(sequence: answer.sequence, delta: answer.delta)
+        if outcome.changesDisplay {
+            // 只更新装配体；屏幕上那一处由 `refreshStreamingAnswerText` 统一推导。
+            refreshStreamingAnswerText()
+        } else if outcome == .duplicate || outcome == .outOfOrder {
+            // 迟到与重复必须可判定：真机上「答案为什么少了一段 / 串了一段」
+            // 只能靠这条。答案原文不入日志（用户内容），只记序号与计数。
+            WatchLog.info(
+                "session", "session_answer_delta_dropped", requestId: requestId,
+                detail: "turn_index=\(turnIndex) reason=\(outcome.logName) "
+                    + "incoming_seq=\(answer.sequence?.description ?? "nil") "
+                    + "\(answerStream.logDetail)"
+            )
+        }
+        return outcome
+    }
+
+    /// ESS-1111（#412 / #413 合并收口）：屏幕上那一处答案文本的**唯一推导点**。
+    ///
+    /// 优先级见 `streamingAnswerText` 的注释：权威答案流（`answer_seq`）一旦
+    /// 出过内容，本回合此后只认它；否则退到兼容入口（`progress_category ==
+    /// "answer"`）。两条来源各自保留独立的序号闸门，这里只做选择、不做装配。
+    private func refreshStreamingAnswerText() {
+        let next = answerStream.hasAnswer
+            ? answerStream.text
+            : answerTranscript.displayText
+        guard next != streamingAnswerText else { return }
+        streamingAnswerText = next
+    }
+
+    // MARK: - ESS-1100 进展文字
+
+    /// ESS-1111：一帧增量的展示分流。答案正文走累积器（追加 + 尾窗滚动），
+    /// 其余类目走进展行（覆盖 + 节流）。返回处置结果的日志名。
+    ///
+    /// 两条流各有**独立的序号闸门**：网关的 `progress_seq` 在会话内单调，
+    /// 因此按类目切出来的两条子序列各自也单调；合用一个闸门则会让交替到达的
+    /// 答案与进展互相判成「乱序」而彼此丢弃。
+    private func applyActivityDisplay(
+        _ progress: AgentTaskProgress?, kind: LongTaskActivityKind, requestId: String
+    ) -> String {
+        guard let progress else { return "absent" }
+        guard kind.isAnswerStream else {
+            return applyProgressNarration(progress, requestId: requestId)?.logName ?? "absent"
+        }
+        let outcome = answerTranscript.apply(sequence: progress.sequence, delta: progress.text)
+        if outcome.changesDisplay {
+            // 只搬运一个已经有界的字符串（`displayText` 恒 ≤ 尾窗 + 1）。
+            // 没有解码、没有 I/O、没有锁——本单「不阻塞音频线程」的要求在
+            // 这里是结构性的，而不是靠调度承诺。
+            refreshStreamingAnswerText()
+        } else if outcome == .duplicate || outcome == .outOfOrder {
+            WatchLog.info(
+                "session", "session_answer_delta_dropped", requestId: requestId,
+                detail: "turn_index=\(turnIndex) reason=\(outcome.logName) "
+                    + "incoming_seq=\(progress.sequence?.description ?? "nil") "
+                    + answerTranscript.logDetail
+            )
+        }
+        return outcome.logName
+    }
+
+    /// 把一帧进展喂给回合级叙述。返回处置结果（`nil` = 本帧没带进展）。
+    ///
+    /// 回合归属已经由 `acceptsTurnEvent` 挡过一层（跨回合的迟到帧根本走不到
+    /// 这里）；本方法只负责回合**内**的排序与去重，不重复第二套归属真相。
+    @discardableResult
+    private func applyProgressNarration(
+        _ progress: AgentTaskProgress?, requestId: String
+    ) -> ToolProgressNarration.Outcome? {
+        guard let progress else { return nil }
+        let outcome = toolProgress.apply(
+            sequence: progress.sequence, text: progress.text, category: progress.category
+        )
+        if outcome.changesDisplay, let text = toolProgress.text {
+            scheduleProgressDisplay(text, requestId: requestId)
+        } else if outcome == .duplicate || outcome == .outOfOrder {
+            // 迟到与重复必须可判定：真机上「为什么那句进展没出现」只能靠这条。
+            WatchLog.info(
+                "session", "session_progress_dropped", requestId: requestId,
+                detail: "turn_index=\(turnIndex) reason=\(outcome.logName) "
+                    + "incoming_seq=\(progress.sequence?.description ?? "nil") "
+                    + "\(toolProgress.logDetail)"
+            )
+        }
+        return outcome
+    }
+
+    /// 节流发布：窗口空闲就立刻显示并开窗；窗口内则存为 pending，窗口一到补显。
+    private func scheduleProgressDisplay(_ text: String, requestId: String) {
+        guard progressThrottleToken == nil else {
+            pendingProgressText = text
+            WatchLog.info(
+                "session", "session_progress_coalesced", requestId: requestId,
+                detail: "turn_index=\(turnIndex) \(toolProgress.logDetail)"
+            )
+            return
+        }
+        publishProgressDisplay(text, requestId: requestId)
+    }
+
+    private func publishProgressDisplay(_ text: String, requestId: String) {
+        visibleProgressText = text
+        pendingProgressText = nil
+        refreshToolProcessingText()
+        WatchLog.info(
+            "session", "session_progress_shown", requestId: requestId,
+            detail: "turn_index=\(turnIndex) \(toolProgress.logDetail)"
+        )
+        progressThrottleToken = scheduleDelay(Self.progressUpdateMinIntervalSeconds) { [weak self] in
+            guard let self else { return }
+            self.progressThrottleToken = nil
+            guard let pending = self.pendingProgressText else { return }
+            self.pendingProgressText = nil
+            guard pending != self.visibleProgressText else { return }
+            self.publishProgressDisplay(pending, requestId: self.activeTurnRequestId ?? requestId)
+        }
+    }
+
+    /// 从「相位 + 是否工具回合 + 已显示的进展」推导那一行文案。
+    ///
+    /// 唯一的推导点。普通回合（无任何工具证据）恒为 `nil`——视图据此原样沿用
+    /// 「正在思考…」，不产生任何多余跳转。
+    private func refreshToolProcessingText() {
+        let shouldShow = turnPhase == .thinking
+            && toolTurn.hasToolEvidence
+            && toolTurn.terminal == nil
+        guard shouldShow else {
+            if toolProcessingText != nil { toolProcessingText = nil }
+            return
+        }
+        // ESS-1111：断线宽限期压过一切进展文字。此刻屏幕上停着一句「正在查询
+        // 相关信息」会让用户以为一切正常，而事实是这一跳断了、正在等重连。
+        if isDownlinkInterrupted {
+            if toolProcessingText != Self.reconnectingCopy { toolProcessingText = Self.reconnectingCopy }
+            return
+        }
+        // ESS-1111：没有真实进展文字时，兜底那句由**类目**决定：排队说「正在
+        // 排队」、收尾说「正在整理结果」，其余（含 reasoning / tool）一律退到
+        // 通用的「正在处理」——手表不知道模型在想什么、也不知道调的哪个工具，
+        // 替它编一句就是伪造。
+        let fallback = latestActivityKind?.statusFallbackText ?? ToolProgressNarration.fallbackText
+        let next = visibleProgressText ?? fallback
+        guard next != toolProcessingText else { return }
+        toolProcessingText = next
+    }
+
+    /// ESS-1111：断线宽限期的那一行。与失败文案刻意不同——它不是终态，
+    /// 任务还在上游跑着。
+    static let reconnectingCopy = "连接断开了，正在重连…"
 
     /// 一轮之内只武装一次的工具绝对上限。到点走与 45s 硬超时完全同构的收口。
     private func armToolTurnDeadlineIfNeeded() {
@@ -601,8 +965,127 @@ final class SessionController: ObservableObject {
                 code: "ERR_SESSION_TOOL_TURN_TIMEOUT"
             )
             self.toolTurn.apply(.timedOut(reason: "tool_turn_timeout"))
+            self.refreshToolProcessingText()
             self.enterFailed(reason: "这件事做得有点久，要再试一次吗？", retryable: true)
         }
+    }
+
+    // MARK: - ESS-1111 活动续期与断线重连
+
+    /// 收到一帧合法活动 ⇒ 整体重置静默预算。
+    ///
+    /// 「合法」的口径就是 `acceptsTurnEvent` + 代际闸门放行过的那些帧，一个
+    /// 不多一个不少。**刻意不看有没有音频**：长任务的绝大多数时间里上游一个
+    /// 字节音频都不会发，拿「无音频」当退出判据正是本单要消灭的那条规则。
+    private func renewTaskActivityDeadline(reason: String) {
+        guard isInSession, turnPhase == .thinking else { return }
+        // 没有任何在跑的工作时不武装：普通回合的有界性归 45s
+        // `thinkingHardTimeoutSeconds`，两条预算永远只有一条在跑。
+        guard toolTurn.hasOutstandingWork || toolTurn.awaitingReconnect else {
+            taskActivityToken?.cancel(); taskActivityToken = nil
+            return
+        }
+        taskActivityToken?.cancel()
+        taskActivityToken = scheduleDelay(Self.taskActivityTimeoutSeconds) { [weak self] in
+            guard let self, self.isInSession, self.turnPhase == .thinking else { return }
+            guard self.toolTurn.terminal == nil else { return }
+            WatchLog.error(
+                "session", "session_task_activity_timeout", requestId: self.activeTurnRequestId,
+                detail: "turn_index=\(self.turnIndex) "
+                    + "silence_s=\(Int(Self.taskActivityTimeoutSeconds)) " + self.toolTurn.logDetail,
+                code: "ERR_SESSION_TASK_ACTIVITY_TIMEOUT"
+            )
+            self.toolTurn.apply(.timedOut(reason: "task_activity_timeout"))
+            self.refreshToolProcessingText()
+            self.enterFailed(reason: "那件事没有新消息了，要再试一次吗？", retryable: true)
+        }
+        WatchLog.info(
+            "session", "session_task_activity_renewed", requestId: activeTurnRequestId,
+            detail: "turn_index=\(turnIndex) reason=\(reason) "
+                + "budget_s=\(Int(Self.taskActivityTimeoutSeconds)) " + toolTurn.logDetail
+        )
+    }
+
+    /// 下行断了，但任务仍在上游跑着。
+    ///
+    /// 这是本单与既有 `markChannelFailed` 的分界：那条说的是「通道死了、不会
+    /// 再有上游事实」，本条说的是「这一跳断了、任务还在」。真机取证里两者被
+    /// 混为一谈，代价是一个已经跑到 12s 的任务连同它 11.9s 后产出的答案一起
+    /// 被丢掉。断线期间：task identity 原样保留、回合不收口、不开下一轮，
+    /// 屏幕如实显示正在重连；宽限到点仍未恢复才按明确终态收场。
+    func markDownlinkInterrupted(requestId: String, reason: String) {
+        guard acceptsTurnEvent(requestId, event: "downlink_interrupted") else { return }
+        guard !isDownlinkInterrupted else { return }
+        isDownlinkInterrupted = true
+        toolTurn.apply(.downlinkInterrupted(reason: reason))
+        // 断线期间不再有帧可收，静默预算失去意义，改由宽限计时器承担有界性。
+        taskActivityToken?.cancel(); taskActivityToken = nil
+        refreshToolProcessingText()
+        WatchLog.info(
+            "session", "session_downlink_interrupted", requestId: requestId,
+            detail: "turn_index=\(turnIndex) reason=\(reason) "
+                + "grace_s=\(Int(Self.downlinkReconnectGraceSeconds)) " + toolTurn.logDetail
+        )
+        downlinkResumeToken?.cancel()
+        downlinkResumeToken = scheduleDelay(Self.downlinkReconnectGraceSeconds) { [weak self] in
+            guard let self, self.isInSession, self.isDownlinkInterrupted else { return }
+            WatchLog.error(
+                "session", "session_downlink_resume_timeout", requestId: self.activeTurnRequestId,
+                detail: "turn_index=\(self.turnIndex) reason=\(reason) "
+                    + "grace_s=\(Int(Self.downlinkReconnectGraceSeconds)) " + self.toolTurn.logDetail,
+                code: "ERR_SESSION_DOWNLINK_RESUME_TIMEOUT"
+            )
+            self.isDownlinkInterrupted = false
+            self.toolTurn.apply(.downlinkClosed(reason: "resume_timeout:\(reason)"))
+            self.refreshToolProcessingText()
+            // ESS-1111 复审整改（阻断 1）——**顺序是这条路径的正确性本身**。
+            //
+            // 之前的顺序是「先通知适配器、后 enterFailed」，那条链是：
+            //   onDownlinkGraceExpired → finishDeferredTransportFailure
+            //   → onAnswerPlaybackFailed → markAnswerFinished(success: false)
+            // 而上一行的 `.downlinkClosed` 已经让聚合体 `isClosed == true`，
+            // 于是 `blocksAutomaticNextTurn == false`，`markAnswerFinished`
+            // 一路落到 `startNextTurn` —— 在一条**失败**路径上真实开了一轮新
+            // 录音（新 requestId / 新 generation / `recorder.start()`），随后
+            // 才被 `enterFailed` 打到 `.failed`：失败页面上麦克风还在采集，
+            // 且 `resetToolTurn("next_turn")` 把断线现场的取证一起清掉了。
+            //
+            // 先落会话终态即可结构性地关掉这条边：`state == .failed` 之后
+            // `acceptsTurnEvent` 会挡掉迟到的 `answer_finished`，
+            // `finishTransportFailure` 只剩 `markDownlinkBridgeFallback()`
+            // 这条应有的清理。
+            self.enterFailed(reason: "连接没能恢复，要再试一次吗？", retryable: true)
+            self.onDownlinkGraceExpired?(reason)
+            // 下行已判死，通道要真的拆掉——与 `markChannelFailed` 同一口径。
+            // `enterFailed` 只收束回合状态，不拆通道；少了这一行，失败页上
+            // 采集与传输都还挂着。
+            self.onTeardownChannel?()
+        }
+    }
+
+    /// 下行恢复。**不需要新协议帧**：宽限期内收到任何一帧合法增量即视为恢复
+    /// （见 `markTaskState`），这也是「重连后可继续接收」在客户端的全部含义。
+    func markDownlinkResumed(requestId: String, reason: String) {
+        guard isDownlinkInterrupted else { return }
+        guard let active = activeTurnRequestId, active == requestId else {
+            WatchLog.info(
+                "session", "session_stale_turn_event", requestId: requestId,
+                detail: "event=downlink_resumed active_request_id=\(activeTurnRequestId ?? "nil") "
+                    + "turn_index=\(turnIndex)"
+            )
+            return
+        }
+        isDownlinkInterrupted = false
+        downlinkResumeToken?.cancel(); downlinkResumeToken = nil
+        toolTurn.apply(.downlinkResumed)
+        refreshToolProcessingText()
+        WatchLog.info(
+            "session", "session_downlink_resumed", requestId: requestId,
+            detail: "turn_index=\(turnIndex) reason=\(reason) " + toolTurn.logDetail
+        )
+        // 单一判据：会话认定恢复 ⇒ 适配器撤销推迟中的收口。
+        onDownlinkResumed?(reason)
+        renewTaskActivityDeadline(reason: "downlink_resumed")
     }
 
     /// 每轮开始时重置聚合体。聚合体是**回合级**的：跨轮复用会把上一轮的
@@ -611,6 +1094,25 @@ final class SessionController: ObservableObject {
         toolTurn = ToolTurnAggregate()
         toolTurnDeadlineArmed = false
         toolTurnHardToken?.cancel(); toolTurnHardToken = nil
+        // ESS-1100：进展叙述与闸门同生共死。留着上一轮的「正在查询相关信息」
+        // 挂到新一轮头上，就是本单点名禁止的「旧任务污染新会话」。
+        toolProgress = ToolProgressNarration()
+        visibleProgressText = nil
+        pendingProgressText = nil
+        // ESS-1111：答案装配同生共死。上一轮的半句答案留在屏幕上，
+        // 比不显示更糟——用户会把它当成这一轮的回答。
+        answerStream.clear()
+        progressThrottleToken?.cancel(); progressThrottleToken = nil
+        // ESS-1111：答案流、类目、代际游标与断线宽限同样是**回合级**的。
+        // 任何一样留到下一轮，就是本单点名禁止的「旧 generation 污染新回合」。
+        answerTranscript = LongTaskAnswerTranscript()
+        streamingAnswerText = nil
+        latestActivityKind = nil
+        latestTaskGeneration = nil
+        isDownlinkInterrupted = false
+        taskActivityToken?.cancel(); taskActivityToken = nil
+        downlinkResumeToken?.cancel(); downlinkResumeToken = nil
+        refreshToolProcessingText()
         WatchLog.info(
             "session", "session_tool_turn_reset", requestId: activeTurnRequestId,
             detail: "turn_index=\(turnIndex) reason=\(reason)"
@@ -645,6 +1147,8 @@ final class SessionController: ObservableObject {
             detail: "turn_index=\(turnIndex) from=\(fromPhase.logName) phase=thinking \(toolTurn.logDetail)"
         )
         armThinkingTimeout()
+        // ESS-1111：段落播完退回等待态 ⇒ 静默预算重新接管。
+        renewTaskActivityDeadline(reason: "answer_interim")
     }
 
     /// 回答音频**真实起播**（realtime 首帧已渲染 / SpeechPlayer 起播成功）。
@@ -663,6 +1167,9 @@ final class SessionController: ObservableObject {
         // ESS-1097：首帧真实起播 = 「正在回答」。它**不**让回合收口——
         // 工具结果的第一段可能只是「我正在查询…」。
         toolTurn.apply(.playbackStarted)
+        // ESS-1111：音频真实在放 = 有界性由播放面承担，静默预算让位。
+        // 播放中断/段落结束退回 thinking 时会重新武装（见 markAnswerInterim）。
+        taskActivityToken?.cancel(); taskActivityToken = nil
         WatchLog.info(
             "session", "session_answer_started", requestId: requestId,
             detail: "turn_index=\(turnIndex) phase=speaking \(toolTurn.logDetail)"
@@ -804,6 +1311,7 @@ final class SessionController: ObservableObject {
                     + "from=\(fromPhase.logName) answer_reason=\(reason) \(toolTurn.logDetail)"
             )
             armThinkingTimeout()
+            renewTaskActivityDeadline(reason: "next_turn_suppressed")
             return
         }
         startNextTurn(reason: success ? "answer_finished" : "answer_failed:\(reason)")
@@ -849,6 +1357,7 @@ final class SessionController: ObservableObject {
             return
         }
         toolTurn.apply(.turnFailed(code: errorCode ?? "ERR_SESSION_TURN_FAILED"))
+        refreshToolProcessingText()
         WatchLog.error(
             "session", "session_turn_failed", requestId: requestId,
             detail: "turn_index=\(turnIndex) reason=\(reason) \(toolTurn.logDetail)",
@@ -894,6 +1403,7 @@ final class SessionController: ObservableObject {
         // 让路（验收原文：「工具回合未完成时禁止自动开启新 generation；
         // 用户主动打断除外」）。
         toolTurn.apply(.userCancelled(reason: source.rawValue))
+        refreshToolProcessingText()
         // ESS-650：打断即离开 speaking，先停采再停播——顺序有意：停采在前，
         // 停播过程中的扬声器余音才不会再喂进检测器。
         stopBargeInListening(reason: "interrupted")
@@ -999,6 +1509,7 @@ final class SessionController: ObservableObject {
         // 这个事实，让聚合体走「放弃等待、但在播的音频要放完」那条边，
         // 而不是把回合永远按在思考态。
         toolTurn.apply(.downlinkClosed(reason: failure.logReason))
+        refreshToolProcessingText()
         cancelConnectingTimers()
         cancelTurnTimers()
         stopBargeInListeningOnTeardown()
@@ -1128,6 +1639,8 @@ final class SessionController: ObservableObject {
         thinkingSlowToken?.cancel()
         thinkingHardToken?.cancel()
         toolTurnHardToken?.cancel(); toolTurnHardToken = nil
+        taskActivityToken?.cancel(); taskActivityToken = nil
+        downlinkResumeToken?.cancel(); downlinkResumeToken = nil
         silenceToken?.cancel()
         failedAutoToken?.cancel()
         hungupDismissToken?.cancel()
@@ -1206,6 +1719,9 @@ final class SessionController: ObservableObject {
         thinkingHardToken?.cancel(); thinkingHardToken = nil
         // ESS-1097：工具绝对上限属于回合，回合收束时一并取消。
         toolTurnHardToken?.cancel(); toolTurnHardToken = nil
+        // ESS-1111：静默预算与重连宽限同为回合级。
+        taskActivityToken?.cancel(); taskActivityToken = nil
+        downlinkResumeToken?.cancel(); downlinkResumeToken = nil
         thinkingSlowHint = false
     }
 
@@ -1414,8 +1930,24 @@ enum SessionTurnWiring {
             session?.markTurnFailed(requestId: requestId, errorCode: errorCode)
         }
         // ESS-1097：上游任务生命周期 → 会话层回合聚合状态机。
-        pushToTalk.onSessionTaskState = { [weak session] requestId, taskId, status in
-            session?.markTaskState(requestId: requestId, taskId: taskId, status: status)
+        pushToTalk.onSessionTaskState = { [weak session] requestId, taskId, status, progress, answer, generation in
+            session?.markTaskState(
+                requestId: requestId, taskId: taskId, status: status,
+                progress: progress, answer: answer, generation: generation
+            )
+        }
+        // ESS-1111：长任务在跑期间的断线 → 有界重连宽限，而不是当场判失败。
+        pushToTalk.sessionHasLongTaskInFlight = { [weak session] in
+            session?.hasLongTaskInFlight ?? false
+        }
+        pushToTalk.onSessionDownlinkInterrupted = { [weak session] requestId, reason in
+            session?.markDownlinkInterrupted(requestId: requestId, reason: reason)
+        }
+        session.onDownlinkGraceExpired = { [weak pushToTalk] reason in
+            pushToTalk?.finishDeferredTransportFailure(reason: reason)
+        }
+        session.onDownlinkResumed = { [weak pushToTalk] reason in
+            pushToTalk?.clearDeferredTransportFailure(reason: reason)
         }
         pushToTalk.onLocalCaptureChanged = { [weak session] active in
             session?.markLocalCapture(active: active)

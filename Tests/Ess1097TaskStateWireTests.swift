@@ -21,7 +21,7 @@ final class Ess1097TaskStateWireTests: XCTestCase {
         guard case .event(let event) = AudioRealtimeAgentCodec.decodeOutcome(json) else {
             return XCTFail("task.state 必须是一等事件，不能落到 unrecognised")
         }
-        guard case .taskState(let sid, let rid, let gen, let taskId, let status) = event else {
+        guard case .taskState(let sid, let rid, let gen, let taskId, let status, _, _) = event else {
             return XCTFail("decoded as \(event)")
         }
         XCTAssertEqual(sid, sessionId)
@@ -37,7 +37,7 @@ final class Ess1097TaskStateWireTests: XCTestCase {
             "type": "task.state", "session_id": sessionId, "request_id": requestId,
             "status": "tool_call_pending",
         ])
-        guard case .event(.taskState(_, _, let gen, let taskId, let status)) =
+        guard case .event(.taskState(_, _, let gen, let taskId, let status, _, _)) =
                 AudioRealtimeAgentCodec.decodeOutcome(json) else {
             return XCTFail("缺 task_id 不该让整帧解码失败")
         }
