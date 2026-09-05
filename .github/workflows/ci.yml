@@ -113,6 +113,77 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
 
+      # ESS-1139 复审整改（毕玄 2026-09-05 阻断）：iOS 侧单测门禁。
+      #
+      # 补这一步的理由就是那次阻断本身：`PhoneRealtimeSession` 的收口顺序缺陷
+      # 在 `Shared/` 的纯策略用例里结构上看不见（策略裁决是对的，错的是会话层
+      # 怎么用它），而 `iOS/` 此前没有任何单测 target。测试不进 CI 就不是门禁，
+      # 所以 target 与这一步必须成对出现。
+      - name: Pick iOS simulator
+        id: pick-ios-sim
+        run: |
+          set -euo pipefail
+          ios_sim_id=$(xcrun simctl list devices -j iOS \
+            | node -e '
+                const data = JSON.parse(require("fs").readFileSync(0, "utf8"));
+                const runtimes = data.devices || {};
+                const all = [];
+                for (const [rt, list] of Object.entries(runtimes)) {
+                  if (!rt.includes("iOS")) continue;
+                  for (const d of list) if (d.isAvailable !== false) all.push(d);
+                }
+                const booted = all.find(d => d.state === "Booted");
+                const pick = booted || all[0];
+                if (!pick) { process.exit(2); }
+                process.stdout.write(pick.udid);
+              ')
+          if [ -z "$ios_sim_id" ]; then
+            echo "::error::No iOS Simulator available on this runner"
+            exit 1
+          fi
+          echo "id=$ios_sim_id" >> "$GITHUB_OUTPUT"
+          echo "Picked iOS sim: $ios_sim_id"
+
+      - name: xcodebuild test — WristAgent (iOS unit tests)
+        timeout-minutes: 20
+        run: |
+          set -uo pipefail
+          xcodebuild test \
+            -project WristAgent.xcodeproj \
+            -scheme WristAgent \
+            -destination "id=${{ steps.pick-ios-sim.outputs.id }}" \
+            -derivedDataPath .build/DerivedData-iOSTest \
+            WRISTAGENT_BUNDLE_ID=com.benyuan.wristagent.ci.WristAgent \
+            | tee xcodebuild-ios-test.log
+          xcode_exit=${PIPESTATUS[0]}
+          # 与 Watch 那一步同一套 ESS-360 冗余判定：exit code 之外再校验输出，
+          # 「0 failures 但 Failing tests: 非空」这种形态不得漏过。
+          if grep -qE '^\*\* TEST FAILED \*\*' xcodebuild-ios-test.log; then
+            echo "::error::iOS xctest failed: '** TEST FAILED **' marker present"
+            exit 1
+          fi
+          if awk '
+              /^Failing tests:$/ { in_block = 1; next }
+              in_block && /^[[:space:]]*$/ { in_block = 0; next }
+              in_block { print }
+            ' xcodebuild-ios-test.log | grep -qE '\S'; then
+            echo "::error::iOS xctest failed: 'Failing tests:' section is non-empty (ESS-360 pattern)"
+            exit 1
+          fi
+          if [ "$xcode_exit" -ne 0 ]; then
+            echo "::error::xcodebuild test exited with code $xcode_exit"
+            exit "$xcode_exit"
+          fi
+
+      - name: Upload xcodebuild iOS test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-ios-test-log
+          path: xcodebuild-ios-test.log
+          if-no-files-found: ignore
+          retention-days: 14
+
       # R-02.5 关卡一 · 第 2 行：Watch 模拟器 xctest 全绿
       # ESS-360 教训：xcodebuild 在"所有套件 0 failures 但末尾 Failing tests:
       # 非空"时仍会退出非零，靠 exit code 兜底；同时对输出做冗余校验，任一

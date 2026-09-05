@@ -120,6 +120,7 @@
 		770DB683BEC61B9851F2B0D1 /* WatchDownlinkOutbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA60FA5DC7EA82EC5729B54B /* WatchDownlinkOutbox.swift */; };
 		7787B4B28677EFC96B299E8D /* RealtimeMediaFormat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CEDAB5F3CD7B29B993F0FA2 /* RealtimeMediaFormat.swift */; };
 		77E5E0F50F586720D18A5DCA /* Ess1139TurnTerminalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D340147D2C03BA578750652 /* Ess1139TurnTerminalTests.swift */; };
+		79E2F035EFFC27AA8C11FC1E /* Ess1139SessionHoldTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A7602B536E298BDD668E55AC /* Ess1139SessionHoldTests.swift */; };
 		7B62721FF4D9FAC7D8F87F4D /* ToolTurnAggregate.swift in Sources */ = {isa = PBXBuildFile; fileRef = F23B7FB4EB5389A4286F9FFA /* ToolTurnAggregate.swift */; };
 		7C465E62628112B008899B51 /* SpeechPlayerInterruptionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D83133781FDC42821BB13DF /* SpeechPlayerInterruptionTests.swift */; };
 		7CBCA51C89D61E95EAD52B9D /* SelfCheck.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9D95B86CF79B5796D5EA9DC /* SelfCheck.swift */; };
@@ -268,6 +269,13 @@
 			remoteGlobalIDString = 3B9F782E44A10D91CA405688;
 			remoteInfo = "WristAgent Watch App";
 		};
+		AC763793CCE5E3DCB02D7276 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 85B21323A96B25B07A518363 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = CF25B19D6DB2959DBE22B263;
+			remoteInfo = WristAgent;
+		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -398,7 +406,9 @@
 		9FDE52A8C1B2854E4646A286 /* SpeechPlayerInterruptionEvidenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechPlayerInterruptionEvidenceTests.swift; sourceTree = "<group>"; };
 		A062C41AB26ED23BE9E1A26B /* RealtimeSessionKeepAlive.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeSessionKeepAlive.swift; sourceTree = "<group>"; };
 		A5752A6573A7A674BF8880E4 /* BargeInGenerationCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BargeInGenerationCoordinator.swift; sourceTree = "<group>"; };
+		A7602B536E298BDD668E55AC /* Ess1139SessionHoldTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Ess1139SessionHoldTests.swift; sourceTree = "<group>"; };
 		AAD9BD4DBA7700C65F134EF3 /* SpeechPlayerReleaseTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechPlayerReleaseTests.swift; sourceTree = "<group>"; };
+		AD2C29EAB2E4EBC4A2E9E768 /* WristAgent Tests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = "WristAgent Tests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		AFF7358416B9853C70000E04 /* Ess1044RelayFailureClosureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Ess1044RelayFailureClosureTests.swift; sourceTree = "<group>"; };
 		B059A6F3DD6B2B19D18CFB5E /* PCM16LevelMeter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PCM16LevelMeter.swift; sourceTree = "<group>"; };
 		B1CE1503A0D6F97C52A835D5 /* WatchAppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchAppDelegate.swift; sourceTree = "<group>"; };
@@ -587,6 +597,14 @@
 			path = iOS;
 			sourceTree = "<group>";
 		};
+		92F0A58099CCA131E46C3E73 /* iOSTests */ = {
+			isa = PBXGroup;
+			children = (
+				A7602B536E298BDD668E55AC /* Ess1139SessionHoldTests.swift */,
+			);
+			path = iOSTests;
+			sourceTree = "<group>";
+		};
 		BE04671AC7E90D1581E6AC05 /* Watch */ = {
 			isa = PBXGroup;
 			children = (
@@ -634,6 +652,7 @@
 		C2ED56EF033338F62BCCC439 /* Products */ = {
 			isa = PBXGroup;
 			children = (
+				AD2C29EAB2E4EBC4A2E9E768 /* WristAgent Tests.xctest */,
 				2E88D71F4696224E69D652E8 /* WristAgent Watch App.app */,
 				53B51BD6D2B825F5E3E2A727 /* WristAgent Watch Tests.xctest */,
 				6AE6645A23368CC50DBD7CCE /* WristAgent.app */,
@@ -693,6 +712,7 @@
 			isa = PBXGroup;
 			children = (
 				54A036CF449463DCBB1BE0B1 /* iOS */,
+				92F0A58099CCA131E46C3E73 /* iOSTests */,
 				1496EF7B8FA3D1016A22CDC1 /* Shared */,
 				BE04671AC7E90D1581E6AC05 /* Watch */,
 				E0960019F13FD9B843014358 /* WatchTests */,
@@ -759,6 +779,24 @@
 			productReference = 6AE6645A23368CC50DBD7CCE /* WristAgent.app */;
 			productType = "com.apple.product-type.application";
 		};
+		F247EFAE1FC5B1265D7A3B0C /* WristAgent Tests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 329EB02FC320AA8F78694FCC /* Build configuration list for PBXNativeTarget "WristAgent Tests" */;
+			buildPhases = (
+				2E101D62B240E35932F8AFDF /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				B1AA680CB20BEDC04F06181D /* PBXTargetDependency */,
+			);
+			name = "WristAgent Tests";
+			packageProductDependencies = (
+			);
+			productName = "WristAgent Tests";
+			productReference = AD2C29EAB2E4EBC4A2E9E768 /* WristAgent Tests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -777,6 +815,10 @@
 						ProvisioningStyle = Automatic;
 					};
 					CF25B19D6DB2959DBE22B263 = {
+						DevelopmentTeam = "";
+						ProvisioningStyle = Automatic;
+					};
+					F247EFAE1FC5B1265D7A3B0C = {
 						DevelopmentTeam = "";
 						ProvisioningStyle = Automatic;
 					};
@@ -799,6 +841,7 @@
 				CF25B19D6DB2959DBE22B263 /* WristAgent */,
 				3B9F782E44A10D91CA405688 /* WristAgent Watch App */,
 				4DEDBCFFC6FBD241C13DA076 /* WristAgent Watch Tests */,
+				F247EFAE1FC5B1265D7A3B0C /* WristAgent Tests */,
 			);
 		};
 /* End PBXProject section */
@@ -837,6 +880,14 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		2E101D62B240E35932F8AFDF /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				79E2F035EFFC27AA8C11FC1E /* Ess1139SessionHoldTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		85E2CB81B75454076D009B1F /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -1093,6 +1144,11 @@
 			target = 3B9F782E44A10D91CA405688 /* WristAgent Watch App */;
 			targetProxy = 3ABDD484832A2B8AC012AB10 /* PBXContainerItemProxy */;
 		};
+		B1AA680CB20BEDC04F06181D /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = CF25B19D6DB2959DBE22B263 /* WristAgent */;
+			targetProxy = AC763793CCE5E3DCB02D7276 /* PBXContainerItemProxy */;
+		};
 		CD9B13C4307B406F5162154C /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			target = 3B9F782E44A10D91CA405688 /* WristAgent Watch App */;
@@ -1118,6 +1174,24 @@
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Release;
+		};
+		2C325DB99A9E15C8A5EFE8F6 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(WRISTAGENT_BUNDLE_ID).tests";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = 1;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/WristAgent.app/WristAgent";
+			};
+			name = Debug;
 		};
 		3C2819C71873BB6C0685EE77 /* Release */ = {
 			isa = XCBuildConfiguration;
@@ -1178,6 +1252,24 @@
 				SWIFT_VERSION = 5.0;
 				WATCHOS_DEPLOYMENT_TARGET = 10.0;
 				WRISTAGENT_BUNDLE_ID = com.benyuan.wristagent.WristAgent;
+			};
+			name = Release;
+		};
+		6821162FCB502022857999FB /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "$(WRISTAGENT_BUNDLE_ID).tests";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = 1;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/WristAgent.app/WristAgent";
 			};
 			name = Release;
 		};
@@ -1342,6 +1434,15 @@
 			buildConfigurations = (
 				7B175453FF778828AB5528C0 /* Debug */,
 				C1018E014A7C2D7D7F9549DC /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		329EB02FC320AA8F78694FCC /* Build configuration list for PBXNativeTarget "WristAgent Tests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				2C325DB99A9E15C8A5EFE8F6 /* Debug */,
+				6821162FCB502022857999FB /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;

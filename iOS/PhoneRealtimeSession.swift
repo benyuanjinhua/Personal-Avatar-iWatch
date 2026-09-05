@@ -80,6 +80,33 @@ final class PhoneRealtimeSession {
     private var blockedCloseReason: String?
     private var blockedCloseCount = 0
 
+    /// ESS-1139 复审整改（毕玄 2026-09-05 阻断）：**被推迟的那次关闭**。
+    ///
+    /// 「保住 socket」只有在会话层同时保住 transport 引用、会话状态与下行缓冲
+    /// 时才成立。少了这条记录，一次 hold 就变成「物理没关、逻辑失管」——
+    /// 比直接关掉更糟：socket 还占着，回调却全被身份闸门拒掉。
+    ///
+    /// 记下来还有第二个作用：**有界性需要一个重试点**。`RealtimeSocketLifetime
+    /// Policy` 的静默预算与绝对上限只有在被再次问到时才会生效，而背景态下
+    /// 不会再有第二次 `lifecycleInterrupted`。
+    private var deferredClose: (cause: RealtimeSocketCloseCause, reason: String)?
+    private var deferredCloseRetryArmed = false
+
+    /// 被推迟的关闭多久重问一次策略。取上游静默预算：到点时若上游确实静默，
+    /// 策略会当场放行；若还在持续下发，策略继续 hold 并重新武装，最终由
+    /// `absoluteHoldCapMs` 兜底。因此重试次数有界，socket 不会永久泄漏。
+    static let deferredCloseRetrySeconds: TimeInterval =
+        TimeInterval(RealtimeSocketLifetimePolicy.upstreamSilenceBudgetMs) / 1000
+
+    /// 重试计时器接缝。生产用 `Task.sleep`；测试注入以零睡眠驱动。
+    var scheduleDeferredCloseRetry: (TimeInterval, @escaping @MainActor () -> Void) -> Void = {
+        seconds, fire in
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+            fire()
+        }
+    }
+
     init(transportFactory: @escaping (_ requestId: String, _ sessionId: String) -> Transport?) {
         self.transportFactory = transportFactory
     }
@@ -98,6 +125,7 @@ final class PhoneRealtimeSession {
     ) -> Bool {
         let identity = Self.turnIdentity(of: state)
         guard let transport = currentTransport else {
+            deferredClose = nil
             flushBlockedCloseSummary(identity)
             return true
         }
@@ -106,6 +134,7 @@ final class PhoneRealtimeSession {
         )
         switch decision {
         case .close(let detail):
+            deferredClose = nil
             flushBlockedCloseSummary(identity)
             PhoneAgentClientLog.info(
                 module: "phone_session", event: "realtime_socket_close",
@@ -118,6 +147,8 @@ final class PhoneRealtimeSession {
             // 上游还在干活：不关、不换 transport、不丢 socket。这条日志就是
             // 「客户端为什么没有关」的直接证据，与网关的 `socket_closed`
             // 一一对照。
+            deferredClose = (cause, reason)
+            armDeferredCloseRetry()
             blockedCloseCount += 1
             if blockedCloseReason == nil {
                 blockedCloseReason = reason
@@ -260,14 +291,86 @@ final class PhoneRealtimeSession {
     /// ESS-1139：`cause` 不再由本方法猜。用户显式退出与生命周期打断的语义
     /// 完全不同——前者压过在飞任务，后者不得压过——把两者塞进同一个字符串
     /// reason 里再现场解析，正是判定会随措辞漂移的来源。
-    func endTurn(reason: String, cause: RealtimeSocketCloseCause = .userExit) {
+    ///
+    /// ESS-1139 复审整改（毕玄 2026-09-05 阻断）：**收口是原子的**。
+    ///
+    /// 整改前这里先 `transition(to: .cancelled)`、再问策略、然后**无条件**
+    /// 清 `currentTransport` 与 `pendingDownlink`。于是 hold 只保住了物理
+    /// socket，会话层却已经把它丢了：
+    ///   • `receiveAgentDownlink` 的 `currentTransport === transport` 不成立
+    ///     → 迟到的 `task.state` / `audio.done` 全被判 `superseded_transport`；
+    ///   • `state` 已是 `.cancelled` → 身份闸门第二道也拒；
+    ///   • `pendingDownlink.discardAll()` 把已缓冲的下行一并丢掉。
+    /// 结果比直接关掉更糟——socket 还占着，答案却一样送不到。
+    ///
+    /// 现在顺序反过来：**先问策略，只有真的关掉了才动会话状态与缓冲**。
+    /// hold 时 transport 引用、`state`、`pendingDownlink` 三者原样保留，
+    /// 下行能力完整；关闭动作记进 `deferredClose`，由 `armDeferredCloseRetry`
+    /// 与每一帧下行共同承担重试，最终由策略的静默预算 / 绝对上限收口。
+    ///
+    /// - Returns: 是否真的收口了。`false` = 上游还有活在跑，会话原样保留。
+    @discardableResult
+    func endTurn(reason: String, cause: RealtimeSocketCloseCause = .userExit) -> Bool {
+        guard closeCurrentTransport(cause: cause, reason: reason) else {
+            PhoneAgentClientLog.info(
+                module: "phone_session", event: "realtime_end_turn_deferred",
+                requestId: Self.turnIdentity(of: state)?.requestId ?? "",
+                sessionId: Self.turnIdentity(of: state)?.sessionId ?? "",
+                detail: "reason=\(reason) cause=\(cause.rawValue) "
+                    + "retained=transport|state|pending_downlink "
+                    + "pending=\(pendingDownlink.pendingCount)"
+            )
+            return false
+        }
         transition(to: .cancelled)
-        closeCurrentTransport(cause: cause, reason: reason)
         currentTransport = nil
         pendingDownlink.discardAll()
         // ESS-987：回合边界是压制日志的收口点——把这一轮攒下的计数打成一条
         // 汇总，而不是逐帧刷屏。
         emit(turnGate.flushSuppressionSummaries())
+        return true
+    }
+
+    /// ESS-1139：被推迟的关闭到点重问一次策略。
+    ///
+    /// 只武装一支计时器：策略仍判 hold 时由 `retryDeferredClose` 重新武装，
+    /// 因此任何时刻至多一支在跑。有界性来自策略本身——上游静默满预算、或
+    /// 从第一次出现未结任务起满绝对上限，`decide` 就会放行。
+    private func armDeferredCloseRetry() {
+        guard !deferredCloseRetryArmed else { return }
+        deferredCloseRetryArmed = true
+        scheduleDeferredCloseRetry(Self.deferredCloseRetrySeconds) { [weak self] in
+            guard let self else { return }
+            // armed 标志**只由计时器回调复位**。若让下行触发的重试也复位它，
+            // 每一帧下行都会再武装一支新计时器（真机节奏下就是一秒好几支），
+            // 旧的那些仍会到点触发——一个本该单支的计时器变成 Task 泄漏。
+            self.deferredCloseRetryArmed = false
+            self.retryDeferredClose(trigger: "retry_timer")
+        }
+    }
+
+    /// ESS-1139：重试那次被推迟的关闭。
+    ///
+    /// 两个触发点，缺一不可：
+    /// - `armDeferredCloseRetry` 的计时器 —— 覆盖「上游从此静默」，没有它
+    ///   背景态下不会再有第二次询问，socket 会一直占着；
+    /// - 回合终态 `audio.done`（`receiveAgentDownlink`）—— 覆盖「上游真的说完
+    ///   了」，让收口在那一刻立刻发生，而不是干等一个计时器周期。**只认终态**
+    ///   的理由见该调用点的注释。
+    private func retryDeferredClose(trigger: String) {
+        guard let pending = deferredClose else { return }
+        guard currentTransport != nil else {
+            deferredClose = nil
+            return
+        }
+        PhoneAgentClientLog.info(
+            module: "phone_session", event: "realtime_deferred_close_retry",
+            requestId: Self.turnIdentity(of: state)?.requestId ?? "",
+            sessionId: Self.turnIdentity(of: state)?.sessionId ?? "",
+            detail: "trigger=\(trigger) reason=\(pending.reason) cause=\(pending.cause.rawValue)"
+        )
+        // `endTurn` 自己会在真的关掉时清引用与缓冲；仍是 hold 就再武装一支。
+        _ = endTurn(reason: pending.reason, cause: pending.cause)
     }
 
     /// System reported the phone entered background / lost network / the
@@ -277,7 +380,9 @@ final class PhoneRealtimeSession {
         Self.logger.notice(
             "realtime session interrupted reason=\(reason, privacy: .public)"
         )
-        endTurn(reason: "lifecycle_\(reason)", cause: .lifecycle)
+        // ESS-1139：返回值刻意丢弃——生命周期打断没有「失败」可言。上游还有活
+        // 在跑时它推迟收口并原样保留会话，这本身就是正确结果，不是错误。
+        _ = endTurn(reason: "lifecycle_\(reason)", cause: .lifecycle)
     }
 
     /// ESS-751：唯一的下行出口。消费者**真正接手**（持久 outbox 入队成功）
@@ -307,6 +412,13 @@ final class PhoneRealtimeSession {
         )
         return outcome.handled
     }
+
+    /// ESS-1139：会话层**是否还握着**这条 socket。
+    ///
+    /// 复审阻断正是「物理没关、逻辑失管」——hold 之后 `currentTransport` 被清，
+    /// 后续回调全被第一道身份闸门拒掉。那条不变量必须能被断言，不能只靠人眼
+    /// 复核；`currentTransport` 本身是 private，这里给出只读投影。
+    var hasCurrentTransportForTesting: Bool { currentTransport != nil }
 
     /// 当前缓冲深度（条数 / 字节），供测试与排查对账。
     var pendingDownlinkStats: (count: Int, bytes: Int) {
@@ -342,6 +454,19 @@ final class PhoneRealtimeSession {
             return
         }
         deliverDownlink(envelope)
+        // ESS-1139：**只有回合终态**才立即重问一次被推迟的关闭。
+        //
+        // 这里的判据必须精确到 `audio.done`，不能是「任意一帧」：网关的顺序是
+        // `task.state completed` → 最终答案音频 → `audio.done`，而账本在
+        // `task.state completed` 那一刻就已经没有未结任务了。若逐帧重试，
+        // 收口会发生在任务终态与最终答案之间——正好把答案切掉，等于把本单要修
+        // 的那个 bug 换个地方重演。
+        //
+        // 终态之后再问就安全了：此时既没有未结任务、上游也说完了。仍在跑的
+        // 情况（阶段播报的终态）策略会照常 hold，由计时器继续兜底。
+        if deferredClose != nil, envelope.kind == .audioDone {
+            retryDeferredClose(trigger: "audio_done")
+        }
     }
 
     /// 把闸门给的日志指令翻译成 `bridge.log` 事件。首条与汇总用**不同事件名**，
