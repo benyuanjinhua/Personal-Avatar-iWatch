@@ -298,8 +298,15 @@ test('ESS-1111 · 任务持续报进展时不按固定窗口收口（ESS-1109 �
         send(ws, streamFrame({ category: 'progress', seq: ticks, message: 'running', status: 'running' }))
         if (ticks === 24) {
           clearInterval(timer)
-          send(ws, streamFrame({ category: 'text', seq: 0, delta: '杭州今天晴' }))
+          // ESS-1145 修正夹具顺序：这里原来是「答案 → task.completed」，而
+          // 真实上游（`server/src/voice/realtime-gateway.mjs` 的同一个订阅
+          // 回调）是 `sendTaskEvent()` 先发生命周期终态，之后才把最终答案推进
+          // `taskStreamProtocol`，最后发唯一一帧 `category:'terminal'`。
+          // 旧顺序把「答案早于 task.completed」写成了前提，正是它让 ESS-1140
+          // 的丢答案路径在回归里看不见。
           send(ws, { type: 'task.completed', task: { id: 'work_codex', status: 'completed' } })
+          send(ws, streamFrame({ category: 'text', seq: 0, delta: '杭州今天晴' }))
+          send(ws, streamFrame({ category: 'terminal', seq: 0, status: 'completed' }))
         }
       }, 10)
     }
@@ -310,6 +317,7 @@ test('ESS-1111 · 任务持续报进展时不按固定窗口收口（ESS-1109 �
     // 两个窗口都**短于**任务全长（240 ms）：一次性预算必然在任务结束前到点，
     // 只有「按静默时长续期」才能让这一条通过。
     segmentGapMs: 40, segmentGapBusyMs: 100, toolCallWindowMs: 100,
+    taskAnswerWindowMs: 300,
     log: (evt, extra) => logs.push({ evt, ...extra }),
   })
   const turn = transport.openTurn({
@@ -390,8 +398,10 @@ test('ESS-1111 · 分段回合里，任务活动把停放段落的空闲窗口�
         send(ws, streamFrame({ category: 'progress', seq: ticks, message: '正在查询相关信息' }))
         if (ticks === 24) {
           clearInterval(timer)
-          send(ws, streamFrame({ category: 'text', seq: 0, delta: '杭州今天晴' }))
+          // ESS-1145：同上，按真实上游顺序（终态 → 答案 → 交付终态）。
           send(ws, { type: 'task.completed', task: { id: 'work_codex', status: 'completed' } })
+          send(ws, streamFrame({ category: 'text', seq: 0, delta: '杭州今天晴' }))
+          send(ws, streamFrame({ category: 'terminal', seq: 0, status: 'completed' }))
         }
       }, 10)
     }
@@ -401,6 +411,7 @@ test('ESS-1111 · 分段回合里，任务活动把停放段落的空闲窗口�
     gatewayUrl: url, responseTimeoutMs: 0,
     // 忙档 100 ms 远短于任务全长 240 ms：旧口径（从段落收口起表）必然提前收口。
     segmentGapMs: 40, segmentGapBusyMs: 100, toolCallWindowMs: 300,
+    taskAnswerWindowMs: 300,
     log: (evt, extra) => logs.push({ evt, ...extra }),
   })
   const turn = transport.openTurn({

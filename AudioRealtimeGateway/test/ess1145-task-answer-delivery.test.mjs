@@ -1,0 +1,344 @@
+// ESS-1145 —— 委派任务的整轮收口必须排在**最终答案交付**之后。
+//
+// ESS-1140 三段真实语音 E2E 只过 1/3。两条失败时间线（杭州天气
+// `work_df15b9b6-…`、Obsidian 最新文章观点 `work_9c7c9665-…`）形状完全一样，
+// 逐帧证据在父 Issue 的测试评论里：
+//
+//   41578.9 ms  upstream_event_seen        task.completed
+//   41579.2 ms  upstream_turn_busy_cleared cause=task_terminal
+//   41579.2 ms  upstream_turn_terminal     reason=task_terminal_audio_done   ← 收口
+//   41579.3 ms  upstream_task_state        status=completed
+//   —— 消费端收到 `agent.audio.done` 后关闭 WSS ——
+//   之后 qwen-audio-agent 侧：
+//     task.streaming_fallback  reason=cancelled          （答案文本完整，没人收）
+//     task.stream.frame_dropped reason=socket_not_open category=terminal
+//
+// 根因不是竞态，是**顺序写反了**：`task.completed` 只证明后台任务算完了，
+// 上游随后才把最终答案推进有序下行——`server/src/voice/realtime-gateway.mjs`
+// 在同一个订阅回调里先 `sendTaskEvent()`（生命周期终态），再
+// `taskStreamProtocol.text(finalSpeech)` + `codexStreamProjector.push()`，
+// 等语音段全部排空后由 `task-stream-protocol.mjs` 的 `finish()`
+// （要求 taskDone **且** responseDone）发唯一一帧 `category:'terminal'`。
+// 那一帧才是「答案已交付」。本网关此前把它整个过滤掉，于是必然领先答案收口。
+//
+// 本文件钉四件事：
+//   1. 顺序：task.completed → 答案增量 → 交付终态 → `agent.audio.done`，
+//      且完整答案恰好到达一次；
+//   2. 不提前收口：交付终态到达前不得有任何 `agent.audio.done`，
+//      `toolGateActive()` 保持为真（WSS 不得被收口关掉）；
+//   3. 终态分类：取消 / 失败 / 交付超时各有各的终态，不用正常 done 掩盖；
+//   4. 向后兼容：上游不走 `task.stream` 契约时，逐字节保持改动前的行为。
+
+import assert from 'node:assert/strict'
+import { after, test } from 'node:test'
+import { WebSocketServer } from 'ws'
+
+import { QwenAgentTransport } from '../qwen-agent-transport.mjs'
+
+const servers = []
+after(async () => {
+  await Promise.all(servers.splice(0).map(server => new Promise(resolve => {
+    for (const client of server.clients) client.terminate()
+    server.close(resolve)
+  })))
+})
+
+async function upstream(onMessage) {
+  const server = new WebSocketServer({ port: 0 })
+  servers.push(server)
+  server.on('connection', ws => {
+    ws.on('message', raw => onMessage(ws, JSON.parse(raw.toString())))
+  })
+  await new Promise(resolve => server.once('listening', resolve))
+  return `ws://127.0.0.1:${server.address().port}/api/realtime`
+}
+
+function waitFor(predicate, timeoutMs = 4_000) {
+  const started = Date.now()
+  return new Promise((resolve, reject) => {
+    const poll = () => {
+      if (predicate()) return resolve()
+      if (Date.now() - started > timeoutMs) return reject(new Error('waitFor timeout'))
+      setTimeout(poll, 5)
+    }
+    poll()
+  })
+}
+
+const send = (ws, event) => ws.send(JSON.stringify(event))
+const audioDelta = (ws, sequence, text) => send(ws, {
+  type: 'audio.delta', sequence, audio: Buffer.from(text).toString('base64'), sampleRate: 24_000,
+})
+
+// ESS-1140 逐帧证据里两条失败用例共有的委派回合骨架（杭州天气那条的时间戳）：
+//   0.51 s  段1 response.started origin=model  … response.done hasFunctionCall=true
+//   1.60 s  audio.done                          → upstream_tool_call_pending
+//   1.60 s  task.accepted / task.stream progress / task.running
+//   1.86 s  段2 response.started origin=agent 「我去查一下」
+//   2.86 s  response.done hasFunctionCall=false → upstream_tool_call_resolved
+//   2.98 s  audio.done → endTurn('tool_result_done') → 因任务在飞而挂起
+// 分歧只发生在 `task.completed` 之后，所以这里把「之后」交给调用方写。
+const delegationPrologue = (ws, taskId, { taskStream = true } = {}) => {
+  send(ws, { type: 'response.started', responseId: 'up-1', origin: 'model' })
+  audioDelta(ws, 0, '我正在查询')
+  send(ws, { type: 'response.done', responseId: 'up-1', origin: 'model', hasFunctionCall: true })
+  send(ws, { type: 'audio.done', responseId: 'up-1' })
+  send(ws, { type: 'voice.state', state: 'idle', origin: 'model' })
+  send(ws, { type: 'task.accepted', task: { id: taskId, status: 'queued' } })
+  if (taskStream) {
+    send(ws, {
+      type: 'task.stream', protocolVersion: 1,
+      taskId, requestId: taskId, sessionId: 's1145', generation: 1,
+      category: 'progress', seq: 0, message: 'running', status: 'running',
+    })
+  }
+  send(ws, { type: 'task.running', task: { id: taskId, status: 'running' } })
+  // 委派确认段：它一收口，整轮终态就变成「候选」并被任务在飞挂起——
+  // ESS-1140 里那个提前 0.3 ms 兑现的候选终态就是它。
+  setTimeout(() => {
+    send(ws, { type: 'response.started', responseId: 'up-2', origin: 'agent' })
+    audioDelta(ws, 1, '我去查一下')
+    send(ws, { type: 'response.done', responseId: 'up-2', origin: 'agent', hasFunctionCall: false })
+    send(ws, { type: 'audio.done', responseId: 'up-2' })
+  }, 10)
+}
+
+const streamFrame = (taskId, over = {}) => ({
+  type: 'task.stream', protocolVersion: 1,
+  taskId, requestId: taskId, sessionId: 's1145', generation: 1,
+  ...over,
+})
+
+const ANSWER = '杭州现在大约二十七摄氏度，多云，湿度约百分之八十。'
+
+function harness(url, over = {}) {
+  const events = []; const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, responseTimeoutMs: 0, doneSettleMs: 20,
+    // 空闲窗口刻意短：本文件钉的不是「窗口够不够宽」，而是「交付没到就不许
+    // 收口」。窗口再短也不该越过交付门禁——越过就是 ESS-1140 的丢答案路径。
+    segmentGapMs: 40, segmentGapBusyMs: 80, toolCallWindowMs: 200,
+    taskAnswerWindowMs: 1_500,
+    log: (evt, extra) => logs.push({ evt, ...extra }),
+    ...over,
+  })
+  const turn = transport.openTurn({
+    requestId: 'r1145', sessionId: 's1145', deviceId: 'd1145', generation: 1,
+    responseId: 'r1145:gen1',
+    onEvent: event => events.push(event),
+  })
+  return { events, logs, turn }
+}
+
+test('ESS-1145 · 杭州天气时间线：答案在收口之前完整到达，且恰好一次', async () => {
+  const taskId = 'work_df15b9b6-f8c6-4932-b556-a8fb1d371674'
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') send(ws, { type: 'voice.ready' })
+    if (message.type !== 'audio.commit') return
+    delegationPrologue(ws, taskId)
+    // 上游真实顺序：生命周期终态在前，答案与交付终态在后。旧代码在第一行
+    // 就收口了，后面三帧全部撞在已关闭的 socket 上。
+    setTimeout(() => {
+      send(ws, { type: 'task.completed', task: { id: taskId, status: 'completed' } })
+      send(ws, streamFrame(taskId, { category: 'text', seq: 0, delta: ANSWER }))
+      // 答案语音：上游 `codexStreamProjector` 逐段 speak，段间还会发投影旁白。
+      send(ws, { type: 'task.stream.first_audio', taskId, sequence: 0, latency_ms: 12 })
+      send(ws, { type: 'response.started', responseId: 'up-3', origin: 'agent' })
+      audioDelta(ws, 2, 'answer-audio')
+      send(ws, { type: 'response.done', responseId: 'up-3', origin: 'agent', hasFunctionCall: false })
+      send(ws, { type: 'audio.done', responseId: 'up-3' })
+      send(ws, { type: 'task.stream.segment', taskId, sequence: 0, text: ANSWER })
+      send(ws, streamFrame(taskId, {
+        category: 'terminal', seq: 0, status: 'completed', finalAudioSequence: 0,
+      }))
+      send(ws, { type: 'task.stream.done', taskId, final_sequence: 0 })
+    }, 60)
+  })
+  const { events, logs, turn } = harness(url)
+  turn.commit()
+  try {
+    await waitFor(() => events.some(e => e.type === 'agent.audio.done'))
+    await new Promise(resolve => setTimeout(resolve, 120))
+
+    const answers = events.filter(e => e.type === 'agent.task' && e.answer?.delta)
+    assert.equal(answers.length, 1, '完整答案恰好到达一次')
+    assert.equal(answers[0].answer.delta, ANSWER)
+
+    const answerAt = events.indexOf(answers[0])
+    const doneAt = events.findIndex(e => e.type === 'agent.audio.done')
+    assert.ok(answerAt < doneAt,
+      'ESS-1140 的失败面：答案必须排在整轮 agent.audio.done 之前')
+    assert.equal(events.filter(e => e.type === 'agent.audio.done').length, 1,
+      '唯一最终 terminal')
+    assert.equal(events.at(-1).type, 'agent.audio.done',
+      '收口必须是最后一帧——它之后没有任何东西还需要这条 WSS')
+
+    // 收口理由可判定，且证据链完整：欠交付 → 交付到达 → 收口。
+    const terminal = logs.find(l => l.evt === 'upstream_turn_terminal')
+    assert.equal(terminal.reason, 'task_terminal_audio_done')
+    assert.equal(terminal.awaiting_delivery, 0)
+    const pending = logs.find(l => l.evt === 'upstream_task_answer_pending')
+    const delivered = logs.find(l => l.evt === 'upstream_task_answer_delivered')
+    assert.equal(pending.task_id, taskId)
+    assert.equal(delivered.task_id, taskId)
+    assert.equal(delivered.status, 'completed')
+    assert.ok(logs.indexOf(pending) < logs.indexOf(delivered))
+    assert.ok(logs.indexOf(delivered) < logs.indexOf(terminal))
+    // 交付超时窗口必须真的武装过，否则「有界等待」只是嘴上说说。
+    assert.ok(logs.some(l => l.evt === 'upstream_task_answer_window_armed'))
+    // 上游的投影旁白不得被当成生命周期帧下发成 `status:'stream.done'`。
+    assert.ok(!events.some(e => e.type === 'agent.task'
+      && String(e.task?.status ?? '').startsWith('stream.')),
+    '`task.stream.*` 是投影旁白，不是任务状态')
+  } finally { turn.close() }
+})
+
+test('ESS-1145 · Obsidian 时间线：交付终态到达前，一帧 audio.done 都不许发', async () => {
+  const taskId = 'work_9c7c9665-86fa-4d9d-bb7b-8cd52742cb97'
+  let gate
+  const opened = new Promise(resolve => { gate = resolve })
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') send(ws, { type: 'voice.ready' })
+    if (message.type !== 'audio.commit') return
+    delegationPrologue(ws, taskId)
+    setTimeout(() => {
+      send(ws, { type: 'task.completed', task: { id: taskId, status: 'completed' } })
+      gate(ws)
+    }, 60)
+  })
+  const { events, logs, turn } = harness(url)
+  turn.commit()
+  try {
+    const ws = await opened
+    await waitFor(() => logs.some(l => l.evt === 'upstream_task_answer_pending'))
+    // 任务已经 completed。旧代码此刻就发 `agent.audio.done`，消费端随即关闭
+    // WSS——真机上答案 100% 丢失。停在这里等两个窗口的时长，证明收口没发生。
+    await new Promise(resolve => setTimeout(resolve, 250))
+    assert.equal(events.filter(e => e.type === 'agent.audio.done').length, 0,
+      '答案没交付就收口，正是 ESS-1140 丢答案的入口')
+    assert.ok(!logs.some(l => l.evt === 'upstream_turn_terminal'))
+    // 候选终态确实已经产生并被扣住（`tool_result_done` 就是 ESS-1140 里那个
+    // 提前 0.3 ms 兑现的候选），而欠交付账本是扣住它的那条证据。
+    assert.ok(logs.some(l => l.evt === 'upstream_turn_terminal_deferred'
+      && l.candidate_reason === 'tool_result_done'))
+    const pending = logs.find(l => l.evt === 'upstream_task_answer_pending')
+    assert.equal(pending.task_id, taskId)
+    assert.equal(pending.turn_state, 'busy')
+    // 收口没发生 ⇒ 上游 socket 仍然可用，最终答案还追得上。
+    send(ws, streamFrame(taskId, { category: 'text', seq: 0, delta: '最新文章的观点是……' }))
+    send(ws, streamFrame(taskId, { category: 'terminal', seq: 0, status: 'completed' }))
+
+    await waitFor(() => events.some(e => e.type === 'agent.audio.done'))
+    const answerAt = events.findIndex(e => e.type === 'agent.task' && e.answer?.delta)
+    const doneAt = events.findIndex(e => e.type === 'agent.audio.done')
+    assert.ok(answerAt >= 0 && answerAt < doneAt)
+  } finally { turn.close() }
+})
+
+test('ESS-1145 · 上游哑在交付上：显式失败，不用正常 done 掩盖', async () => {
+  const taskId = 'work_silent_delivery'
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') send(ws, { type: 'voice.ready' })
+    if (message.type !== 'audio.commit') return
+    delegationPrologue(ws, taskId)
+    // 生命周期终态到了，交付终态永远不来（上游 socket 半死 / 投影卡住）。
+    setTimeout(() => {
+      send(ws, { type: 'task.completed', task: { id: taskId, status: 'completed' } })
+    }, 60)
+  })
+  const { events, logs, turn } = harness(url, { taskAnswerWindowMs: 150 })
+  turn.commit()
+  try {
+    await waitFor(() => events.some(e => e.type === 'agent.error'))
+    const error = events.find(e => e.type === 'agent.error')
+    assert.equal(error.code, 'ERR_UPSTREAM_TASK_ANSWER_TIMEOUT')
+    assert.equal(events.filter(e => e.type === 'agent.audio.done').length, 0,
+      '答案没到就报 done，等于把失败报成通过——ESS-1140 的判定错误正是这样来的')
+    const timeout = logs.find(l => l.evt === 'upstream_task_answer_timeout')
+    assert.equal(timeout.task_id, taskId)
+    assert.equal(timeout.ui_state, 'error')
+    // 等待必须是有界的：窗口只准量静默时长，不准变成永久锁死。
+    assert.equal(timeout.timeout_ms, 150)
+  } finally { turn.close() }
+})
+
+test('ESS-1145 · 取消与正常收口不共用一个终态', async () => {
+  const taskId = 'work_cancelled'
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') send(ws, { type: 'voice.ready' })
+    if (message.type !== 'audio.commit') return
+    delegationPrologue(ws, taskId)
+    setTimeout(() => {
+      // 上游取消路径：`taskStreamProtocol.cancel()` 先发交付终态，
+      // `sendTaskEvent()` 的生命周期终态后到——合法乱序，不得因此空等。
+      send(ws, streamFrame(taskId, { category: 'terminal', seq: 0, status: 'cancelled' }))
+      send(ws, { type: 'task.cancelled', task: { id: taskId, status: 'cancelled' } })
+    }, 60)
+  })
+  const { events, logs, turn } = harness(url)
+  turn.commit()
+  try {
+    await waitFor(() => events.some(e => e.type === 'agent.audio.done'))
+    const done = events.find(e => e.type === 'agent.audio.done')
+    assert.equal(done.reason, 'task_cancelled_answer_done',
+      '取消不得被记成一次正常交付')
+    assert.equal(events.filter(e => e.type === 'agent.audio.done').length, 1)
+    assert.ok(!logs.some(l => l.evt === 'upstream_task_answer_timeout'),
+      '交付终态先到时不得再去等一帧永远不会来的第二个终态')
+  } finally { turn.close() }
+})
+
+test('ESS-1145 · 不走 task.stream 契约的上游逐字节保持原行为', async () => {
+  const taskId = 'work_legacy'
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') send(ws, { type: 'voice.ready' })
+    if (message.type !== 'audio.commit') return
+    // 老上游：只有生命周期帧，一帧 `task.stream` 都没有。
+    delegationPrologue(ws, taskId, { taskStream: false })
+    setTimeout(() => {
+      send(ws, { type: 'task.completed', task: { id: taskId, status: 'completed' } })
+    }, 60)
+  })
+  const { events, logs, turn } = harness(url)
+  turn.commit()
+  try {
+    await waitFor(() => events.some(e => e.type === 'agent.audio.done'))
+    const terminal = logs.find(l => l.evt === 'upstream_turn_terminal')
+    assert.equal(terminal.reason, 'task_terminal_audio_done',
+      '老上游仍然由 task.completed 直接裁决收口')
+    assert.ok(!logs.some(l => l.evt === 'upstream_task_answer_pending'),
+      '没承诺过交付终态的 task 不得被等')
+    assert.ok(!logs.some(l => l.evt === 'upstream_task_answer_window_armed'))
+  } finally { turn.close() }
+})
+
+test('ESS-1145 · 交付未完成时上游断连：显式断连终态，不沉默也不假装成功', async () => {
+  const taskId = 'work_disconnect'
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') send(ws, { type: 'voice.ready' })
+    if (message.type !== 'audio.commit') return
+    delegationPrologue(ws, taskId)
+    setTimeout(() => {
+      send(ws, { type: 'task.completed', task: { id: taskId, status: 'completed' } })
+      // 答案已经开口（段落会被停放），但交付终态还没发上游就断了。
+      // 这条 close 分支原本会把停放的段落当成「回合正常收口」，而挂起的
+      // 候选终态被交付门禁扣着，客户端于是一帧终态都收不到。
+      send(ws, streamFrame(taskId, { category: 'text', seq: 0, delta: '半截答案' }))
+      send(ws, { type: 'response.started', responseId: 'up-3', origin: 'agent' })
+      audioDelta(ws, 2, 'half')
+      send(ws, { type: 'response.done', responseId: 'up-3', origin: 'agent', hasFunctionCall: false })
+      send(ws, { type: 'audio.done', responseId: 'up-3' })
+      setTimeout(() => ws.close(1001, 'gone'), 40)
+    }, 60)
+  })
+  const { events, logs, turn } = harness(url)
+  turn.commit()
+  try {
+    await waitFor(() => events.some(e => e.type === 'agent.error'))
+    assert.equal(events.find(e => e.type === 'agent.error').code, 'ERR_UPSTREAM_DISCONNECTED')
+    assert.equal(events.filter(e => e.type === 'agent.audio.done').length, 0,
+      '断连不得借正常 done 收口')
+    assert.ok(logs.some(l => l.evt === 'upstream_closed_task_answer_undelivered'
+      && l.task_id === taskId))
+  } finally { turn.close() }
+})
