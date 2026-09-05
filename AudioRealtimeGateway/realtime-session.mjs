@@ -112,6 +112,9 @@ export class RealtimeSession {
     this.downlinkHighWatermark = -1
     this.downlinkBytes = 0
     this.doneEmitted = false
+    // ESS-1145: 收口原因（`task_terminal_audio_done` / `task_cancelled_answer_done`
+    // / `segment_gap` …）。只留证，不上线格。
+    this.doneReason = null
     this.cancelled = false
     // `pendingFinalSequence` is the raw `final_sequence` the upstream sent on
     // `agent.audio.done`; we hold it verbatim until `0..pendingFinalSequence`
@@ -758,6 +761,10 @@ export class RealtimeSession {
     const claimed = Number.isInteger(event.final_sequence)
       ? event.final_sequence
       : this.downlinkHighWatermark
+    // ESS-1145: 终态**原因**只进日志，不上线格——客户端的 `audio.done` 契约
+    // 一个字都没变。有了它，一条真机日志就能分清「答案交付完才收口」
+    // (`task_terminal_audio_done`) 与「取消 / 失败」，不必再去比对上游时间戳。
+    if (typeof event.reason === 'string' && event.reason) this.doneReason = event.reason
     // A barrier outside the sequence window can never be satisfied — waiting
     // for it would only burn the full gap timeout before failing anyway.
     if (claimed >= this.maxDownlinkFrames) {
@@ -820,6 +827,7 @@ export class RealtimeSession {
         request_id: this.scope.request_id, session_id: this.scope.session_id,
         generation: this.scope.generation,
         response_id: this.responseId, final_sequence: this.finalSequence,
+        reason: this.doneReason ?? null,
       })
       return
     }

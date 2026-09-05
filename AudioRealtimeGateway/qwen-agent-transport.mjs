@@ -183,6 +183,27 @@ export class QwenAgentTransport {
     // and still ends before the Watch's own 45 s hard thinking timeout, so a
     // lost tool result cannot hold the turn open past the client budget.
     toolCallWindowMs = 30_000,
+    // ESS-1145 交付静默预算。`task.completed` 只说明后台任务**算完**了，答案
+    // 此刻还没进有序下行：上游 `server/src/voice/realtime-gateway.mjs` 在同一
+    // 个订阅回调里先 `sendTaskEvent()` 发生命周期终态，之后才把最终答案推进
+    // `taskStreamProtocol.text()` / `codexStreamProjector`，等语音段全部排空
+    // 才发唯一一帧 `task.stream {category:'terminal'}`（`task-stream-protocol.mjs`
+    // 的 `finish()` 要求 taskDone **且** responseDone）。ESS-1140 实测：本网关
+    // 在 `task.completed` 那一刻就收口，消费端收到 `agent.audio.done` 后关闭
+    // WSS，上游随即 `task.streaming_fallback reason=cancelled` +
+    // `task.stream.frame_dropped reason=socket_not_open category=terminal`，
+    // 杭州天气与 Obsidian 两条时间线的最终答案 100% 丢失。
+    //
+    // 这条窗口量的是**交付期间的静默时长**（每一帧 task.stream / 答案音频都
+    // 续期），不是答案总时长——一段 20 s 的 TTS 一路都在产帧，不会被判超时；
+    // 上游整段哑掉才到点。到点走 `ERR_UPSTREAM_TASK_ANSWER_TIMEOUT` 显式失败，
+    // 不用正常 `audio.done` 掩盖「答案没到」。取 30 s 与 `toolCallWindowMs`
+    // 同量级：都在客户端 `SessionController.toolTurnHardTimeoutSeconds = 180`
+    // 之内，且实测最长的答案交付（Obsidian 那条）首帧在 1 s 内就到。
+    //
+    // `<= 0` 是**关掉整条交付门禁**的应急拉闸（见下方 `deliveryGateEnabled`），
+    // 不是「不设超时」。
+    taskAnswerWindowMs = 30_000,
     takeover = true,
     // ESS-978: our own identity on the upstream. The label embeds the pid so
     // two copies of this gateway on one machine are distinguishable, and the
@@ -206,6 +227,7 @@ export class QwenAgentTransport {
     this.segmentGapMs = segmentGapMs
     this.segmentGapBusyMs = segmentGapBusyMs
     this.toolCallWindowMs = toolCallWindowMs
+    this.taskAnswerWindowMs = taskAnswerWindowMs
     this.takeover = takeover
     this.clientLabel = clientLabel
     this.log = log
@@ -459,10 +481,29 @@ export class QwenAgentTransport {
       // that segment's audio settles instead of waiting out the idle window.
       pendingToolCall: false, endAfterDone: false,
       pendingToolTerminal: null, awaitingToolAudioTerminal: false,
+      // ESS-1145 委派任务的**交付**账本，与生命周期账本
+      // (`outstandingTasks`) 分开记，因为它们回答的是两个不同的问题：
+      //   • `outstandingTasks`：后台任务算完了吗？（`task.completed` 裁决）
+      //   • `awaitingTaskDelivery`：算出来的答案下行了吗？
+      //     （`task.stream {category:'terminal'}` 裁决）
+      // ESS-1140 的两条失败时间线就是把第二个问题当成第一个问题回答的：
+      // 41.5792 s `agent.audio.done` → 41.5793 s task completed → 最终答案
+      // 在已关闭的 socket 上被丢弃。
+      //
+      // `streamedTasks` 记住哪些 task 走了 ESS-1110 的 `task.stream` 契约：
+      // 只有它们才有交付终态可等。没走契约的上游（老版本、control task、
+      // 跨 session）逐字节保持改动前的行为——加性契约不能反过来把老上游锁死。
+      // `deliveredTasks` 处理「交付终态先于生命周期终态」的合法乱序：取消路径
+      // 上游先 `taskStreamProtocol.cancel()` 再 `sendTaskEvent()`，终态帧确实
+      // 会先到，那时不能再去等一帧永远不会来的第二个终态。
+      streamedTasks: new Set(), awaitingTaskDelivery: new Set(),
+      deliveredTasks: new Set(), taskAnswerTimer: null,
+      taskDeliveryOutcome: null,
     }
     turn.toolGateActive = () => !turn.terminal && !turn.turnEnded
       && (turn.pendingToolCall || turn.outstandingTasks.size > 0
-        || turn.pendingToolTerminal !== null || turn.awaitingToolAudioTerminal)
+        || turn.pendingToolTerminal !== null || turn.awaitingToolAudioTerminal
+        || turn.awaitingTaskDelivery.size > 0)
     const scopeLog = { request_id: requestId, session_id: sessionId, device_id: deviceId, generation }
     turn.supersede = nextRequestId => {
       if (turn.terminal) return
@@ -475,6 +516,7 @@ export class QwenAgentTransport {
       clearTimeout(turn.segmentGapTimer)
       clearTimeout(turn.taskTerminalTimer)
       clearTimeout(turn.toolAudioTimer)
+      clearTimeout(turn.taskAnswerTimer)
       this.log('upstream_turn_superseded', {
         ...scopeLog, superseded_by_request_id: nextRequestId,
       })
@@ -503,6 +545,7 @@ export class QwenAgentTransport {
       clearTimeout(turn.segmentGapTimer)
       clearTimeout(turn.taskTerminalTimer)
       clearTimeout(turn.toolAudioTimer)
+      clearTimeout(turn.taskAnswerTimer)
       this.log('upstream_error', { ...scopeLog, code })
       onEvent({ type: 'agent.error', response_id: responseId, code, detail, retriable: true })
       try { turn.ws?.close() } catch { /* best effort */ }
@@ -640,6 +683,11 @@ export class QwenAgentTransport {
       // terminal is no longer an instantaneous upstream event.
       turn.segmentClosedAt = Date.now()
       armSegmentGap('segment_closed')
+      // ESS-1145: 交付终态可能在这一段的 settle 窗口里就到了（上游的
+      // `finish()` 紧跟 `response.done`）。那时 `maybeEndDeferredTurn` 手上
+      // 既没有挂起的候选、也还没有停放的段落，什么都做不了。现在段落停放好
+      // 了，再问一次——否则终态原因会退化成 `segment_gap`。
+      maybeEndDeferredTurn()
     }
 
     // The turn produced more output after a segment closed: that closed
@@ -730,6 +778,16 @@ export class QwenAgentTransport {
       turn.taskTerminalTimer = setTimeout(() => {
         turn.taskTerminalTimer = null
         if (turn.turnEnded || !turn.pendingToolTerminal) return
+        // ESS-1145: 这条兜底守的是「任务终态没来」。任务终态已经来了、只差
+        // 答案交付时它不成立——`tool_task_timeout` 会绕过收口门禁，用它收口
+        // 等于把 ESS-1140 的丢答案路径原样放回来。交给交付窗口裁决。
+        if (deliveryPending()) {
+          this.log('upstream_task_terminal_timeout_yielded', {
+            ...scopeLog, awaiting_delivery: turn.awaitingTaskDelivery.size,
+            task_id: turn.awaitingTaskDelivery.values().next().value ?? null,
+          })
+          return
+        }
         this.log('upstream_task_terminal_timeout', {
           ...scopeLog, task_id: turn.outstandingTasks.values().next().value ?? null,
           outstanding_tasks: turn.outstandingTasks.size,
@@ -742,21 +800,168 @@ export class QwenAgentTransport {
       turn.taskTerminalTimer.unref?.()
     }
 
+    // ESS-1145 交付静默窗口。与上面那条的区别是它守的东西不同：
+    // `armTaskTerminalTimer` 守的是「任务终态会不会到」，这一条守的是
+    // 「任务终态**之后**，答案会不会真的下行」。两者都是静默预算（任何一帧
+    // 交付活动都续期），但到点后的处置不同：这条走显式失败，因为一个已经
+    // completed 却没交付答案的回合，用正常 `audio.done` 收口就是 ESS-1140
+    // 里「3 项里 2 项被报成通过」的那个失败面。
+    const armTaskAnswerTimer = cause => {
+      if (turn.turnEnded || turn.terminal) return
+      if (turn.awaitingTaskDelivery.size === 0) return
+      if (!(this.taskAnswerWindowMs > 0)) return
+      clearTimeout(turn.taskAnswerTimer)
+      this.log('upstream_task_answer_window_armed', {
+        ...scopeLog, cause, timeout_ms: this.taskAnswerWindowMs,
+        awaiting_delivery: turn.awaitingTaskDelivery.size,
+        task_id: turn.awaitingTaskDelivery.values().next().value ?? null,
+      })
+      turn.taskAnswerTimer = setTimeout(() => {
+        turn.taskAnswerTimer = null
+        if (turn.turnEnded || turn.terminal) return
+        if (turn.awaitingTaskDelivery.size === 0) return
+        this.log('upstream_task_answer_timeout', {
+          ...scopeLog,
+          task_id: turn.awaitingTaskDelivery.values().next().value ?? null,
+          awaiting_delivery: turn.awaitingTaskDelivery.size,
+          timeout_ms: this.taskAnswerWindowMs,
+          idle_ms: turn.lastTaskActivityAt ? Date.now() - turn.lastTaskActivityAt : null,
+          ui_state: 'error', turn_state: 'terminal',
+        })
+        fail('ERR_UPSTREAM_TASK_ANSWER_TIMEOUT',
+          'task reached a terminal status but its answer never reached the ordered'
+          + ` downlink within ${this.taskAnswerWindowMs}ms`)
+      }, this.taskAnswerWindowMs)
+      turn.taskAnswerTimer.unref?.()
+    }
+
+    // ESS-1145：一个委派任务的**交付**闭环。只有走过 `task.stream` 契约的
+    // task 会进这个账本，所以 `deliveryPending()` 为真 ⇔ 上游明确承诺过还有
+    // 一帧 `category:'terminal'` 要来。
+    const deliveryPending = () => turn.awaitingTaskDelivery.size > 0
+
+    // ESS-1145 复审整改第 2 点（毕玄 2026-09-05）：我上一版把
+    // 「`taskAnswerWindowMs = 0`」说成软回滚，那是错的 —— 当时 0 只是让
+    // `armTaskAnswerTimer()` 不武装计时器，`awaitingTaskDelivery` 门禁照常拦，
+    // 于是交付终态一旦缺失就是**永久挂起**：比回滚前更坏的故障，不是回滚。
+    //
+    // 现在这个值有且只有一个明确语义：`<= 0` 关掉整条交付门禁，账本根本不建，
+    // 逐字节回到本单之前的收口时序。代价也说清楚：那等于重新暴露 ESS-1140 的
+    // 丢答案面，所以它是线上应急拉闸，不是可以长期停留的状态；长期回滚仍然
+    // 只有 revert。`test/ess1145 · 交付门禁可关` 钉住「关掉后不挂起、且退回
+    // 旧时序」，因为一个没被测过的开关在事故里不能用。
+    const deliveryGateEnabled = () => this.taskAnswerWindowMs > 0
+
+    // 交付终态到达：答案（`category:'text'` 增量）此刻已经全部排进有序下行，
+    // 语音段也已排空（上游 `finish()` 要求 taskDone && responseDone）。这是
+    // 唯一可以收口的时刻。
+    const noteTaskDelivered = (id, frame) => {
+      const status = String(frame?.status ?? '') || null
+      if (!deliveryGateEnabled()) {
+        this.log('upstream_task_answer_gate_disabled', { ...scopeLog, task_id: id, status })
+        return
+      }
+      const wasAwaited = turn.awaitingTaskDelivery.delete(id)
+      turn.deliveredTasks.add(id)
+      while (turn.deliveredTasks.size > MAX_TASKS_PER_CONVERSATION) {
+        turn.deliveredTasks.delete(turn.deliveredTasks.values().next().value)
+      }
+      // ESS-1145 复审整改（毕玄 2026-09-05 阻断）：这里原来无条件
+      // `turn.outstandingTasks.delete(id)`，理由写的是「交付终态同时也是生命
+      // 周期终态的证据」。那句话在取消路径上是错的，而取消恰恰是唯一会乱序的
+      // 路径：上游 `realtime-gateway.mjs` 先 `taskStreamProtocol.cancel()`
+      //（发 `category:'terminal' status=cancelled`）再走到 `sendTaskEvent()`，
+      // 所以交付终态**先于**权威的 `task.cancelled` 到达。删掉在飞账再收口，
+      // 就等于用交付终态替生命周期终态签字：`agent.audio.done` 抢在
+      // `agent.task{status:'cancelled'}` 前面，消费端按契约收到 done 即可关闭
+      // WSS——本单要修的失败面原样换了个入口。
+      //
+      // 两本账各自签自己的字：交付终态只记 `deliveredTasks` 与 outcome，
+      // 生命周期账一个都不动，收口留给随后到达的 `task.cancelled/failed`。
+      const lifecyclePending = turn.outstandingTasks.has(id)
+      if (!deliveryPending()) {
+        clearTimeout(turn.taskAnswerTimer)
+        turn.taskAnswerTimer = null
+      }
+      this.log('upstream_task_answer_delivered', {
+        ...scopeLog, task_id: id, status,
+        streaming_fallback_reason: frame?.streamingFallbackReason ?? null,
+        was_awaited: wasAwaited,
+        lifecycle_pending: lifecyclePending,
+        awaiting_delivery: turn.awaitingTaskDelivery.size,
+        outstanding_tasks: turn.outstandingTasks.size,
+        final_sequence: turn.nextOutputSequence - 1,
+      })
+      // 取消 / 失败不得被记成一次正常交付：终态原因分开，客户端与回归都能判。
+      if (status === 'cancelled' || status === 'failed') {
+        turn.taskDeliveryOutcome = status
+      } else if (turn.taskDeliveryOutcome === null) {
+        turn.taskDeliveryOutcome = 'completed'
+      }
+      // 生命周期终态还没下行：这一轮什么都不收。等 `task.cancelled/failed`
+      // 走到下面的生命周期分支，把权威状态发给客户端之后再收口。上游若始终
+      // 不发那一帧，仍由原有的 `tool_task_timeout` 静默预算兜底（在飞账没被
+      // 动过，那条兜底依然成立）。
+      if (lifecyclePending) {
+        noteTaskActivity('task_answer_delivered_early')
+        return
+      }
+      noteTurnIdle('task_answer_delivered')
+      maybeEndDeferredTurn()
+    }
+
+    // 挂起的整轮终态只有在「没有在飞任务」且「没有欠交付」时才真正收口。
+    const maybeEndDeferredTurn = () => {
+      if (turn.outstandingTasks.size > 0 || deliveryPending()) return
+      const reason = turn.taskDeliveryOutcome === 'cancelled' ? 'task_cancelled_answer_done'
+        : turn.taskDeliveryOutcome === 'failed' ? 'task_failed_answer_done'
+        : 'task_terminal_audio_done'
+      if (turn.pendingToolTerminal) {
+        return endTurn(reason, turn.pendingToolTerminal.finalSequence)
+      }
+      // 答案语音段一开口，`releaseClosedSegment` 就会作废挂起的候选终态
+      // （ESS-1096），所以交付结束时手上往往只剩一个**停放的答案段落**。
+      // 那就是本回合的终点：上游 `finish()` 要求投影已排空，这个 task 不会
+      // 再有下一段。此时还去等空闲窗口，只会把终态原因退化成 `segment_gap`，
+      // 把「答案已交付」这个正向信号丢掉——而正向信号正是本单要求的
+      //「明确且可测试的顺序」。仍有音频在飞（`pendingDone` / 乱序空洞）时
+      // 不抢：那条路本来就由 `flushDone` 负责。
+      //
+      // `taskDeliveryOutcome !== null` 是这条分支的**前提**，不是修饰：没有
+      // 委派任务的普通多段回合必须继续由 ESS-969 的空闲窗口裁决段落边界，
+      // 否则第一段一停放就会被当成回合终点。
+      if (
+        turn.taskDeliveryOutcome !== null
+        && turn.closedSegment && !turn.pendingDone && turn.reorderBuffer.size === 0
+      ) {
+        endTurn(reason, turn.closedSegment.finalSequence)
+      }
+    }
+
     // The one place a turn ends. `finalSequence` defaults to everything
     // forwarded so far, which is exactly the last segment's endpoint.
     const endTurn = (reason, finalSequence = turn.nextOutputSequence - 1) => {
       if (turn.turnEnded) return
-      if (turn.outstandingTasks.size > 0 && reason !== 'tool_task_timeout') {
+      // ESS-1145: 欠交付与在飞任务一样是「回合还没完」的**否决**证据，而不是
+      // 一个只加宽窗口的旁证——上游已经承诺了那一帧 terminal，等它是有界的。
+      if (
+        (turn.outstandingTasks.size > 0 || deliveryPending())
+        && reason !== 'tool_task_timeout'
+      ) {
         turn.awaitingToolAudioTerminal = false
         clearTimeout(turn.toolAudioTimer)
         turn.toolAudioTimer = null
         turn.pendingToolTerminal = { reason, finalSequence }
         this.log('upstream_turn_terminal_deferred', {
-          ...scopeLog, reason: 'task_in_flight', candidate_reason: reason,
+          ...scopeLog,
+          reason: deliveryPending() ? 'task_answer_pending' : 'task_in_flight',
+          candidate_reason: reason,
           final_sequence: finalSequence, outstanding_tasks: turn.outstandingTasks.size,
+          awaiting_delivery: turn.awaitingTaskDelivery.size,
           ui_state: 'thinking', turn_state: 'busy',
         })
         armTaskTerminalTimer('turn_terminal_deferred')
+        armTaskAnswerTimer('turn_terminal_deferred')
         return
       }
       turn.turnEnded = true
@@ -766,6 +971,8 @@ export class QwenAgentTransport {
       turn.taskTerminalTimer = null
       clearTimeout(turn.toolAudioTimer)
       turn.toolAudioTimer = null
+      clearTimeout(turn.taskAnswerTimer)
+      turn.taskAnswerTimer = null
       turn.closedSegment = null
       clearTimeout(turn.segmentGapTimer)
       turn.segmentGapTimer = null
@@ -778,11 +985,15 @@ export class QwenAgentTransport {
         gap_ms: turn.segmentClosedAt ? Date.now() - turn.segmentClosedAt : null,
         window_ms: turn.segmentGapWindowMs || null,
         outstanding_tasks: turn.outstandingTasks.size,
+        awaiting_delivery: turn.awaitingTaskDelivery.size,
+        delivered_tasks: turn.deliveredTasks.size,
       })
       turn.segmentGapWindowMs = 0
       onEvent({
+        // ESS-1145: `reason` 是加性字段。取消 / 失败不能与正常收口共用一个
+        // 不带信息的终帧——那正是 ESS-1140 里「失败被报成通过」的形状。
         type: 'agent.audio.done', response_id: responseId, final_sequence: finalSequence,
-        segments: turn.segmentsClosed || 1,
+        segments: turn.segmentsClosed || 1, reason,
       })
     }
 
@@ -811,7 +1022,9 @@ export class QwenAgentTransport {
       turn.segmentGapWindowMs = window
       // 起表基准：任务在飞时取「段落收口」与「最近一次任务活动」里更晚的那个。
       // 没有任务在飞时逐字节保持 ESS-990 的老口径（从段落收口起表）。
-      const base = turn.outstandingTasks.size > 0
+      // ESS-1145：欠交付与在飞任务同档——上游正在把答案排进下行，也是「还在
+      // 说话」。
+      const base = (turn.outstandingTasks.size > 0 || deliveryPending())
         ? Math.max(turn.segmentClosedAt, turn.lastTaskActivityAt)
         : turn.segmentClosedAt
       const remaining = Math.max(0, base + window - Date.now())
@@ -847,6 +1060,9 @@ export class QwenAgentTransport {
     const noteTaskActivity = cause => {
       turn.lastTaskActivityAt = Date.now()
       armTaskTerminalTimer(cause)
+      // ESS-1145：交付期间上游每产一帧（答案增量、语音段、任务帧）都续期。
+      // 这条窗口守的是「上游整段哑了」，不是「答案说得久」。
+      armTaskAnswerTimer(cause)
       armSegmentGap('task_activity')
     }
 
@@ -862,11 +1078,15 @@ export class QwenAgentTransport {
     const noteTurnIdle = cause => {
       if (!turn.turnBusy) return
       if (turn.outstandingTasks.size > 0) return
+      // ESS-1145: 欠交付时回合仍然是忙的。放掉 busy 会把停放段落的窗口从
+      // 12 s 收窄回 2.5 s，答案还没开口就先被 `segment_gap` 收口。
+      if (deliveryPending()) return
       turn.turnBusy = false
       this.log('upstream_turn_busy_cleared', {
         ...scopeLog, cause,
         active_announcements: turn.activeAnnouncements.size,
         outstanding_tasks: turn.outstandingTasks.size,
+        awaiting_delivery: turn.awaitingTaskDelivery.size,
       })
       armSegmentGap('turn_busy_cleared')
     }
@@ -1526,13 +1746,34 @@ export class QwenAgentTransport {
             // 增量文本本身不落日志：它是用户可见的答案内容，日志里只留长度。
             delta_length: typeof event.delta === 'string' ? event.delta.length : 0,
           })
+          // ESS-1145：只要上游对这个 task 说过 `task.stream`，它就承诺了会发
+          // 一帧 `category:'terminal'`（`task-stream-protocol.mjs` 的
+          // `finish()` 每个 stream 恰好发一次）。记下这件事，`task.completed`
+          // 才知道自己该不该等交付。没说过的 task 一律走老路径。
+          turn.streamedTasks.add(streamTaskId)
+          while (turn.streamedTasks.size > MAX_TASKS_PER_CONVERSATION) {
+            turn.streamedTasks.delete(turn.streamedTasks.values().next().value)
+          }
+          // ESS-1145：`category:'terminal'` 是**交付**终态——上游只在
+          // taskDone && responseDone 之后发它，也就是答案增量已全部入有序
+          // 下行、语音段已排空之后。生命周期终态仍由
+          // `task.completed/failed/cancelled` 裁决（下面的通用 `task.` 分支），
+          // 这里裁决的是另一件事：答案到齐了没有。ESS-1140 之前这一帧被整个
+          // 丢掉，回合于是在 `task.completed` 那一刻收口，答案永远追不上。
+          if (category === 'terminal') {
+            noteResponseProgress()
+            noteTaskDelivered(streamTaskId, event)
+            return
+          }
           if (category !== 'progress' && category !== 'text') return
           if (TASK_TERMINAL_STATUSES.has(streamStatus)) return
-          // 终态仍然只由 `task.completed/failed/cancelled` 裁决（`category:
-          // 'terminal'` 帧上面已经被过滤掉）：两套终态真相并存，就等于给
-          // 「终态只发一次」开了第二个入口。
-          turn.outstandingTasks.add(streamTaskId)
-          noteTurnBusy('task_in_flight')
+          // 生命周期已终态、正在交付答案的 task 不得被答案增量重新算成「在飞
+          // 任务」——那样 outstandingTasks 会在交付终态之后仍然非空，回合再也
+          // 收不了口。
+          if (!turn.awaitingTaskDelivery.has(streamTaskId)) {
+            turn.outstandingTasks.add(streamTaskId)
+            noteTurnBusy('task_in_flight')
+          }
           noteTaskActivity(`task_stream_${category}`)
           if (category === 'progress') {
             const progress = projectStreamProgress(event)
@@ -1550,6 +1791,30 @@ export class QwenAgentTransport {
             task: { id: streamTaskId, status: streamStatus },
             answer: { delta },
           })
+          return
+        }
+        // ESS-1145：`task.stream.*` 子族（`segment` / `first_audio` / `done` /
+        // `aborted` / `fallback`，上游 `realtime-gateway.mjs` 的投影通知）是
+        // 关于**有序投影**的旁白，不是任务生命周期迁移。它们带**顶层**
+        // `taskId`，所以会掉进下面的通用 `task.` 分支，在那里：
+        //   • `event.type.slice(5)` 变成 `'stream.done'` 这类非枚举状态原样
+        //     下发给客户端；
+        //   • 更要命的是 `task.stream.done` 在任务已经终态之后又把它加回
+        //     `outstandingTasks`——回合从此收不了口。
+        // ESS-1140 那两条时间线因为在这些帧之前就关掉了 socket，没暴露出来；
+        // 本单让回合真的等到交付，它们就成了必经路径。
+        // 它们只做一件事：证明上游还在交付，续期。
+        if (event.type.startsWith('task.stream.')) {
+          const noteTaskId = String(event.taskId ?? event.task?.id ?? '')
+          this.log('upstream_task_stream_note', {
+            ...scopeLog, task_id: noteTaskId || null,
+            note: event.type.slice('task.stream.'.length),
+            streaming_fallback_reason: event.streaming_fallback_reason ?? null,
+            final_sequence: Number.isInteger(event.final_sequence)
+              ? event.final_sequence : null,
+          })
+          noteResponseProgress()
+          noteTaskActivity('task_stream_note')
           return
         }
         // ESS-990 task lifecycle. Real captured frames carry the id on
@@ -1580,12 +1845,37 @@ export class QwenAgentTransport {
               turn.taskIdentity.delete(turn.taskIdentity.keys().next().value)
             }
           }
+          // ESS-1145 复审整改：收口不能在这里发。本分支下面还要把权威的
+          // `agent.task{status}` 帧下发给客户端，而「终态是最后一帧」要求
+          // 那一帧排在 `agent.audio.done` **之前**。ESS-1140 逐帧证据里的
+          // 41579.2 ms done / 41579.3 ms task completed 就是这个倒序。
+          let closeAfterLifecycleFrame = false
           if (terminal) {
             turn.outstandingTasks.delete(id)
-            noteTurnIdle('task_terminal')
-            if (turn.outstandingTasks.size === 0 && turn.pendingToolTerminal) {
-              const candidate = turn.pendingToolTerminal
-              endTurn('task_terminal_audio_done', candidate.finalSequence)
+            // ESS-1145 本单的根因就在这三行原来的写法里：`task.completed`
+            // 被当成「可以收口」，可它只证明后台任务**算完**了。上游随后才把
+            // 最终答案推进有序下行，并在语音排空后发唯一一帧
+            // `task.stream {category:'terminal'}`。ESS-1140 的杭州天气与
+            // Obsidian 两条时间线上，收口领先答案约 0.3 ms，消费端关掉 WSS，
+            // 上游只剩 `socket_not_open`：答案是**确定性**丢失，不是竞态。
+            //
+            // 走过 `task.stream` 契约的 task 因此改为等交付终态；没走契约的
+            // （老上游 / control task / 跨 session）逐字节保持原行为。
+            if (
+              deliveryGateEnabled()
+              && turn.streamedTasks.has(id) && !turn.deliveredTasks.has(id)
+            ) {
+              turn.awaitingTaskDelivery.add(id)
+              this.log('upstream_task_answer_pending', {
+                ...scopeLog, task_id: id, status,
+                outstanding_tasks: turn.outstandingTasks.size,
+                awaiting_delivery: turn.awaitingTaskDelivery.size,
+                final_sequence: turn.nextOutputSequence - 1,
+                ui_state: 'thinking', turn_state: 'busy',
+              })
+              noteTaskActivity('task_lifecycle_terminal')
+            } else {
+              closeAfterLifecycleFrame = true
             }
           } else if (!TASK_NON_LIFECYCLE_EVENTS.has(event.type)) {
             turn.outstandingTasks.add(id)
@@ -1612,6 +1902,11 @@ export class QwenAgentTransport {
             type: 'agent.task', response_id: responseId, task: { id, status },
             ...(progress ? { progress } : {}),
           })
+          // ESS-1145: 权威生命周期终态已经落到下行，现在才谈得上收口。
+          if (closeAfterLifecycleFrame) {
+            noteTurnIdle('task_terminal')
+            maybeEndDeferredTurn()
+          }
           return
         }
         // ESS-1043: qwen `response.done` is the response-level metadata that
@@ -1738,12 +2033,26 @@ export class QwenAgentTransport {
         if ((turn.pendingDone || turn.closedSegment) && turn.reorderBuffer.size === 0) {
           flushDone()
           if (turn.closedSegment) endTurn('upstream_closed', turn.closedSegment.finalSequence)
+          // ESS-1145: 断连撞上「答案还没交付」时，上面那次 `endTurn` 会被交付
+          // 门禁挂起，而挂起的候选终态随 turn 一起被丢掉——客户端一帧终态都
+          // 收不到，只能干等自己的硬超时。断连必须有自己的终态，不能沉默，
+          // 更不能借正常 `audio.done` 把「答案丢了」报成通过。
+          if (!turn.turnEnded && deliveryPending()) {
+            this.log('upstream_closed_task_answer_undelivered', {
+              ...scopeLog, code,
+              awaiting_delivery: turn.awaitingTaskDelivery.size,
+              task_id: turn.awaitingTaskDelivery.values().next().value ?? null,
+            })
+            return fail('ERR_UPSTREAM_DISCONNECTED',
+              `code=${code} reason=${String(reason)} task_answer_undelivered`)
+          }
           turn.terminal = true
           clearTimeout(turn.connectTimer)
           clearTimeout(turn.responseTimer)
           clearTimeout(turn.segmentGapTimer)
           clearTimeout(turn.taskTerminalTimer)
           clearTimeout(turn.toolAudioTimer)
+          clearTimeout(turn.taskAnswerTimer)
           this.#release(turn)
           return
         }
@@ -1790,6 +2099,7 @@ export class QwenAgentTransport {
         clearTimeout(turn.segmentGapTimer)
         clearTimeout(turn.taskTerminalTimer)
         clearTimeout(turn.toolAudioTimer)
+        clearTimeout(turn.taskAnswerTimer)
         turn.ws?.close()
         this.#release(turn)
       },
@@ -1807,6 +2117,7 @@ export class QwenAgentTransport {
         clearTimeout(turn.segmentGapTimer)
         clearTimeout(turn.taskTerminalTimer)
         clearTimeout(turn.toolAudioTimer)
+        clearTimeout(turn.taskAnswerTimer)
         if (turn.ws?.readyState === WebSocket.OPEN) {
           turn.ws.send(JSON.stringify({ type: 'mute' }))
         }
