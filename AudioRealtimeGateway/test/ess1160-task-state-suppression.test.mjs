@@ -240,7 +240,9 @@ describe('ESS-1160 · 抑制不吃裁决面', () => {
     }
     const terminal = taskState(h.sent).filter(f => f.status === 'completed')
     assert.equal(terminal.length, 500, '每个终态都必须下发——客户端靠它清未结集合')
-    assert.equal(h.session._taskStateSlots.size, 0, '终态发完槽必须归零')
+    assert.equal(h.session._taskStateSlots.size, 0, '终态发完活跃槽必须归零')
+    assert.equal(h.session._taskStateSettled.size, h.session.maxTaskStateTombstones,
+      '墓碑表按 LRU 有界，不随任务数无限增长')
     assert.equal(h.sent.some(f => f.type === 'error'), false)
   })
 
@@ -257,6 +259,70 @@ describe('ESS-1160 · 抑制不吃裁决面', () => {
     assert.ok(frames.some(f => f.task_id === 'task-0' && f.status === 'completed'))
     assert.ok(frames.some(f => f.task_id === 'task-new'), '释放出来的格子必须能被新 task 用上')
     assert.equal(h.sent.some(f => f.type === 'error'), false)
+  })
+
+  // 三轮复审取证：终态下发后直接删掉唯一那份记录，重复的同一条终态又成了
+  // `prior === null` 的「首见」——同一个 `task-0/completed` 连发 100 次实测
+  // `emitted=100 suppressed=0`。释放活跃槽不等于遗忘，要留一块终态墓碑。
+  it('同一 task 连续 100 个 completed 只下发首帧，活跃槽归零', () => {
+    const h = harness()
+    for (let i = 0; i < 100; i += 1) {
+      h.task({ id: 'task-0', status: 'completed' })
+      h.advance(7)                                   // 700ms < 心跳间隔
+    }
+    const frames = taskState(h.sent)
+    assert.equal(frames.length, 1, '幂等的重复终态只应下发第一条')
+    assert.equal(frames[0].status, 'completed')
+    assert.equal(h.session.taskStateSuppressedSameText, 99)
+    assert.equal(h.session._taskStateSlots.size, 0, '终态必须释放活跃槽')
+    assert.equal(h.session._taskStateSettled.size, 1, '并留下一块墓碑')
+  })
+
+  it('重复终态跨心跳间隔时按心跳策略有界下发', () => {
+    const h = harness()
+    for (let i = 0; i < 100; i += 1) {
+      h.task({ id: 'task-0', status: 'completed' })
+      h.advance(100)                                 // 跨 10s
+    }
+    // 首帧 + 每 2s 一次心跳 = 5 帧，而不是 100 帧。与展示帧同一条心跳规则，
+    // 不为终态另开特例。
+    assert.equal(taskState(h.sent).length, 5)
+    assert.equal(h.session.taskStateSuppressedSameText, 95)
+  })
+
+  it('重复 tool_call_resolved 同样去重（无 taskId 的闩锁槽）', () => {
+    const h = harness()
+    for (let i = 0; i < 100; i += 1) { h.latch('tool_call_resolved'); h.advance(7) }
+    assert.equal(taskState(h.sent).length, 1)
+    assert.equal(h.session.taskStateSuppressedSameText, 99)
+  })
+
+  it('已收口的 task 真复活时销毁墓碑、重开活跃槽', () => {
+    const h = harness()
+    h.task({ id: 'task-0', status: 'running', text: '正在整理结果', category: 'text' })
+    h.advance(5)
+    h.task({ id: 'task-0', status: 'completed' })
+    h.advance(5)
+    h.task({ id: 'task-0', status: 'completed' })     // 幂等重复 → 抑制
+    h.advance(5)
+    h.task({ id: 'task-0', status: 'running', text: '正在整理结果', category: 'text' })
+    assert.deepEqual(taskState(h.sent).map(f => f.status),
+      ['running', 'completed', 'running'], '收口后又开始推进是货真价实的新信息')
+    assert.equal(h.session._taskStateSlots.size, 1)
+    assert.equal(h.session._taskStateSettled.size, 0)
+  })
+
+  it('墓碑按 LRU 有界，淘汰不丢裁决面（真终态早已下发）', () => {
+    const h = harness()
+    const cap = h.session.maxTaskStateTombstones
+    for (let i = 0; i < cap + 50; i += 1) {
+      h.task({ id: `task-${i}`, status: 'completed' })
+      h.advance(3)
+    }
+    assert.equal(h.session._taskStateSettled.size, cap, '墓碑表必须有界')
+    assert.equal(h.session._taskStateSlots.size, 0)
+    // 每个 task 的**真**终态都下发过了，墓碑淘汰只影响重复去重，不影响收口。
+    assert.equal(taskState(h.sent).filter(f => f.status === 'completed').length, cap + 50)
   })
 
   it('闩锁槽由 tool_call_resolved 释放，下一轮 pending 重新算首见', () => {

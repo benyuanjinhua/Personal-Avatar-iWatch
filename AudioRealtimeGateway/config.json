@@ -34,6 +34,7 @@
   "max_task_state_frames_per_second": 10,
   "task_state_snapshot_window_ms": 5000,
   "max_task_state_slots": 64,
+  "max_task_state_tombstones": 256,
   "max_downlink_buffered_bytes": 4194304,
   "downlink_backpressure_warn_bytes": 1048576,
   "downlink_close_grace_ms": 5000,

@@ -85,6 +85,8 @@ export class RealtimeSession {
     taskStateSnapshotWindowMs = 5_000,
     // 同时可跟踪的**未收口** task 数上限。超过即 fail-closed，见下方槽表注释。
     maxTaskStateSlots = 64,
+    // 终态墓碑上限（只用于重复终态去重，可安全 LRU 淘汰）。
+    maxTaskStateTombstones = 256,
     now = () => Date.now(),
     setTimer = (fn, ms) => setTimeout(fn, ms),
     clearTimer = t => clearTimeout(t),
@@ -192,8 +194,20 @@ export class RealtimeSession {
     // rateLimited=0`。所以活跃 task 的裁决状态一格都不能被静默丢掉；容量真的
     // 用尽时 fail-closed（`ERR_TASK_STATE_SLOTS_EXHAUSTED`，retriable），把
     // 「上游同时挂着 64 个未收口任务」这件事变成可判定的错误，而不是无声降级。
+    //
+    // 释放不等于遗忘（ESS-1160 三轮复审取证）：`5814fa8` 在终态下发后直接删掉
+    // 唯一那份记录，于是**重复的同一条终态**又成了 `prior === null` 的「首见」，
+    // 逐帧放行——同一个 `task-0/completed` 连发 100 次实测 `emitted=100
+    // suppressed=0`。本单根因就是上游重复投递，终态一样会重复。
+    //
+    // 所以分两张表：`_taskStateSlots` 是**未收口** task 的活跃槽（占容量、
+    // 只由终态释放、绝不淘汰）；`_taskStateSettled` 是终态**墓碑**，只用于
+    // 重复终态去重，可以按 LRU 淘汰——墓碑被淘汰不丢裁决面，因为那条真正的
+    // 终态早已实际下发过了，客户端的未结集合在第一条就已清空。
     this._taskStateSlots = new Map()
+    this._taskStateSettled = new Map()
     this.maxTaskStateSlots = maxTaskStateSlots
+    this.maxTaskStateTombstones = maxTaskStateTombstones
     this.taskStateSlotsExhausted = 0
     this.taskStateFrames = 0
     this.taskStateSuppressedSameText = 0
@@ -298,6 +312,7 @@ export class RealtimeSession {
       task_state_suppressed_same_text: this.taskStateSuppressedSameText,
       task_state_rate_limited: this.taskStateRateLimited,
       task_state_slots_open: this._taskStateSlots.size,
+      task_state_slots_settled: this._taskStateSettled.size,
       task_state_slots_exhausted: this.taskStateSlotsExhausted,
     })
   }
@@ -603,7 +618,9 @@ export class RealtimeSession {
     // 拿全局上一帧当基准会被两个并行 task 的交替上报整个绕开——每帧都「换了
     // task_id」，于是每帧都伪装成跃迁（复审实测 1 秒 100 帧全部放行）。
     const slot = taskKey ?? '\u0000latch'
-    const prior = this._taskStateSlots.get(slot) ?? null
+    // 先查活跃槽，再查终态墓碑。墓碑命中意味着「这个 task 已经收口过」——
+    // 逐字相同的重复终态因此走同文抑制，而不是又被当成首见。
+    const prior = this._taskStateSlots.get(slot) ?? this._taskStateSettled.get(slot) ?? null
     const displayKey = `${statusText}\u0000${progressText ?? ''}\u0000${progressCategory ?? ''}`
     // 终态帧不需要占槽——它是这个 task 的最后一帧，发完即释放。
     const releasesSlot = TERMINAL_STATUSES.has(statusText.toLowerCase())
@@ -611,7 +628,7 @@ export class RealtimeSession {
     // 容量硬闸：只有**首见且非终态**的帧要新开一格。开不出来时不能继续把每帧
     // 当首见放行（那正是二轮复审复现的绕过面），只能显式失败。已在册的 task
     // 与任何终态帧都不受这道闸影响——终态还必须能进来释放它自己那一格。
-    if (prior === null && !releasesSlot
+    if (!releasesSlot && !this._taskStateSlots.has(slot)
       && this._taskStateSlots.size >= this.maxTaskStateSlots) {
       this.taskStateSlotsExhausted += 1
       this.log('task_state_slots_exhausted', {
@@ -722,11 +739,21 @@ export class RealtimeSession {
     this._rollTaskStateWindow(at)
     this._taskStateInRateWindow += 1
     this.taskStateFrames += 1
-    // 终态实际下发之后才释放槽：一格只被它自己的收口回收，不被容量压力挤掉。
-    // 释放后同名 task 再来会重新算「首见」——那是正确的，一个已收口的 task
-    // 又开始报进展，本来就是新信息。
-    if (releasesSlot) this._taskStateSlots.delete(slot)
-    else this._taskStateSlots.set(slot, { statusText, displayKey, sentAt: at })
+    // 终态实际下发之后才释放活跃槽：一格只被它自己的收口回收，不被容量压力
+    // 挤掉。释放的同时留一块**墓碑**，重复终态因此走同文抑制而不是「首见」。
+    // 已收口的 task 又报出**非终态**（真的复活了）则销毁墓碑、重开活跃槽——
+    // 那是货真价实的新信息。
+    if (releasesSlot) {
+      this._taskStateSlots.delete(slot)
+      this._taskStateSettled.delete(slot)   // 重新 set 以移到 LRU 末尾
+      this._taskStateSettled.set(slot, { statusText, displayKey, sentAt: at })
+      while (this._taskStateSettled.size > this.maxTaskStateTombstones) {
+        this._taskStateSettled.delete(this._taskStateSettled.keys().next().value)
+      }
+    } else {
+      this._taskStateSettled.delete(slot)
+      this._taskStateSlots.set(slot, { statusText, displayKey, sentAt: at })
+    }
     this._taskStateEmitTimes.push(at)
     this._taskStateFramesSince(at)
   }

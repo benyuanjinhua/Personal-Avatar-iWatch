@@ -243,14 +243,29 @@ ESS-1100 的「同文去抖 + 0.8 s 节流」在客户端 `Shared/ToolProgressNa
 「换了 `task_id`」，于是每帧都伪装成跃迁，抑制与限速双双落空（ESS-1160 复审实测：
 A/B 交替刷同文，1 秒 100 帧 `emitted=100 rateLimited=0`）。
 
-**槽只由终态释放，绝不按容量做 LRU 淘汰。** 淘汰过的活跃 task 下次到来时又被当成
-「首见」无条件放行，绕过面原样回来（二轮复审实测：65 个活跃 task 轮转 130 次，
+**活跃槽只由终态释放，绝不按容量做 LRU 淘汰。** 淘汰过的活跃 task 下次到来时又被
+当成「首见」无条件放行，绕过面原样回来（二轮复审实测：65 个活跃 task 轮转 130 次，
 `emitted=130 suppressed=0 rateLimited=0`）。终态帧本身不占槽——它是这个 task 的
 最后一帧，发完即释放，因此顺序任务再多也不会耗尽容量。未收口 task 数超过
 `max_task_state_slots`（默认 64）时**fail-closed**：下发
 `ERR_TASK_STATE_SLOTS_EXHAUSTED`（`retriable: true`）并落
 `task_state_slots_exhausted`，把「上游同时挂着 64 个未收口任务」变成可判定的错误，
 而不是无声降级成逐帧放行。
+
+**释放不等于遗忘：终态留墓碑。** 只删记录的话，重复的同一条终态又成了「首见」并
+逐帧放行（三轮复审实测：同一个 `task-0/completed` 连发 100 次 → `emitted=100
+suppressed=0`）。本单根因就是上游重复投递，终态一样会重复。所以记录分两张表：
+
+| 表 | 内容 | 容量策略 |
+|---|---|---|
+| 活跃槽 | **未收口** task 的上一帧 | `max_task_state_slots`（64），只由终态释放，**绝不淘汰**，满即 fail-closed |
+| 终态墓碑 | 已收口 task 的终态帧 | `max_task_state_tombstones`（256），**可按 LRU 淘汰** |
+
+墓碑可以淘汰而活跃槽不行，是因为两者丢的东西不同：墓碑丢的只是「重复终态的去重
+能力」，那条**真**终态早已实际下发、客户端的未结集合在第一条就已清空；活跃槽丢的
+是还在生效的裁决状态。重复终态因此走同文抑制（首帧 + 心跳，与展示帧同一条规则，
+不为终态另开特例）；已收口的 task 再报**非终态**则销毁墓碑、重开活跃槽——那是货
+真价实的复活，是新信息。无 `task_id` 的 `tool_call_resolved` 走同一套机制。
 
 第 3 层之上再加一道**背压护栏**：`max_task_state_frames_per_second`（默认 10）。
 它是**展示帧的每秒预算，不是会话总帧率上限**——第 1、2 层只计入窗口、不受它拦截。
@@ -285,7 +300,7 @@ A/B 交替刷同文，1 秒 100 帧 `emitted=100 rateLimited=0`）。
 | `downlink_task_state` | `suppressed_same_text`（到本帧为止累计抑制数）、`same_text_heartbeat`（本帧是否同文心跳补发） |
 | `task_state_rate_limited` | `limit_per_second` / `window_ms` / `frames_in_window` / `dropped_total`，**每个窗口只落一行** |
 | `task_state_slots_exhausted` | `task_id` / `status` / `slots` / `max_slots`，随后 fail-closed |
-| `session_ended` | `task_state_frames`、`task_state_frames_last_window` + `task_state_snapshot_window_ms`（断线前这段时间实际下发了多少帧）、`task_state_suppressed_same_text`、`task_state_rate_limited`、`task_state_slots_open`、`task_state_slots_exhausted` |
+| `session_ended` | `task_state_frames`、`task_state_frames_last_window` + `task_state_snapshot_window_ms`（断线前这段时间实际下发了多少帧）、`task_state_suppressed_same_text`、`task_state_rate_limited`、`task_state_slots_open`、`task_state_slots_settled`、`task_state_slots_exhausted` |
 
 Server-initiated `ping` frames from `ws.ping()` are honoured but the
 protocol also supports the JSON `ping`/`pong` pair for platforms that can't
