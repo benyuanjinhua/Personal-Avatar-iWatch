@@ -395,3 +395,39 @@ test('ESS-1145 · 交付未完成时上游断连：显式断连终态，不沉�
       && l.task_id === taskId))
   } finally { turn.close() }
 })
+
+test('ESS-1145 · 交付门禁可关：taskAnswerWindowMs<=0 退回旧收口时序，不是永久挂起', async () => {
+  // 毕玄复审第 2 点：我上一版把 `taskAnswerWindowMs = 0` 说成软回滚，但当时
+  // 它只是不武装计时器，门禁照拦——交付终态缺失就是永久挂起。这条用例钉住
+  // 现在的语义：关掉门禁 ⇒ 逐字节回到旧时序（`task.completed` 直接收口），
+  // 而且**在没有交付终态的情况下**也能收口，不挂起。
+  const taskId = 'work_gate_off'
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') send(ws, { type: 'voice.ready' })
+    if (message.type !== 'audio.commit') return
+    delegationPrologue(ws, taskId)
+    setTimeout(() => {
+      // 故意不发 `category:'terminal'`：门禁开着时这会走交付超时，
+      // 关掉后必须按旧时序正常收口。
+      send(ws, { type: 'task.completed', task: { id: taskId, status: 'completed' } })
+    }, 60)
+  })
+  const { events, logs, turn } = harness(url, { taskAnswerWindowMs: 0 })
+  turn.commit()
+  try {
+    await waitFor(() => events.some(e => e.type === 'agent.audio.done'))
+    await new Promise(resolve => setTimeout(resolve, 120))
+    assert.equal(events.filter(e => e.type === 'agent.error').length, 0,
+      '关掉门禁后不得再走交付超时失败')
+    assert.equal(events.filter(e => e.type === 'agent.audio.done').length, 1)
+    assert.ok(!logs.some(l => l.evt === 'upstream_task_answer_pending'),
+      '门禁关掉时账本根本不建')
+    assert.ok(!logs.some(l => l.evt === 'upstream_task_answer_window_armed'))
+    // 旧时序也必须守住「权威终态先于收口」——那一处整改与门禁无关。
+    const lifecycle = events.filter(e => e.type === 'agent.task'
+      && e.task?.id === taskId && e.task?.status === 'completed')
+    const doneAt = events.findIndex(e => e.type === 'agent.audio.done')
+    assert.equal(lifecycle.length, 1)
+    assert.ok(events.indexOf(lifecycle[0]) < doneAt)
+  } finally { turn.close() }
+})

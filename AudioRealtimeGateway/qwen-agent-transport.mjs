@@ -200,6 +200,9 @@ export class QwenAgentTransport {
     // 不用正常 `audio.done` 掩盖「答案没到」。取 30 s 与 `toolCallWindowMs`
     // 同量级：都在客户端 `SessionController.toolTurnHardTimeoutSeconds = 180`
     // 之内，且实测最长的答案交付（Obsidian 那条）首帧在 1 s 内就到。
+    //
+    // `<= 0` 是**关掉整条交付门禁**的应急拉闸（见下方 `deliveryGateEnabled`），
+    // 不是「不设超时」。
     taskAnswerWindowMs = 30_000,
     takeover = true,
     // ESS-978: our own identity on the upstream. The label embeds the pid so
@@ -837,11 +840,27 @@ export class QwenAgentTransport {
     // 一帧 `category:'terminal'` 要来。
     const deliveryPending = () => turn.awaitingTaskDelivery.size > 0
 
+    // ESS-1145 复审整改第 2 点（毕玄 2026-09-05）：我上一版把
+    // 「`taskAnswerWindowMs = 0`」说成软回滚，那是错的 —— 当时 0 只是让
+    // `armTaskAnswerTimer()` 不武装计时器，`awaitingTaskDelivery` 门禁照常拦，
+    // 于是交付终态一旦缺失就是**永久挂起**：比回滚前更坏的故障，不是回滚。
+    //
+    // 现在这个值有且只有一个明确语义：`<= 0` 关掉整条交付门禁，账本根本不建，
+    // 逐字节回到本单之前的收口时序。代价也说清楚：那等于重新暴露 ESS-1140 的
+    // 丢答案面，所以它是线上应急拉闸，不是可以长期停留的状态；长期回滚仍然
+    // 只有 revert。`test/ess1145 · 交付门禁可关` 钉住「关掉后不挂起、且退回
+    // 旧时序」，因为一个没被测过的开关在事故里不能用。
+    const deliveryGateEnabled = () => this.taskAnswerWindowMs > 0
+
     // 交付终态到达：答案（`category:'text'` 增量）此刻已经全部排进有序下行，
     // 语音段也已排空（上游 `finish()` 要求 taskDone && responseDone）。这是
     // 唯一可以收口的时刻。
     const noteTaskDelivered = (id, frame) => {
       const status = String(frame?.status ?? '') || null
+      if (!deliveryGateEnabled()) {
+        this.log('upstream_task_answer_gate_disabled', { ...scopeLog, task_id: id, status })
+        return
+      }
       const wasAwaited = turn.awaitingTaskDelivery.delete(id)
       turn.deliveredTasks.add(id)
       while (turn.deliveredTasks.size > MAX_TASKS_PER_CONVERSATION) {
@@ -1842,7 +1861,10 @@ export class QwenAgentTransport {
             //
             // 走过 `task.stream` 契约的 task 因此改为等交付终态；没走契约的
             // （老上游 / control task / 跨 session）逐字节保持原行为。
-            if (turn.streamedTasks.has(id) && !turn.deliveredTasks.has(id)) {
+            if (
+              deliveryGateEnabled()
+              && turn.streamedTasks.has(id) && !turn.deliveredTasks.has(id)
+            ) {
               turn.awaitingTaskDelivery.add(id)
               this.log('upstream_task_answer_pending', {
                 ...scopeLog, task_id: id, status,
