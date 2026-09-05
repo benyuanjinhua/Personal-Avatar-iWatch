@@ -107,6 +107,134 @@ final class PhoneRealtimeSession {
         }
     }
 
+    // MARK: - ESS-1159 播放排空屏障（复审阻断 1）
+
+    /// 已经开始、还没播完的 `response_id`。
+    ///
+    /// 由 Watch 的 `playback.started` / `playback.ended` 回执独占喂养。它回答
+    /// 收口三条件里的第三条：**播放队列排空了吗**。放在会话层是因为回执正是
+    /// 在这里落地（`forward` 的 `.playbackStarted/.playbackEnded` 分支）。
+    private(set) var playbackInFlight: Set<String> = []
+
+    /// 回合终态（`audio.done`）已经到过。屏障的第二条件。
+    private var sawTurnTerminalForDeferredClose = false
+
+    /// 排空屏障的兜底计时器是否已武装。与 `deferredCloseRetryArmed` 一样，
+    /// **任何时刻至多一支**——否则每一帧回执都会再武装一支，旧的仍会到点。
+    private var playbackDrainCapArmed = false
+
+    /// 首帧渲染回执的宽限：`audio.done` 到达时若还没有任何 `playback.started`，
+    /// 给 WCSession 那一跳一点时间把回执送上来，再决定收口。
+    ///
+    /// 取 2s，与 Watch 侧 `WatchRealtimeMediaAdapter.doneBarrierTimeoutSeconds`
+    /// 同值——它量的是同一件事：一帧本该已经在路上的消息还要多久才算不来了。
+    /// 不取更大值：没有音频的回合（纯错误终态）不该为一个不会到来的回执白等。
+    static let deferredClosePlaybackReceiptGraceSeconds: TimeInterval = 2.0
+
+    /// 播放真的在跑时的排空上限。
+    ///
+    /// 直接复用 `RealtimeSocketLifetimePolicy.absoluteHoldCapMs`（180s，与
+    /// `SessionController.toolTurnHardTimeoutSeconds` 同源），**不新造第二个
+    /// 数字**：这条 socket 无论因为什么原因被保住，天花板都是同一个。
+    static let deferredClosePlaybackDrainCapSeconds: TimeInterval =
+        TimeInterval(RealtimeSocketLifetimePolicy.absoluteHoldCapMs) / 1000
+
+    /// 排空屏障计时器接缝。生产用 `Task.sleep`；测试注入以零睡眠驱动。
+    var schedulePlaybackDrainCap: (TimeInterval, @escaping @MainActor () -> Void) -> Void = {
+        seconds, fire in
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+            fire()
+        }
+    }
+
+    /// ESS-1159：`stream.fallback` 的动因映射。
+    ///
+    /// 归类**只看帧上的结构化字段**，不解析 `reason` 字符串。字段缺席（老 Watch
+    /// 进程）时按可抢占处理，即本单之前的行为——理由见
+    /// `RealtimeUplinkFallbackDescriptor.kind` 的注释。
+    static func closeCause(
+        for descriptor: RealtimeUplinkFallbackDescriptor
+    ) -> RealtimeSocketCloseCause {
+        switch descriptor.kind {
+        case .uplinkFailure: return .uplinkFallback
+        case .userCancelled, nil: return .userExit
+        }
+    }
+
+    /// 一次播放回执落地。
+    private func notePlaybackReceipt(kind: RealtimeUplinkKind, responseId: String) {
+        switch kind {
+        case .playbackStarted:
+            playbackInFlight.insert(responseId)
+        case .playbackEnded:
+            playbackInFlight.remove(responseId)
+            // 排空的那一刻就是屏障第三条件成立的那一刻——立刻重问，而不是
+            // 干等一个计时器周期。前两条件不成立时 `retryDeferredClose`
+            // 自己会再挡回去。
+            if deferredClose != nil, sawTurnTerminalForDeferredClose, playbackInFlight.isEmpty {
+                retryDeferredClose(trigger: "playback_drained")
+            }
+        default:
+            break
+        }
+    }
+
+    /// 这次重试要不要被排空屏障挡下。`nil` = 放行。
+    ///
+    /// 只挡**回合终态**触发的那一次快路径；两支兜底计时器
+    /// （`playback_receipt_grace` / `playback_drain_cap`）和上游静默重试
+    /// （`retry_timer`）一律放行，否则「保住 socket」会变成永久泄漏。
+    private func playbackDrainGate(
+        trigger: String
+    ) -> (reason: String, phase: String, capSeconds: TimeInterval)? {
+        switch trigger {
+        case "audio_done":
+            // 终态刚到。播放已经在跑 ⇒ 等排空；还没跑 ⇒ 给首帧回执一点宽限。
+            guard sawTurnTerminalForDeferredClose else { return nil }
+            if !playbackInFlight.isEmpty {
+                return ("playback_in_flight", "playback_drain_cap",
+                        Self.deferredClosePlaybackDrainCapSeconds)
+            }
+            return ("awaiting_first_receipt", "playback_receipt_grace",
+                    Self.deferredClosePlaybackReceiptGraceSeconds)
+        case "playback_receipt_grace":
+            // 宽限到点。这段时间里播放**真的**开始了就升级成排空上限继续等；
+            // 一帧回执都没来，就认账「这一轮没有音频要放」，照常收口。
+            guard !playbackInFlight.isEmpty else { return nil }
+            return ("playback_in_flight", "playback_drain_cap",
+                    Self.deferredClosePlaybackDrainCapSeconds)
+        default:
+            // `playback_drained` / `playback_drain_cap` / `retry_timer` 一律放行。
+            // 少了这一条，「保住 socket」就会变成永久泄漏。
+            return nil
+        }
+    }
+
+    private func armPlaybackDrainCap(seconds: TimeInterval, phase: String) {
+        guard !playbackDrainCapArmed else { return }
+        playbackDrainCapArmed = true
+        schedulePlaybackDrainCap(seconds) { [weak self] in
+            guard let self else { return }
+            // 与 `deferredCloseRetryArmed` 同一条纪律：标志只由计时器回调复位，
+            // 这样任何时刻至多一支在跑，宽限→排空上限的升级也才武装得进来。
+            self.playbackDrainCapArmed = false
+            guard self.deferredClose != nil else { return }
+            PhoneAgentClientLog.info(
+                module: "phone_session", event: "realtime_playback_drain_timer_fired",
+                requestId: Self.turnIdentity(of: self.state)?.requestId ?? "",
+                sessionId: Self.turnIdentity(of: self.state)?.sessionId ?? "",
+                detail: "phase=\(phase) playback_in_flight=\(self.playbackInFlight.count)"
+            )
+            self.retryDeferredClose(trigger: phase)
+        }
+    }
+
+    private func cancelPlaybackDrainGate() {
+        sawTurnTerminalForDeferredClose = false
+        playbackInFlight.removeAll(keepingCapacity: false)
+    }
+
     init(transportFactory: @escaping (_ requestId: String, _ sessionId: String) -> Transport?) {
         self.transportFactory = transportFactory
     }
@@ -236,6 +364,11 @@ final class PhoneRealtimeSession {
                 completion?(false)
                 return
             }
+            // ESS-1159 复审整改（毕玄阻断 1）：播放回执参与收口屏障。
+            // 整改前这两个回执只被转发和记日志，`retryDeferredClose` 在
+            // `audio.done` 那一刻就关掉了 WSS——「播放队列完成后才收口」这条
+            // 门禁根本没有实现点。
+            notePlaybackReceipt(kind: envelope.kind, responseId: receipt.responseId)
         case .fallback:
             guard let descriptor = envelope.fallback else { return }
             // ESS-1159：Watch 的快速上行通道死了 **≠** 这条 WSS 死了。
@@ -259,11 +392,23 @@ final class PhoneRealtimeSession {
             // 上行语义一个字未改：完整文件回退走的是另一条链路
             // （`fullFileFallback`），与这条 socket 的存亡无关，因此无论
             // 裁决如何都照常回 `true`。
-            guard closeCurrentTransport(cause: .uplinkFallback, reason: descriptor.reason) else {
+            //
+            // ESS-1159 复审整改（毕玄阻断 2）：**动因由帧上的结构化归类决定，
+            // 不是所有 `stream.fallback` 都 hold**。
+            //
+            // `RealtimeUplinkStream.FallbackReason.cancelled` 的文档口径是
+            // 「user cancel / new turn / lifecycle switch」——那是用户意图，
+            // 必须当场收口；把它一并 hold 到终态 / 30s 静默 / 180s 上限，
+            // 等于用「保住答案」去劫持用户，正是本单要求 2 禁止的形状。
+            // 归类走 `RealtimeUplinkFallbackKind`（Watch 侧由
+            // `FallbackReason.wireKind` 产出），不解析 reason 字符串。
+            let cause = Self.closeCause(for: descriptor)
+            guard closeCurrentTransport(cause: cause, reason: descriptor.reason) else {
                 PhoneAgentClientLog.info(
                     module: "phone_session", event: "realtime_uplink_fallback_deferred",
                     requestId: descriptor.requestId, sessionId: descriptor.sessionId,
-                    detail: "reason=\(descriptor.reason) cause=uplink_fallback "
+                    detail: "reason=\(descriptor.reason) cause=\(cause.rawValue) "
+                        + "kind=\(descriptor.kind?.rawValue ?? "absent") "
                         + "retained=transport|state|pending_downlink "
                         + "pending=\(pendingDownlink.pendingCount)"
                 )
@@ -357,6 +502,8 @@ final class PhoneRealtimeSession {
         }
         transition(to: .cancelled)
         currentTransport = nil
+        // ESS-1159：这一轮真的收了，播放屏障的两条件随本轮一起作废。
+        cancelPlaybackDrainGate()
         // ESS-1139 第三轮复审整改（毕玄 2026-09-05）：**收口不清缓冲**。
         //
         // 这里原先无条件 `pendingDownlink.discardAll()`，是一次确定性的数据丢失：
@@ -416,8 +563,28 @@ final class PhoneRealtimeSession {
         guard let pending = deferredClose else { return }
         guard currentTransport != nil else {
             deferredClose = nil
+            cancelPlaybackDrainGate()
             return
         }
+        // ESS-1159 复审整改（阻断 1）：**三条件屏障**。业务终态（账本无未结
+        // 任务，由策略裁决）+ 唯一最终 `audio.done`（本方法的 `audio_done`
+        // 触发点）+ **播放队列完成**，三者齐了才收口。第三条以前完全缺席。
+        //
+        // 两条兜底计时器把它限死，socket 不会因为一个永远不到的回执而泄漏：
+        // 回执宽限（首帧渲染回执还在 WCSession 路上）与排空上限。
+        if let gate = playbackDrainGate(trigger: trigger) {
+            PhoneAgentClientLog.info(
+                module: "phone_session", event: "realtime_deferred_close_awaiting_playback",
+                requestId: Self.turnIdentity(of: state)?.requestId ?? "",
+                sessionId: Self.turnIdentity(of: state)?.sessionId ?? "",
+                detail: "trigger=\(trigger) gate=\(gate.reason) "
+                    + "playback_in_flight=\(playbackInFlight.count) "
+                    + "cap_s=\(Int(gate.capSeconds))"
+            )
+            armPlaybackDrainCap(seconds: gate.capSeconds, phase: gate.phase)
+            return
+        }
+        cancelPlaybackDrainGate()
         PhoneAgentClientLog.info(
             module: "phone_session", event: "realtime_deferred_close_retry",
             requestId: Self.turnIdentity(of: state)?.requestId ?? "",
@@ -530,6 +697,8 @@ final class PhoneRealtimeSession {
         // 终态之后再问就安全了：此时既没有未结任务、上游也说完了。仍在跑的
         // 情况（阶段播报的终态）策略会照常 hold，由计时器继续兜底。
         if deferredClose != nil, envelope.kind == .audioDone {
+            // ESS-1159 复审整改（阻断 1）：终态先入账，屏障才看得见它。
+            sawTurnTerminalForDeferredClose = true
             retryDeferredClose(trigger: "audio_done")
         }
     }

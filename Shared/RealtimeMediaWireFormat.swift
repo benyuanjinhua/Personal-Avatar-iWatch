@@ -224,10 +224,42 @@ struct RealtimeBargeInRequest: Codable, Sendable, Equatable {
     }
 }
 
+/// ESS-1159 复审整改（毕玄 2026-09-05 阻断 2）：`stream.fallback` 的**结构化
+/// 归类**。
+///
+/// 阻断原文：`RealtimeUplinkStream.FallbackReason.cancelled` 明确用于
+/// 「user cancel / new turn / lifecycle switch」，它和 `.transportFailed` /
+/// `.backpressure` 一类**纯上行故障**共用同一个 `stream.fallback` 信封；
+/// iPhone 若一律按 `.uplinkFallback` 裁决，用户明确退出/新回合在任务在飞时
+/// 也会被 hold 到终态 / 30s 静默 / 180s 上限——直接违反本单要求 2
+/// 「错误、取消、用户主动打断使用独立路径」。
+///
+/// 所以归类必须**上线**，而不是让 iPhone 去解析 `reason` 字符串猜：调用点
+/// 各写各的措辞，判定就会随一次手滑漂移（同 `RealtimeSocketCloseCause` 当初
+/// 不用字符串的理由）。
+enum RealtimeUplinkFallbackKind: String, Codable, Sendable, Equatable, CaseIterable {
+    /// 用户意图：显式取消、开了新一轮、会话生命周期切换
+    /// （`RealtimeUplinkStream.markCancelled()`）。**压过在飞的上游工作**。
+    case userCancelled = "user_cancelled"
+    /// 纯上行故障：录音器死了、WCSession 送不出去、没采到音频、上行背压、
+    /// 序号溢出、载荷非法。它只说明 **Watch↔iPhone** 那一跳断了，
+    /// iPhone↔网关那条 WSS 与上游任务都还活着 —— **不得**压过在飞工作。
+    case uplinkFailure = "uplink_failure"
+}
+
 struct RealtimeUplinkFallbackDescriptor: Codable, Sendable, Equatable {
     let requestId: String
     let sessionId: String
     let reason: String
+    /// ESS-1159：这次回退的**结构化归类**。见 `RealtimeUplinkFallbackKind`。
+    ///
+    /// 可选是为了向后兼容老 Watch 进程。缺席时按 `.userCancelled`（可抢占）
+    /// 处理，理由与 ESS-1139 的 `upstream_work_outstanding` 一致：字段缺席
+    /// 就退回本单之前的行为（当时这条分支固定按 `.transportFailure` 抢占），
+    /// 而不是替一个没说话的对端做出「继续持有 socket」的决定——那会把一次
+    /// 用户退出拖上 30 秒。Watch App 与 iOS App 打在同一个包里
+    /// （`WristAgent.app/Watch/…`），所以缺席在生产上不是一个真实状态。
+    var kind: RealtimeUplinkFallbackKind?
     /// ESS-571: optional conversation-level identity.
     var conversationId: String?
     /// ESS-571: optional turn-level identity.
@@ -237,6 +269,7 @@ struct RealtimeUplinkFallbackDescriptor: Codable, Sendable, Equatable {
         case requestId = "request_id"
         case sessionId = "session_id"
         case reason
+        case kind
         case conversationId = "conversation_id"
         case turnId = "turn_id"
     }

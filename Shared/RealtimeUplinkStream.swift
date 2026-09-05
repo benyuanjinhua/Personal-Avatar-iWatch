@@ -26,6 +26,24 @@ struct RealtimeUplinkStream: Sendable {
         /// the retained complete-file recording instead of silently ending.
         case noAudioFrames
         case invalidPayload(VoiceStreamValidationError)
+
+        /// ESS-1159 复审整改（阻断 2）：这次回退在**线协议上**属于哪一类。
+        ///
+        /// 归类留在枚举自己身上，而不是让下游解析 `"\(reason)"` 的字符串——
+        /// 将来加一个 case 时，编译器会在这里逼作者表态，而字符串解析只会
+        /// 悄悄把新 case 归进默认分支。
+        ///
+        /// `.cancelled` 是**用户意图**（本类型 `markCancelled()` 的文档口径：
+        /// user cancel / new turn / lifecycle switch），其余全部是纯上行故障。
+        var wireKind: RealtimeUplinkFallbackKind {
+            switch self {
+            case .cancelled:
+                return .userCancelled
+            case .transportFailed, .backpressure, .sequenceOverflow,
+                 .noAudioFrames, .invalidPayload:
+                return .uplinkFailure
+            }
+        }
     }
 
     enum Outcome: Equatable, Sendable {
