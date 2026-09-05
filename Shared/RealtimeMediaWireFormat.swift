@@ -389,6 +389,20 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
     /// `progressSequence` — this WCSession hop does not preserve ordering, and
     /// appending a late slice after a newer one produces a scrambled sentence.
     var answerSequence: Int?
+    /// ESS-1139：**这一条回合终态到达时，上游还有没有活在跑**。
+    ///
+    /// 由 iPhone 侧的 `UpstreamWorkLedger` 在**有序的** WSS 上就地判定后随帧
+    /// 下发。它存在的全部理由就写在上面 `progressSequence` 的注释里：
+    /// **WCSession 这一跳不保证跨消息顺序**。网关在有序链路上先发
+    /// `tool_call_pending` / `task.state`、后发 `audio.done`，两者到了 Watch
+    /// 却可能倒过来——于是 Watch 在还没拿到任何工具证据的那一瞬间把阶段播报
+    /// 的 `audio.done` 当成回合答完，开下一轮，iPhone 随即 supersede 并关掉
+    /// 一条上游任务还在跑的 WSS（2026-09-05 真机：天气 1.2s、知识库 11.5s）。
+    ///
+    /// 把判据搬到顺序有保证的那一侧，这个竞态就结构性地不存在了：`true`
+    /// 表示这条终态只是**段落**边界，回合必须继续等。
+    /// 缺席（老 iPhone 进程）时不猜——按本单之前逐字相同的路径处理。
+    var upstreamWorkOutstanding: Bool?
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
@@ -411,6 +425,7 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         case progressText = "progress_text"
         case progressCategory = "progress_category"
         case progressSequence = "progress_seq"
+        case upstreamWorkOutstanding = "upstream_work_outstanding"
     }
 
     init(
@@ -433,7 +448,8 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         progressCategory: String? = nil,
         progressSequence: Int? = nil,
         answerDelta: String? = nil,
-        answerSequence: Int? = nil
+        answerSequence: Int? = nil,
+        upstreamWorkOutstanding: Bool? = nil
     ) {
         self.protocolVersion = protocolVersion
         self.kind = kind
@@ -455,6 +471,7 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         self.progressSequence = progressSequence
         self.answerDelta = answerDelta
         self.answerSequence = answerSequence
+        self.upstreamWorkOutstanding = upstreamWorkOutstanding
     }
 
     /// Explicit decoder so pre-ESS-404 messages (no `generation`, no
@@ -485,6 +502,11 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         // ESS-1111：答案增量同样宽松解码，理由与上面逐字相同。
         self.answerDelta = try c.decodeIfPresent(String.self, forKey: .answerDelta)
         self.answerSequence = try c.decodeIfPresent(Int.self, forKey: .answerSequence)
+        // ESS-1139：同样宽松解码。滚动升级窗口内老 iPhone 不带这个字段，
+        // 缺席必须退回本单之前的路径，而不是让整条终态报废。
+        self.upstreamWorkOutstanding = try c.decodeIfPresent(
+            Bool.self, forKey: .upstreamWorkOutstanding
+        )
     }
 
     /// Bridge PR #113 handshake ack. Carries no payload. Adapter treats this
@@ -531,13 +553,15 @@ struct RealtimeDownlinkEnvelope: Codable, Sendable, Equatable {
         sessionId: String,
         responseId: String? = nil,
         generation: Int? = nil,
-        finalSequence: Int? = nil
+        finalSequence: Int? = nil,
+        upstreamWorkOutstanding: Bool? = nil
     ) -> Self {
         RealtimeDownlinkEnvelope(
             protocolVersion: RealtimeWireVersion.downlink,
             kind: .audioDone, requestId: requestId, sessionId: sessionId,
             sequence: nil, audio: nil, transcript: nil, reason: nil,
-            responseId: responseId, generation: generation, finalSequence: finalSequence
+            responseId: responseId, generation: generation, finalSequence: finalSequence,
+            upstreamWorkOutstanding: upstreamWorkOutstanding
         )
     }
 

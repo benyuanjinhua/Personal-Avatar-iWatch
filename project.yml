@@ -113,12 +113,36 @@ targets:
         WATCHOS_DEPLOYMENT_TARGET: "10.0"
         GENERATE_INFOPLIST_FILE: YES
 
+  # ESS-1139 复审整改（毕玄 2026-09-05 阻断）：iOS 侧第一次有单测 target。
+  #
+  # 这道口子正是本次阻断的成因。`PhoneRealtimeSession` 的收口顺序缺陷
+  # （hold 之后仍无条件清 currentTransport / pendingDownlink）在 `Shared/` 的
+  # 纯策略用例里**结构上看不见**——策略给的裁决是对的，错的是会话层怎么用它。
+  # 既有注释「`iOS/` 没有单测 target，留在这里就只能靠人眼复核」被这次事故
+  # 兑现了一次，因此补上 target，而不是再写一条只覆盖策略的用例。
+  WristAgent Tests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: iOSTests
+    dependencies:
+      - target: WristAgent
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(WRISTAGENT_BUNDLE_ID).tests
+        TARGETED_DEVICE_FAMILY: "1"
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        GENERATE_INFOPLIST_FILE: YES
+
 schemes:
   WristAgent:
     build:
       targets:
         WristAgent: all
         WristAgent Watch App: all
+    test:
+      targets:
+        - WristAgent Tests
     run:
       config: Debug
     archive:

@@ -370,11 +370,52 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
                 )
             }
         case .audioDone:
-            adapter.markDownlinkComplete(
-                responseId: envelope.responseId,
-                generation: envelope.generation,
-                finalSequence: envelope.finalSequence
+            // ESS-1139：回合终态的**分类**由 iPhone 在有序 WSS 上给出。
+            //
+            // 真机三条用例的死因都是这一条：阶段播报的回合级 `audio.done` 在
+            // 任何 `task.state` 之前到达（WCSession 不保证跨消息顺序），Watch
+            // 判本轮答完 → 开下一轮 → iPhone supersede → 关掉一条上游任务还在
+            // 跑的 WSS → 网关对上游 `mute`，其后所有帧 `socket_closed`。
+            //
+            // 有了这个字段就不必再赌到达顺序：`true` = 上游还有活在跑，这条
+            // 终态只是**段落**边界，走 interim（退回等待态、不开下一轮）；
+            // 同时把「有工具工作」这个事实喂给回合聚合体，让它接管有界性
+            // （45s 等回答预算让位给 180s 工具绝对上限）。
+            // 字段缺席（老 iPhone 进程）时一个字都不改，走本单之前的原路径。
+            let terminalKind = RealtimeTurnTerminalClassifier.classify(
+                upstreamWorkOutstanding: envelope.upstreamWorkOutstanding
             )
+            WatchLog.info(
+                "turn", "realtime_turn_terminal_classified",
+                requestId: envelope.requestId,
+                detail: "upstream_work_outstanding="
+                    + "\(envelope.upstreamWorkOutstanding?.description ?? "absent") "
+                    + "kind=\(terminalKind == .segmentBoundary ? "segment" : "terminal") "
+                    + "final_sequence=\(envelope.finalSequence?.description ?? "nil")"
+            )
+            // 顺序有意：先落工具证据、后落屏障。反过来的话屏障释放那一瞬间
+            // 聚合体还看不到工具工作，`markAnswerFinished` 又会开下一轮。
+            if let status = RealtimeTurnTerminalClassifier.toolEvidenceStatus(
+                upstreamWorkOutstanding: envelope.upstreamWorkOutstanding
+            ) {
+                adapter.markAgentTaskState(
+                    taskId: nil, status: status, generation: envelope.generation
+                )
+            }
+            switch terminalKind {
+            case .segmentBoundary:
+                adapter.markDownlinkSegmentComplete(
+                    responseId: envelope.responseId,
+                    generation: envelope.generation,
+                    finalSequence: envelope.finalSequence
+                )
+            case .turnTerminal:
+                adapter.markDownlinkComplete(
+                    responseId: envelope.responseId,
+                    generation: envelope.generation,
+                    finalSequence: envelope.finalSequence
+                )
+            }
         case .audioSegmentDone:
             // ESS-971：与 `audioDone` 共用同一套播放屏障（本段音频要照常收齐、
             // 播完），区别只在**播完之后**——走 interim 而不是回合终态。
