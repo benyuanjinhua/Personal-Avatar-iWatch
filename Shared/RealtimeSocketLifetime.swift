@@ -53,16 +53,34 @@ public enum RealtimeSocketCloseCause: String, Equatable, Sendable, CaseIterable 
     case localTimeout = "local_timeout"
     /// 前后台切换、可达性丢失一类的生命周期事件。
     case lifecycle = "lifecycle"
+    /// ESS-1159：Watch 的**快速上行通道**判死（`stream.fallback`）。
+    ///
+    /// 它与 `transportFailure` 只差一个字，语义却相反，必须分开：
+    /// - `transportFailure` 说的是**这条 WSS** 死了（recv 出错、心跳失败）。
+    ///   socket 本来就没了，"关闭"只是记账，压过在飞任务是对的。
+    /// - `uplinkFallback` 说的是 **Watch↔iPhone 那一跳**死了：录音器故障、
+    ///   WCSession 送不出去、没采到音频、上行背压。此刻 iPhone 手上这条
+    ///   WSS **仍在收 `task.state`**，上游的 Codex 任务照跑不误。
+    ///
+    /// 把后者当成前者，等于让一条 WCSession 的故障去替上游宣布任务结束——
+    /// 这正是 ESS-1139 判定被绕开的那条边：`PhoneRealtimeSession.forward`
+    /// 的 `.fallback` 分支此前写死 `cause: .transportFailure`，无论账本上
+    /// 挂着多少未结任务都当场关闭，最终答案随之丢失。
+    ///
+    /// 回退的**上行**语义一个字未改：完整文件回退仍照常执行，它走的是另一条
+    /// 链路（`fullFileFallback`），与这条 socket 的存亡无关。
+    case uplinkFallback = "uplink_fallback"
 
     /// 这次关闭是否**压过**在飞的上游工作。
     ///
-    /// 只有三种：用户显式退出、用户打断、传输真的死了。其余四种全部是
-    /// 「客户端自己的状态变了」——它们没有资格替上游宣布任务结束，这正是
-    /// ESS-1139 三条用例共同的死因。
+    /// 只有三种：用户显式退出、用户打断、**这条 WSS** 真的死了。其余五种
+    /// 全部是「客户端自己的状态变了」——它们没有资格替上游宣布任务结束，
+    /// 这正是 ESS-1139 三条用例共同的死因。
     public var overridesInFlightUpstreamWork: Bool {
         switch self {
         case .userExit, .bargeIn, .transportFailure: return true
-        case .turnSupersede, .uiStateChange, .localTimeout, .lifecycle: return false
+        case .turnSupersede, .uiStateChange, .localTimeout, .lifecycle, .uplinkFallback:
+            return false
         }
     }
 }
