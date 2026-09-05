@@ -185,6 +185,13 @@ final class WatchSettingsStore: NSObject, ObservableObject, WCSessionDelegate {
         if let data = userInfo[RealtimeMediaMessage.downlinkEnvelopeKey] as? Data {
             Task { @MainActor in self.applyRealtimeDownlink(data) }
         }
+        // ESS-869: the iPhone now delivers a deferred channel ready through the
+        // reliable `transferUserInfo` queue. `receiveChannelReady` is idempotent
+        // and stale-guarded, so a duplicate with the interactive copy is a no-op.
+        if let data = userInfo[RealtimeMediaMessage.channelReadyEnvelopeKey] as? Data,
+           let ready = try? JSONDecoder().decode(RealtimeChannelReady.self, from: data) {
+            Task { @MainActor in self.realtimeAdapter?.receiveChannelReady(ready) }
+        }
         guard let data = userInfo[VoiceStatusMessage.envelopeKey] as? Data else { return }
         Task { @MainActor in self.applyVoiceStatus(data) }
     }

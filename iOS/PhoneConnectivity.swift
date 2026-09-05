@@ -26,6 +26,15 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     /// it there leaves the Watch in `.connecting` until its timeout cancels
     /// recording. Keep the latest turn-scoped value and replay on reachability.
     private var pendingRealtimeChannelReady: RealtimeChannelReady?
+    /// ESS-869: dedup markers so repeated activation/reachability/watch-state
+    /// callbacks do not re-send (interactive) or re-enqueue (durable) the same
+    /// ready. Both reset when a new turn supersedes `pendingRealtimeChannelReady`.
+    private var interactiveReadyDelivered: RealtimeChannelReady?
+    /// ESS-869 (architecture-review fix): bounded-retry state machine for the
+    /// durable `transferUserInfo` path. The dedup marker lives here so a failed
+    /// system receipt can clear it and re-enqueue instead of being blocked
+    /// forever; after `maxAttempts` failures it gives up (no infinite retry).
+    private var durableTracker = RealtimeChannelReadyDurableTracker()
     private var realtimeSession: PhoneRealtimeSession {
         if let existing = realtimeSessionStorage { return existing }
         let session = PhoneRealtimeSession(transportFactory: { [weak self] requestId, sessionId in
@@ -227,6 +236,17 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
         didFinish userInfoTransfer: WCSessionUserInfoTransfer,
         error: Error?
     ) {
+        // ESS-869: the reliable-channel delivery receipt for a deferred channel
+        // ready. This is the success event that pairs with
+        // `channel_ready_deferred` by request_id (acceptance §2), and the
+        // bounded-retry / give-up decision on a failed receipt.
+        if let readyData = userInfoTransfer.userInfo[RealtimeMediaMessage.channelReadyEnvelopeKey] as? Data,
+           let ready = try? JSONDecoder().decode(RealtimeChannelReady.self, from: readyData) {
+            Task { @MainActor in
+                self.handleChannelReadyDurableReceipt(ready, error: error)
+            }
+            return
+        }
         let itemId = userInfoTransfer.userInfo[Self.downlinkItemIdKey] as? String
         Task { @MainActor in
             self.completeDownlink(itemId: itemId, error: error)
@@ -369,6 +389,8 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     private func sendRealtimeChannelReady(requestId: String, sessionId: String) {
         let ready = RealtimeChannelReady(requestId: requestId, sessionId: sessionId)
         pendingRealtimeChannelReady = ready
+        interactiveReadyDelivered = nil
+        durableTracker.reset()
         deliverRealtimeChannelReady(ready, trigger: "session_active")
     }
 
@@ -380,42 +402,121 @@ final class PhoneConnectivity: NSObject, ObservableObject, WCSessionDelegate {
     private func deliverRealtimeChannelReady(_ ready: RealtimeChannelReady, trigger: String) {
         guard let data = try? JSONEncoder().encode(ready) else { return }
         let session = WCSession.default
-        guard session.activationState == .activated, session.isReachable else {
+        switch RealtimeChannelReadyDeliveryPolicy.action(
+            isActivated: session.activationState == .activated,
+            isReachable: session.isReachable,
+            isWatchAppInstalled: session.isWatchAppInstalled
+        ) {
+        case .interactive:
+            // Repeated reachability callbacks must not emit duplicates.
+            guard interactiveReadyDelivered != ready else { return }
+            interactiveReadyDelivered = ready
+            session.sendMessage(
+                [RealtimeMediaMessage.channelReadyEnvelopeKey: data],
+                replyHandler: nil,
+                errorHandler: { [weak self] error in
+                    Task { @MainActor in
+                        self?.handleChannelReadyInteractiveFailure(ready, data: data, trigger: trigger, error: error)
+                    }
+                }
+            )
+            PhoneAgentClientLog.info(
+                module: "agent_transport", event: "channel_ready_sent",
+                requestId: ready.requestId, sessionId: ready.sessionId,
+                detail: "trigger=\(trigger)"
+            )
+        case .durable:
+            // ESS-869: the Watch is unreachable. Do NOT drop the ready — hand it
+            // to the system-managed reliable `transferUserInfo` queue, which
+            // delivers when the Watch is reachable without relying on the phone
+            // app observing a reachability change. The pending value is also
+            // kept so the interactive fast path can still fire on replay.
             PhoneAgentClientLog.info(
                 module: "agent_transport", event: "channel_ready_deferred",
                 requestId: ready.requestId, sessionId: ready.sessionId,
                 detail: "reason=watch_unreachable trigger=\(trigger)"
             )
+            enqueueRealtimeChannelReadyDurable(ready, data: data, trigger: trigger)
+        case .none:
+            // Not activated / Watch app missing: nothing can be handed to the
+            // system yet. Keep the pending value; activation replay delivers it.
+            PhoneAgentClientLog.info(
+                module: "agent_transport", event: "channel_ready_deferred",
+                requestId: ready.requestId, sessionId: ready.sessionId,
+                detail: "reason=session_unavailable trigger=\(trigger)"
+            )
+        }
+    }
+
+    /// System-managed reliable delivery for a deferred/failed interactive ready.
+    /// `transferUserInfo` is FIFO and acknowledged via `didFinish userInfoTransfer`,
+    /// which emits the `channel_ready_durable_delivered` success event that pairs
+    /// with `channel_ready_deferred` by request_id (ESS-869 acceptance §2).
+    private func enqueueRealtimeChannelReadyDurable(
+        _ ready: RealtimeChannelReady, data: Data, trigger: String
+    ) {
+        guard case .enqueue(let attempt) = durableTracker.requestEnqueue(ready) else {
             return
         }
-        // Clear optimistically so repeated reachability callbacks do not emit
-        // duplicates. An asynchronous WCSession failure restores this exact
-        // turn only if no newer ready value has superseded it.
-        if pendingRealtimeChannelReady == ready {
-            pendingRealtimeChannelReady = nil
-        }
-        session.sendMessage(
-            [RealtimeMediaMessage.channelReadyEnvelopeKey: data],
-            replyHandler: nil,
-            errorHandler: { [weak self] error in
-                Task { @MainActor in
-                    if self?.pendingRealtimeChannelReady == nil {
-                        self?.pendingRealtimeChannelReady = ready
-                    }
-                    PhoneAgentClientLog.error(
-                        module: "agent_transport", event: "channel_ready_send_failed",
-                        requestId: ready.requestId, sessionId: ready.sessionId,
-                        detail: "trigger=\(trigger) \(error.localizedDescription)",
-                        code: "ERR_CHANNEL_READY_SEND"
-                    )
-                }
-            }
-        )
+        WCSession.default.transferUserInfo([RealtimeMediaMessage.channelReadyEnvelopeKey: data])
         PhoneAgentClientLog.info(
-            module: "agent_transport", event: "channel_ready_sent",
+            module: "agent_transport", event: "channel_ready_durable_enqueued",
             requestId: ready.requestId, sessionId: ready.sessionId,
-            detail: "trigger=\(trigger)"
+            detail: "trigger=\(trigger) attempt=\(attempt)"
         )
+    }
+
+    /// System receipt for a durable channel-ready delivery. Clears the in-flight
+    /// dedup marker on every terminal receipt, then either marks delivered,
+    /// retries (bounded), or records a terminal give-up — a failed receipt must
+    /// never leave the marker set and block the same request_id forever.
+    private func handleChannelReadyDurableReceipt(
+        _ ready: RealtimeChannelReady, error: Error?
+    ) {
+        guard let outcome = durableTracker.recordReceipt(ready, delivered: error == nil) else {
+            // Delivered (nil outcome) or a stale receipt for another turn.
+            if error == nil {
+                PhoneAgentClientLog.info(
+                    module: "agent_transport", event: "channel_ready_durable_delivered",
+                    requestId: ready.requestId, sessionId: ready.sessionId
+                )
+            }
+            return
+        }
+        PhoneAgentClientLog.error(
+            module: "agent_transport", event: "channel_ready_durable_failed",
+            requestId: ready.requestId, sessionId: ready.sessionId,
+            detail: error?.localizedDescription ?? "unknown",
+            code: "ERR_CHANNEL_READY_DURABLE"
+        )
+        switch outcome {
+        case .retry:
+            guard let data = try? JSONEncoder().encode(ready) else { return }
+            enqueueRealtimeChannelReadyDurable(ready, data: data, trigger: "durable_retry")
+        case .giveUp:
+            // Terminal for the durable path; the interactive path can still
+            // deliver on a later reachability callback. Log a definite defect.
+            PhoneAgentClientLog.error(
+                module: "agent_transport", event: "channel_ready_durable_gave_up",
+                requestId: ready.requestId, sessionId: ready.sessionId,
+                detail: "attempts=\(durableTracker.attempts)",
+                code: "ERR_CHANNEL_READY_DURABLE"
+            )
+        }
+    }
+
+    private func handleChannelReadyInteractiveFailure(
+        _ ready: RealtimeChannelReady, data: Data, trigger: String, error: Error
+    ) {
+        PhoneAgentClientLog.error(
+            module: "agent_transport", event: "channel_ready_send_failed",
+            requestId: ready.requestId, sessionId: ready.sessionId,
+            detail: "trigger=\(trigger) \(error.localizedDescription)",
+            code: "ERR_CHANNEL_READY_SEND"
+        )
+        // The interactive send failed despite the session reporting reachable;
+        // fall back to the reliable channel rather than dropping the ready.
+        enqueueRealtimeChannelReadyDurable(ready, data: data, trigger: trigger)
     }
 
     private static func turnIdentity(for envelope: RealtimeUplinkEnvelope) -> (requestId: String, sessionId: String)? {

@@ -689,9 +689,61 @@ final class SessionAutoRelistenTests: XCTestCase {
 
         XCTAssertEqual(salvaged, 1, "已录语音必须被抢救提交，不能无反馈丢弃")
         XCTAssertEqual(h.log.count(of: "session_ready_timeout_salvage"), 1)
+        // ESS-869：就绪超时升格为缺陷信号——出现即计数并标红（error 级 + 错误码）。
+        XCTAssertEqual(h.session.readyTimeoutSalvageCount, 1, "缺陷必须计数")
+        let salvage = h.log.last(of: "session_ready_timeout_salvage")
+        XCTAssertTrue(
+            salvage?.detail?.contains("salvage_count=1") == true,
+            "salvage 事件必须带计数，否则无法按会话聚合"
+        )
+        XCTAssertEqual(salvage?.errorCode, "ERR_SESSION_READY_TIMEOUT", "缺陷信号必须有稳定错误码")
         // ESS-652: after salvage, enters P6 failed, not idle.
         XCTAssertEqual(h.session.state, .failed)
         XCTAssertNotNil(h.session.failedReason)
+    }
+
+    /// ESS-869 acceptance §4：挂断小结必须把就绪超时降级次数汇总进会话日志，
+    /// 让「实时链路降级」成为可 grep、可聚合的缺陷信号，而不是静默兜底。
+    func testCallSummarySurfacesReadyTimeoutSalvageCount() {
+        let h = makeHarness()
+        h.session.onSalvageTurn = {}
+
+        h.session.enterSession()
+        h.session.markLocalCapture(active: true)
+        h.fireScheduled(withDelay: SessionController.readyTimeoutSeconds)
+        XCTAssertEqual(h.session.readyTimeoutSalvageCount, 1)
+
+        // P6 挂断 → P7 小结。
+        h.session.hangupFromFailed()
+
+        let summary = h.log.last(of: "session_call_summary")
+        XCTAssertTrue(
+            summary?.detail?.contains("ready_timeout_salvage_count=1") == true,
+            "挂断小结必须带 ready_timeout_salvage_count，否则缺陷被当正常兜底"
+        )
+        XCTAssertTrue(
+            h.session.hungupSummary?.contains("实时链路降级 1 次") == true,
+            "有降级时挂断摘要必须如实告知用户"
+        )
+    }
+
+    /// 干净会话（实时链路正常建立）不得误报降级：计数为 0、小结不带降级文案。
+    func testCleanSessionDoesNotCountSalvage() {
+        let h = makeHarness()
+        h.startFirstTurn()   // 通道真实就绪，不会触发 ready 超时
+
+        h.session.exitSession()
+
+        XCTAssertEqual(h.session.readyTimeoutSalvageCount, 0)
+        let summary = h.log.last(of: "session_call_summary")
+        XCTAssertTrue(
+            summary?.detail?.contains("ready_timeout_salvage_count=0") == true,
+            "干净会话也必须带 ready_timeout_salvage_count=0，才能区分「无缺陷」与「没记录」"
+        )
+        XCTAssertFalse(
+            h.session.hungupSummary?.contains("实时链路降级") == true,
+            "干净会话不得出现降级文案"
+        )
     }
 
     /// 本地采集态与网络 ready 独立呈现：建立中就能如实显示「表在听」。
