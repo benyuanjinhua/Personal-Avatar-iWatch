@@ -238,8 +238,39 @@ final class PhoneRealtimeSession {
             }
         case .fallback:
             guard let descriptor = envelope.fallback else { return }
+            // ESS-1159：Watch 的快速上行通道死了 **≠** 这条 WSS 死了。
+            //
+            // 整改前这里写死 `cause: .transportFailure`——那是「传输真死」的
+            // 动因，`overridesInFlightUpstreamWork == true`，于是无论账本上
+            // 挂着多少未结任务，一条 `stream.fallback` 都当场把 socket 关掉。
+            // 而 `stream.fallback` 的全部来源都在 Watch 自己那一侧
+            // （`RealtimeUplinkStream.FallbackReason`：录音器故障、WCSession
+            // 送不出去、没采到音频、上行背压、本轮取消），说的是
+            // **Watch↔iPhone** 那一跳；此刻 iPhone 手上这条 WSS 仍在收
+            // `task.state`，上游的 Codex 任务照跑不误。关掉它 = 网关对上游
+            // `mute` + `terminate`，最终答案随即被判 `socket_closed` 丢弃。
+            //
+            // 现在它走 `.uplinkFallback`，与 supersede / UI 状态 / 本地超时
+            // 同档：由账本裁决，并且**收口是原子的**——只有真的关掉了才动
+            // 会话状态与 transport 引用（同 `endTurn` 的整改口径）。
+            // hold 时那次关闭记进 `deferredClose`，由重试计时器与后续下行
+            // 共同兑现，最终由静默预算 / 绝对上限收口。
+            //
+            // 上行语义一个字未改：完整文件回退走的是另一条链路
+            // （`fullFileFallback`），与这条 socket 的存亡无关，因此无论
+            // 裁决如何都照常回 `true`。
+            guard closeCurrentTransport(cause: .uplinkFallback, reason: descriptor.reason) else {
+                PhoneAgentClientLog.info(
+                    module: "phone_session", event: "realtime_uplink_fallback_deferred",
+                    requestId: descriptor.requestId, sessionId: descriptor.sessionId,
+                    detail: "reason=\(descriptor.reason) cause=uplink_fallback "
+                        + "retained=transport|state|pending_downlink "
+                        + "pending=\(pendingDownlink.pendingCount)"
+                )
+                completion?(true)
+                return
+            }
             transition(to: .failed(reason: descriptor.reason))
-            closeCurrentTransport(cause: .transportFailure, reason: descriptor.reason)
             currentTransport = nil
             completion?(true)
             return
@@ -394,7 +425,17 @@ final class PhoneRealtimeSession {
             detail: "trigger=\(trigger) reason=\(pending.reason) cause=\(pending.cause.rawValue)"
         )
         // `endTurn` 自己会在真的关掉时清引用与缓冲；仍是 hold 就再武装一支。
-        _ = endTurn(reason: pending.reason, cause: pending.cause)
+        guard endTurn(reason: pending.reason, cause: pending.cause) else { return }
+        // ESS-1159：被推迟的那次关闭兑现时，**终态语义不得退化**。
+        // `endTurn` 的收口状态是 `.cancelled`（「这一轮收了」），而
+        // `.uplinkFallback` 表达的是「Watch 的快速上行通道判死了」——协调层与
+        // 真机日志靠 `.failed(reason:)` 才看得出这一轮是回退收场，不是正常收口。
+        // 立即收口时那条 `transition(to: .failed(...))` 走的是 `forward` 里的
+        // 同一行；推迟之后必须在这里补上，否则同一个事件因为「有没有被推迟」
+        // 而落到两个不同的终态。
+        if pending.cause == .uplinkFallback {
+            transition(to: .failed(reason: pending.reason))
+        }
     }
 
     /// System reported the phone entered background / lost network / the
