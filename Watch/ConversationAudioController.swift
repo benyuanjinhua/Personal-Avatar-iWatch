@@ -23,9 +23,20 @@ protocol ConversationAudioSessionDriving: AnyObject {
         options: AVAudioSession.CategoryOptions
     ) throws
     func setActive(_ active: Bool, options: AVAudioSession.SetActiveOptions) throws
+    /// ESS-892：当前输出路由的可观测描述。`.voiceChat` 会改变路由与增益，
+    /// 响度判定必须知道「当时到底从哪个端口出声」——把「路由变了」与
+    /// 「mode 变了」在日志上分开（验收标准 4）。
+    var currentRouteDescription: String { get }
 }
 
-extension AVAudioSession: ConversationAudioSessionDriving {}
+extension AVAudioSession: ConversationAudioSessionDriving {
+    var currentRouteDescription: String {
+        let outputs = currentRoute.outputs
+            .map { "\($0.portType.rawValue)(\($0.portName))" }
+            .joined(separator: "+")
+        return outputs.isEmpty ? "none" : outputs
+    }
+}
 
 /// 窄化引擎接缝：hosted CI 无音频硬件，真实 `AVAudioEngine.start()` 属于
 /// ESS-498 hang 家族，单测用 fake 注入；生产默认转发到真实引擎。
@@ -197,10 +208,13 @@ final class ConversationAudioController {
             Self.module, "conversation_audio_acquired",
             // ESS-650 F2-1：mode 必须落在日志里——真机上「.voiceChat 到底有没有
             // 配上」是 AEC 结论的前提，靠读代码推断不算运行时证据（R-02.1）。
+            // ESS-892 验收 4：补输出路由——`.voiceChat` 同时改变 mode 与路由，
+            // 光有 mode 分不清「响度小是 mode 的增益策略还是换了输出端口」。
             detail: "conversation_id=\(conversationId) "
                 + "duration_ms=\(Self.elapsedMs(since: started)) "
                 + "mode=\(lastConfiguredMode?.rawValue ?? "unknown") "
-                + "voice_barge_in=\(voiceBargeInEnabled())"
+                + "voice_barge_in=\(voiceBargeInEnabled()) "
+                + "route=\(session.currentRouteDescription)"
         )
     }
 

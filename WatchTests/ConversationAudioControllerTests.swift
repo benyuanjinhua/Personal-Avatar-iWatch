@@ -34,6 +34,10 @@ final class ConversationAudioControllerTests: XCTestCase {
         /// 第 N 次 setActive(true) 抛错（1 起计），用于走 ESS-61 阶梯。
         var failActivationsBefore = 0
         private var activateCalls = 0
+        /// ESS-892：测试替身可注入的输出路由，断言 `route=` 字段落地。
+        var route: String = "Speaker(BuiltInSpeaker)"
+
+        var currentRouteDescription: String { route }
 
         func setCategory(
             _ category: AVAudioSession.Category,
@@ -143,6 +147,10 @@ final class ConversationAudioControllerTests: XCTestCase {
         XCTAssertEqual(acquired.count, 1)
         XCTAssertTrue(acquired[0].detail?.contains("conversation_id=conv-1") == true)
         XCTAssertTrue(acquired[0].detail?.contains("duration_ms=") == true)
+        XCTAssertTrue(
+            acquired[0].detail?.contains("route=Speaker(BuiltInSpeaker)") == true,
+            "ESS-892：acquired 必须带输出路由，把「路由变了」与「mode 变了」分开"
+        )
         let restarted = collector.matches(event: "engine_restarted")
         XCTAssertEqual(restarted.count, 1)
         XCTAssertTrue(restarted[0].detail?.contains("conversation_id=conv-1") == true)
