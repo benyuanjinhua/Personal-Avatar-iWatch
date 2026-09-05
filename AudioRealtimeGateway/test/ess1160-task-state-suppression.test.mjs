@@ -248,6 +248,23 @@ describe('ESS-1160 · 背压护栏', () => {
     assert.equal(h.session.taskStateRateLimited, 1)
   })
 
+  it('繁忙窗口里的终态帧必须到达客户端——丢它就是把 ESS-1095 装回去', () => {
+    // 上游一秒内推 12 帧并不病态：ESS-1109 的 24 s Codex 任务每秒都在报进展。
+    // 若限速对生命周期帧一视同仁，第 11 帧起被丢，紧随其后的 `completed`
+    // 正好落在窗口里 —— 客户端的工具回合闩锁就要等到 180 s 绝对上限才解除。
+    const h = harness()
+    for (let i = 0; i < 11; i += 1) {
+      h.task({ status: 'running', text: `正在执行第${i}步`, category: 'plan' })
+      h.advance(80)
+    }
+    h.task({ status: 'completed' })
+    const frames = taskState(h.sent)
+    assert.equal(frames.filter(f => f.status === 'running').length, 10, '第 11 帧展示帧超限被丢')
+    assert.equal(h.session.taskStateRateLimited, 1)
+    assert.ok(frames.some(f => f.status === 'completed'), '终态帧必须穿过限速窗口')
+    assert.equal(frames.at(-1).status, 'completed', '终态必须是最后一帧')
+  })
+
   it('maxTaskStateFramesPerSecond=0 关闭限速', () => {
     const h = harness({ maxTaskStateFramesPerSecond: 0 })
     for (let i = 0; i < 30; i += 1) { h.task({ text: `第${i}步` }); h.advance(1) }
