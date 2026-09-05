@@ -449,6 +449,15 @@ export class RealtimeSession {
     if (event.type === 'agent.audio.delta') return this._emitDelta(event)
     if (event.type === 'agent.audio.segment_done') return this._emitSegmentDone(event)
     if (event.type === 'agent.audio.done') return this._emitDone(event)
+    if (event.type === 'agent.transcript.final') {
+      return this._sendJson({
+        type: 'transcript.final', session_id: this.scope.session_id,
+        request_id: this.scope.request_id, generation: this.scope.generation,
+        response_id: this.responseId,
+        role: event.role === 'assistant' ? 'assistant' : 'user',
+        content: typeof event.content === 'string' ? event.content.slice(0, 16_000) : '',
+      })
+    }
     if (event.type === 'agent.error') return this.fail(event.code ?? 'ERR_UPSTREAM_UNAVAILABLE',
       { detail: event.detail ?? null, retriable: Boolean(event.retriable) })
   }

@@ -46,6 +46,42 @@ cancelled, and completed-turn rejection records remain terminal/idempotent.
 | POST | `/v1/realtime/session-token/revoke` | HMAC device signature | Revoke a previously issued token before use (safety valve). |
 | WSS | `/api/realtime` | Bearer <token> | Realtime bidirectional media plane. Token is single-use (single upgrade). |
 
+## Browser H5
+
+The Gateway serves a dependency-free browser client at `/` when `h5_enabled`
+is not `false`. On the Mac mini, open `https://localhost:8444/`; on a phone in
+an allowed LAN/Tailnet range, open `https://<mac-mini-host>:8444/`. Enter the
+Gateway WSS URL and either a development token or the complete JSON returned by
+`POST /v1/realtime/session-token`. Pasting the complete response is required
+for ephemeral tokens because the page must reuse its scope-bound
+`device_id/session_id/request_id/generation`. Then connect and use **开始说话** /
+**停止并发送**.
+
+Browsers cannot attach an `Authorization` header during a WebSocket upgrade.
+The H5 therefore presents the same `rtk_…` token as a WebSocket subprotocol;
+the server applies the normal one-time consumption and scope checks. The page
+contains no API key or built-in token. It persists only the Gateway address in
+`localStorage`; the token is held in `sessionStorage` until the tab closes.
+
+Microphone access requires a secure context. `localhost` is accepted by modern
+browsers, but phone/LAN access must use HTTPS/WSS with a certificate trusted by
+that device. A self-signed certificate that has not been trusted will prevent
+both microphone use and the WSS connection. The configured `allowed_peer_ips`
+must also include the phone's network range.
+
+Start with:
+
+```bash
+cd AudioRealtimeGateway
+npm ci
+npm start
+```
+
+The UI covers connecting, connected, failure/reconnect, permission denial,
+network interruption, recording, waiting, playback, and empty states. Chrome
+and Safari still require a user gesture before microphone capture or audio
+playback; the record button supplies that gesture.
+
 The service listens over TLS (`wss://`) and honours an IP allowlist
 (loopback + Tailnet CIDRs). Development-only `ws://` mode requires the
 explicit config flag `dev_allow_plain_ws: true` and refuses to start on any

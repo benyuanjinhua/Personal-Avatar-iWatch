@@ -137,7 +137,10 @@ export function createGateway(overrides = {}) {
       log('ws_upgrade_rejected', { code: 'ERR_SOURCE_NOT_ALLOWED', ip: peerIp(socket) })
       return refuseUpgrade(socket, 403, 'ERR_SOURCE_NOT_ALLOWED')
     }
-    const bearer = extractBearer(req.headers.authorization)
+    // Native clients use Authorization. Browsers cannot set that header on a
+    // WebSocket upgrade, so the H5 client presents the same short-lived token
+    // as a subprotocol entry. It is still consumed once and scope-bound below.
+    const bearer = extractBearer(req.headers.authorization) ?? extractProtocolBearer(req.headers['sec-websocket-protocol'])
     if (!bearer) {
       log('ws_upgrade_rejected', { code: 'ERR_TOKEN_INVALID', reason: 'missing_bearer' })
       return refuseUpgrade(socket, 401, 'ERR_TOKEN_INVALID')
@@ -414,6 +417,19 @@ function createHttpListener(CONFIG, { devices, issuer, log, protocolVersion, fal
     if (req.method === 'GET' && url.pathname === '/v1/health') {
       return writeJson(res, 200, { ok: true, service: 'audio-realtime-gateway', protocol_version: protocolVersion })
     }
+    if (CONFIG.h5_enabled !== false && req.method === 'GET') {
+      const asset = h5Asset(url.pathname)
+      if (asset) {
+        res.writeHead(200, {
+          'content-type': asset.contentType,
+          'cache-control': asset.cacheControl,
+          'x-content-type-options': 'nosniff',
+          'content-security-policy': "default-src 'self'; connect-src 'self' ws: wss:; media-src 'self' blob:; script-src 'self'; style-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'",
+          'permissions-policy': 'microphone=(self)',
+        })
+        return res.end(asset.body)
+      }
+    }
     const fallbackMatch = /^\/v1\/fallback-jobs\/([^/]+)$/.exec(url.pathname)
     // The public TLS listener exposes this route only in loopback dev tests.
     // Production uses the dedicated loopback listener above, so widening WSS
@@ -567,6 +583,26 @@ export function extractBearer(header) {
   if (!header || typeof header !== 'string') return null
   const match = /^Bearer\s+(rtk_[A-Za-z0-9_]+)$/.exec(header.trim())
   return match ? match[1] : null
+}
+
+export function extractProtocolBearer(header) {
+  if (!header || typeof header !== 'string') return null
+  for (const item of header.split(',').map(value => value.trim())) {
+    if (/^rtk_[A-Za-z0-9_]+$/.test(item)) return item
+  }
+  return null
+}
+
+function h5Asset(pathName) {
+  const files = {
+    '/': ['h5/index.html', 'text/html; charset=utf-8', 'no-store'],
+    '/index.html': ['h5/index.html', 'text/html; charset=utf-8', 'no-store'],
+    '/app.js': ['h5/app.js', 'text/javascript; charset=utf-8', 'no-cache'],
+    '/styles.css': ['h5/styles.css', 'text/css; charset=utf-8', 'no-cache'],
+  }
+  const file = files[pathName]
+  if (!file) return null
+  return { body: readFileSync(join(BASE, file[0])), contentType: file[1], cacheControl: file[2] }
 }
 
 function peerIp(socket) {

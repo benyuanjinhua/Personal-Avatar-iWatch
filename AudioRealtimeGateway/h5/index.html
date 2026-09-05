@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#10151f">
+  <title>Qwen Audio</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div class="brand"><span class="logo" aria-hidden="true">Q</span><div><h1>Qwen Audio</h1><p>Mac mini 实时语音入口</p></div></div>
+      <div id="connectionBadge" class="badge offline"><span></span><b>未连接</b></div>
+    </header>
+
+    <section class="setup" aria-labelledby="setupTitle">
+      <div><h2 id="setupTitle">连接配置</h2><p>地址保存在本机；token 仅保留到当前标签页关闭。</p></div>
+      <label>Gateway 地址<input id="gatewayUrl" inputmode="url" autocomplete="url" spellcheck="false" placeholder="wss://mac-mini:8444/api/realtime"></label>
+      <label>token 或签发响应<input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="rtk_… 或完整 JSON"></label>
+      <button id="connectButton" class="secondary">连接 Gateway</button>
+    </section>
+
+    <section class="conversation" aria-labelledby="conversationTitle">
+      <div class="section-title"><div><h2 id="conversationTitle">本次对话</h2><p id="sessionHint">连接后即可开始录音</p></div><button id="clearButton" class="text-button">清空</button></div>
+      <div id="emptyState" class="empty"><div class="empty-orb">〰</div><strong>还没有对话</strong><span>按下开始，说完后停止并等待回复</span></div>
+      <ol id="messages" class="messages" aria-live="polite"></ol>
+    </section>
+
+    <section id="notice" class="notice" role="alert" hidden><div><strong id="noticeTitle"></strong><p id="noticeBody"></p></div><button id="retryButton">重试</button></section>
+
+    <section class="controls" aria-label="会话控制">
+      <div id="level" class="level" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+      <button id="recordButton" class="record" disabled aria-describedby="recordHint"><span class="mic">●</span><span id="recordLabel">开始说话</span></button>
+      <p id="recordHint">需先连接 Gateway</p>
+      <button id="endButton" class="text-button" disabled>结束会话</button>
+    </section>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

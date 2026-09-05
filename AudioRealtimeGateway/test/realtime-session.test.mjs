@@ -91,6 +91,20 @@ describe('RealtimeSession — happy path', () => {
     assert.ok(logs.some(l => l.evt === 'session_ready'))
   })
 
+  it('forwards final user and assistant transcripts to clients', () => {
+    const { session, sent, agent, scope } = harness()
+    start(session, scope)
+    agent.emit(scope.request_id, {
+      type: 'agent.transcript.final', response_id: 'r-1:gen1', role: 'user', content: '你好',
+    })
+    agent.emit(scope.request_id, {
+      type: 'agent.transcript.final', response_id: 'r-1:gen1', role: 'assistant', content: '你好！',
+    })
+    assert.deepEqual(sent.filter(e => e.type === 'transcript.final').map(e => [e.role, e.content]), [
+      ['user', '你好'], ['assistant', '你好！'],
+    ])
+  })
+
   it('rejects unknown fields on client frames (strict schema)', () => {
     const { session, sent, scope } = harness()
     start(session, scope)
