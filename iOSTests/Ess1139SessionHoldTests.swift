@@ -109,6 +109,73 @@ final class Ess1139SessionHoldTests: XCTestCase {
         XCTAssertEqual(h.session.pendingDownlinkStats.count, 0)
     }
 
+    /// **第三轮阻断正面复现**：consumer 全程不可达 ⇒ 最终 task / answer /
+    /// `audio.done` 三帧全部入缓冲；被推迟的关闭在 `audio.done` 那一刻兑现，
+    /// **但绝不能把刚存进去的那三帧一起抹掉**；恢复后按序恰好重放一次。
+    ///
+    /// 整改前 `endTurn` 收口时无条件 `pendingDownlink.discardAll()`，而
+    /// `audio.done` 正是触发 `retryDeferredClose` 的那一帧——账本此刻已无未结
+    /// 任务、关闭获准，紧接着那一行就把最终答案全部删掉。等的就是这三帧，
+    /// 收口的动作却顺手删了它们：一次确定性的数据丢失。
+    func testConsumerUnavailableThroughoutStillReplaysFinalAnswerExactlyOnceInOrder() {
+        let h = makeActiveSession()
+        h.consumerTakesDelivery = false  // WCSession 全程接不住
+        h.transport.upstreamWorkLedger.noteTaskState(
+            taskId: Self.taskId, status: "running", atMs: 0
+        )
+        h.session.nowMs = { 1_000 }
+        h.session.lifecycleInterrupted(reason: "background")
+        XCTAssertTrue(h.transport.closeReasons.isEmpty, "任务在飞 ⇒ 收口被推迟")
+
+        // 上游把这一轮跑完：任务终态 → 答案增量 → 回合终态，三帧全部入缓冲。
+        h.transport.upstreamWorkLedger.noteTaskState(
+            taskId: Self.taskId, status: "completed", atMs: 9_000
+        )
+        h.session.nowMs = { 9_000 }
+        h.session.receiveAgentDownlink(
+            .taskState(requestId: Self.requestId, sessionId: Self.sessionId,
+                       taskId: Self.taskId, status: "completed"),
+            from: h.transport
+        )
+        h.session.receiveAgentDownlink(
+            .taskState(requestId: Self.requestId, sessionId: Self.sessionId,
+                       taskId: Self.taskId, status: "completed",
+                       answer: AgentTaskAnswerDelta(sequence: 1, delta: "杭州今天晴")),
+            from: h.transport
+        )
+        XCTAssertEqual(h.session.pendingDownlinkStats.count, 2, "夹具前提：两帧确实入了缓冲")
+
+        h.transport.upstreamWorkLedger.noteTurnTerminal(atMs: 10_000)
+        h.session.nowMs = { 10_000 }
+        h.session.receiveAgentDownlink(
+            .audioDone(requestId: Self.requestId, sessionId: Self.sessionId,
+                       finalSequence: 7, upstreamWorkOutstanding: false),
+            from: h.transport
+        )
+
+        // 收口确实发生了（上游说完了，socket 该关）……
+        XCTAssertEqual(h.transport.closeReasons, ["lifecycle_background"],
+                       "上游终态之后必须补上那次被推迟的关闭")
+        XCTAssertEqual(h.session.state, .cancelled)
+        // ……但缓冲里的三帧一帧都不许少。
+        XCTAssertEqual(h.session.pendingDownlinkStats.count, 3,
+                       "收口不得清掉待重放的最终答案——这正是本轮阻断")
+        XCTAssertTrue(h.delivered.isEmpty, "consumer 全程不可达 ⇒ 此刻一帧都还没送出去")
+
+        // WCSession 恢复：按序、恰好一次。
+        h.consumerTakesDelivery = true
+        XCTAssertEqual(h.session.replayPendingDownlink(trigger: "test_reachable"), 3)
+        XCTAssertEqual(h.delivered.map(\.kind), [.taskState, .taskState, .audioDone],
+                       "重放必须保序")
+        XCTAssertEqual(h.delivered.last?.finalSequence, 7, "最终答案的屏障值不得丢失")
+        XCTAssertEqual(h.delivered[1].answerDelta, "杭州今天晴", "答案增量原文不得丢失")
+        XCTAssertEqual(h.session.pendingDownlinkStats.count, 0)
+
+        // 恰好一次：再重放一遍不得重复投递。
+        XCTAssertEqual(h.session.replayPendingDownlink(trigger: "test_again"), 0)
+        XCTAssertEqual(h.delivered.count, 3, "重放必须恰好一次，不得重复")
+    }
+
     // MARK: - 主链路不受影响
 
     /// **无在飞任务的正常收口**：行为与本单之前逐字相同——当场关闭、清引用、

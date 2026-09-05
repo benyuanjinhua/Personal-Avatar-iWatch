@@ -326,7 +326,29 @@ final class PhoneRealtimeSession {
         }
         transition(to: .cancelled)
         currentTransport = nil
-        pendingDownlink.discardAll()
+        // ESS-1139 第三轮复审整改（毕玄 2026-09-05）：**收口不清缓冲**。
+        //
+        // 这里原先无条件 `pendingDownlink.discardAll()`，是一次确定性的数据丢失：
+        // consumer（WCSession）全程不可达时，最终 `task.state completed` /
+        // answer / `audio.done` 会**依次进缓冲**；而 `audio.done` 正是触发
+        // `retryDeferredClose` 的那一帧——账本此刻已无未结任务，关闭获准，
+        // 紧接着这一行就把刚刚存进去的最终答案全部抹掉。等的就是那三帧，
+        // 收口的动作却顺手删了它们。
+        //
+        // 现在全文件只保留**一条**作废规则，与 `openIfNeeded` 里那条同源：
+        // **只有新一轮真的建起来，上一轮的缓冲才作废**。收口只是「这条 socket
+        // 不再收新帧」，与「已经收到、还没送出去的帧还算不算数」是两件事。
+        //
+        // 不会泄漏：`RealtimeDownlinkRelay` 自带三条上限（条数 / 512KB /
+        // 30s 时长），过期与超量由它自己收口；真开了新一轮时 `openIfNeeded`
+        // 会清。
+        PhoneAgentClientLog.info(
+            module: "phone_session", event: "realtime_end_turn_closed",
+            requestId: Self.turnIdentity(of: state)?.requestId ?? "",
+            sessionId: Self.turnIdentity(of: state)?.sessionId ?? "",
+            detail: "reason=\(reason) cause=\(cause.rawValue) "
+                + "retained_pending_downlink=\(pendingDownlink.pendingCount)"
+        )
         // ESS-987：回合边界是压制日志的收口点——把这一轮攒下的计数打成一条
         // 汇总，而不是逐帧刷屏。
         emit(turnGate.flushSuppressionSummaries())
