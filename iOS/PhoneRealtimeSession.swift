@@ -182,9 +182,11 @@ final class PhoneRealtimeSession {
 
     /// 这次重试要不要被排空屏障挡下。`nil` = 放行。
     ///
-    /// 只挡**回合终态**触发的那一次快路径；两支兜底计时器
-    /// （`playback_receipt_grace` / `playback_drain_cap`）和上游静默重试
-    /// （`retry_timer`）一律放行，否则「保住 socket」会变成永久泄漏。
+    /// 挡三种触发：回合终态的快路径（`audio_done`）、首帧回执宽限到点
+    /// （`playback_receipt_grace`）、上游静默重试到点（`retry_timer`）——
+    /// 后两支都可能在播放正跑着的时候到点。真正的放行口只有两个：播放确实
+    /// 排空了（`playback_drained`）与绝对上限本身（`playback_drain_cap`），
+    /// 因此「保住 socket」不会变成永久泄漏。
     private func playbackDrainGate(
         trigger: String
     ) -> (reason: String, phase: String, capSeconds: TimeInterval)? {
@@ -198,15 +200,28 @@ final class PhoneRealtimeSession {
             }
             return ("awaiting_first_receipt", "playback_receipt_grace",
                     Self.deferredClosePlaybackReceiptGraceSeconds)
-        case "playback_receipt_grace":
-            // 宽限到点。这段时间里播放**真的**开始了就升级成排空上限继续等；
-            // 一帧回执都没来，就认账「这一轮没有音频要放」，照常收口。
+        case "playback_receipt_grace", "retry_timer":
+            // 宽限到点 / 上游静默重试到点。这两支计时器都可能在**播放正跑着**
+            // 的时候到点，此时放行等于把用户正在听的那一段切掉——正是验收要求 2
+            // 禁止的形状。
+            //
+            // `retry_timer` 尤其致命：它在 hold 的那一刻就按上游静默预算（30s）
+            // 武装好了，**早于**终态与播放的到来。真机时间线里 12.157s 的
+            // `stream.fallback` 会让它在 ~42s 到点，而最终答案此时刚播到一半
+            // （22.3s 终态 + 一段十几秒的 TTS）。整改前它走 `default` 一律放行，
+            // 于是屏障挡住的那次收口被这支更早的计时器绕过去了。
+            //
+            // 播放没在跑就照常放行：一帧回执都没来说明「这一轮没有音频要放」。
+            // 有界性不受影响——排空上限（`playback_drain_cap` = 180s 绝对上限）
+            // 是同一支计时器，`playbackDrainCapArmed` 保证至多一支，到点时走
+            // 下面的 `default` 真的收口。
             guard !playbackInFlight.isEmpty else { return nil }
             return ("playback_in_flight", "playback_drain_cap",
                     Self.deferredClosePlaybackDrainCapSeconds)
         default:
-            // `playback_drained` / `playback_drain_cap` / `retry_timer` 一律放行。
-            // 少了这一条，「保住 socket」就会变成永久泄漏。
+            // `playback_drained` / `playback_drain_cap` 一律放行：前者说明播放
+            // 真的排空了，后者是绝对上限本身。少了这一条，「保住 socket」就会
+            // 变成永久泄漏。
             return nil
         }
     }

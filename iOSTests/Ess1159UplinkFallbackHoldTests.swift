@@ -413,6 +413,83 @@ final class Ess1159UplinkFallbackHoldTests: XCTestCase {
         XCTAssertFalse(h.session.hasCurrentTransportForTesting)
     }
 
+    /// **屏障不得被上行静默重试计时器绕过。**
+    ///
+    /// `armDeferredCloseRetry` 在 hold 的那一刻就按上游静默预算（30s）武装好了，
+    /// **早于**回合终态与播放的到来。真机时间线：12.157s 的 `stream.fallback`
+    /// 让它在 ~42.2s 到点，而最终答案 22.3s 才终态、TTS 还要念十几秒——到点那
+    /// 一刻用户正听到一半。整改前 `playbackDrainGate` 让 `retry_timer` 走
+    /// `default` 一律放行，于是 `audio_done` 那一次被屏障挡住的收口，被这支
+    /// 更早武装的计时器整个绕过去，WSS 在播放中途关掉。
+    func testUpstreamSilenceRetryTimerCannotCutOffPlaybackInFlight() {
+        let h = makeActiveSession()
+        h.transport.upstreamWorkLedger.noteTaskState(
+            taskId: Self.taskId, status: "running", atMs: 0
+        )
+        h.session.nowMs = { Self.incidentMs }
+        h.session.forward(Self.fallback(.transportFailed))
+        XCTAssertEqual(h.pendingRetries.count, 1,
+                       "夹具前提：hold 的那一刻就武装了上游静默重试计时器")
+
+        // 上游说完了，最终答案开始播。
+        h.transport.upstreamWorkLedger.noteTaskState(
+            taskId: Self.taskId, status: "completed", atMs: Self.taskCompletedMs
+        )
+        h.session.nowMs = { Self.taskCompletedMs }
+        h.session.forward(Self.playbackStarted("resp-final"))
+        h.session.receiveAgentDownlink(
+            .audioDone(requestId: Self.requestId, sessionId: Self.sessionId,
+                       finalSequence: 94, upstreamWorkOutstanding: false),
+            from: h.transport
+        )
+        XCTAssertTrue(h.transport.closeReasons.isEmpty, "屏障挡住了 audio_done 那一次")
+
+        // ~42.2s：上游静默重试到点，而播放**仍在跑**。
+        h.session.nowMs = { Self.incidentMs + RealtimeSocketLifetimePolicy.upstreamSilenceBudgetMs }
+        h.firePendingRetries()
+        XCTAssertTrue(h.transport.closeReasons.isEmpty,
+                      "播放正跑着 ⇒ 上游静默重试到点也不得切掉用户正在听的那一段")
+        XCTAssertTrue(h.session.hasCurrentTransportForTesting)
+        XCTAssertEqual(h.pendingDrainTimers.count, 1,
+                       "仍由同一支排空上限兜底，且至多一支——不得叠计时器")
+
+        // 播完 ⇒ 恰好收口一次。
+        h.session.forward(Self.playbackEnded("resp-final"))
+        XCTAssertEqual(h.transport.closeReasons, ["transportFailed"])
+        XCTAssertFalse(h.session.hasCurrentTransportForTesting)
+    }
+
+    /// 有界性不得因上一条整改而丢失：静默重试被挡下之后，排空上限到点仍必须
+    /// 真的收口——回执永远不来也关得掉。
+    func testPlaybackDrainCapStillReleasesAfterTheRetryTimerWasGated() {
+        let h = makeActiveSession()
+        h.transport.upstreamWorkLedger.noteTaskState(
+            taskId: Self.taskId, status: "running", atMs: 0
+        )
+        h.session.nowMs = { Self.incidentMs }
+        h.session.forward(Self.fallback(.transportFailed))
+
+        h.transport.upstreamWorkLedger.noteTaskState(
+            taskId: Self.taskId, status: "completed", atMs: Self.taskCompletedMs
+        )
+        h.session.nowMs = { Self.taskCompletedMs }
+        h.session.forward(Self.playbackStarted("resp-final"))
+        h.session.receiveAgentDownlink(
+            .audioDone(requestId: Self.requestId, sessionId: Self.sessionId,
+                       finalSequence: 94, upstreamWorkOutstanding: false),
+            from: h.transport
+        )
+        h.session.nowMs = { Self.incidentMs + RealtimeSocketLifetimePolicy.upstreamSilenceBudgetMs }
+        h.firePendingRetries()
+        XCTAssertTrue(h.transport.closeReasons.isEmpty)
+
+        // `playback.ended` 永远不来（Watch 被杀 / WCSession 永久不可达）。
+        h.fireDrainTimers()
+        XCTAssertEqual(h.transport.closeReasons, ["transportFailed"],
+                       "排空上限必须真的兜住，否则 socket 永远关不掉")
+        XCTAssertFalse(h.session.hasCurrentTransportForTesting)
+    }
+
     /// 被推迟的关闭仍然有界：上游从此静默，重试计时器到点必须真的收口。
     func testDeferredUplinkFallbackIsReleasedByTheRetryTimer() {
         let h = makeActiveSession()
