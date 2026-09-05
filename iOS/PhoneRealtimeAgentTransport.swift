@@ -146,6 +146,30 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
 
         case .fallback:
             let reason = envelope.fallback?.reason ?? "bridge_fallback"
+            // ESS-1159：这条分支在生产上到不了——`PhoneRealtimeSession.forward`
+            // 先截住 `stream.fallback` 并按 `.uplinkFallback` 走账本裁决。但它
+            // 本身是一条**没有任务感知**的关闭路径（直接 `disconnect`，绕开
+            // `close(reason:)` 与 `RealtimeSocketLifetimePolicy`），一旦哪天
+            // 有人把 `.fallback` 放行到这里，ESS-1139/1159 的不变量就凭空破了。
+            // 这里补上同一道判定，让「绕开」在结构上不可能。
+            let decision = RealtimeSocketLifetimePolicy.decide(
+                cause: .uplinkFallback, ledger: upstreamWorkLedger, nowMs: nowMs()
+            )
+            guard decision.isClose else {
+                PhoneAgentClientLog.error(
+                    module: Self.logModule, event: "agent_socket_close_blocked",
+                    requestId: requestId, sessionId: sessionId,
+                    detail: "reason=\(reason) \(decision.detail)",
+                    code: "ERR_REALTIME_CLOSE_BLOCKED_TASK_IN_FLIGHT"
+                )
+                completion(nil)
+                return
+            }
+            PhoneAgentClientLog.info(
+                module: Self.logModule, event: "agent_socket_close",
+                requestId: requestId, sessionId: sessionId,
+                detail: "reason=\(reason) gen=\(gate.generation) \(decision.detail)"
+            )
             agentSession.disconnect(reason: reason)
             onStateChange?(.failed(reason: reason))
             completion(nil)
