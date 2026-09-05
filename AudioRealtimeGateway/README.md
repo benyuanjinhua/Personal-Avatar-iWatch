@@ -220,6 +220,46 @@ progress / text / audio / terminal 各有独立的 `seq`，`category:'text'` 帧
    上限没有消失，只是移到了客户端一轮只武装一次的 180 s 绝对上限
    （`SessionController.toolTurnHardTimeoutSeconds`）。
 
+##### 产生端抑制与背压护栏（ESS-1160）
+
+真机取证（turn `01a07230-b0a1-795a-ad2a-d2e67c6478be`）：上游在 **209 ms 内推了
+33 次逐字相同的「正在整理结果」**，本网关只要文本非空就自增 `progress_seq` 并整帧
+下发（每帧 295 bytes）。客户端在 `iPhone → Watch` 的 WCSession 那一跳积压 3 s，
+随后 1006 断连，`segments_emitted=0 done_emitted=false`，答案一个字都没到手表。
+ESS-1100 的「同文去抖 + 0.8 s 节流」在客户端 `Shared/ToolProgressNarration.swift`
+——那是**渲染**节流，减的是 UI 刷新次数，减不掉已经上了网络的帧。抑制必须做在
+产生端。
+
+判据分三层，越靠前越不可抑制：
+
+| 层 | 帧 | 处置 |
+|---|---|---|
+| 1 | 带 `answer_delta` 的帧（ESS-1111） | **永远下发**。每帧内容都不同，抑制它就是丢答案。 |
+| 2 | `task_id` 或 `status` 与上一帧不同（ESS-1097 的裁决面） | **永远下发**。客户端的任务集合裁决与终态收口全靠它，丢一帧就是把 ESS-1095 的死等装回去。 |
+| 3 | 纯展示帧（`task_id`+`status`+`progress_text`+`progress_category` 与上一帧逐字相同） | 距上一帧不足 `task_state_heartbeat_ms`（默认 2000）即**丢弃且不占 `progress_seq`**；满间隔补一帧心跳。 |
+
+第 3 层之上再加一道**背压护栏**：纯展示帧的每秒上限
+`max_task_state_frames_per_second`（默认 10）。第 1、2 层不过这道闸（丢裁决面比
+风暴更危险），但仍计入窗口——占用的是同一份带宽。两个开关置 0 即分别关闭抑制与
+限速，可回退到 ESS-1145 时代的逐帧行为。
+
+三条不变量：
+
+1. **抑制的帧不占 `progress_seq`**。客户端的「不比已应用的更新就丢弃」依赖序号
+   连续可比，被抑制的帧不该在那条线上留洞。
+2. **心跳不可省**。完全不发会让客户端无从区分「上游在慢慢做」与「网关死了」，
+   而 `SessionController.taskActivityTimeoutSeconds`（60 s）量的正是静默时长。
+3. **抑制不落日志**。一条被抑制的帧一行日志，就是把线格上的风暴原样搬进日志。
+   累计数改由每条 `downlink_task_state` 的 `suppressed_same_text` 携带。
+
+取证字段：
+
+| 事件 | 字段 |
+|---|---|
+| `downlink_task_state` | `suppressed_same_text`（到本帧为止累计抑制数）、`same_text_heartbeat`（本帧是否同文心跳补发） |
+| `task_state_rate_limited` | `limit_per_second` / `window_ms` / `frames_in_window` / `dropped_total`，**每个窗口只落一行** |
+| `session_ended` | `task_state_frames`、`task_state_frames_last_window` + `task_state_snapshot_window_ms`（断线前这段时间实际下发了多少帧）、`task_state_suppressed_same_text`、`task_state_rate_limited` |
+
 Server-initiated `ping` frames from `ws.ping()` are honoured but the
 protocol also supports the JSON `ping`/`pong` pair for platforms that can't
 inspect control frames.

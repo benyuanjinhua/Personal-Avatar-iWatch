@@ -250,6 +250,9 @@ export function createGateway(overrides = {}) {
         maxUplinkBytesPerSecond: CONFIG.max_uplink_bytes_per_second,
         maxDownlinkFrames: CONFIG.max_downlink_frames,
         maxDownlinkBytes: CONFIG.max_downlink_bytes,
+        taskStateHeartbeatMs: CONFIG.task_state_heartbeat_ms,
+        maxTaskStateFramesPerSecond: CONFIG.max_task_state_frames_per_second,
+        taskStateSnapshotWindowMs: CONFIG.task_state_snapshot_window_ms,
       })
       ws.on('message', (raw, isBinary) => {
         if (isBinary) return session.onBinary()
