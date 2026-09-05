@@ -173,6 +173,15 @@ test('ESS-1145 · 杭州天气时间线：答案在收口之前完整到达，�
     assert.equal(events.at(-1).type, 'agent.audio.done',
       '收口必须是最后一帧——它之后没有任何东西还需要这条 WSS')
 
+    // ESS-1145 复审整改：生命周期先到的这条路径也要钉住权威终态的位置。
+    // 整改前 `maybeEndDeferredTurn()` 跑在 `onEvent(agent.task)` **之前**，
+    // 正是 ESS-1140 逐帧证据里 41579.2 done / 41579.3 completed 的倒序。
+    const lifecycle = events.filter(e => e.type === 'agent.task'
+      && e.task?.id === taskId && e.task?.status === 'completed')
+    assert.equal(lifecycle.length, 1, '权威 completed 生命周期终态恰好一次')
+    assert.ok(events.indexOf(lifecycle[0]) < doneAt,
+      "agent.task{status:'completed'} 必须排在 agent.audio.done 之前")
+
     // 收口理由可判定，且证据链完整：欠交付 → 交付到达 → 收口。
     const terminal = logs.find(l => l.evt === 'upstream_turn_terminal')
     assert.equal(terminal.reason, 'task_terminal_audio_done')
@@ -262,30 +271,74 @@ test('ESS-1145 · 上游哑在交付上：显式失败，不用正常 done 掩�
   } finally { turn.close() }
 })
 
-test('ESS-1145 · 取消与正常收口不共用一个终态', async () => {
-  const taskId = 'work_cancelled'
-  const url = await upstream((ws, message) => {
-    if (message.type === 'connect') send(ws, { type: 'voice.ready' })
-    if (message.type !== 'audio.commit') return
-    delegationPrologue(ws, taskId)
-    setTimeout(() => {
-      // 上游取消路径：`taskStreamProtocol.cancel()` 先发交付终态，
-      // `sendTaskEvent()` 的生命周期终态后到——合法乱序，不得因此空等。
-      send(ws, streamFrame(taskId, { category: 'terminal', seq: 0, status: 'cancelled' }))
-      send(ws, { type: 'task.cancelled', task: { id: taskId, status: 'cancelled' } })
-    }, 60)
+// ESS-1145 复审整改（毕玄 2026-09-05 阻断）：**乱序**路径的回归。
+//
+// 上游只有取消/失败这一条路径会先发交付终态：`realtime-gateway.mjs` 的
+// `['task.cancelling','task.cancelled']` 分支先 `taskStreamProtocol.cancel()`
+//（立刻满足 taskDone && responseDone ⇒ 发 `category:'terminal'`），之后才走到
+// 同一回调末尾的 `sendTaskEvent()` 下发权威的 `task.cancelled`。
+//
+// 整改前这里只断言 reason 与 done 次数，看不见真正的失败面：交付终态被当成
+// 生命周期终态签了字，`agent.audio.done` 抢在 `agent.task{status}` 前面。
+// 下面这个工厂把两条乱序用例（cancelled / failed）钉在同一组不变量上。
+const outOfOrderTerminalCase = ({ title, taskId, status, expectedReason }) => {
+  test(title, async () => {
+    const url = await upstream((ws, message) => {
+      if (message.type === 'connect') send(ws, { type: 'voice.ready' })
+      if (message.type !== 'audio.commit') return
+      delegationPrologue(ws, taskId)
+      setTimeout(() => {
+        // 交付终态**先**到（合法乱序），权威生命周期终态后到。
+        send(ws, streamFrame(taskId, { category: 'terminal', seq: 0, status }))
+        setTimeout(() => {
+          send(ws, { type: `task.${status}`, task: { id: taskId, status } })
+        }, 30)
+      }, 60)
+    })
+    const { events, logs, turn } = harness(url)
+    turn.commit()
+    try {
+      // 交付终态到达后先停一拍：整改前这一拍里就已经收口了。
+      await waitFor(() => logs.some(l => l.evt === 'upstream_task_answer_delivered'))
+      assert.equal(events.filter(e => e.type === 'agent.audio.done').length, 0,
+        '交付终态不得替权威生命周期终态签字——收口不能早于 task.' + status)
+      const delivered = logs.find(l => l.evt === 'upstream_task_answer_delivered')
+      assert.equal(delivered.lifecycle_pending, true)
+      assert.ok(delivered.outstanding_tasks >= 1,
+        '在飞的生命周期账不得被交付终态删掉')
+
+      await waitFor(() => events.some(e => e.type === 'agent.audio.done'))
+      await new Promise(resolve => setTimeout(resolve, 120))
+
+      const lifecycle = events.filter(e => e.type === 'agent.task'
+        && e.task?.id === taskId && e.task?.status === status)
+      const doneEvents = events.filter(e => e.type === 'agent.audio.done')
+      assert.equal(lifecycle.length, 1, `权威 ${status} 生命周期终态恰好一次`)
+      assert.equal(doneEvents.length, 1, '整轮终态恰好一次')
+      assert.ok(events.indexOf(lifecycle[0]) < events.indexOf(doneEvents[0]),
+        `agent.task{status:'${status}'} 必须排在 agent.audio.done 之前`)
+      assert.equal(events.at(-1).type, 'agent.audio.done',
+        '收口必须是最后一帧——消费端收到它就可以关 WSS')
+      assert.equal(doneEvents[0].reason, expectedReason,
+        '取消 / 失败不得与正常交付共用一个终态')
+      assert.ok(!logs.some(l => l.evt === 'upstream_task_answer_timeout'),
+        '交付终态先到时不得再去等一帧永远不会来的第二个交付终态')
+      assert.ok(!logs.some(l => l.evt === 'upstream_task_terminal_timeout'),
+        '等待权威生命周期终态是短暂的，不得烧掉在飞兜底窗口')
+    } finally { turn.close() }
   })
-  const { events, logs, turn } = harness(url)
-  turn.commit()
-  try {
-    await waitFor(() => events.some(e => e.type === 'agent.audio.done'))
-    const done = events.find(e => e.type === 'agent.audio.done')
-    assert.equal(done.reason, 'task_cancelled_answer_done',
-      '取消不得被记成一次正常交付')
-    assert.equal(events.filter(e => e.type === 'agent.audio.done').length, 1)
-    assert.ok(!logs.some(l => l.evt === 'upstream_task_answer_timeout'),
-      '交付终态先到时不得再去等一帧永远不会来的第二个终态')
-  } finally { turn.close() }
+}
+
+outOfOrderTerminalCase({
+  title: 'ESS-1145 · 取消乱序：交付终态先到也必须等权威 task.cancelled 下行后再收口',
+  taskId: 'work_cancelled', status: 'cancelled',
+  expectedReason: 'task_cancelled_answer_done',
+})
+
+outOfOrderTerminalCase({
+  title: 'ESS-1145 · 失败乱序：交付终态先到也必须等权威 task.failed 下行后再收口',
+  taskId: 'work_failed', status: 'failed',
+  expectedReason: 'task_failed_answer_done',
 })
 
 test('ESS-1145 · 不走 task.stream 契约的上游逐字节保持原行为', async () => {

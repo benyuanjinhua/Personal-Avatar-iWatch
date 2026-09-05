@@ -847,8 +847,19 @@ export class QwenAgentTransport {
       while (turn.deliveredTasks.size > MAX_TASKS_PER_CONVERSATION) {
         turn.deliveredTasks.delete(turn.deliveredTasks.values().next().value)
       }
-      // 交付终态同时也是生命周期终态的证据：上游只在 taskDone 之后发它。
-      turn.outstandingTasks.delete(id)
+      // ESS-1145 复审整改（毕玄 2026-09-05 阻断）：这里原来无条件
+      // `turn.outstandingTasks.delete(id)`，理由写的是「交付终态同时也是生命
+      // 周期终态的证据」。那句话在取消路径上是错的，而取消恰恰是唯一会乱序的
+      // 路径：上游 `realtime-gateway.mjs` 先 `taskStreamProtocol.cancel()`
+      //（发 `category:'terminal' status=cancelled`）再走到 `sendTaskEvent()`，
+      // 所以交付终态**先于**权威的 `task.cancelled` 到达。删掉在飞账再收口，
+      // 就等于用交付终态替生命周期终态签字：`agent.audio.done` 抢在
+      // `agent.task{status:'cancelled'}` 前面，消费端按契约收到 done 即可关闭
+      // WSS——本单要修的失败面原样换了个入口。
+      //
+      // 两本账各自签自己的字：交付终态只记 `deliveredTasks` 与 outcome，
+      // 生命周期账一个都不动，收口留给随后到达的 `task.cancelled/failed`。
+      const lifecyclePending = turn.outstandingTasks.has(id)
       if (!deliveryPending()) {
         clearTimeout(turn.taskAnswerTimer)
         turn.taskAnswerTimer = null
@@ -857,6 +868,7 @@ export class QwenAgentTransport {
         ...scopeLog, task_id: id, status,
         streaming_fallback_reason: frame?.streamingFallbackReason ?? null,
         was_awaited: wasAwaited,
+        lifecycle_pending: lifecyclePending,
         awaiting_delivery: turn.awaitingTaskDelivery.size,
         outstanding_tasks: turn.outstandingTasks.size,
         final_sequence: turn.nextOutputSequence - 1,
@@ -866,6 +878,14 @@ export class QwenAgentTransport {
         turn.taskDeliveryOutcome = status
       } else if (turn.taskDeliveryOutcome === null) {
         turn.taskDeliveryOutcome = 'completed'
+      }
+      // 生命周期终态还没下行：这一轮什么都不收。等 `task.cancelled/failed`
+      // 走到下面的生命周期分支，把权威状态发给客户端之后再收口。上游若始终
+      // 不发那一帧，仍由原有的 `tool_task_timeout` 静默预算兜底（在飞账没被
+      // 动过，那条兜底依然成立）。
+      if (lifecyclePending) {
+        noteTaskActivity('task_answer_delivered_early')
+        return
       }
       noteTurnIdle('task_answer_delivered')
       maybeEndDeferredTurn()
@@ -1806,6 +1826,11 @@ export class QwenAgentTransport {
               turn.taskIdentity.delete(turn.taskIdentity.keys().next().value)
             }
           }
+          // ESS-1145 复审整改：收口不能在这里发。本分支下面还要把权威的
+          // `agent.task{status}` 帧下发给客户端，而「终态是最后一帧」要求
+          // 那一帧排在 `agent.audio.done` **之前**。ESS-1140 逐帧证据里的
+          // 41579.2 ms done / 41579.3 ms task completed 就是这个倒序。
+          let closeAfterLifecycleFrame = false
           if (terminal) {
             turn.outstandingTasks.delete(id)
             // ESS-1145 本单的根因就在这三行原来的写法里：`task.completed`
@@ -1828,8 +1853,7 @@ export class QwenAgentTransport {
               })
               noteTaskActivity('task_lifecycle_terminal')
             } else {
-              noteTurnIdle('task_terminal')
-              maybeEndDeferredTurn()
+              closeAfterLifecycleFrame = true
             }
           } else if (!TASK_NON_LIFECYCLE_EVENTS.has(event.type)) {
             turn.outstandingTasks.add(id)
@@ -1856,6 +1880,11 @@ export class QwenAgentTransport {
             type: 'agent.task', response_id: responseId, task: { id, status },
             ...(progress ? { progress } : {}),
           })
+          // ESS-1145: 权威生命周期终态已经落到下行，现在才谈得上收口。
+          if (closeAfterLifecycleFrame) {
+            noteTurnIdle('task_terminal')
+            maybeEndDeferredTurn()
+          }
           return
         }
         // ESS-1043: qwen `response.done` is the response-level metadata that
