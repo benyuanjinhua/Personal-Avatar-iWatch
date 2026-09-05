@@ -178,6 +178,8 @@ describe('RealtimeSession — happy path', () => {
     }))
     const err = sent.find(e => e.type === 'error')
     assert.equal(err?.code, 'ERR_STREAM_SEQUENCE')
+    assert.equal(err.expected_sequence, 0)
+    assert.equal(err.got_sequence, 4)
   })
 })
 

@@ -345,8 +345,7 @@ export class RealtimeSession {
     if (this.cancelled) return this.fail('ERR_GENERATION_STALE')
     if (message.sequence !== this.nextUplinkSequence - 1) {
       return this.fail('ERR_STREAM_SEQUENCE', {
-        detail: 'commit sequence must equal last accepted uplink sequence',
-        expected: this.nextUplinkSequence - 1, got: message.sequence,
+        expected_sequence: this.nextUplinkSequence - 1, got_sequence: message.sequence,
       })
     }
     this.uplinkCommitted = true
