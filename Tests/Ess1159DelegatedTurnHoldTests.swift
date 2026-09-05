@@ -208,6 +208,52 @@ final class Ess1159DelegatedTurnHoldTests: XCTestCase {
         )
     }
 
+    // MARK: - 上行回退归类（复审阻断 2）
+
+    /// `.cancelled` 的文档口径是「user cancel / new turn / lifecycle switch」，
+    /// 它是**用户意图**，必须与纯上行故障分开上线；其余全部是纯上行故障。
+    ///
+    /// 这条断言是穷举的：`FallbackReason` 将来加 case 时，`wireKind` 的
+    /// `switch` 会先在编译期逼作者表态，这里再兜一层运行期。
+    func testFallbackReasonWireKindSplitsUserIntentFromUplinkFailure() {
+        XCTAssertEqual(RealtimeUplinkStream.FallbackReason.cancelled.wireKind, .userCancelled)
+        let failures: [RealtimeUplinkStream.FallbackReason] = [
+            .transportFailed, .backpressure, .sequenceOverflow, .noAudioFrames,
+            .invalidPayload(.emptyPayload)
+        ]
+        for reason in failures {
+            XCTAssertEqual(
+                reason.wireKind, .uplinkFailure,
+                "\(reason) 是纯上行故障，不得被当成用户意图抢占在飞任务"
+            )
+        }
+    }
+
+    /// 归类必须**真的上线**：Codable 往返之后字段还在，且老载荷（无 `kind`）
+    /// 解得出来、值为 `nil`。
+    func testFallbackDescriptorCarriesKindOverTheWireAndTolerAtesLegacyPayload() throws {
+        let descriptor = RealtimeUplinkFallbackDescriptor(
+            requestId: "r", sessionId: "s",
+            reason: "\(RealtimeUplinkStream.FallbackReason.backpressure)",
+            kind: RealtimeUplinkStream.FallbackReason.backpressure.wireKind
+        )
+        let data = try JSONEncoder().encode(descriptor)
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        XCTAssertEqual(json["kind"] as? String, "uplink_failure", "归类必须落在线上")
+        XCTAssertEqual(
+            try JSONDecoder().decode(RealtimeUplinkFallbackDescriptor.self, from: data),
+            descriptor
+        )
+
+        let legacy = Data(#"{"request_id":"r","session_id":"s","reason":"cancelled"}"#.utf8)
+        let decoded = try JSONDecoder().decode(
+            RealtimeUplinkFallbackDescriptor.self, from: legacy
+        )
+        XCTAssertNil(decoded.kind, "老 Watch 载荷必须仍然解得出来")
+    }
+
     // MARK: - 有界性（保住 socket 不得变成永久泄漏）
 
     /// 上游在 12s 之后彻底静默：满 30s 静默预算即放行，socket 不会永久占着。
