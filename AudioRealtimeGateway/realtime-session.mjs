@@ -15,6 +15,8 @@
 // It is transport-agnostic: `send` is injected. The Node WSS glue lives in
 // server.mjs; unit tests exercise this module directly.
 
+import { TERMINAL_STATUSES } from './task-progress.mjs'
+
 const OPEN = 'open'
 const CLOSED = 'closed'
 
@@ -65,6 +67,26 @@ export class RealtimeSession {
     // never be part of a legal dense prefix within the budget.
     maxDownlinkFrames = 4096,
     maxDownlinkBytes = 32 * 1024 * 1024,
+    // ESS-1160 产生端抑制与背压护栏。真机取证（turn
+    // `01a07230-b0a1-795a-ad2a-d2e67c6478be`）：上游在 209 ms 内推了 33 次
+    // 逐字相同的「正在整理结果」，网关逐帧下发，客户端（iPhone → Watch 走
+    // WCSession 那一跳）积压 3 s 后 1006 断连，答案一个字都没到。
+    //   • `taskStateHeartbeatMs`：同文帧的**最小下发间隔**。0 关闭抑制。
+    //     下限心跳仍要留——完全不发会让客户端无从区分「上游在慢慢做」和
+    //     「网关死了」，而客户端的任务活动看门狗（`SessionController`
+    //     `taskActivityTimeoutSeconds = 60 s`）量的正是静默时长。
+    //   • `maxTaskStateFramesPerSecond`：**纯展示帧的每秒预算**（不是会话总
+    //     帧率上限——裁决帧与答案帧只计入窗口、不受它拦截），防止「文字每帧
+    //     都在变」的上游异常再打穿客户端。0 关闭限速。
+    taskStateHeartbeatMs = 2_000,
+    maxTaskStateFramesPerSecond = 10,
+    taskStateRateWindowMs = 1_000,
+    // `session_ended` 帧率快照的回看窗口：断线前这段时间里实际下发了多少帧。
+    taskStateSnapshotWindowMs = 5_000,
+    // 同时可跟踪的**未收口** task 数上限。超过即 fail-closed，见下方槽表注释。
+    maxTaskStateSlots = 64,
+    // 终态墓碑上限（只用于重复终态去重，可安全 LRU 淘汰）。
+    maxTaskStateTombstones = 256,
     now = () => Date.now(),
     setTimer = (fn, ms) => setTimeout(fn, ms),
     clearTimer = t => clearTimeout(t),
@@ -89,6 +111,10 @@ export class RealtimeSession {
     this.maxUplinkBytesPerSecond = maxUplinkBytesPerSecond
     this.maxDownlinkFrames = maxDownlinkFrames
     this.maxDownlinkBytes = maxDownlinkBytes
+    this.taskStateHeartbeatMs = taskStateHeartbeatMs
+    this.maxTaskStateFramesPerSecond = maxTaskStateFramesPerSecond
+    this.taskStateRateWindowMs = taskStateRateWindowMs
+    this.taskStateSnapshotWindowMs = taskStateSnapshotWindowMs
     this.commitDeadlineMs = commitDeadlineMs
     this.now = now
     this.setTimer = setTimer
@@ -151,6 +177,46 @@ export class RealtimeSession {
     // sequence space — a progress frame must never renumber the answer
     // stream, and an answer delta must never consume an audio sequence.
     this.answerSequence = 0
+    // ESS-1160: 产生端同文抑制的记账，**按 task 分槽**。
+    //
+    // 只记「全局上一帧」是不够的（ESS-1160 复审取证）：两个并行 task 交替上报
+    // 同一句 `running + 同文` 时，每一帧相对全局上一帧都「换了 task_id」，于是
+    // 每帧都被判成生命周期跃迁，抑制与限速双双落空——1 秒 100 帧实测
+    // `emitted=100 rateLimited=0`。判据必须落在**同一个 task 自己的上一帧**上：
+    // A 的这一帧只跟 A 的上一帧比，跃迁才是真跃迁。
+    //
+    // 槽位：`task_id`；无 `task_id` 的 ESS-1097 闩锁帧（`tool_call_pending` /
+    // `tool_call_resolved`）共用一个保留槽。
+    //
+    // 槽的释放**只由终态驱动**，绝不按容量做 LRU 淘汰（ESS-1160 二轮复审取证）：
+    // 淘汰过的活跃 task 下次到来时 `prior === null`，又被当成「首见」无条件放行，
+    // 绕过面原样回来——65 个活跃 task 轮转 130 次实测 `emitted=130 suppressed=0
+    // rateLimited=0`。所以活跃 task 的裁决状态一格都不能被静默丢掉；容量真的
+    // 用尽时 fail-closed（`ERR_TASK_STATE_SLOTS_EXHAUSTED`，retriable），把
+    // 「上游同时挂着 64 个未收口任务」这件事变成可判定的错误，而不是无声降级。
+    //
+    // 释放不等于遗忘（ESS-1160 三轮复审取证）：`5814fa8` 在终态下发后直接删掉
+    // 唯一那份记录，于是**重复的同一条终态**又成了 `prior === null` 的「首见」，
+    // 逐帧放行——同一个 `task-0/completed` 连发 100 次实测 `emitted=100
+    // suppressed=0`。本单根因就是上游重复投递，终态一样会重复。
+    //
+    // 所以分两张表：`_taskStateSlots` 是**未收口** task 的活跃槽（占容量、
+    // 只由终态释放、绝不淘汰）；`_taskStateSettled` 是终态**墓碑**，只用于
+    // 重复终态去重，可以按 LRU 淘汰——墓碑被淘汰不丢裁决面，因为那条真正的
+    // 终态早已实际下发过了，客户端的未结集合在第一条就已清空。
+    this._taskStateSlots = new Map()
+    this._taskStateSettled = new Map()
+    this.maxTaskStateSlots = maxTaskStateSlots
+    this.maxTaskStateTombstones = maxTaskStateTombstones
+    this.taskStateSlotsExhausted = 0
+    this.taskStateFrames = 0
+    this.taskStateSuppressedSameText = 0
+    this.taskStateRateLimited = 0
+    this._taskStateRateWindowStart = this.now()
+    this._taskStateInRateWindow = 0
+    this._taskStateRateWindowLogged = false
+    // 断线前 N 秒的帧率快照用的发送时刻环形缓冲，按窗口裁剪，天然有界。
+    this._taskStateEmitTimes = []
     this._barrierTimer = null
 
     this.agentTurn = null
@@ -237,6 +303,17 @@ export class RealtimeSession {
       final_sequence: this.finalSequence,
       done_emitted: this.doneEmitted,
       cancelled: this.cancelled,
+      // ESS-1160 取证：断线的**成因面**。1006 之后只有「done_emitted=false」
+      // 一句话时，无从判断是客户端放下手腕还是被下行帧打穿；这四个数把
+      // 「断线前这几秒网关到底往下灌了多少」变成可判定的。
+      task_state_frames: this.taskStateFrames,
+      task_state_frames_last_window: this._taskStateFramesSince(this.now()),
+      task_state_snapshot_window_ms: this.taskStateSnapshotWindowMs,
+      task_state_suppressed_same_text: this.taskStateSuppressedSameText,
+      task_state_rate_limited: this.taskStateRateLimited,
+      task_state_slots_open: this._taskStateSlots.size,
+      task_state_slots_settled: this._taskStateSettled.size,
+      task_state_slots_exhausted: this.taskStateSlotsExhausted,
     })
   }
 
@@ -494,11 +571,6 @@ export class RealtimeSession {
     const progressText = typeof progress?.text === 'string' && progress.text.trim()
       ? progress.text.trim()
       : null
-    let progressSeq = null
-    if (progressText !== null) {
-      this.progressSequence = (this.progressSequence ?? 0) + 1
-      progressSeq = this.progressSequence
-    }
     // ESS-1111 的第四个可选切面 `answer_delta` / `answer_seq`：最终答案的
     // **文本增量**。与 `progress_*` 一样是纯展示面，不参与任何屏障，也不占用
     // 音频的 sequence 空间——音频仍按既有序列与 barrier 保序，两者互不阻塞。
@@ -510,11 +582,94 @@ export class RealtimeSession {
     const answerDelta = typeof answer?.delta === 'string' && answer.delta !== ''
       ? answer.delta
       : null
+
+    // ESS-1160 产生端抑制。ESS-1100 把「同文去抖 + 0.8 s 节流」放在客户端
+    // `Shared/ToolProgressNarration.swift`，那是**渲染**节流——它减少 UI 刷新
+    // 次数，减不掉已经上了 WSS 与 WCSession 的帧。真机取证里 209 ms 33 帧同文
+    // 全部过网，客户端积压 3 s 后 1006。抑制必须做在产生端。
+    //
+    // 判据分三层，越靠前的越不可抑制：
+    //   1. **答案增量**（ESS-1111）：每一帧内容都不同，永远下发。
+    //   2. **生命周期跃迁**（ESS-1097 的 `task_id` + `status`）：客户端的任务集合
+    //      裁决与终态收口全靠它，丢一帧就是把 ESS-1095 的死等装回去，永远下发。
+    //   3. **纯展示帧**：只有这一层进抑制与限速。与**同一 task 上一帧**逐字
+    //      相同且间隔不足 `taskStateHeartbeatMs` 的丢弃；满了心跳间隔补发一帧，
+    //      让客户端的 60 s 任务活动看门狗有据可依。
+    //
+    // 第 1、2 层无界绕过限速是**刻意**的取舍：丢裁决面会把 ESS-1095 的死等装
+    // 回去，代价比风暴大。但要如实说清剩余风险（ESS-1160 二轮复审纠正了我上一版
+    // 的说法）：`server.mjs` 的 `createDownlinkGuard` 只看本网关这条 WSS 的
+    // `ws.bufferedAmount`，**量不到 iPhone → Watch 的 WCSession 积压**——本单事故
+    // 的 33 帧约 10 KiB，离 1 MiB 告警差两个数量级，那道闸从头到尾没有触发。
+    // 只要 iPhone 能持续排空 WSS，它就看不见手表侧的积压。
+    //
+    // 因此这条链上**没有跨跳硬背压**。裁决帧的实际约束只有两条，都在产生端：
+    // 同一 task 的 `status` 必须真的跃迁才算新信息（同 status 重复被第 3 层压掉），
+    // 以及未收口 task 数的硬上限 `maxTaskStateSlots`。两者之外的「单个 task 高频
+    // 真跃迁 status」仍能过量下发，这是已知且未消除的暴露面，需要跨跳背压
+    // （客户端回执 / 信用窗口）才能真正关掉，另单跟踪。
+    const taskKey = taskId === null ? null : String(taskId)
+    const statusText = String(status ?? 'unknown')
+    const progressCategory = progressText !== null && progress?.category
+      ? String(progress.category)
+      : null
+    //
+    // 判据按 **task 分槽**：这一帧只跟**同一个 task 自己**上一次实际下发的帧比。
+    // 拿全局上一帧当基准会被两个并行 task 的交替上报整个绕开——每帧都「换了
+    // task_id」，于是每帧都伪装成跃迁（复审实测 1 秒 100 帧全部放行）。
+    const slot = taskKey ?? '\u0000latch'
+    // 先查活跃槽，再查终态墓碑。墓碑命中意味着「这个 task 已经收口过」——
+    // 逐字相同的重复终态因此走同文抑制，而不是又被当成首见。
+    const prior = this._taskStateSlots.get(slot) ?? this._taskStateSettled.get(slot) ?? null
+    const displayKey = `${statusText}\u0000${progressText ?? ''}\u0000${progressCategory ?? ''}`
+    // 终态帧不需要占槽——它是这个 task 的最后一帧，发完即释放。
+    const releasesSlot = TERMINAL_STATUSES.has(statusText.toLowerCase())
+      || statusText === 'tool_call_resolved'
+    // 容量硬闸：只有**首见且非终态**的帧要新开一格。开不出来时不能继续把每帧
+    // 当首见放行（那正是二轮复审复现的绕过面），只能显式失败。已在册的 task
+    // 与任何终态帧都不受这道闸影响——终态还必须能进来释放它自己那一格。
+    if (!releasesSlot && !this._taskStateSlots.has(slot)
+      && this._taskStateSlots.size >= this.maxTaskStateSlots) {
+      this.taskStateSlotsExhausted += 1
+      this.log('task_state_slots_exhausted', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
+        task_id: taskKey, status: statusText,
+        slots: this._taskStateSlots.size, max_slots: this.maxTaskStateSlots,
+      })
+      return this.fail('ERR_TASK_STATE_SLOTS_EXHAUSTED', {
+        detail: `more than ${this.maxTaskStateSlots} unsettled tasks in one session`,
+        retriable: true,
+      })
+    }
+    // 首次见到的 task 一律放行——它本身就是「有个新任务」这条新信息。
+    const lifecycleChanged = prior === null || prior.statusText !== statusText
+    const sameAsLastFrame = prior !== null && prior.displayKey === displayKey
+    const at = this.now()
+    if (answerDelta === null && !lifecycleChanged) {
+      if (sameAsLastFrame
+        && this.taskStateHeartbeatMs > 0
+        && at - prior.sentAt < this.taskStateHeartbeatMs) {
+        // 抑制的帧**不占** `progress_seq`：客户端的「不比已应用的更新就丢弃」
+        // 规则依赖序号连续可比，被抑制的帧本来就不该在那条线上留洞。
+        // 这里刻意不落日志——一条帧一行日志就是把线格上的风暴原样搬进日志。
+        this.taskStateSuppressedSameText += 1
+        return
+      }
+      if (!this._admitTaskStateFrame(at)) return
+    }
+
+    let progressSeq = null
+    if (progressText !== null) {
+      this.progressSequence = (this.progressSequence ?? 0) + 1
+      progressSeq = this.progressSequence
+    }
     let answerSeq = null
     if (answerDelta !== null) {
       this.answerSequence = (this.answerSequence ?? 0) + 1
       answerSeq = this.answerSequence
     }
+    this._noteTaskStateEmitted(at, { slot, statusText, displayKey, releasesSlot })
     this._sendJson({
       type: 'task.state',
       session_id: this.scope.session_id, request_id: this.scope.request_id,
@@ -524,7 +679,7 @@ export class RealtimeSession {
       ...(progressText === null ? {} : {
         progress_text: progressText,
         progress_seq: progressSeq,
-        ...(progress?.category ? { progress_category: String(progress.category) } : {}),
+        ...(progressCategory === null ? {} : { progress_category: progressCategory }),
       }),
       ...(answerDelta === null ? {} : {
         answer_delta: answerDelta,
@@ -543,7 +698,76 @@ export class RealtimeSession {
       answer_seq: answerSeq,
       answer_delta_length: answerDelta === null ? null : answerDelta.length,
       after_turn_done: this.doneEmitted,
+      // ESS-1160 取证：到这一帧为止被同文抑制掉的累计帧数，以及本帧是不是
+      // 「同文但到了心跳间隔」补发的那一帧。
+      suppressed_same_text: this.taskStateSuppressedSameText,
+      same_text_heartbeat: answerDelta === null && !lifecycleChanged && sameAsLastFrame,
     })
+  }
+
+  /// ESS-1160 背压护栏：纯展示帧的每秒上限。生命周期帧与答案增量帧**不过**这道
+  /// 闸（它们承载裁决与内容，丢弃比风暴更危险），但仍计入窗口——占用的带宽
+  /// 是同一份。超限只在每个窗口首次触发时落一行日志，累计数一直记着。
+  _admitTaskStateFrame(at) {
+    if (this.maxTaskStateFramesPerSecond <= 0) return true
+    this._rollTaskStateWindow(at)
+    if (this._taskStateInRateWindow < this.maxTaskStateFramesPerSecond) return true
+    this.taskStateRateLimited += 1
+    if (!this._taskStateRateWindowLogged) {
+      this._taskStateRateWindowLogged = true
+      this.log('task_state_rate_limited', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
+        limit_per_second: this.maxTaskStateFramesPerSecond,
+        window_ms: this.taskStateRateWindowMs,
+        frames_in_window: this._taskStateInRateWindow,
+        dropped_total: this.taskStateRateLimited,
+      })
+    }
+    return false
+  }
+
+  _rollTaskStateWindow(at) {
+    if (at - this._taskStateRateWindowStart >= this.taskStateRateWindowMs) {
+      this._taskStateRateWindowStart = at
+      this._taskStateInRateWindow = 0
+      this._taskStateRateWindowLogged = false
+    }
+  }
+
+  _noteTaskStateEmitted(at, { slot, statusText, displayKey, releasesSlot }) {
+    this._rollTaskStateWindow(at)
+    this._taskStateInRateWindow += 1
+    this.taskStateFrames += 1
+    // 终态实际下发之后才释放活跃槽：一格只被它自己的收口回收，不被容量压力
+    // 挤掉。释放的同时留一块**墓碑**，重复终态因此走同文抑制而不是「首见」。
+    // 已收口的 task 又报出**非终态**（真的复活了）则销毁墓碑、重开活跃槽——
+    // 那是货真价实的新信息。
+    if (releasesSlot) {
+      this._taskStateSlots.delete(slot)
+      this._taskStateSettled.delete(slot)   // 重新 set 以移到 LRU 末尾
+      this._taskStateSettled.set(slot, { statusText, displayKey, sentAt: at })
+      while (this._taskStateSettled.size > this.maxTaskStateTombstones) {
+        this._taskStateSettled.delete(this._taskStateSettled.keys().next().value)
+      }
+    } else {
+      this._taskStateSettled.delete(slot)
+      this._taskStateSlots.set(slot, { statusText, displayKey, sentAt: at })
+    }
+    this._taskStateEmitTimes.push(at)
+    this._taskStateFramesSince(at)
+  }
+
+  /// 裁掉快照窗口之外的发送时刻并返回窗口内的帧数。裁剪就地做，缓冲区因此
+  /// 由「窗口 × 实际帧率」定界；再加一道硬上限，防止时钟回拨把它撑大。
+  _taskStateFramesSince(at) {
+    const cutoff = at - this.taskStateSnapshotWindowMs
+    let drop = 0
+    while (drop < this._taskStateEmitTimes.length && this._taskStateEmitTimes[drop] < cutoff) drop += 1
+    if (drop > 0) this._taskStateEmitTimes.splice(0, drop)
+    const overflow = this._taskStateEmitTimes.length - 1024
+    if (overflow > 0) this._taskStateEmitTimes.splice(0, overflow)
+    return this._taskStateEmitTimes.length
   }
 
   _emitDelta(event) {

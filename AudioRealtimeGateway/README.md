@@ -220,6 +220,88 @@ progress / text / audio / terminal 各有独立的 `seq`，`category:'text'` 帧
    上限没有消失，只是移到了客户端一轮只武装一次的 180 s 绝对上限
    （`SessionController.toolTurnHardTimeoutSeconds`）。
 
+##### 产生端抑制与背压护栏（ESS-1160）
+
+真机取证（turn `01a07230-b0a1-795a-ad2a-d2e67c6478be`）：上游在 **209 ms 内推了
+33 次逐字相同的「正在整理结果」**，本网关只要文本非空就自增 `progress_seq` 并整帧
+下发（每帧 295 bytes）。客户端在 `iPhone → Watch` 的 WCSession 那一跳积压 3 s，
+随后 1006 断连，`segments_emitted=0 done_emitted=false`，答案一个字都没到手表。
+ESS-1100 的「同文去抖 + 0.8 s 节流」在客户端 `Shared/ToolProgressNarration.swift`
+——那是**渲染**节流，减的是 UI 刷新次数，减不掉已经上了网络的帧。抑制必须做在
+产生端。
+
+判据分三层，越靠前越不可抑制：
+
+| 层 | 帧 | 处置 |
+|---|---|---|
+| 1 | 带 `answer_delta` 的帧（ESS-1111） | **永远下发**。每帧内容都不同，抑制它就是丢答案。 |
+| 2 | `task_id` 或 `status` 与上一帧不同（ESS-1097 的裁决面） | **永远下发**。客户端的任务集合裁决与终态收口全靠它，丢一帧就是把 ESS-1095 的死等装回去。 |
+| 3 | 纯展示帧（`status`+`progress_text`+`progress_category` 与**同一 task 上一帧**逐字相同） | 间隔不足 `task_state_heartbeat_ms`（默认 2000）即**丢弃且不占 `progress_seq`**；满间隔补一帧心跳。 |
+
+**判据按 task 分槽**，不是按「全局上一帧」。槽位是 `task_id`，无 `task_id` 的闩锁帧
+共用一个保留槽。拿全局上一帧当基准会被两个并行 task 的交替上报整个绕开——每帧都
+「换了 `task_id`」，于是每帧都伪装成跃迁，抑制与限速双双落空（ESS-1160 复审实测：
+A/B 交替刷同文，1 秒 100 帧 `emitted=100 rateLimited=0`）。
+
+**活跃槽只由终态释放，绝不按容量做 LRU 淘汰。** 淘汰过的活跃 task 下次到来时又被
+当成「首见」无条件放行，绕过面原样回来（二轮复审实测：65 个活跃 task 轮转 130 次，
+`emitted=130 suppressed=0 rateLimited=0`）。终态帧本身不占槽——它是这个 task 的
+最后一帧，发完即释放，因此顺序任务再多也不会耗尽容量。未收口 task 数超过
+`max_task_state_slots`（默认 64）时**fail-closed**：下发
+`ERR_TASK_STATE_SLOTS_EXHAUSTED`（`retriable: true`）并落
+`task_state_slots_exhausted`，把「上游同时挂着 64 个未收口任务」变成可判定的错误，
+而不是无声降级成逐帧放行。
+
+**释放不等于遗忘：终态留墓碑。** 只删记录的话，重复的同一条终态又成了「首见」并
+逐帧放行（三轮复审实测：同一个 `task-0/completed` 连发 100 次 → `emitted=100
+suppressed=0`）。本单根因就是上游重复投递，终态一样会重复。所以记录分两张表：
+
+| 表 | 内容 | 容量策略 |
+|---|---|---|
+| 活跃槽 | **未收口** task 的上一帧 | `max_task_state_slots`（64），只由终态释放，**绝不淘汰**，满即 fail-closed |
+| 终态墓碑 | 已收口 task 的终态帧 | `max_task_state_tombstones`（256），**可按 LRU 淘汰** |
+
+墓碑可以淘汰而活跃槽不行，是因为两者丢的东西不同：墓碑丢的只是「重复终态的去重
+能力」，那条**真**终态早已实际下发、客户端的未结集合在第一条就已清空；活跃槽丢的
+是还在生效的裁决状态。重复终态因此走同文抑制（首帧 + 心跳，与展示帧同一条规则，
+不为终态另开特例）；已收口的 task 再报**非终态**则销毁墓碑、重开活跃槽——那是货
+真价实的复活，是新信息。无 `task_id` 的 `tool_call_resolved` 走同一套机制。
+
+第 3 层之上再加一道**背压护栏**：`max_task_state_frames_per_second`（默认 10）。
+它是**展示帧的每秒预算，不是会话总帧率上限**——第 1、2 层只计入窗口、不受它拦截。
+这是刻意的取舍：丢裁决面会把 ESS-1095 的死等装回去，代价比风暴大。
+
+##### 剩余风险：这条链上没有跨跳硬背压
+
+`server.mjs` 的 `createDownlinkGuard` **不是**本风险的兜底。它只看本网关这条 WSS 的
+`ws.bufferedAmount`，量的是「Gateway → iPhone 这一段慢消费」；本单事故的积压发生在
+**WSS 之后的 iPhone → Watch WCSession 跳**，33 帧约 10 KiB，离 1 MiB 告警差两个
+数量级，那道闸从头到尾没有触发过。只要 iPhone 能持续排空 WSS，它就看不见手表侧的
+积压。
+
+所以裁决帧（第 1、2 层）的实际约束只有产生端这两条：同一 task 的 `status` 必须真的
+跃迁才算新信息，以及未收口 task 数的硬上限。两者之外的「单个 task 高频**真**跃迁
+`status`」「高频答案增量」仍能过量下发——这是**已知且未消除**的暴露面，关掉它需要
+跨跳背压（客户端回执 / 信用窗口），不在本单范围内。
+
+三条不变量：
+
+1. **抑制的帧不占 `progress_seq`**。客户端的「不比已应用的更新就丢弃」依赖序号
+   连续可比，被抑制的帧不该在那条线上留洞。
+2. **心跳不可省**。完全不发会让客户端无从区分「上游在慢慢做」与「网关死了」，
+   而 `SessionController.taskActivityTimeoutSeconds`（60 s）量的正是静默时长。
+3. **抑制不落日志**。一条被抑制的帧一行日志，就是把线格上的风暴原样搬进日志。
+   累计数改由每条 `downlink_task_state` 的 `suppressed_same_text` 携带。
+
+取证字段：
+
+| 事件 | 字段 |
+|---|---|
+| `downlink_task_state` | `suppressed_same_text`（到本帧为止累计抑制数）、`same_text_heartbeat`（本帧是否同文心跳补发） |
+| `task_state_rate_limited` | `limit_per_second` / `window_ms` / `frames_in_window` / `dropped_total`，**每个窗口只落一行** |
+| `task_state_slots_exhausted` | `task_id` / `status` / `slots` / `max_slots`，随后 fail-closed |
+| `session_ended` | `task_state_frames`、`task_state_frames_last_window` + `task_state_snapshot_window_ms`（断线前这段时间实际下发了多少帧）、`task_state_suppressed_same_text`、`task_state_rate_limited`、`task_state_slots_open`、`task_state_slots_settled`、`task_state_slots_exhausted` |
+
 Server-initiated `ping` frames from `ws.ping()` are honoured but the
 protocol also supports the JSON `ping`/`pong` pair for platforms that can't
 inspect control frames.
@@ -369,6 +451,7 @@ upstream nor a Watch that stopped draining can grow the process without limit.
 | `ERR_UPSTREAM_FRAME_INVALID` | — / 1008 | Upstream `audio.delta` payload is not base64 (retriable). |
 | `ERR_UPSTREAM_BUDGET_EXCEEDED` | — / 1008 | Upstream exceeded the per-turn downlink frame/byte budget. |
 | `ERR_DOWNLINK_BUDGET` | — / 1008 | Session downlink budget or sequence window exhausted (not retriable). |
+| `ERR_TASK_STATE_SLOTS_EXHAUSTED` | — / 1008 | ESS-1160: 一个会话里同时挂着超过 `max_task_state_slots`（默认 64）个**未收口** task。活跃 task 的裁决状态不能被静默淘汰（淘汰会让每帧重新变成「首见」而绕过抑制与限速），所以这里 fail-closed 而不是降级（retriable）。 |
 | `ERR_UPSTREAM_NO_RESPONSE` | — / 1008 | ESS-842: no upstream response frame within `agent_response_timeout_ms` of `audio.commit` (retriable). |
 | `ERR_VOICE_OWNERSHIP_LOST` | — / 1008 | ESS-842: upstream voice ownership was taken by another client mid-turn, so our audio is being discarded (retriable). The `upstream_ownership` log now carries the thief's `holder_label` and `holder_instance_id` (ESS-978). |
 | `ERR_VOICE_BUSY` | — / 1008 | ESS-978: the upstream single voice slot is held by another client at connect time and the holder is not eligible for takeover — a foreign gateway instance, or a frontend while `agent_takeover_voice` is off (retriable). |
