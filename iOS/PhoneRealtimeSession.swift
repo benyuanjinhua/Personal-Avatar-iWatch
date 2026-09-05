@@ -24,6 +24,10 @@ final class PhoneRealtimeSession {
         func send(_ envelope: RealtimeUplinkEnvelope, completion: @escaping @MainActor (Error?) -> Void)
         func receive(handler: @escaping @MainActor (Result<RealtimeDownlinkEnvelope, Error>) -> Void)
         func close(reason: String)
+        /// ESS-1139：这条 socket 上还有没有上游工作在跑。Agent transport 由它
+        /// 消费的 `task.state` 流独占喂养；Bridge transport 与测试替身走默认
+        /// 实现（空账本 = 没有在飞工作），行为与本单之前逐字相同。
+        var upstreamWorkLedger: UpstreamWorkLedger { get }
     }
 
     enum State: Equatable {
@@ -66,8 +70,78 @@ final class PhoneRealtimeSession {
     /// Emits state transitions so callers can flip UI or log evidence.
     var onStateChange: ((State) -> Void)?
 
+    /// ESS-1139 判定用时钟。生产用单调时钟。
+    var nowMs: () -> Int64 = { RealtimeSocketLifetimePolicy.monotonicNowMs() }
+
+    /// ESS-1139 日志收敛：一次被拦下的 supersede 会被**每一个上行帧**重问一遍
+    /// （`forward(_:)` 的 `.audioAppend` 分支，真机节奏 ≈184ms）。逐帧打 error
+    /// 就是 ESS-960 那场 47 秒刷屏的翻版。首条如实打 error，其余只累计，解除
+    /// 时补一条汇总——「拦了多久、拦了多少帧」仍然可直接 grep。
+    private var blockedCloseReason: String?
+    private var blockedCloseCount = 0
+
     init(transportFactory: @escaping (_ requestId: String, _ sessionId: String) -> Transport?) {
         self.transportFactory = transportFactory
+    }
+
+    /// ESS-1139：**唯一的关闭出口**。
+    ///
+    /// 这条 socket 关不关，由 `RealtimeSocketLifetimePolicy` 按「动因 + 上游
+    /// 工作账本」裁决；本方法只负责把裁决落到 transport 上并如实留证。
+    /// 散在各处的 `currentTransport?.close(reason:)` 全部收敛到这里——真机
+    /// 事故里杀掉三个回合的正是其中一条没有任何任务感知的调用。
+    ///
+    /// - Returns: 这次是否真的关闭了。`false` = 上游还有活在跑，socket 保住了。
+    @discardableResult
+    private func closeCurrentTransport(
+        cause: RealtimeSocketCloseCause, reason: String
+    ) -> Bool {
+        let identity = Self.turnIdentity(of: state)
+        guard let transport = currentTransport else {
+            flushBlockedCloseSummary(identity)
+            return true
+        }
+        let decision = RealtimeSocketLifetimePolicy.decide(
+            cause: cause, ledger: transport.upstreamWorkLedger, nowMs: nowMs()
+        )
+        switch decision {
+        case .close(let detail):
+            flushBlockedCloseSummary(identity)
+            PhoneAgentClientLog.info(
+                module: "phone_session", event: "realtime_socket_close",
+                requestId: identity?.requestId ?? "", sessionId: identity?.sessionId ?? "",
+                detail: "reason=\(reason) \(detail)"
+            )
+            transport.close(reason: reason)
+            return true
+        case .hold(let detail):
+            // 上游还在干活：不关、不换 transport、不丢 socket。这条日志就是
+            // 「客户端为什么没有关」的直接证据，与网关的 `socket_closed`
+            // 一一对照。
+            blockedCloseCount += 1
+            if blockedCloseReason == nil {
+                blockedCloseReason = reason
+                PhoneAgentClientLog.error(
+                    module: "phone_session", event: "realtime_socket_close_blocked",
+                    requestId: identity?.requestId ?? "", sessionId: identity?.sessionId ?? "",
+                    detail: "reason=\(reason) \(detail)",
+                    code: "ERR_REALTIME_CLOSE_BLOCKED_TASK_IN_FLIGHT"
+                )
+            }
+            return false
+        }
+    }
+
+    /// ESS-1139：一次拦截结束时补一条汇总，然后归零。
+    private func flushBlockedCloseSummary(_ identity: (requestId: String, sessionId: String)?) {
+        guard let blocked = blockedCloseReason else { return }
+        PhoneAgentClientLog.info(
+            module: "phone_session", event: "realtime_socket_close_blocked_summary",
+            requestId: identity?.requestId ?? "", sessionId: identity?.sessionId ?? "",
+            detail: "reason=\(blocked) blocked_attempts=\(blockedCloseCount)"
+        )
+        blockedCloseReason = nil
+        blockedCloseCount = 0
     }
 
     /// Forward a Watch-side envelope. Opens the WSS session lazily on
@@ -132,7 +206,7 @@ final class PhoneRealtimeSession {
         case .fallback:
             guard let descriptor = envelope.fallback else { return }
             transition(to: .failed(reason: descriptor.reason))
-            currentTransport?.close(reason: descriptor.reason)
+            closeCurrentTransport(cause: .transportFailure, reason: descriptor.reason)
             currentTransport = nil
             completion?(true)
             return
@@ -169,7 +243,7 @@ final class PhoneRealtimeSession {
                     "realtime uplink send failed error=\(String(describing: error), privacy: .public)"
                 )
                 self?.transition(to: .failed(reason: "send_failed"))
-                self?.currentTransport?.close(reason: "send_failed")
+                self?.closeCurrentTransport(cause: .transportFailure, reason: "send_failed")
                 self?.currentTransport = nil
             }
             completion?(error == nil)
@@ -182,9 +256,13 @@ final class PhoneRealtimeSession {
 
     /// Watch reported the turn is over (audio.done acknowledged and playback
     /// finished) — or the user cancelled. Either way, tear down the WSS.
-    func endTurn(reason: String) {
+    ///
+    /// ESS-1139：`cause` 不再由本方法猜。用户显式退出与生命周期打断的语义
+    /// 完全不同——前者压过在飞任务，后者不得压过——把两者塞进同一个字符串
+    /// reason 里再现场解析，正是判定会随措辞漂移的来源。
+    func endTurn(reason: String, cause: RealtimeSocketCloseCause = .userExit) {
         transition(to: .cancelled)
-        currentTransport?.close(reason: reason)
+        closeCurrentTransport(cause: cause, reason: reason)
         currentTransport = nil
         pendingDownlink.discardAll()
         // ESS-987：回合边界是压制日志的收口点——把这一轮攒下的计数打成一条
@@ -199,7 +277,7 @@ final class PhoneRealtimeSession {
         Self.logger.notice(
             "realtime session interrupted reason=\(reason, privacy: .public)"
         )
-        endTurn(reason: "lifecycle_\(reason)")
+        endTurn(reason: "lifecycle_\(reason)", cause: .lifecycle)
     }
 
     /// ESS-751：唯一的下行出口。消费者**真正接手**（持久 outbox 入队成功）
@@ -328,7 +406,20 @@ final class PhoneRealtimeSession {
         )
         emit(verdict.logs)
         guard verdict.isAdmitted else { return false }
-        currentTransport?.close(reason: "supersede")
+        // ESS-1139：**这里就是真机上杀掉三个回合的那一行**。
+        //
+        // 旧代码无条件 `close(reason: "supersede")`：Watch 一旦（因为阶段播报
+        // 的回合级 `audio.done` 抢在 `task.state` 之前落地）开了下一轮，
+        // iPhone 就把一条上游 Codex 任务还在跑的 socket 关掉，网关随即对上游
+        // 发 `mute` 并 `terminate`，此后所有帧按 `socket_closed` 丢弃——天气
+        // 在任务启动后 1.2s、知识库在 11.5s，答案再也送不回来。
+        //
+        // 现在换 transport 之前先问账本：上游还有活在跑就**不换、不关**，
+        // 本信封原地丢弃（Watch 侧由 ESS-1097 的回合闸门 + 180s 绝对上限兜底）。
+        // 判定与有界性全在 `Shared/RealtimeSocketLifetimePolicy`。
+        guard closeCurrentTransport(cause: .turnSupersede, reason: "supersede") else {
+            return false
+        }
         guard let transport = transportFactory(requestId, sessionId) else {
             transition(to: .failed(reason: "no_transport"))
             return false
@@ -433,4 +524,13 @@ final class PhoneRealtimeSession {
             detail: "reason=\(reason) incoming_generation=\(incomingGeneration) \(active)"
         )
     }
+}
+
+// MARK: - ESS-1139 默认账本
+
+extension PhoneRealtimeSession.Transport {
+    /// Bridge transport 与测试替身没有 `task.state` 这条流，也就没有「上游还有
+    /// 活在跑」可言。默认给空账本 = 一律放行关闭，行为与本单之前逐字相同——
+    /// 新闸门只对真正携带任务生命周期的 Agent transport 生效。
+    var upstreamWorkLedger: UpstreamWorkLedger { UpstreamWorkLedger() }
 }

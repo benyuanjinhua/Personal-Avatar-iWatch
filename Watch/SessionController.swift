@@ -369,6 +369,14 @@ final class SessionController: ObservableObject {
     /// 迟到音频不得进入下一轮」在会话层的闸门。上一轮的迟到 `.ended` 到达时
     /// 这里已经换成新 id，事件被丢弃并留证（`session_stale_turn_event`）。
     private(set) var activeTurnRequestId: String?
+    /// ESS-1139：上一轮的 request_id。**只用于取证**。
+    ///
+    /// 确认这一点在真机上曾经发生过，是本单最需要的一条证据：我们在一个
+    /// 还在跑的任务上开了新一轮，而 iPhone 侧那条 WSS 正是被这一步 supersede
+    /// 掉的。这类迟到帧会被 `acceptsTurnEvent` 按陈旧事件丢掉，那条 info 级
+    /// 日志和「上一轮的迟到 `.ended`」混在一起，看不出这件事。留下这个 id，
+    /// 就能把它单独打成一条可 grep 的 error。
+    private var previousTurnRequestId: String?
     /// ESS-600：会话内回合序号，从 1 开始严格递增。conversation 级的
     /// `conversation_id` / `turn_id` 真相在 `RealtimeMediaSession.ConversationHandle`
     /// （唯一铸造点），本序号只是会话层日志的可读游标，不另铸 id。
@@ -674,6 +682,19 @@ final class SessionController: ObservableObject {
         answer: AgentTaskAnswerDelta? = nil,
         generation: Int? = nil
     ) {
+        // ESS-1139：**先取证，后闸门**。这一帧若属于刚刚被换掉的那一轮且带着
+        // 未终结的任务，说明「阶段播报的终态没被正确分类」这条边漏了——
+        // 上游任务还在跑，而我们已经开了新一轮。这是真机复盘唯一能把
+        // 「客户端为什么关了 WSS」一句话钉死的证据。
+        if requestId != activeTurnRequestId, requestId == previousTurnRequestId,
+           taskId != nil, !ToolTaskStatus(rawValue: status).isTerminal {
+            WatchLog.error(
+                "session", "session_task_state_after_relisten", requestId: requestId,
+                detail: "turn_index=\(turnIndex) task_id=\(taskId ?? "nil") status=\(status) "
+                    + "active_request_id=\(activeTurnRequestId ?? "nil")",
+                code: "ERR_SESSION_TASK_STATE_AFTER_RELISTEN"
+            )
+        }
         guard acceptsTurnEvent(requestId, event: "task_state") else { return }
         // ESS-1111：代际闸门。打断（barge-in）之后上一代仍在跑的任务会继续
         // 下发进展；requestId 相同的情况下 `acceptsTurnEvent` 拦不住它们，
@@ -1521,6 +1542,7 @@ final class SessionController: ObservableObject {
             return
         }
         turnIndex += 1
+        previousTurnRequestId = activeTurnRequestId
         activeTurnRequestId = requestId
         turnPhase = .listening
         didDetectSpeechThisTurn = false

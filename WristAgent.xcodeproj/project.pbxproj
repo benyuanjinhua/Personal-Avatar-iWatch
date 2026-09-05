@@ -110,6 +110,7 @@
 		6FC7DD8CDED2FC4F48C4D782 /* WorkoutSessionKeeper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 873CEEDCC164019112A771BF /* WorkoutSessionKeeper.swift */; };
 		7045B87E2347FCA6BB2FFE4F /* ErrorCue_VoiceBusy.m4a in Resources */ = {isa = PBXBuildFile; fileRef = 69D850E7D15B7525D07D9DBF /* ErrorCue_VoiceBusy.m4a */; };
 		707A59AAF2C9619F3909A162 /* RecorderErrorCopyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD573B88FBB9CCE341ED1513 /* RecorderErrorCopyTests.swift */; };
+		708F8FA785F9730AA535A769 /* RealtimeSocketLifetime.swift in Sources */ = {isa = PBXBuildFile; fileRef = D75D7046CE3C23AAAA0D059A /* RealtimeSocketLifetime.swift */; };
 		70FD953CB2F4AAEE8EC1B04A /* RealtimeDownlinkRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE23EED29A03F535392EF09F /* RealtimeDownlinkRelay.swift */; };
 		7249351A21B20AAC649807D9 /* RealtimeMediaFormat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CEDAB5F3CD7B29B993F0FA2 /* RealtimeMediaFormat.swift */; };
 		72AEE3274DC1730DAB22022E /* VoiceTurnJournal.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6F558DCDF4B9CA8F0BA2E2D /* VoiceTurnJournal.swift */; };
@@ -118,6 +119,7 @@
 		7522A68DCE1692BE3EC03F18 /* PlaybackRecoveryPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 905294A59B10050708A50FBF /* PlaybackRecoveryPolicy.swift */; };
 		770DB683BEC61B9851F2B0D1 /* WatchDownlinkOutbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA60FA5DC7EA82EC5729B54B /* WatchDownlinkOutbox.swift */; };
 		7787B4B28677EFC96B299E8D /* RealtimeMediaFormat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CEDAB5F3CD7B29B993F0FA2 /* RealtimeMediaFormat.swift */; };
+		77E5E0F50F586720D18A5DCA /* Ess1139TurnTerminalTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D340147D2C03BA578750652 /* Ess1139TurnTerminalTests.swift */; };
 		7B62721FF4D9FAC7D8F87F4D /* ToolTurnAggregate.swift in Sources */ = {isa = PBXBuildFile; fileRef = F23B7FB4EB5389A4286F9FFA /* ToolTurnAggregate.swift */; };
 		7C465E62628112B008899B51 /* SpeechPlayerInterruptionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D83133781FDC42821BB13DF /* SpeechPlayerInterruptionTests.swift */; };
 		7CBCA51C89D61E95EAD52B9D /* SelfCheck.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9D95B86CF79B5796D5EA9DC /* SelfCheck.swift */; };
@@ -132,6 +134,7 @@
 		88162BC2A9F5ADF2F56E6246 /* PlaybackEndgamePolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F3363DB5FB9EF9FF44F0744 /* PlaybackEndgamePolicy.swift */; };
 		8A5EEAA528E32C9DAB749BFD /* AudioSessionPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = CC3ECBAA9A62DE9AED7C9C34 /* AudioSessionPolicy.swift */; };
 		8B6A6F0FCCDA3292ED9D8EDC /* RecordingInterruptionPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 660A4DC8375BF7F24E66C40F /* RecordingInterruptionPolicy.swift */; };
+		8D4ECFB8631C38DCC8EC9963 /* RealtimeSocketLifetime.swift in Sources */ = {isa = PBXBuildFile; fileRef = D75D7046CE3C23AAAA0D059A /* RealtimeSocketLifetime.swift */; };
 		8D74BBCA5601E569150562B6 /* PhoneHistoryViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0A1CA98E116775B1257DB33 /* PhoneHistoryViews.swift */; };
 		8DF32A5F83D4DAB84323E012 /* SpeechVaultCleaner.swift in Sources */ = {isa = PBXBuildFile; fileRef = D22D20695006303F619B7C73 /* SpeechVaultCleaner.swift */; };
 		8E707FCD5F8E34356AF80305 /* WatchDownlinkOutbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA60FA5DC7EA82EC5729B54B /* WatchDownlinkOutbox.swift */; };
@@ -373,6 +376,7 @@
 		79F87E24A5046DA1229304B2 /* WristAgentPhoneRelay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WristAgentPhoneRelay.swift; sourceTree = "<group>"; };
 		7C39EB1E56AB7E26A9E4F72C /* IphoneRelayStuckHintTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IphoneRelayStuckHintTests.swift; sourceTree = "<group>"; };
 		7D32404639DC13C1A992EC83 /* WatchHaptics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchHaptics.swift; sourceTree = "<group>"; };
+		7D340147D2C03BA578750652 /* Ess1139TurnTerminalTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Ess1139TurnTerminalTests.swift; sourceTree = "<group>"; };
 		7FB53D6920928D88D7BE6631 /* PushToTalkController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PushToTalkController.swift; sourceTree = "<group>"; };
 		825EC2CED4ACE4E583D94864 /* WatchStreamReceiver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchStreamReceiver.swift; sourceTree = "<group>"; };
 		827B4FDF631BEBEFA13118A9 /* PersistHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PersistHelper.swift; sourceTree = "<group>"; };
@@ -426,6 +430,7 @@
 		D4F4270CF6A0906299F8D2B2 /* SessionAutoRelistenTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionAutoRelistenTests.swift; sourceTree = "<group>"; };
 		D57D9FD3BB121F4AAB879ACF /* RealtimeUplinkStream.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeUplinkStream.swift; sourceTree = "<group>"; };
 		D70795CA9CC1B496467FE2B8 /* VoiceInteractionCue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceInteractionCue.swift; sourceTree = "<group>"; };
+		D75D7046CE3C23AAAA0D059A /* RealtimeSocketLifetime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeSocketLifetime.swift; sourceTree = "<group>"; };
 		D766F1C25818E2E0E25B2FD6 /* LongTaskActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LongTaskActivity.swift; sourceTree = "<group>"; };
 		DA80AE8DA7716EC314B4D3C7 /* WatchLogShipper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchLogShipper.swift; sourceTree = "<group>"; };
 		DADB09FEF300D41C2F68E5BA /* WatchRealtimeMediaAdapterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchRealtimeMediaAdapterTests.swift; sourceTree = "<group>"; };
@@ -506,6 +511,7 @@
 				63B4FAFE429B15682CA5E9F8 /* RealtimeMediaWireFormat.swift */,
 				716B2884D666AEE57BA6AB37 /* RealtimePlaybackReceiptTracker.swift */,
 				73DA7FDE513C75183DABE590 /* RealtimeSessionReducer.swift */,
+				D75D7046CE3C23AAAA0D059A /* RealtimeSocketLifetime.swift */,
 				71DD57EEBFF1E751752CCEB3 /* RealtimeTurnGate.swift */,
 				D57D9FD3BB121F4AAB879ACF /* RealtimeUplinkStream.swift */,
 				660A4DC8375BF7F24E66C40F /* RecordingInterruptionPolicy.swift */,
@@ -649,6 +655,7 @@
 				3B69C4A55A57C14A2C8BA890 /* Ess1100ThinkingProgressTests.swift */,
 				6DB79DCBE358AFFAF3546BAF /* Ess1111AnswerStreamDisplayTests.swift */,
 				62FE5A408D073A5BA1A4A71B /* Ess1111LongTaskSessionTests.swift */,
+				7D340147D2C03BA578750652 /* Ess1139TurnTerminalTests.swift */,
 				501DA6C27E71C17FBEE74B79 /* HostedCITestGate.swift */,
 				49FB03B4D918EF4092A7E9FB /* InterruptedRecordingNoticeTests.swift */,
 				7C39EB1E56AB7E26A9E4F72C /* IphoneRelayStuckHintTests.swift */,
@@ -884,6 +891,7 @@
 				ADA9DA139E2F37E309F1C70C /* RealtimeMediaWireFormat.swift in Sources */,
 				AFE89128B354D801AA7BF512 /* RealtimePlaybackReceiptTracker.swift in Sources */,
 				687F960B1AC7EF8B42C02037 /* RealtimeSessionReducer.swift in Sources */,
+				708F8FA785F9730AA535A769 /* RealtimeSocketLifetime.swift in Sources */,
 				EED7D35175AB7700D90515E8 /* RealtimeTurnGate.swift in Sources */,
 				954F45FCF33EA311254AEDDF /* RealtimeUplinkStream.swift in Sources */,
 				D3C4178F9DE0CC5B10EE75A9 /* RecordingInterruptionPolicy.swift in Sources */,
@@ -975,6 +983,7 @@
 				9CC8DFCBBBA03E71A76FA9BB /* RealtimePlaybackReceiptTracker.swift in Sources */,
 				6D85A1C0165351F512F9726D /* RealtimeSessionKeepAlive.swift in Sources */,
 				18AF771525FEA7D04A2B155B /* RealtimeSessionReducer.swift in Sources */,
+				8D4ECFB8631C38DCC8EC9963 /* RealtimeSocketLifetime.swift in Sources */,
 				5BC89FB6037F20841DEEA515 /* RealtimeTurnGate.swift in Sources */,
 				B6585933C8D51C2E81B72056 /* RealtimeUplinkStream.swift in Sources */,
 				8B6A6F0FCCDA3292ED9D8EDC /* RecordingInterruptionPolicy.swift in Sources */,
@@ -1043,6 +1052,7 @@
 				D59B30C5F214D5134585349D /* Ess1100ThinkingProgressTests.swift in Sources */,
 				DF2A203215898ED735E1714A /* Ess1111AnswerStreamDisplayTests.swift in Sources */,
 				97364D6F37E7E26DB0EB6976 /* Ess1111LongTaskSessionTests.swift in Sources */,
+				77E5E0F50F586720D18A5DCA /* Ess1139TurnTerminalTests.swift in Sources */,
 				39C8B4C513C81F2A195FEE5D /* HostedCITestGate.swift in Sources */,
 				E2E5A72D5B095D12B991CFDB /* InterruptedRecordingNoticeTests.swift in Sources */,
 				FB1CEDBA1C036BC17C6BEF2C /* IphoneRelayStuckHintTests.swift in Sources */,

@@ -48,6 +48,18 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
     private var cancelTimeout: Task<Void, Never>?
     private var didEmitTransportFailure = false
 
+    /// ESS-1139：这条 socket 上**还有没有上游工作在跑**。
+    ///
+    /// 它由本适配器已经在消费的 `task.state` 流独占喂养，与 Watch 的
+    /// `ToolTurnAggregate` 分工明确：那边管「这一轮该显示什么、能不能开下一轮」
+    /// 并随 `startNextTurn` 重置；这边只管「这条 socket 关得掉吗」，回合重置
+    /// 动不了它。真机三条用例丢结果的正是这条边——Watch 已经进了下一轮，
+    /// 而 iPhone 手上这条 socket 上的 Codex 任务还在跑，却被无条件 `close`。
+    private(set) var upstreamWorkLedger = UpstreamWorkLedger()
+
+    /// 判定用时钟。生产用单调时钟，测试可注入。
+    var nowMs: () -> Int64 = { RealtimeSocketLifetimePolicy.monotonicNowMs() }
+
     /// Pending completion for the latest `send` call — the Agent transport
     /// is asynchronous (WSS), so `send` reports completion via this pending
     /// closure on error or next success.
@@ -153,6 +165,15 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
 
     func close(reason: String) {
         cancelTimeout?.cancel()
+        // ESS-1139 验收 6：**每一次**客户端主动关闭都必须在 bridge.log 里带上
+        // 原因与当时的上游账本。事故复盘卡在「客户端关闭了 WSS」而说不出为什么，
+        // 就是因为这里以前只写 `os.Logger`——真机导出的 bridge.log 里根本没有
+        // 这条边。
+        PhoneAgentClientLog.info(
+            module: Self.logModule, event: "agent_socket_close",
+            requestId: requestId, sessionId: sessionId,
+            detail: "reason=\(reason) gen=\(gate.generation) \(upstreamWorkLedger.logDetail)"
+        )
         agentSession.disconnect(reason: reason)
     }
 
@@ -240,17 +261,33 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
                 )
                 return
             }
+            // ESS-1139：**判据搬到顺序有保证的这一侧**。网关在有序 WSS 上先发
+            // `tool_call_pending` / `task.state`、后发 `audio.done`，但 WCSession
+            // 那一跳不保证跨消息顺序（见 `RealtimeDownlinkEnvelope
+            // .progressSequence` 的注释与 `RealtimePlaybackReceiptTracker
+            // .requestDrain` 里的同一条事实）。Watch 因此可能在还没拿到任何
+            // 工具证据的那一瞬间，把阶段播报的这条终态当成回合答完。
+            // 这里就地把账本的结论钉在帧上，Watch 不必再赌两条消息的到达顺序。
+            // 回合级 `audio.done` **只记事实，不清账**：真机天气用例里它是阶段
+            // 播报的收口，而 Codex 任务此后还要跑 10s；拿它去宣布任务结束正是
+            // 那次 1.2s 关闭的授权来源。记账放在代际门禁**之后**——被判陈旧的
+            // 那一帧属于上一代，不该改写本代账本。
+            self.upstreamWorkLedger.noteTurnTerminal(atMs: self.nowMs())
+            let workOutstanding = self.upstreamWorkLedger.hasOutstandingWork
             let envelope = RealtimeDownlinkEnvelope.audioDone(
                 requestId: rid, sessionId: self.sessionId,
                 responseId: responseId,
                 generation: gen,
-                finalSequence: finalSeq
+                finalSequence: finalSeq,
+                upstreamWorkOutstanding: workOutstanding
             )
             PhoneAgentClientLog.info(
                 module: Self.logModule,
                 event: "downlink_enqueued",
                 requestId: rid, sessionId: self.sessionId,
-                detail: "type=audio.done final_seq=\(finalSeq) gen=\(gen)"
+                detail: "type=audio.done final_seq=\(finalSeq) gen=\(gen) "
+                    + "upstream_work_outstanding=\(workOutstanding) "
+                    + self.upstreamWorkLedger.logDetail
             )
             self.onDownlink?(envelope)
         }
@@ -286,6 +323,12 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
         // request_id 归属闸门（`SessionController.acceptsTurnEvent`）承担。
         agentSession.onTaskState = { [weak self] rid, gen, taskId, status, progress, answer in
             guard let self else { return }
+            // ESS-1139：先记账、后转发。账本是本条 socket 能不能被关掉的唯一
+            // 依据，它必须在任何转发失败/丢弃之前就落定——否则 Watch 那一侧
+            // 一旦漏收，iPhone 也跟着以为「上游没活了」，两层同时失明。
+            self.upstreamWorkLedger.noteTaskState(
+                taskId: taskId, status: status, atMs: self.nowMs()
+            )
             let envelope = RealtimeDownlinkEnvelope.taskState(
                 requestId: rid, sessionId: self.sessionId,
                 generation: gen, taskId: taskId, status: status,
@@ -313,6 +356,10 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
                 "agent gateway error code=\(code, privacy: .public) rid=\(rid.prefix(8), privacy: .public) gen=\(gen) retriable=\(retriable)"
             )
             if !retriable {
+                // ESS-1139：不可重试的网关错误 = 这条 socket 上不会再有上游
+                // 事实。如实清账，否则一个永远关不掉的 socket 会把 supersede
+                // 一路顶到 180s 绝对上限。
+                self.upstreamWorkLedger.noteUpstreamSettled(atMs: self.nowMs())
                 self.onStateChange?(.failed(reason: "gateway_error_\(code)"))
             }
         }
@@ -339,6 +386,9 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
                 Self.logger.error(
                     "agent failed sid=\(sid.prefix(8), privacy: .public) reason=\(reason, privacy: .public)"
                 )
+                // ESS-1139：socket 真的没了 ⇒ 账本清零。保住一条已死的 socket
+                // 不叫防御，叫拦住下一轮。
+                self.upstreamWorkLedger.noteUpstreamSettled(atMs: self.nowMs())
                 if !self.didEmitTransportFailure {
                     self.didEmitTransportFailure = true
                     PhoneAgentClientLog.error(
