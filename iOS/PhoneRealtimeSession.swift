@@ -185,15 +185,17 @@ final class PhoneRealtimeSession {
         switch envelope.kind {
         case .streamStart:
             guard let start = envelope.start else { return }
-            // ESS-539: a new stream.start means a new turn. Discard any
-            // downlink envelopes queued from a previous incomplete session
-            // so they don't pollute the new turn's playback.
-            if !pendingDownlink.isEmpty {
-                let discarded = pendingDownlink.discardAll()
-                Self.logger.info(
-                    "realtime discarding \(discarded) stale downlink envelopes from previous session"
-                )
-            }
+            // ESS-539 的陈旧缓冲清理**不在这里**了。
+            //
+            // ESS-1139 第二轮复审阻断（毕玄 2026-09-05）：它原先无条件跑在
+            // `openIfNeeded` **之前**。旧 transport 还挂着在飞任务、
+            // WCSession 暂时接不住、缓冲里正压着待重放的答案时，新 request 的
+            // `stream.start` 会先把那批帧清掉；随后 supersede 被任务感知策略
+            // 正确地判成 hold，socket 与 state 都保住了，**可答案缓冲已经没了**。
+            // 保住一条空转的 socket 不叫保住答案。
+            //
+            // 现在清理跟着「新一轮真的建起来了」这个事实走，落在 `openIfNeeded`
+            // 里换完 transport 之后。判据见那里的注释。
             guard openIfNeeded(
                 requestId: start.requestId, sessionId: start.sessionId, trigger: .turnStart
             ) else {
@@ -550,6 +552,31 @@ final class PhoneRealtimeSession {
             return false
         }
         currentTransport = transport
+        // ESS-539 / ESS-1139 第二轮复审整改：陈旧下行缓冲在**新一轮真的建起来
+        // 之后**才清。
+        //
+        // 不变量收敛成一句可判定的话：**只有真的换了一轮，上一轮的缓冲才作废**。
+        // 于是三条边自动落到正确的一侧——
+        //   • 被策略判 hold（上游还有活在跑）：根本走不到这里，缓冲原样保留，
+        //     恢复后照常重放；
+        //   • 被 ESS-960 闸门拦下 / transport 工厂失败：同样走不到这里，
+        //     上一轮仍是当前那一轮，它的缓冲不该被一个没建成的新轮清掉；
+        //   • 同一轮重发的 `stream.start`（方法开头就短路返回了）：不再误清
+        //     自己的缓冲——这是把清理挪进来顺带修掉的一条。
+        //
+        // 触发面刻意维持 ESS-539 原样：只有 `.turnStart` 清。`.uplinkFrame` /
+        // `.turnCommit` 触发的 supersede 本来就不清，这次不顺手扩大。
+        if trigger == .turnStart, !pendingDownlink.isEmpty {
+            let discarded = pendingDownlink.discardAll()
+            Self.logger.info(
+                "realtime discarding \(discarded) stale downlink envelopes from previous session"
+            )
+            PhoneAgentClientLog.info(
+                module: "phone_session", event: "realtime_stale_downlink_discarded",
+                requestId: requestId, sessionId: sessionId,
+                detail: "discarded=\(discarded) reason=new_turn_established"
+            )
+        }
         transition(to: .connecting(requestId: requestId, sessionId: sessionId))
         scheduleReceive(transport)
         // Agent WSS connect is asynchronous. Its adapter reports the real

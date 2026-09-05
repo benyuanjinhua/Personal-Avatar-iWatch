@@ -20,6 +20,8 @@ final class Ess1139SessionHoldTests: XCTestCase {
     private static let requestId = "01a0392b-c9ea-7c1a-a265-4688ba0cd894"
     private static let sessionId = "78829197-723E-4253-A84F-C1B7E3267A21"
     private static let taskId = "work_a8f61916-3b05-4831-9122-355f613365d3"
+    private static let nextRequestId = "01a0392b-c9ea-7c1a-a265-000000000002"
+    private static let nextSessionId = "78829197-723E-4253-A84F-000000000002"
 
     // MARK: - 阻断复现
 
@@ -196,6 +198,126 @@ final class Ess1139SessionHoldTests: XCTestCase {
         XCTAssertEqual(h.pendingRetries.count, 1, "逐帧重试不得堆积计时器")
     }
 
+    // MARK: - supersede 主链路（第二轮复审阻断）
+
+    /// **第二轮阻断正面复现**：旧任务在飞 + `pendingDownlink` 非空 + 新 request
+    /// 的 `stream.start`。
+    ///
+    /// 整改前 `.streamStart` 分支在 `openIfNeeded` **之前**就无条件
+    /// `pendingDownlink.discardAll()`：随后 supersede 被任务感知策略正确判成
+    /// hold，socket 与 state 都保住了，**可答案缓冲已经没了**。保住一条空转的
+    /// socket 不叫保住答案。
+    func testSupersedeHeldByInFlightTaskKeepsTransportStateAndBuffer() {
+        let h = makeActiveSession()
+        h.consumerTakesDelivery = false  // WCSession 暂时接不住 → 进断连缓冲
+        h.transport.upstreamWorkLedger.noteTaskState(
+            taskId: Self.taskId, status: "running", atMs: 0
+        )
+        h.session.nowMs = { 1_000 }
+
+        // 旧任务的答案已经压在缓冲里等重放。
+        h.session.receiveAgentDownlink(
+            .taskState(requestId: Self.requestId, sessionId: Self.sessionId,
+                       taskId: Self.taskId, status: "running"),
+            from: h.transport
+        )
+        XCTAssertEqual(h.session.pendingDownlinkStats.count, 1, "夹具前提：缓冲里确实有待重放的帧")
+
+        // Watch 开了新一轮：新 request_id 的 stream.start 到达。
+        var opened = true
+        h.session.forward(.start(RealtimeStreamStart(
+            requestId: Self.nextRequestId, sessionId: Self.nextSessionId,
+            format: .uplinkPCM16, capturedAtMs: 0
+        ))) { opened = $0 }
+
+        XCTAssertFalse(opened, "上游还有活在跑 ⇒ 这一轮必须被拒")
+        XCTAssertTrue(h.transport.closeReasons.isEmpty, "旧 socket 不得被关")
+        XCTAssertEqual(h.session.state,
+                       .active(requestId: Self.requestId, sessionId: Self.sessionId),
+                       "会话状态必须仍指向旧回合")
+        XCTAssertTrue(h.session.hasCurrentTransportForTesting, "旧 transport 引用必须保留")
+        XCTAssertEqual(h.session.pendingDownlinkStats.count, 1,
+                       "hold 时旧缓冲不得被新一轮清掉——这正是本次阻断")
+        XCTAssertTrue(h.transportRequests.isEmpty, "被拒的一轮不得建新 transport")
+
+        // 三者都还在 ⇒ 旧回合仍然能继续收、能恢复重放。
+        h.transport.upstreamWorkLedger.noteTaskState(
+            taskId: Self.taskId, status: "completed", atMs: 9_000
+        )
+        h.session.nowMs = { 9_000 }
+        h.session.receiveAgentDownlink(
+            .taskState(requestId: Self.requestId, sessionId: Self.sessionId,
+                       taskId: Self.taskId, status: "completed"),
+            from: h.transport
+        )
+        XCTAssertEqual(h.session.pendingDownlinkStats.count, 2)
+
+        h.consumerTakesDelivery = true
+        XCTAssertEqual(h.session.replayPendingDownlink(trigger: "test_reachable"), 2,
+                       "保留下来的缓冲必须真的能恢复重放")
+        XCTAssertEqual(h.session.pendingDownlinkStats.count, 0)
+    }
+
+    /// **主链路不受影响**：没有在飞任务时，正常 supersede 仍然清旧缓冲、
+    /// 关旧 socket、建新 transport ——ESS-539 的语义一个字未改。
+    func testNormalSupersedeStillDiscardsStaleBufferAndOpensNewTransport() {
+        let h = makeActiveSession()
+        h.consumerTakesDelivery = false
+        h.session.nowMs = { 1_000 }
+
+        h.session.receiveAgentDownlink(
+            .taskState(requestId: Self.requestId, sessionId: Self.sessionId,
+                       taskId: Self.taskId, status: "running"),
+            from: h.transport
+        )
+        XCTAssertEqual(h.session.pendingDownlinkStats.count, 1, "夹具前提：缓冲里有上一轮的帧")
+
+        // 账本为空 = 上游没有在飞工作。
+        var opened = false
+        h.session.forward(.start(RealtimeStreamStart(
+            requestId: Self.nextRequestId, sessionId: Self.nextSessionId,
+            format: .uplinkPCM16, capturedAtMs: 0
+        ))) { opened = $0 }
+
+        XCTAssertTrue(opened, "没有在飞任务 ⇒ 照常开新一轮")
+        XCTAssertEqual(h.transport.closeReasons, ["supersede"], "旧 socket 照常关闭")
+        XCTAssertEqual(h.transportRequests, [Self.nextRequestId], "必须建起新 transport")
+        XCTAssertEqual(h.session.pendingDownlinkStats.count, 0,
+                       "新一轮真的建起来了 ⇒ 上一轮的缓冲照常作废")
+        XCTAssertEqual(h.session.state,
+                       .connecting(requestId: Self.nextRequestId, sessionId: Self.nextSessionId))
+    }
+
+    /// 把清理挪进 `openIfNeeded` 顺带修掉的一条：**同一轮重发的 `stream.start`
+    /// 不得清掉自己的缓冲**。
+    ///
+    /// 旧代码的清理跑在方法开头，连「同一轮的重发」都一起清——而
+    /// `openIfNeeded` 对同一轮是直接短路返回的，根本没有「新一轮」可言。
+    func testDuplicateStreamStartForSameTurnKeepsItsOwnBuffer() {
+        let h = makeActiveSession()
+        h.consumerTakesDelivery = false
+        h.session.nowMs = { 1_000 }
+        h.session.receiveAgentDownlink(
+            .taskState(requestId: Self.requestId, sessionId: Self.sessionId,
+                       taskId: Self.taskId, status: "running"),
+            from: h.transport
+        )
+        XCTAssertEqual(h.session.pendingDownlinkStats.count, 1)
+
+        // 同一 request/session 重发 stream.start（幂等重试）。
+        var opened = false
+        h.session.forward(.start(RealtimeStreamStart(
+            requestId: Self.requestId, sessionId: Self.sessionId,
+            format: .uplinkPCM16, capturedAtMs: 0
+        ))) { opened = $0 }
+
+        XCTAssertTrue(opened)
+        XCTAssertEqual(h.session.pendingDownlinkStats.count, 1,
+                       "同一轮的重发不得清掉本轮自己的待重放帧")
+        XCTAssertTrue(h.transport.closeReasons.isEmpty)
+        XCTAssertTrue(h.transportRequests.isEmpty, "同一轮不得重建 transport")
+    }
+
     // MARK: - 夹具
 
     private struct Harness {
@@ -207,6 +329,9 @@ final class Ess1139SessionHoldTests: XCTestCase {
             var delivered: [RealtimeDownlinkEnvelope] = []
             var consumerTakesDelivery = true
             var pendingRetries: [@MainActor () -> Void] = []
+            /// 工厂被问过哪些 request_id。「被拒的一轮不得建新 transport」
+            /// 只有盯着工厂才断言得了。
+            var transportRequests: [String] = []
         }
 
         init(session: PhoneRealtimeSession, transport: FakeTransport, box: Box) {
@@ -217,6 +342,7 @@ final class Ess1139SessionHoldTests: XCTestCase {
 
         var delivered: [RealtimeDownlinkEnvelope] { box.delivered }
         var pendingRetries: [@MainActor () -> Void] { box.pendingRetries }
+        var transportRequests: [String] { box.transportRequests }
         var consumerTakesDelivery: Bool {
             get { box.consumerTakesDelivery }
             nonmutating set { box.consumerTakesDelivery = newValue }
@@ -234,7 +360,14 @@ final class Ess1139SessionHoldTests: XCTestCase {
     private func makeActiveSession() -> Harness {
         let transport = FakeTransport()
         let box = Harness.Box()
-        let session = PhoneRealtimeSession(transportFactory: { _, _ in transport })
+        let session = PhoneRealtimeSession(transportFactory: { requestId, _ in
+            // 首轮交出夹具持有的那一个（后续断言都盯着它）；此后每次工厂被
+            // 调用都记一笔并给一个新的替身，供「被拒的一轮不得建新 transport」
+            // 断言。
+            guard requestId != Self.requestId else { return transport }
+            box.transportRequests.append(requestId)
+            return FakeTransport()
+        })
         session.isAgentTransport = true
         session.onDownlink = { envelope in
             guard box.consumerTakesDelivery else { return .deferred }
