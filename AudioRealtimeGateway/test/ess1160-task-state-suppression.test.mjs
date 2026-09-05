@@ -166,6 +166,59 @@ describe('ESS-1160 · 抑制不吃裁决面', () => {
     assert.deepEqual(frames.map(f => f.task_id), ['task-1', 'task-2'])
   })
 
+  // 复审取证（ESS-1160）：只记「全局上一帧」时，两个并行 task 交替上报同一句
+  // `running + 同文`，每帧相对全局上一帧都「换了 task_id」，于是每帧都被伪装成
+  // 生命周期跃迁——抑制与限速双双落空，实测 1 秒 100 帧 `emitted=100
+  // rateLimited=0`。判据改成按 task 分槽后，A 只跟 A 的上一帧比。
+  it('两个 task 交替刷同文 100 次不再互相伪装成跃迁', () => {
+    const h = harness()
+    for (let i = 0; i < 100; i += 1) {
+      h.task({ id: i % 2 === 0 ? 'task-0' : 'task-1', status: 'running',
+        text: '正在整理结果', category: 'text' })
+      h.advance(5)          // 500ms 内 100 帧，同一个限速窗口
+    }
+    const frames = taskState(h.sent)
+    // 两个 task 各自的第一帧（首见即新信息），其余 98 帧全被同文抑制。
+    assert.equal(frames.length, 2)
+    assert.deepEqual(frames.map(f => f.task_id), ['task-0', 'task-1'])
+    assert.equal(h.session.taskStateSuppressedSameText, 98)
+  })
+
+  it('交错风暴之后，两个 task 的 completed 都立即下发', () => {
+    const h = harness()
+    for (let i = 0; i < 100; i += 1) {
+      h.task({ id: i % 2 === 0 ? 'task-0' : 'task-1', status: 'running',
+        text: '正在整理结果', category: 'text' })
+      h.advance(5)
+    }
+    h.task({ id: 'task-0', status: 'completed' })
+    h.task({ id: 'task-1', status: 'completed' })
+    const terminal = taskState(h.sent).filter(f => f.status === 'completed')
+    // 客户端 `ToolTurnAggregate` 靠这两帧清空未结集合，一帧都不能少。
+    assert.deepEqual(terminal.map(f => f.task_id), ['task-0', 'task-1'])
+  })
+
+  it('文字每帧都在变的交错风暴由限速兜住', () => {
+    const h = harness({ maxTaskStateFramesPerSecond: 5 })
+    for (let i = 0; i < 40; i += 1) {
+      h.task({ id: i % 2 === 0 ? 'task-0' : 'task-1', status: 'running',
+        text: `正在执行第${i}步`, category: 'plan' })
+      h.advance(5)
+    }
+    // 两个 task 的首帧是「首见」跃迁，直通；其余展示帧受 5 fps 预算约束。
+    assert.equal(taskState(h.sent).length, 5)
+    assert.equal(h.session.taskStateRateLimited, 35)
+  })
+
+  it('槽表按插入序淘汰，长时间不动的 task 不会把内存撑大', () => {
+    const h = harness()
+    for (let i = 0; i < 200; i += 1) {
+      h.task({ id: `task-${i}`, status: 'running' })
+      h.advance(1)
+    }
+    assert.equal(h.session._taskStateSlots.size, h.session.maxTaskStateSlots)
+  })
+
   it('答案增量帧永不被抑制（内容是增量，逐帧都不同）', () => {
     const h = harness()
     h.task({ status: 'running', delta: '杭州' })

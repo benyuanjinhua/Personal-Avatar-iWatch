@@ -73,8 +73,9 @@ export class RealtimeSession {
     //     下限心跳仍要留——完全不发会让客户端无从区分「上游在慢慢做」和
     //     「网关死了」，而客户端的任务活动看门狗（`SessionController`
     //     `taskActivityTimeoutSeconds = 60 s`）量的正是静默时长。
-    //   • `maxTaskStateFramesPerSecond`：**纯展示帧**的每秒上限，防止未来
-    //     任何「文字每帧都在变」的上游异常再打穿客户端。0 关闭限速。
+    //   • `maxTaskStateFramesPerSecond`：**纯展示帧的每秒预算**（不是会话总
+    //     帧率上限——裁决帧与答案帧只计入窗口、不受它拦截），防止「文字每帧
+    //     都在变」的上游异常再打穿客户端。0 关闭限速。
     taskStateHeartbeatMs = 2_000,
     maxTaskStateFramesPerSecond = 10,
     taskStateRateWindowMs = 1_000,
@@ -170,13 +171,18 @@ export class RealtimeSession {
     // sequence space — a progress frame must never renumber the answer
     // stream, and an answer delta must never consume an audio sequence.
     this.answerSequence = 0
-    // ESS-1160: 产生端同文抑制的记账。`lifecycleKey` 是 ESS-1097 的裁决面
-    // （`task_id` + `status`），`displayKey` 在它之上再叠 ESS-1100 的展示面
-    // （进展文字 + 类目）。抑制只发生在**两者都没变且不带答案增量**的帧上：
-    // 生命周期跃迁与答案增量永远原样下发，护栏不碰它们。
-    this._lastTaskStateLifecycleKey = null
-    this._lastTaskStateDisplayKey = null
-    this._lastTaskStateSentAt = null
+    // ESS-1160: 产生端同文抑制的记账，**按 task 分槽**。
+    //
+    // 只记「全局上一帧」是不够的（ESS-1160 复审取证）：两个并行 task 交替上报
+    // 同一句 `running + 同文` 时，每一帧相对全局上一帧都「换了 task_id」，于是
+    // 每帧都被判成生命周期跃迁，抑制与限速双双落空——1 秒 100 帧实测
+    // `emitted=100 rateLimited=0`。判据必须落在**同一个 task 自己的上一帧**上：
+    // A 的这一帧只跟 A 的上一帧比，跃迁才是真跃迁。
+    //
+    // 槽位：`task_id`；无 `task_id` 的 ESS-1097 闩锁帧（`tool_call_pending` /
+    // `tool_call_resolved`）共用一个保留槽。槽表按插入序淘汰，天然有界。
+    this._taskStateSlots = new Map()
+    this.maxTaskStateSlots = 64
     this.taskStateFrames = 0
     this.taskStateSuppressedSameText = 0
     this.taskStateRateLimited = 0
@@ -557,24 +563,35 @@ export class RealtimeSession {
     //   1. **答案增量**（ESS-1111）：每一帧内容都不同，永远下发。
     //   2. **生命周期跃迁**（ESS-1097 的 `task_id` + `status`）：客户端的任务集合
     //      裁决与终态收口全靠它，丢一帧就是把 ESS-1095 的死等装回去，永远下发。
-    //   3. **纯展示帧**：只有这一层进抑制与限速。逐字相同且距上一帧不足
-    //      `taskStateHeartbeatMs` 的丢弃；满了心跳间隔补发一帧，让客户端的
-    //      60 s 任务活动看门狗有据可依。
+    //   3. **纯展示帧**：只有这一层进抑制与限速。与**同一 task 上一帧**逐字
+    //      相同且间隔不足 `taskStateHeartbeatMs` 的丢弃；满了心跳间隔补发一帧，
+    //      让客户端的 60 s 任务活动看门狗有据可依。
+    //
+    // 第 1、2 层无界绕过限速是**刻意**的取舍：丢裁决面会把 ESS-1095 的死等装
+    // 回去，代价比风暴大。它们的兜底不在这里，而在 `server.mjs` 的
+    // `createDownlinkGuard`——socket 发送缓冲超过 `max_downlink_buffered_bytes`
+    // （4 MiB，1 MiB 告警）即按背压收口。剩余暴露面因此是「单个 task 高频跃迁
+    // status」，它会撞上那道缓冲闸而不是无声打穿客户端。
     const taskKey = taskId === null ? null : String(taskId)
     const statusText = String(status ?? 'unknown')
     const progressCategory = progressText !== null && progress?.category
       ? String(progress.category)
       : null
-    const lifecycleKey = `${taskKey ?? ''}\u0000${statusText}`
-    const displayKey = `${lifecycleKey}\u0000${progressText ?? ''}\u0000${progressCategory ?? ''}`
-    const lifecycleChanged = lifecycleKey !== this._lastTaskStateLifecycleKey
-    const sameAsLastFrame = displayKey === this._lastTaskStateDisplayKey
+    //
+    // 判据按 **task 分槽**：这一帧只跟**同一个 task 自己**上一次实际下发的帧比。
+    // 拿全局上一帧当基准会被两个并行 task 的交替上报整个绕开——每帧都「换了
+    // task_id」，于是每帧都伪装成跃迁（复审实测 1 秒 100 帧全部放行）。
+    const slot = taskKey ?? '\u0000latch'
+    const prior = this._taskStateSlots.get(slot) ?? null
+    const displayKey = `${statusText}\u0000${progressText ?? ''}\u0000${progressCategory ?? ''}`
+    // 首次见到的 task 一律放行——它本身就是「有个新任务」这条新信息。
+    const lifecycleChanged = prior === null || prior.statusText !== statusText
+    const sameAsLastFrame = prior !== null && prior.displayKey === displayKey
     const at = this.now()
     if (answerDelta === null && !lifecycleChanged) {
       if (sameAsLastFrame
         && this.taskStateHeartbeatMs > 0
-        && this._lastTaskStateSentAt !== null
-        && at - this._lastTaskStateSentAt < this.taskStateHeartbeatMs) {
+        && at - prior.sentAt < this.taskStateHeartbeatMs) {
         // 抑制的帧**不占** `progress_seq`：客户端的「不比已应用的更新就丢弃」
         // 规则依赖序号连续可比，被抑制的帧本来就不该在那条线上留洞。
         // 这里刻意不落日志——一条帧一行日志就是把线格上的风暴原样搬进日志。
@@ -594,7 +611,7 @@ export class RealtimeSession {
       this.answerSequence = (this.answerSequence ?? 0) + 1
       answerSeq = this.answerSequence
     }
-    this._noteTaskStateEmitted(at, { lifecycleKey, displayKey })
+    this._noteTaskStateEmitted(at, { slot, statusText, displayKey })
     this._sendJson({
       type: 'task.state',
       session_id: this.scope.session_id, request_id: this.scope.request_id,
@@ -660,13 +677,16 @@ export class RealtimeSession {
     }
   }
 
-  _noteTaskStateEmitted(at, { lifecycleKey, displayKey }) {
+  _noteTaskStateEmitted(at, { slot, statusText, displayKey }) {
     this._rollTaskStateWindow(at)
     this._taskStateInRateWindow += 1
     this.taskStateFrames += 1
-    this._lastTaskStateLifecycleKey = lifecycleKey
-    this._lastTaskStateDisplayKey = displayKey
-    this._lastTaskStateSentAt = at
+    // 重新 set 一次把槽移到插入序末尾，淘汰的因此总是最久没动过的那个。
+    this._taskStateSlots.delete(slot)
+    this._taskStateSlots.set(slot, { statusText, displayKey, sentAt: at })
+    while (this._taskStateSlots.size > this.maxTaskStateSlots) {
+      this._taskStateSlots.delete(this._taskStateSlots.keys().next().value)
+    }
     this._taskStateEmitTimes.push(at)
     this._taskStateFramesSince(at)
   }

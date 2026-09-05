@@ -236,12 +236,21 @@ ESS-1100 的「同文去抖 + 0.8 s 节流」在客户端 `Shared/ToolProgressNa
 |---|---|---|
 | 1 | 带 `answer_delta` 的帧（ESS-1111） | **永远下发**。每帧内容都不同，抑制它就是丢答案。 |
 | 2 | `task_id` 或 `status` 与上一帧不同（ESS-1097 的裁决面） | **永远下发**。客户端的任务集合裁决与终态收口全靠它，丢一帧就是把 ESS-1095 的死等装回去。 |
-| 3 | 纯展示帧（`task_id`+`status`+`progress_text`+`progress_category` 与上一帧逐字相同） | 距上一帧不足 `task_state_heartbeat_ms`（默认 2000）即**丢弃且不占 `progress_seq`**；满间隔补一帧心跳。 |
+| 3 | 纯展示帧（`status`+`progress_text`+`progress_category` 与**同一 task 上一帧**逐字相同） | 间隔不足 `task_state_heartbeat_ms`（默认 2000）即**丢弃且不占 `progress_seq`**；满间隔补一帧心跳。 |
 
-第 3 层之上再加一道**背压护栏**：纯展示帧的每秒上限
-`max_task_state_frames_per_second`（默认 10）。第 1、2 层不过这道闸（丢裁决面比
-风暴更危险），但仍计入窗口——占用的是同一份带宽。两个开关置 0 即分别关闭抑制与
-限速，可回退到 ESS-1145 时代的逐帧行为。
+**判据按 task 分槽**，不是按「全局上一帧」。槽位是 `task_id`，无 `task_id` 的闩锁帧
+共用一个保留槽，槽表上限 64、按插入序淘汰。拿全局上一帧当基准会被两个并行 task
+的交替上报整个绕开——每帧都「换了 `task_id`」，于是每帧都伪装成跃迁，抑制与限速
+双双落空（ESS-1160 复审实测：A/B 交替刷同文，1 秒 100 帧 `emitted=100
+rateLimited=0`）。
+
+第 3 层之上再加一道**背压护栏**：`max_task_state_frames_per_second`（默认 10）。
+它是**展示帧的每秒预算，不是会话总帧率上限**——第 1、2 层只计入窗口、不受它拦截。
+这是刻意的取舍：丢裁决面会把 ESS-1095 的死等装回去，代价比风暴大。剩余暴露面
+（单个 task 高频跃迁 `status`，或高频答案增量）的兜底不在这里，而在 `server.mjs`
+的 `createDownlinkGuard`：socket 发送缓冲超过 `max_downlink_buffered_bytes`
+（4 MiB，1 MiB 告警）即按背压收口。两个开关置 0 即分别关闭抑制与限速，可回退到
+ESS-1145 时代的逐帧行为。
 
 三条不变量：
 
