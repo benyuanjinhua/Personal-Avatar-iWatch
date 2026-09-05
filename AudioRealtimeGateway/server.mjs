@@ -250,6 +250,12 @@ export function createGateway(overrides = {}) {
         maxUplinkBytesPerSecond: CONFIG.max_uplink_bytes_per_second,
         maxDownlinkFrames: CONFIG.max_downlink_frames,
         maxDownlinkBytes: CONFIG.max_downlink_bytes,
+        // ESS-1160 进展帧产生端护栏。缺省走 RealtimeSession 的默认值
+        // (2000ms / 10fps)，配置只用于现场调参，不需要为它改代码。
+        ...(CONFIG.progress_heartbeat_ms === undefined
+          ? {} : { progressHeartbeatMs: CONFIG.progress_heartbeat_ms }),
+        ...(CONFIG.max_task_state_frames_per_second === undefined
+          ? {} : { maxTaskStateFramesPerSecond: CONFIG.max_task_state_frames_per_second }),
       })
       ws.on('message', (raw, isBinary) => {
         if (isBinary) return session.onBinary()

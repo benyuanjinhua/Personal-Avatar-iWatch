@@ -55,5 +55,8 @@
   "fallback_turn_state_max_entries": 2048,
   "fallback_upstream_timeout_ms": 30000,
   "fallback_max_audio_bytes": 5242880,
-  "provider_key_env": "AUDIO_REALTIME_PROVIDER_KEY"
+  "provider_key_env": "AUDIO_REALTIME_PROVIDER_KEY",
+
+  "progress_heartbeat_ms": 2000,
+  "max_task_state_frames_per_second": 10
 }

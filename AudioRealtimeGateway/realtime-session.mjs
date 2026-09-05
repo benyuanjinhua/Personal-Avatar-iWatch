@@ -65,6 +65,19 @@ export class RealtimeSession {
     // never be part of a legal dense prefix within the budget.
     maxDownlinkFrames = 4096,
     maxDownlinkBytes = 32 * 1024 * 1024,
+    // ESS-1160: 进展帧的产生端护栏。ESS-1100 把同文去抖放在客户端
+    // (`ToolProgressNarration.swift`)，那只是**渲染**节流——已经上了 WSS 与
+    // WCSession 的帧一个都少不了。真机 2026-09-05 turn 01a07230：上游 209ms
+    // 连发 33 条同文「正在整理结果」，客户端积压 3s，断线前 15ms 猛追 8 帧，
+    // 随即 1006 异常断开，长任务答案全丢。抑制必须在这里做。
+    //
+    // `progressHeartbeatMs`：同文被抑制时的下限心跳。完全静默会让客户端分不清
+    // 「没变化」和「链路卡死」，所以超过这个间隔仍补发一帧（序号照常前进）。
+    progressHeartbeatMs = 2_000,
+    // `maxTaskStateFramesPerSecond`：`task.state` 帧率硬顶。同文抑制挡的是
+    // 重复文本，这一条挡的是「文本一直在变」的病态上游。超限只丢弃并计数，
+    // 不失败整个会话——展示面降级远好于把一次真实回答打断。
+    maxTaskStateFramesPerSecond = 10,
     now = () => Date.now(),
     setTimer = (fn, ms) => setTimeout(fn, ms),
     clearTimer = t => clearTimeout(t),
@@ -89,6 +102,8 @@ export class RealtimeSession {
     this.maxUplinkBytesPerSecond = maxUplinkBytesPerSecond
     this.maxDownlinkFrames = maxDownlinkFrames
     this.maxDownlinkBytes = maxDownlinkBytes
+    this.progressHeartbeatMs = progressHeartbeatMs
+    this.maxTaskStateFramesPerSecond = maxTaskStateFramesPerSecond
     this.commitDeadlineMs = commitDeadlineMs
     this.now = now
     this.setTimer = setTimer
@@ -146,6 +161,21 @@ export class RealtimeSession {
     // progress. Only bumped when a frame actually carries progress text, so
     // the client's「drop anything not newer」rule has no holes to fall into.
     this.progressSequence = 0
+    // ESS-1160: 产生端同文抑制的状态。`_lastProgressText` 记上一条**实际发出**
+    // 的进展文本（被抑制的不算，否则心跳一发就把基准刷新了）；
+    // `_lastProgressSentAt` 是它发出的时刻，用于心跳判定。
+    this._lastProgressText = null
+    this._lastProgressSentAt = 0
+    // 上一条**实际下发**的 status。进展被抑制后若 status 也没变、又没有答案
+    // 增量，整帧就没有任何新信息——那样的帧必须整条压掉，否则「只压掉文本」
+    // 会退化成 status 帧风暴，事故形态原样保留。
+    this._lastSentStatus = null
+    // 观测：被同文抑制掉的帧数 / 被帧率上限丢弃的帧数，随 `session_ended` 汇总。
+    this.progressSuppressedSameText = 0
+    this.taskStateRateDropped = 0
+    // `task.state` 帧率滑窗（1s，与既有事件限速同口径）。
+    this._taskStateWindowStart = 0
+    this._taskStateInWindow = 0
     // ESS-1111: per-session monotone display sequence for `task.state`
     // answer deltas. Independent of `progressSequence` and of the audio
     // sequence space — a progress frame must never renumber the answer
@@ -237,6 +267,10 @@ export class RealtimeSession {
       final_sequence: this.finalSequence,
       done_emitted: this.doneEmitted,
       cancelled: this.cancelled,
+      // ESS-1160：断线诊断需要知道展示面到底压了多少帧。1006 复盘时这两个数
+      // 直接区分「上游安静」与「被帧风暴打爆」。
+      progress_suppressed_same_text: this.progressSuppressedSameText,
+      task_state_rate_dropped: this.taskStateRateDropped,
     })
   }
 
@@ -491,13 +525,65 @@ export class RealtimeSession {
   // WCSession 跳）不保证顺序，只靠到达顺序会把旧进展盖回新进展上。
   _emitTaskState({ taskId, status, progress = null, answer = null }) {
     if (taskId === null && !status) return
-    const progressText = typeof progress?.text === 'string' && progress.text.trim()
+    const rawProgressText = typeof progress?.text === 'string' && progress.text.trim()
       ? progress.text.trim()
       : null
+
+    // ESS-1160 同文抑制（产生端）。上游把「任务还在跑」表达成高频 `task.progress`，
+    // 文本往往整段不变；ESS-1100 只在客户端做渲染节流，帧照样全量过网。这里在
+    // 产生端把「文本没变」的帧压掉：不下发、不占 `progress_seq`，客户端的
+    // 「丢弃不比当前新的序号」规则因此不会出现空洞。
+    //
+    // 心跳例外：完全静默会让客户端无法区分「上游没新进展」与「链路已经断了」，
+    // 所以同文超过 `progressHeartbeatMs` 仍补发一帧。
+    //
+    // 只对**纯进展帧**做抑制。带 `answer_delta` 的帧是答案内容、带 taskId 的
+    // 状态跃迁是屏障相关信号，两者一律放行——抑制展示面不能牵连正确性面。
+    const answerDeltaPresent = typeof answer?.delta === 'string' && answer.delta !== ''
+    let progressText = rawProgressText
     let progressSeq = null
     if (progressText !== null) {
-      this.progressSequence = (this.progressSequence ?? 0) + 1
-      progressSeq = this.progressSequence
+      const now = this.now()
+      const sameAsLast = progressText === this._lastProgressText
+      const heartbeatDue = now - this._lastProgressSentAt >= this.progressHeartbeatMs
+      if (sameAsLast && !heartbeatDue && !answerDeltaPresent) {
+        this.progressSuppressedSameText += 1
+        // 状态跃迁本身仍需下发（客户端靠它解除等待），只是不再重复带进展文本。
+        progressText = null
+        // 文本、状态、答案三者都没有新信息 → 整帧无内容可传，直接不发。
+        // 只压文本不压帧的话，33 条同文会变成 33 条同 status 空帧，事故形态原样保留。
+        if (String(status ?? 'unknown') === this._lastSentStatus) return
+      } else {
+        this.progressSequence = (this.progressSequence ?? 0) + 1
+        progressSeq = this.progressSequence
+        this._lastProgressText = progressText
+        this._lastProgressSentAt = now
+      }
+    }
+
+    // ESS-1160 帧率硬顶：同文抑制挡不住「文本一直在变」的病态上游。超限的帧
+    // 直接丢弃并计数——展示面降级，绝不因此失败会话或影响音频屏障。
+    // 例外：携带 `answer_delta` 的帧是答案内容，永不因限速丢弃。
+    if (!answerDeltaPresent) {
+      const now = this.now()
+      if (now - this._taskStateWindowStart >= 1_000) {
+        this._taskStateWindowStart = now
+        this._taskStateInWindow = 0
+      }
+      this._taskStateInWindow += 1
+      if (this._taskStateInWindow > this.maxTaskStateFramesPerSecond) {
+        this.taskStateRateDropped += 1
+        this.log('downlink_task_state_rate_dropped', {
+          request_id: this.scope.request_id, session_id: this.scope.session_id,
+          generation: this.scope.generation,
+          task_id: taskId === null ? null : String(taskId),
+          status: String(status ?? 'unknown'),
+          frames_in_window: this._taskStateInWindow,
+          cap: this.maxTaskStateFramesPerSecond,
+          total_dropped: this.taskStateRateDropped,
+        })
+        return
+      }
     }
     // ESS-1111 的第四个可选切面 `answer_delta` / `answer_seq`：最终答案的
     // **文本增量**。与 `progress_*` 一样是纯展示面，不参与任何屏障，也不占用
@@ -531,6 +617,7 @@ export class RealtimeSession {
         answer_seq: answerSeq,
       }),
     })
+    this._lastSentStatus = String(status ?? 'unknown')
     this.log('downlink_task_state', {
       request_id: this.scope.request_id, session_id: this.scope.session_id,
       generation: this.scope.generation, response_id: this.responseId,
@@ -543,6 +630,9 @@ export class RealtimeSession {
       answer_seq: answerSeq,
       answer_delta_length: answerDelta === null ? null : answerDelta.length,
       after_turn_done: this.doneEmitted,
+      // ESS-1160 观测：本会话累计被同文抑制 / 被帧率上限丢弃的帧数。
+      suppressed_same_text: this.progressSuppressedSameText,
+      rate_dropped: this.taskStateRateDropped,
     })
   }
 
