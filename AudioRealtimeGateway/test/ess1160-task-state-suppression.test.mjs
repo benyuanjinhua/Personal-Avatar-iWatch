@@ -210,13 +210,64 @@ describe('ESS-1160 · 抑制不吃裁决面', () => {
     assert.equal(h.session.taskStateRateLimited, 35)
   })
 
-  it('槽表按插入序淘汰，长时间不动的 task 不会把内存撑大', () => {
+  // 二轮复审取证：按容量做 LRU 淘汰会把绕过面原样放回来——被淘汰的活跃 task
+  // 下次到来时 `prior === null`，又当「首见」无条件放行。65 个活跃 task 轮转
+  // 130 次实测 `emitted=130 suppressed=0 rateLimited=0`。槽只由终态释放。
+  it('65 个仍活跃 task 轮转同文 130 次：不得 130 帧全放行，容量用尽即 fail-closed', () => {
     const h = harness()
-    for (let i = 0; i < 200; i += 1) {
-      h.task({ id: `task-${i}`, status: 'running' })
-      h.advance(1)
+    for (let i = 0; i < 130; i += 1) {
+      h.task({ id: `task-${i % 65}`, status: 'running', text: '正在整理结果', category: 'text' })
+      h.advance(7)
     }
-    assert.equal(h.session._taskStateSlots.size, h.session.maxTaskStateSlots)
+    const frames = taskState(h.sent)
+    assert.ok(frames.length < 130, `不得全量放行，实际 ${frames.length}`)
+    // 上限就是槽容量：每个活跃 task 只有第一帧算「首见」，之后各自被同文压住。
+    assert.equal(frames.length, h.session.maxTaskStateSlots)
+    const error = h.sent.find(f => f.type === 'error')
+    assert.equal(error?.code, 'ERR_TASK_STATE_SLOTS_EXHAUSTED')
+    assert.equal(error?.retriable, true)
+    assert.equal(h.session.taskStateSlotsExhausted, 1)
+    assert.equal(logsOf(h.logs, 'task_state_slots_exhausted').length, 1)
+  })
+
+  it('合法终态释放槽：500 个顺序任务跑完不耗尽容量、不报错', () => {
+    const h = harness()
+    for (let i = 0; i < 500; i += 1) {
+      h.task({ id: `task-${i}`, status: 'running', text: '正在整理结果', category: 'text' })
+      h.advance(3)
+      h.task({ id: `task-${i}`, status: 'completed' })
+      h.advance(3)
+    }
+    const terminal = taskState(h.sent).filter(f => f.status === 'completed')
+    assert.equal(terminal.length, 500, '每个终态都必须下发——客户端靠它清未结集合')
+    assert.equal(h.session._taskStateSlots.size, 0, '终态发完槽必须归零')
+    assert.equal(h.sent.some(f => f.type === 'error'), false)
+  })
+
+  it('槽满时在册 task 的终态仍能进来释放自己那一格', () => {
+    const h = harness()
+    for (let i = 0; i < 64; i += 1) {
+      h.task({ id: `task-${i}`, status: 'running', text: '正在整理结果', category: 'text' })
+      h.advance(3)
+    }
+    h.task({ id: 'task-0', status: 'completed' })      // 终态不占槽，必须放行
+    h.advance(3)
+    h.task({ id: 'task-new', status: 'running', text: '正在整理结果', category: 'text' })
+    const frames = taskState(h.sent)
+    assert.ok(frames.some(f => f.task_id === 'task-0' && f.status === 'completed'))
+    assert.ok(frames.some(f => f.task_id === 'task-new'), '释放出来的格子必须能被新 task 用上')
+    assert.equal(h.sent.some(f => f.type === 'error'), false)
+  })
+
+  it('闩锁槽由 tool_call_resolved 释放，下一轮 pending 重新算首见', () => {
+    const h = harness()
+    h.latch('tool_call_pending'); h.advance(3)
+    h.latch('tool_call_pending'); h.advance(3)          // 同状态 → 抑制
+    h.latch('tool_call_resolved'); h.advance(3)         // 跃迁 → 下发并释放槽
+    assert.equal(h.session._taskStateSlots.size, 0)
+    h.latch('tool_call_pending')                        // 新一轮闩锁
+    assert.deepEqual(taskState(h.sent).map(f => f.status),
+      ['tool_call_pending', 'tool_call_resolved', 'tool_call_pending'])
   })
 
   it('答案增量帧永不被抑制（内容是增量，逐帧都不同）', () => {

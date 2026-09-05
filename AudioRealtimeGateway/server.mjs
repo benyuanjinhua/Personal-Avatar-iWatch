@@ -253,6 +253,7 @@ export function createGateway(overrides = {}) {
         taskStateHeartbeatMs: CONFIG.task_state_heartbeat_ms,
         maxTaskStateFramesPerSecond: CONFIG.max_task_state_frames_per_second,
         taskStateSnapshotWindowMs: CONFIG.task_state_snapshot_window_ms,
+        maxTaskStateSlots: CONFIG.max_task_state_slots,
       })
       ws.on('message', (raw, isBinary) => {
         if (isBinary) return session.onBinary()

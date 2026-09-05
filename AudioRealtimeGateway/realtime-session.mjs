@@ -15,6 +15,8 @@
 // It is transport-agnostic: `send` is injected. The Node WSS glue lives in
 // server.mjs; unit tests exercise this module directly.
 
+import { TERMINAL_STATUSES } from './task-progress.mjs'
+
 const OPEN = 'open'
 const CLOSED = 'closed'
 
@@ -81,6 +83,8 @@ export class RealtimeSession {
     taskStateRateWindowMs = 1_000,
     // `session_ended` 帧率快照的回看窗口：断线前这段时间里实际下发了多少帧。
     taskStateSnapshotWindowMs = 5_000,
+    // 同时可跟踪的**未收口** task 数上限。超过即 fail-closed，见下方槽表注释。
+    maxTaskStateSlots = 64,
     now = () => Date.now(),
     setTimer = (fn, ms) => setTimeout(fn, ms),
     clearTimer = t => clearTimeout(t),
@@ -180,9 +184,17 @@ export class RealtimeSession {
     // A 的这一帧只跟 A 的上一帧比，跃迁才是真跃迁。
     //
     // 槽位：`task_id`；无 `task_id` 的 ESS-1097 闩锁帧（`tool_call_pending` /
-    // `tool_call_resolved`）共用一个保留槽。槽表按插入序淘汰，天然有界。
+    // `tool_call_resolved`）共用一个保留槽。
+    //
+    // 槽的释放**只由终态驱动**，绝不按容量做 LRU 淘汰（ESS-1160 二轮复审取证）：
+    // 淘汰过的活跃 task 下次到来时 `prior === null`，又被当成「首见」无条件放行，
+    // 绕过面原样回来——65 个活跃 task 轮转 130 次实测 `emitted=130 suppressed=0
+    // rateLimited=0`。所以活跃 task 的裁决状态一格都不能被静默丢掉；容量真的
+    // 用尽时 fail-closed（`ERR_TASK_STATE_SLOTS_EXHAUSTED`，retriable），把
+    // 「上游同时挂着 64 个未收口任务」这件事变成可判定的错误，而不是无声降级。
     this._taskStateSlots = new Map()
-    this.maxTaskStateSlots = 64
+    this.maxTaskStateSlots = maxTaskStateSlots
+    this.taskStateSlotsExhausted = 0
     this.taskStateFrames = 0
     this.taskStateSuppressedSameText = 0
     this.taskStateRateLimited = 0
@@ -285,6 +297,8 @@ export class RealtimeSession {
       task_state_snapshot_window_ms: this.taskStateSnapshotWindowMs,
       task_state_suppressed_same_text: this.taskStateSuppressedSameText,
       task_state_rate_limited: this.taskStateRateLimited,
+      task_state_slots_open: this._taskStateSlots.size,
+      task_state_slots_exhausted: this.taskStateSlotsExhausted,
     })
   }
 
@@ -568,10 +582,17 @@ export class RealtimeSession {
     //      让客户端的 60 s 任务活动看门狗有据可依。
     //
     // 第 1、2 层无界绕过限速是**刻意**的取舍：丢裁决面会把 ESS-1095 的死等装
-    // 回去，代价比风暴大。它们的兜底不在这里，而在 `server.mjs` 的
-    // `createDownlinkGuard`——socket 发送缓冲超过 `max_downlink_buffered_bytes`
-    // （4 MiB，1 MiB 告警）即按背压收口。剩余暴露面因此是「单个 task 高频跃迁
-    // status」，它会撞上那道缓冲闸而不是无声打穿客户端。
+    // 回去，代价比风暴大。但要如实说清剩余风险（ESS-1160 二轮复审纠正了我上一版
+    // 的说法）：`server.mjs` 的 `createDownlinkGuard` 只看本网关这条 WSS 的
+    // `ws.bufferedAmount`，**量不到 iPhone → Watch 的 WCSession 积压**——本单事故
+    // 的 33 帧约 10 KiB，离 1 MiB 告警差两个数量级，那道闸从头到尾没有触发。
+    // 只要 iPhone 能持续排空 WSS，它就看不见手表侧的积压。
+    //
+    // 因此这条链上**没有跨跳硬背压**。裁决帧的实际约束只有两条，都在产生端：
+    // 同一 task 的 `status` 必须真的跃迁才算新信息（同 status 重复被第 3 层压掉），
+    // 以及未收口 task 数的硬上限 `maxTaskStateSlots`。两者之外的「单个 task 高频
+    // 真跃迁 status」仍能过量下发，这是已知且未消除的暴露面，需要跨跳背压
+    // （客户端回执 / 信用窗口）才能真正关掉，另单跟踪。
     const taskKey = taskId === null ? null : String(taskId)
     const statusText = String(status ?? 'unknown')
     const progressCategory = progressText !== null && progress?.category
@@ -584,6 +605,26 @@ export class RealtimeSession {
     const slot = taskKey ?? '\u0000latch'
     const prior = this._taskStateSlots.get(slot) ?? null
     const displayKey = `${statusText}\u0000${progressText ?? ''}\u0000${progressCategory ?? ''}`
+    // 终态帧不需要占槽——它是这个 task 的最后一帧，发完即释放。
+    const releasesSlot = TERMINAL_STATUSES.has(statusText.toLowerCase())
+      || statusText === 'tool_call_resolved'
+    // 容量硬闸：只有**首见且非终态**的帧要新开一格。开不出来时不能继续把每帧
+    // 当首见放行（那正是二轮复审复现的绕过面），只能显式失败。已在册的 task
+    // 与任何终态帧都不受这道闸影响——终态还必须能进来释放它自己那一格。
+    if (prior === null && !releasesSlot
+      && this._taskStateSlots.size >= this.maxTaskStateSlots) {
+      this.taskStateSlotsExhausted += 1
+      this.log('task_state_slots_exhausted', {
+        request_id: this.scope.request_id, session_id: this.scope.session_id,
+        generation: this.scope.generation,
+        task_id: taskKey, status: statusText,
+        slots: this._taskStateSlots.size, max_slots: this.maxTaskStateSlots,
+      })
+      return this.fail('ERR_TASK_STATE_SLOTS_EXHAUSTED', {
+        detail: `more than ${this.maxTaskStateSlots} unsettled tasks in one session`,
+        retriable: true,
+      })
+    }
     // 首次见到的 task 一律放行——它本身就是「有个新任务」这条新信息。
     const lifecycleChanged = prior === null || prior.statusText !== statusText
     const sameAsLastFrame = prior !== null && prior.displayKey === displayKey
@@ -611,7 +652,7 @@ export class RealtimeSession {
       this.answerSequence = (this.answerSequence ?? 0) + 1
       answerSeq = this.answerSequence
     }
-    this._noteTaskStateEmitted(at, { slot, statusText, displayKey })
+    this._noteTaskStateEmitted(at, { slot, statusText, displayKey, releasesSlot })
     this._sendJson({
       type: 'task.state',
       session_id: this.scope.session_id, request_id: this.scope.request_id,
@@ -677,16 +718,15 @@ export class RealtimeSession {
     }
   }
 
-  _noteTaskStateEmitted(at, { slot, statusText, displayKey }) {
+  _noteTaskStateEmitted(at, { slot, statusText, displayKey, releasesSlot }) {
     this._rollTaskStateWindow(at)
     this._taskStateInRateWindow += 1
     this.taskStateFrames += 1
-    // 重新 set 一次把槽移到插入序末尾，淘汰的因此总是最久没动过的那个。
-    this._taskStateSlots.delete(slot)
-    this._taskStateSlots.set(slot, { statusText, displayKey, sentAt: at })
-    while (this._taskStateSlots.size > this.maxTaskStateSlots) {
-      this._taskStateSlots.delete(this._taskStateSlots.keys().next().value)
-    }
+    // 终态实际下发之后才释放槽：一格只被它自己的收口回收，不被容量压力挤掉。
+    // 释放后同名 task 再来会重新算「首见」——那是正确的，一个已收口的 task
+    // 又开始报进展，本来就是新信息。
+    if (releasesSlot) this._taskStateSlots.delete(slot)
+    else this._taskStateSlots.set(slot, { statusText, displayKey, sentAt: at })
     this._taskStateEmitTimes.push(at)
     this._taskStateFramesSince(at)
   }

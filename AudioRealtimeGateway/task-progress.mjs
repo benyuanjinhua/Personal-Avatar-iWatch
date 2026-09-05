@@ -31,7 +31,11 @@ export const MAX_PROGRESS_TEXT = 24
 /// 终态不产出进展文字：终态由 `task.state` 的 `status` 独占表达，客户端对
 /// 完成/失败/取消有各自的终态呈现。在终态帧上再塞一句「进展」，只会让
 /// 「还在做」与「做完了」在同一行里打架。
-const TERMINAL_STATUSES = new Set([
+/// 终态状态字面量。ESS-1160 的会话层也用它决定「这个 task 的生命周期槽可以
+/// 释放了」，两处必须同一口径——各留一份表就是给「网关认为还活着、客户端认为
+/// 已收口」留位置。注意 ESS-1097 的线格契约仍然成立：`status` 对客户端原样
+/// 透传，本表只用于**服务端自己的资源判定**，且对未知取值一律保守当作非终态。
+export const TERMINAL_STATUSES = new Set([
   'completed', 'complete', 'done', 'succeeded',
   'failed', 'error',
   'cancelled', 'canceled', 'aborted',
