@@ -375,6 +375,46 @@ describe('RealtimeSession — downlink ordering', () => {
       && l.code === 'ERR_UPSTREAM_AUDIO_AFTER_DONE'
       && l.request_id === 'r-1' && l.dropped_count === 1))
   })
+
+  it('emits a client-visible audio.segment_dropped warning instead of a silent post-done drop', () => {
+    // ESS-957 acceptance #3: after done, a second segment (the tool-call
+    // answer) must not disappear without a trace — the Watch needs a frame
+    // it can surface/degrade on. Pin the exact payload of that frame.
+    const { session, sent, agent, scope } = harness()
+    start(session, scope)
+    agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: 0, audio: b64('x') })
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: 0 })
+    // Second segment (the real answer) arrives after done.
+    agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: 1, audio: b64('y') })
+    const warnings = sent.filter(e => e.type === 'audio.segment_dropped')
+    assert.equal(warnings.length, 1, 'exactly one segment_dropped warning per dropped delta')
+    assert.equal(warnings[0].session_id, scope.session_id)
+    assert.equal(warnings[0].request_id, scope.request_id)
+    assert.equal(warnings[0].response_id, 'r-1:gen1')
+    assert.equal(warnings[0].generation, scope.generation)
+    assert.equal(warnings[0].sequence, 1, 'carries the dropped delta sequence')
+    assert.equal(warnings[0].dropped_count, 1)
+    assert.equal(warnings[0].reason, 'post_done')
+    // The dropped segment's delta is still not forwarded downstream.
+    assert.deepEqual(sent.filter(e => e.type === 'audio.delta').map(e => e.sequence), [0])
+  })
+
+  it('emits one warning per dropped delta with a monotone dropped_count', () => {
+    // Mirrors the deterministic repro: first segment → done → second segment
+    // of 3 deltas. Every dropped delta must be surfaced, each with an
+    // incremented dropped_count.
+    const { session, sent, agent, scope } = harness()
+    start(session, scope)
+    agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence: 0, audio: b64('x') })
+    agent.emit(scope.request_id, { type: 'agent.audio.done', response_id: 'r-1:gen1', final_sequence: 0 })
+    for (const sequence of [1, 2, 3]) {
+      agent.emit(scope.request_id, { type: 'agent.audio.delta', response_id: 'r-1:gen1', sequence, audio: b64('x') })
+    }
+    const warnings = sent.filter(e => e.type === 'audio.segment_dropped')
+    assert.deepEqual(warnings.map(w => w.sequence), [1, 2, 3])
+    assert.deepEqual(warnings.map(w => w.dropped_count), [1, 2, 3])
+    assert.equal(warnings.every(w => w.reason === 'post_done' && w.response_id === 'r-1:gen1'), true)
+  })
 })
 
 describe('RealtimeSession — heartbeat', () => {
