@@ -90,7 +90,6 @@ final class PhoneRealtimeSession {
     /// Policy` 的静默预算与绝对上限只有在被再次问到时才会生效，而背景态下
     /// 不会再有第二次 `lifecycleInterrupted`。
     private var deferredClose: (cause: RealtimeSocketCloseCause, reason: String)?
-    private var deferredCloseRetryArmed = false
 
     /// 被推迟的关闭多久重问一次策略。取上游静默预算：到点时若上游确实静默，
     /// 策略会当场放行；若还在持续下发，策略继续 hold 并重新武装，最终由
@@ -119,9 +118,32 @@ final class PhoneRealtimeSession {
     /// 回合终态（`audio.done`）已经到过。屏障的第二条件。
     private var sawTurnTerminalForDeferredClose = false
 
-    /// 排空屏障的兜底计时器是否已武装。与 `deferredCloseRetryArmed` 一样，
-    /// **任何时刻至多一支**——否则每一帧回执都会再武装一支，旧的仍会到点。
-    private var playbackDrainCapArmed = false
+    // MARK: 收口代际（复审阻断 3）
+    //
+    // 毕玄 2026-09-05 第四轮阻断：两支收口计时器（上游静默重试、播放排空）
+    // 都是**不可失效**的。回调只检查 `deferredClose != nil`，不校验自己属于
+    // 哪一轮；而共享布尔标志 `…Armed` 只由回调本身复位。于是：
+    //
+    //   旧回合播放中武装 180s 排空上限 → 播放正常排空、当场收口
+    //   → 新回合建立并产生自己的 `deferredClose`
+    //   → 旧 timer 到点，把自己当成**新回合**的 `playback_drain_cap`：
+    //      · 新回合武装不进自己的 grace/cap（armed 仍为 true）；
+    //      · 旧 timer 绕过播放屏障，可能切断新回合。
+    //
+    // 修法不是再加一个布尔，而是给每一轮收口一个**代际号**：计时器在武装那一
+    // 刻捕获它，到点先验证自己仍属于当前代际，不属于就整支作废。回合收口与
+    // 新回合建立各自把代际推进一格，旧回调从此再也影响不了任何人。
+    //
+    // 为什么用单调代际而不是 request/session：同一对 id 完全可能被重新开轮
+    // （`openIfNeeded` 的幂等短路、以及重试路径），那时 id 相等但回合已经换
+    // 了一代——按 id 校验会放过正是本阻断要挡的那种陈旧回调。
+
+    /// 当前收口代际。每次回合收口 / 新回合建立 +1。
+    private var closeEpoch: UInt64 = 0
+    /// 上游静默重试计时器所属的代际；`nil` = 当前没有武装。
+    private var armedRetryEpoch: UInt64?
+    /// 播放排空计时器所属的代际；`nil` = 当前没有武装。
+    private var armedDrainEpoch: UInt64?
 
     /// 首帧渲染回执的宽限：`audio.done` 到达时若还没有任何 `playback.started`，
     /// 给 WCSession 那一跳一点时间把回执送上来，再决定收口。
@@ -227,27 +249,63 @@ final class PhoneRealtimeSession {
     }
 
     private func armPlaybackDrainCap(seconds: TimeInterval, phase: String) {
-        guard !playbackDrainCapArmed else { return }
-        playbackDrainCapArmed = true
+        // 任何时刻至多一支：`armedDrainEpoch` 非空就说明这一代已经有一支在跑。
+        guard armedDrainEpoch == nil else { return }
+        let epoch = closeEpoch
+        armedDrainEpoch = epoch
+        let identity = Self.turnIdentity(of: state)
         schedulePlaybackDrainCap(seconds) { [weak self] in
             guard let self else { return }
-            // 与 `deferredCloseRetryArmed` 同一条纪律：标志只由计时器回调复位，
-            // 这样任何时刻至多一支在跑，宽限→排空上限的升级也才武装得进来。
-            self.playbackDrainCapArmed = false
+            // **第一件事就是验证代际**：不属于当前这一代的回调整支作废，不碰
+            // `armedDrainEpoch`（那是现役计时器的），更不碰 `deferredClose`。
+            guard self.closeEpoch == epoch, self.armedDrainEpoch == epoch else {
+                PhoneAgentClientLog.info(
+                    module: "phone_session", event: "realtime_playback_drain_timer_stale",
+                    requestId: identity?.requestId ?? "", sessionId: identity?.sessionId ?? "",
+                    detail: "phase=\(phase) armed_epoch=\(epoch) "
+                        + "current_epoch=\(self.closeEpoch) "
+                        + "armed_now=\(self.armedDrainEpoch.map(String.init) ?? "none")"
+                )
+                return
+            }
+            self.armedDrainEpoch = nil
             guard self.deferredClose != nil else { return }
             PhoneAgentClientLog.info(
                 module: "phone_session", event: "realtime_playback_drain_timer_fired",
-                requestId: Self.turnIdentity(of: self.state)?.requestId ?? "",
-                sessionId: Self.turnIdentity(of: self.state)?.sessionId ?? "",
-                detail: "phase=\(phase) playback_in_flight=\(self.playbackInFlight.count)"
+                requestId: identity?.requestId ?? "", sessionId: identity?.sessionId ?? "",
+                detail: "phase=\(phase) epoch=\(epoch) "
+                    + "playback_in_flight=\(self.playbackInFlight.count)"
             )
             self.retryDeferredClose(trigger: phase)
         }
     }
 
-    private func cancelPlaybackDrainGate() {
+    /// 推进收口代际：在飞的两支计时器就地作废，新一轮可以武装自己的。
+    ///
+    /// 调用点必须覆盖「这一轮的收口状态不再有效」的**全部**时刻：回合真的
+    /// 收口了（`endTurn` 成功、transport 已消失），以及新一轮真的建起来了
+    /// （`openIfNeeded` 换完 transport）。少一个调用点，陈旧回调就能穿过去。
+    private func invalidateCloseTimers(trigger: String) {
+        guard armedRetryEpoch != nil || armedDrainEpoch != nil else {
+            closeEpoch &+= 1
+            return
+        }
+        PhoneAgentClientLog.info(
+            module: "phone_session", event: "realtime_close_timers_invalidated",
+            requestId: Self.turnIdentity(of: state)?.requestId ?? "",
+            sessionId: Self.turnIdentity(of: state)?.sessionId ?? "",
+            detail: "trigger=\(trigger) epoch=\(closeEpoch) "
+                + "retry_armed=\(armedRetryEpoch != nil) drain_armed=\(armedDrainEpoch != nil)"
+        )
+        closeEpoch &+= 1
+        armedRetryEpoch = nil
+        armedDrainEpoch = nil
+    }
+
+    private func cancelPlaybackDrainGate(trigger: String = "turn_settled") {
         sawTurnTerminalForDeferredClose = false
         playbackInFlight.removeAll(keepingCapacity: false)
+        invalidateCloseTimers(trigger: trigger)
     }
 
     init(transportFactory: @escaping (_ requestId: String, _ sessionId: String) -> Transport?) {
@@ -554,14 +612,29 @@ final class PhoneRealtimeSession {
     /// 因此任何时刻至多一支在跑。有界性来自策略本身——上游静默满预算、或
     /// 从第一次出现未结任务起满绝对上限，`decide` 就会放行。
     private func armDeferredCloseRetry() {
-        guard !deferredCloseRetryArmed else { return }
-        deferredCloseRetryArmed = true
+        // 任何时刻至多一支。用「这一代有没有武装」代替共享布尔：下行触发的
+        // 重试仍然不会叠加计时器（真机节奏下一秒好几支就是 Task 泄漏），但
+        // **陈旧回调不再能替现役计时器把标志复位**——那正是阻断 3 的形状。
+        guard armedRetryEpoch == nil else { return }
+        let epoch = closeEpoch
+        armedRetryEpoch = epoch
+        let identity = Self.turnIdentity(of: state)
         scheduleDeferredCloseRetry(Self.deferredCloseRetrySeconds) { [weak self] in
             guard let self else { return }
-            // armed 标志**只由计时器回调复位**。若让下行触发的重试也复位它，
-            // 每一帧下行都会再武装一支新计时器（真机节奏下就是一秒好几支），
-            // 旧的那些仍会到点触发——一个本该单支的计时器变成 Task 泄漏。
-            self.deferredCloseRetryArmed = false
+            // ESS-1159 复审整改（阻断 3）：这支计时器与排空计时器同一条纪律。
+            // 复审只点到排空那一支，但两者形状完全相同：旧回合的静默重试到点
+            // 时同样只看 `deferredClose != nil`，一样会替新回合作决定。留着
+            // 它就是把刚被判死的 bug 换个字段名再放一遍。
+            guard self.closeEpoch == epoch, self.armedRetryEpoch == epoch else {
+                PhoneAgentClientLog.info(
+                    module: "phone_session", event: "realtime_deferred_close_retry_stale",
+                    requestId: identity?.requestId ?? "", sessionId: identity?.sessionId ?? "",
+                    detail: "armed_epoch=\(epoch) current_epoch=\(self.closeEpoch) "
+                        + "armed_now=\(self.armedRetryEpoch.map(String.init) ?? "none")"
+                )
+                return
+            }
+            self.armedRetryEpoch = nil
             self.retryDeferredClose(trigger: "retry_timer")
         }
     }
@@ -799,6 +872,13 @@ final class PhoneRealtimeSession {
             return false
         }
         currentTransport = transport
+        // ESS-1159 复审整改（阻断 3）：新一轮真的建起来了 ⇒ 上一轮那两支收口
+        // 计时器就地作废。缺了这一条，旧回合「排空后当场收口」路径上留下的
+        // 180s 排空上限会在新回合手里到点，把自己当成新回合的
+        // `playback_drain_cap`：既挡住新回合武装自己的 grace/cap，又绕过播放
+        // 屏障去切新回合。`endTurn` 那一侧的作废管不到这条边——supersede 时
+        // 上一轮可能根本没走 `endTurn`（例如它早已自行收口）。
+        cancelPlaybackDrainGate(trigger: "new_turn_established")
         // ESS-539 / ESS-1139 第二轮复审整改：陈旧下行缓冲在**新一轮真的建起来
         // 之后**才清。
         //

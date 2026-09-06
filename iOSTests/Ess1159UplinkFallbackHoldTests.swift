@@ -508,6 +508,159 @@ final class Ess1159UplinkFallbackHoldTests: XCTestCase {
         XCTAssertFalse(h.session.hasCurrentTransportForTesting)
     }
 
+    // MARK: - 复审阻断 3：计时器必须与回合代际绑定
+
+    /// **阻断 3 正面复现**：旧回合留下的 180s 排空上限，在新回合手里到点。
+    ///
+    /// 整改前这支计时器不可取消、回调只检查 `deferredClose != nil`：
+    ///   1. 新回合武装不进自己的 grace/cap（`playbackDrainCapArmed` 仍为 true，
+    ///      只有那支陈旧回调才复位得了它）；
+    ///   2. 旧 timer 到点会把自己当成**新回合**的 `playback_drain_cap`，
+    ///      绕过播放屏障，可能切断新回合正在播的最终答案。
+    ///
+    /// 断言的是这两件事的反面：陈旧回调整支作废，新回合自己的屏障完整可用。
+    func testStaleDrainTimerFromPreviousTurnCannotTouchTheNextTurn() {
+        let h = makeActiveSession()
+
+        // ── 旧回合：hold → 播放 → 终态 → 排空 → 当场收口 ──
+        h.transport.upstreamWorkLedger.noteTaskState(
+            taskId: Self.taskId, status: "running", atMs: 0
+        )
+        h.session.nowMs = { Self.incidentMs }
+        h.session.forward(Self.fallback(.transportFailed))
+        h.session.forward(Self.playbackStarted("resp-old"))
+        h.transport.upstreamWorkLedger.noteTaskState(
+            taskId: Self.taskId, status: "completed", atMs: Self.taskCompletedMs
+        )
+        h.session.nowMs = { Self.taskCompletedMs }
+        h.session.receiveAgentDownlink(
+            .audioDone(requestId: Self.requestId, sessionId: Self.sessionId,
+                       finalSequence: 94, upstreamWorkOutstanding: false),
+            from: h.transport
+        )
+        // 旧回合在播放中武装了 180s 排空上限 —— 它就是那支会留存下来的计时器。
+        XCTAssertEqual(h.pendingDrainTimers.map(\.seconds),
+                       [PhoneRealtimeSession.deferredClosePlaybackDrainCapSeconds],
+                       "夹具前提：旧回合确实留下了一支 180s 排空上限")
+        h.session.forward(Self.playbackEnded("resp-old"))
+        XCTAssertEqual(h.transport.closeReasons, ["transportFailed"], "旧回合正常收口")
+        XCTAssertFalse(h.session.hasCurrentTransportForTesting)
+        // 那支旧计时器**还挂在那里**（真实世界里 Task 不会因为收口而消失）。
+        XCTAssertEqual(h.pendingDrainTimers.count, 1, "夹具前提：旧 timer 尚未到点")
+
+        // ── 新回合建立，并进入「hold + 播放中 + 待收口」 ──
+        let nextRequestId = "01a0392b-c9ea-7c1a-a265-000000000002"
+        let nextSessionId = "518197E7-CA2A-4B7B-899F-EE2F4738F236"
+        h.session.forward(.start(RealtimeStreamStart(
+            requestId: nextRequestId, sessionId: nextSessionId,
+            format: .uplinkPCM16, capturedAtMs: 0
+        )))
+        let next = try? XCTUnwrap(h.transport(for: nextRequestId))
+        guard let next else { return XCTFail("新回合必须建起自己的 transport") }
+        h.session.agentTransportDidChangeState(
+            .active(requestId: nextRequestId, sessionId: nextSessionId), from: next
+        )
+        next.upstreamWorkLedger.noteTaskState(
+            taskId: "work_next", status: "running", atMs: 0
+        )
+        h.session.nowMs = { 0 }
+        h.session.forward(.fallback(RealtimeUplinkFallbackDescriptor(
+            requestId: nextRequestId, sessionId: nextSessionId,
+            reason: "\(RealtimeUplinkStream.FallbackReason.transportFailed)",
+            kind: RealtimeUplinkStream.FallbackReason.transportFailed.wireKind
+        )))
+        XCTAssertTrue(next.closeReasons.isEmpty, "新回合任务在飞 ⇒ hold")
+        h.session.forward(.playbackStarted(RealtimePlaybackReceipt(
+            requestId: nextRequestId, sessionId: nextSessionId,
+            responseId: "resp-new", bytesPlayed: nil
+        )))
+        next.upstreamWorkLedger.noteTaskState(
+            taskId: "work_next", status: "completed", atMs: 5_000
+        )
+        h.session.nowMs = { 5_000 }
+        h.session.receiveAgentDownlink(
+            .audioDone(requestId: nextRequestId, sessionId: nextSessionId,
+                       finalSequence: 12, upstreamWorkOutstanding: false),
+            from: next
+        )
+
+        // 阻断点 1：新回合必须武装得进**自己**的排空上限。
+        XCTAssertEqual(h.pendingDrainTimers.count, 2,
+                       "新回合必须能武装自己的排空上限——共享布尔卡死时这里只会是 1")
+        XCTAssertTrue(next.closeReasons.isEmpty, "新回合播放还没排空 ⇒ 不得收口")
+
+        // ── 只引爆旧回合那一支（index 0），新回合自己的那支留着 ──
+        h.fireDrainTimer(at: 0)
+
+        // 阻断点 2：陈旧回调整支作废，新回合三样东西一点没动。
+        XCTAssertTrue(next.closeReasons.isEmpty,
+                      "陈旧计时器不得绕过播放屏障切断新回合")
+        XCTAssertEqual(h.session.state,
+                       .active(requestId: nextRequestId, sessionId: nextSessionId),
+                       "新回合会话状态不得被陈旧回调改写")
+        XCTAssertTrue(h.session.hasCurrentTransportForTesting,
+                      "新回合 transport 引用不得被陈旧回调清掉")
+        XCTAssertEqual(h.session.playbackInFlight, ["resp-new"],
+                       "新回合的播放账本不得被陈旧回调清空")
+
+        // 阻断点 3：新回合自己的屏障仍然兑现得了——排空即收口。
+        h.session.forward(.playbackEnded(RealtimePlaybackReceipt(
+            requestId: nextRequestId, sessionId: nextSessionId,
+            responseId: "resp-new", bytesPlayed: 1_024
+        )))
+        XCTAssertEqual(next.closeReasons, ["transportFailed"],
+                       "新回合排空之后必须兑现它自己那次被推迟的关闭")
+        XCTAssertEqual(h.transport.closeReasons, ["transportFailed"],
+                       "旧 transport 不得被重复关闭")
+    }
+
+    /// 同一条纪律也必须覆盖**上游静默重试**那支计时器：形状完全相同，
+    /// 旧回合的 `retry_timer` 到点同样只看 `deferredClose != nil`。
+    func testStaleRetryTimerFromPreviousTurnCannotCloseTheNextTurn() {
+        let h = makeActiveSession()
+        h.transport.upstreamWorkLedger.noteTaskState(
+            taskId: Self.taskId, status: "running", atMs: 0
+        )
+        h.session.nowMs = { Self.incidentMs }
+        h.session.forward(Self.fallback(.transportFailed))
+        XCTAssertEqual(h.pendingRetries.count, 1, "夹具前提：旧回合武装了静默重试")
+
+        // 旧回合被用户显式退出当场收口，那支重试计时器留存。
+        XCTAssertTrue(h.session.endTurn(reason: "user_exit", cause: .userExit))
+        XCTAssertEqual(h.pendingRetries.count, 1, "夹具前提：旧 timer 尚未到点")
+
+        // 新回合建立并进入 hold。
+        let nextRequestId = "01a0392b-c9ea-7c1a-a265-000000000003"
+        let nextSessionId = "518197E7-CA2A-4B7B-899F-000000000003"
+        h.session.forward(.start(RealtimeStreamStart(
+            requestId: nextRequestId, sessionId: nextSessionId,
+            format: .uplinkPCM16, capturedAtMs: 0
+        )))
+        guard let next = h.transport(for: nextRequestId) else {
+            return XCTFail("新回合必须建起自己的 transport")
+        }
+        h.session.agentTransportDidChangeState(
+            .active(requestId: nextRequestId, sessionId: nextSessionId), from: next
+        )
+        next.upstreamWorkLedger.noteTaskState(taskId: "work_next", status: "running", atMs: 0)
+        h.session.nowMs = { 0 }
+        h.session.forward(.fallback(RealtimeUplinkFallbackDescriptor(
+            requestId: nextRequestId, sessionId: nextSessionId,
+            reason: "\(RealtimeUplinkStream.FallbackReason.transportFailed)",
+            kind: RealtimeUplinkStream.FallbackReason.transportFailed.wireKind
+        )))
+        XCTAssertEqual(h.pendingRetries.count, 2,
+                       "新回合必须能武装自己的静默重试——共享布尔卡死时这里只会是 1")
+
+        // 只引爆旧回合那一支：它必须整支作废，动不了新回合任何东西。
+        h.firePendingRetry(at: 0)
+        XCTAssertTrue(next.closeReasons.isEmpty,
+                      "陈旧重试计时器不得替新回合收口；新回合自己的那支此刻应判 hold")
+        XCTAssertEqual(h.session.state,
+                       .active(requestId: nextRequestId, sessionId: nextSessionId))
+        XCTAssertTrue(h.session.hasCurrentTransportForTesting)
+    }
+
     // MARK: - 夹具
 
     private struct Harness {
@@ -520,6 +673,8 @@ final class Ess1159UplinkFallbackHoldTests: XCTestCase {
             var pendingRetries: [@MainActor () -> Void] = []
             /// ESS-1159 复审整改：播放排空屏障的兜底计时器（宽限 / 排空上限）。
             var pendingDrainTimers: [(seconds: TimeInterval, fire: @MainActor () -> Void)] = []
+            /// ESS-1159 复审整改（阻断 3）：跨回合用例要盯住**第二条** transport。
+            var transportsByRequest: [String: FakeTransport] = [:]
         }
 
         init(session: PhoneRealtimeSession, transport: FakeTransport, box: Box) {
@@ -530,6 +685,9 @@ final class Ess1159UplinkFallbackHoldTests: XCTestCase {
 
         var delivered: [RealtimeDownlinkEnvelope] { box.delivered }
         var pendingRetries: [@MainActor () -> Void] { box.pendingRetries }
+        func transport(for requestId: String) -> FakeTransport? {
+            box.transportsByRequest[requestId]
+        }
         var pendingDrainTimers: [(seconds: TimeInterval, fire: @MainActor () -> Void)] {
             box.pendingDrainTimers
         }
@@ -539,6 +697,20 @@ final class Ess1159UplinkFallbackHoldTests: XCTestCase {
             let due = box.pendingRetries
             box.pendingRetries.removeAll()
             for fire in due { fire() }
+        }
+
+        /// 只触发**指定那一支**计时器——跨回合用例必须能单独引爆「旧回合留下
+        /// 的那一支」，否则连同新回合自己的一起触发，断言就说明不了任何事。
+        @MainActor
+        func fireDrainTimer(at index: Int) {
+            let entry = box.pendingDrainTimers.remove(at: index)
+            entry.fire()
+        }
+
+        @MainActor
+        func firePendingRetry(at index: Int) {
+            let fire = box.pendingRetries.remove(at: index)
+            fire()
         }
 
         /// 触发当前武装着的排空屏障计时器（触发中新武装的留到下一次）。
@@ -556,7 +728,10 @@ final class Ess1159UplinkFallbackHoldTests: XCTestCase {
         let transport = FakeTransport()
         let box = Harness.Box()
         let session = PhoneRealtimeSession(transportFactory: { requestId, _ in
-            requestId == Self.requestId ? transport : FakeTransport()
+            if requestId == Self.requestId { return transport }
+            let fresh = FakeTransport()
+            box.transportsByRequest[requestId] = fresh
+            return fresh
         })
         session.isAgentTransport = true
         session.onDownlink = { envelope in
