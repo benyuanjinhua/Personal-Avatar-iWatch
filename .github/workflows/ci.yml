@@ -175,12 +175,21 @@ jobs:
             exit "$xcode_exit"
           fi
 
+      # ESS-1172：纯文本日志之外补 xcresult / DiagnosticReports / CoreSimulator
+      # 日志。见 Scripts/collect-test-diagnostics.sh 顶部注释。脚本内部吞掉所有
+      # 采集失败并恒返回 0，不会把测试结果判红，也不会掩盖真实失败。
+      - name: Collect iOS test diagnostics
+        if: always()
+        run: Scripts/collect-test-diagnostics.sh ios .build/DerivedData-iOSTest ci-diagnostics/ios
+
       - name: Upload xcodebuild iOS test logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: xcodebuild-ios-test-log
-          path: xcodebuild-ios-test.log
+          path: |
+            xcodebuild-ios-test.log
+            ci-diagnostics/ios
           if-no-files-found: ignore
           retention-days: 14
 
@@ -259,12 +268,24 @@ jobs:
             exit "$xcode_exit"
           fi
 
+      # ESS-1172：#570 里宿主进程（pid 23058）在用例执行中途死亡、xctest 重启宿主
+      # 后从下一个用例继续，而 artifact 里只有一个纯文本日志，拿不到栈帧，机理只
+      # 能停在「嫌疑」。这一步把 xcresult、DiagnosticReports、CoreSimulator 设备
+      # 日志一并采下来：有崩溃报告 = 崩溃（可读 signal 与栈帧），没有报告 + 设备
+      # 日志里有回收记录 = 挂起被看门狗回收。两种结果都是判据，所以为空也要留下
+      # MANIFEST 证明采过。
+      - name: Collect watchOS test diagnostics
+        if: always()
+        run: Scripts/collect-test-diagnostics.sh watch .build/DerivedData-WatchTest ci-diagnostics/watch
+
       - name: Upload xcodebuild logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: xcodebuild-watch-test-log
-          path: xcodebuild-watch-test.log
+          path: |
+            xcodebuild-watch-test.log
+            ci-diagnostics/watch
           if-no-files-found: ignore
           retention-days: 14
 

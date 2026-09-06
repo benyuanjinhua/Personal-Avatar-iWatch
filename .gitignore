@@ -5,3 +5,5 @@ xcuserdata/
 WristAgent.xcodeproj/xcuserdata/
 logs/
 build/
+
+ci-diagnostics/
