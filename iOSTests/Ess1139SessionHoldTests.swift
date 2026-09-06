@@ -72,6 +72,10 @@ final class Ess1139SessionHoldTests: XCTestCase {
         XCTAssertEqual(h.delivered.count, 2, "回合终态必须送达")
         XCTAssertEqual(h.delivered.last?.kind, .audioDone)
 
+        // ESS-1159：本轮从头到尾没有播放回执，屏障走首帧回执宽限；到点即放行。
+        XCTAssertTrue(h.transport.closeReasons.isEmpty, "宽限窗口内还不收口")
+        h.fireDrainTimers()
+
         // 上游真的说完了，被推迟的那次关闭这才兑现。
         XCTAssertEqual(h.transport.closeReasons, ["lifecycle_background"],
                        "终态之后必须补上那次被推迟的关闭，且只关一次")
@@ -152,6 +156,10 @@ final class Ess1139SessionHoldTests: XCTestCase {
                        finalSequence: 7, upstreamWorkOutstanding: false),
             from: h.transport
         )
+
+        // ESS-1159：同上，无播放回执 ⇒ 首帧回执宽限到点后才收口。
+        XCTAssertTrue(h.transport.closeReasons.isEmpty, "宽限窗口内还不收口")
+        h.fireDrainTimers()
 
         // 收口确实发生了（上游说完了，socket 该关）……
         XCTAssertEqual(h.transport.closeReasons, ["lifecycle_background"],
@@ -396,6 +404,10 @@ final class Ess1139SessionHoldTests: XCTestCase {
             var delivered: [RealtimeDownlinkEnvelope] = []
             var consumerTakesDelivery = true
             var pendingRetries: [@MainActor () -> Void] = []
+            /// ESS-1159 复审整改：收口现在还要等**播放排空**。这一轮从头到尾
+            /// 没有任何播放回执，屏障因此走「首帧回执宽限」那条短兜底；把它
+            /// 也接出来，本套件才能继续在确定的时刻断言收口。
+            var pendingDrainTimers: [@MainActor () -> Void] = []
             /// 工厂被问过哪些 request_id。「被拒的一轮不得建新 transport」
             /// 只有盯着工厂才断言得了。
             var transportRequests: [String] = []
@@ -413,6 +425,14 @@ final class Ess1139SessionHoldTests: XCTestCase {
         var consumerTakesDelivery: Bool {
             get { box.consumerTakesDelivery }
             nonmutating set { box.consumerTakesDelivery = newValue }
+        }
+
+        /// 触发排空屏障的兜底计时器（ESS-1159）。
+        @MainActor
+        func fireDrainTimers() {
+            let due = box.pendingDrainTimers
+            box.pendingDrainTimers.removeAll()
+            for fire in due { fire() }
         }
 
         /// 触发当前武装着的全部重试计时器（触发过程中新武装的留到下一次）。
@@ -442,6 +462,7 @@ final class Ess1139SessionHoldTests: XCTestCase {
             return .handled
         }
         session.scheduleDeferredCloseRetry = { _, fire in box.pendingRetries.append(fire) }
+        session.schedulePlaybackDrainCap = { _, fire in box.pendingDrainTimers.append(fire) }
 
         // 真实开轮路径：上行 stream.start 建通道，Agent transport 报 .active。
         session.forward(.start(RealtimeStreamStart(

@@ -508,12 +508,17 @@ extension WatchVoiceTransport: WatchRealtimeMediaAdapter.Transport {
         // buffers for this request. The concrete m4a upload is performed by
         // the adapter's injected FullFileFallback closure (which routes to
         // this class's `send(envelope:recording:)`), so no double execution.
+        // ESS-1159 复审整改（阻断 2）：归类**随帧上线**。iPhone 据此决定这次
+        // 回退压不压得过在飞的上游任务；它不再解析 `reason` 字符串猜意图。
+        let kind = reason.wireKind
         WatchLog.info(
             "transport", "realtime_complete_file_fallback",
-            requestId: handle.requestId, detail: "reason=\(reason)"
+            requestId: handle.requestId,
+            detail: "reason=\(reason) kind=\(kind.rawValue)"
         )
         let descriptor = RealtimeUplinkFallbackDescriptor(
-            requestId: handle.requestId, sessionId: handle.sessionId, reason: "\(reason)"
+            requestId: handle.requestId, sessionId: handle.sessionId,
+            reason: "\(reason)", kind: kind
         )
         sendRealtimeUplink(.fallback(descriptor))
     }
