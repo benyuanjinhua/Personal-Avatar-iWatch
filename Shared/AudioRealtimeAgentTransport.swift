@@ -118,12 +118,7 @@ final class AudioRealtimeAgentTransport {
         components.queryItems = queryItems
         guard let resolvedURL = components.url else { return nil }
 
-        var request = URLRequest(url: resolvedURL)
-        request.timeoutInterval = config.connectionTimeout
-        request.setValue(
-            "Bearer \(config.authToken)",
-            forHTTPHeaderField: "Authorization"
-        )
+        let request = makeWebSocketRequest(config: config, url: resolvedURL)
 
         let closeObserver = CloseObserver(
             requestId: requestId, sessionId: sessionId, generation: generation
@@ -139,6 +134,31 @@ final class AudioRealtimeAgentTransport {
             sessionId: sessionId, requestId: requestId, generation: generation,
             closeObserver: closeObserver
         )
+    }
+
+    /// Build the long-lived upgrade request. `URLRequest.timeoutInterval`
+    /// remains active after a WebSocket upgrade in Foundation on real iOS;
+    /// using the 10 s handshake budget here produced the repeatable shape
+    /// seen in ESS-1176: upgrade at 03:14:14.178, peer-side 1006 at
+    /// 03:14:34.105 while task heartbeats were still arriving.
+    ///
+    /// The session's ready/response timers bound protocol progress. This
+    /// request-level cap only prevents an indefinitely retained socket and
+    /// must therefore exceed the 180 s turn/playback-drain ceiling.
+    static func makeWebSocketRequest(
+        config: AudioRealtimeAgentConfig,
+        url: URL
+    ) -> URLRequest {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = max(
+            config.connectionTimeout,
+            AudioRealtimeAgentConfig.minimumWebSocketLifetime
+        )
+        request.setValue(
+            "Bearer \(config.authToken)",
+            forHTTPHeaderField: "Authorization"
+        )
+        return request
     }
 
     // MARK: - Send

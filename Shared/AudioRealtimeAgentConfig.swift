@@ -28,6 +28,10 @@ struct AudioRealtimeAgentConfig: Sendable, Equatable {
     let authToken: String
     /// Device identity for scope binding (sent as `device_id` URL query param).
     let deviceId: String
+    /// Desired handshake budget. Do not copy this value onto the
+    /// `URLRequest.timeoutInterval` used by a `URLSessionWebSocketTask`:
+    /// Foundation keeps applying that request timeout after the upgrade on
+    /// real devices, which used to tear down healthy long turns at ~20 s.
     let connectionTimeout: TimeInterval
     /// ESS-842: how long the client keeps waiting after `audio.commit` before
     /// it gives up on its own. It must stay **longer** than the Gateway's
@@ -56,6 +60,11 @@ struct AudioRealtimeAgentConfig: Sendable, Equatable {
     /// (matches `ERROR_DELIVERY_MARGIN_MS` in
     /// `AudioRealtimeGateway/test/ess842-response-deadline.test.mjs`).
     static let gatewayErrorDeliveryMargin: TimeInterval = 1.5
+
+    /// The socket must outlive the longest client-side turn hold (180 s).
+    /// A WebSocket is a long-lived request; its URLRequest timeout is a
+    /// lifetime cap, not a handshake-only timer on real iOS networking.
+    static let minimumWebSocketLifetime: TimeInterval = 240.0
 
     init(
         gatewayURL: URL,

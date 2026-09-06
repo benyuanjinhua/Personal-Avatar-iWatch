@@ -236,6 +236,34 @@ final class AudioRealtimeAgentSessionTests: XCTestCase {
         XCTAssertNotNil(transport)
     }
 
+    /// ESS-1176: `connectionTimeout` is a handshake budget, but Foundation
+    /// treats `URLRequest.timeoutInterval` on a WebSocket as a live request
+    /// timeout after upgrade. Reusing the 10 s default caused an abnormal
+    /// close at ~20 s session age, before a 43 s Codex task could answer.
+    func testWebSocketRequestLifetimeDoesNotReuseHandshakeTimeout() {
+        let config = makeConfig(connectionTimeout: 5.0)
+        let request = AudioRealtimeAgentTransport.makeWebSocketRequest(
+            config: config,
+            url: URL(string: "wss://agent.example.com/api/realtime")!
+        )
+
+        XCTAssertEqual(
+            request.timeoutInterval,
+            AudioRealtimeAgentConfig.minimumWebSocketLifetime
+        )
+        XCTAssertGreaterThan(request.timeoutInterval, 180.0)
+        XCTAssertGreaterThan(request.timeoutInterval, 43.272)
+    }
+
+    func testExplicitLongerWebSocketLifetimeIsPreserved() {
+        let config = makeConfig(connectionTimeout: 600.0)
+        let request = AudioRealtimeAgentTransport.makeWebSocketRequest(
+            config: config,
+            url: URL(string: "wss://agent.example.com/api/realtime")!
+        )
+        XCTAssertEqual(request.timeoutInterval, 600.0)
+    }
+
     // MARK: - Connection state descriptions
 
     func testConnectionStateDescriptions() {
