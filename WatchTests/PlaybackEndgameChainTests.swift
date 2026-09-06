@@ -99,6 +99,20 @@ final class PlaybackEndgameChainTests: XCTestCase {
     /// `playback_failure_notify_skipped reason=not_authorized`）——这本身也
     /// 是一条 T2 决策链路走通的证据；真机在真实授权后走的是 `result_notified`。
     func testExhaustedExercisesHapticAndT2NotifierIdempotency() async throws {
+        // ESS-1170: 同 ESS-498 家族。本用例虽然用 selfCheckForcedActivationFailures
+        // 强制激活失败，但 `SpeechPlayer.activateSession()` 在读到该标志之前就已经
+        // 调用 `activationEvidence()` 去读真实 `AVAudioSession` 的 category / mode /
+        // routeSharingPolicy / currentRoute，随后 `play(data:)` 还要真解一段 AAC。
+        // GitHub hosted macos-15 runner 没有音频硬件，CI run #570 里测试宿主进程
+        // 就死在这条路径上（pid 23058 → 24946，xctest 打出 "Restarting after
+        // unexpected exit, crash, or test timeout" 并跳到下一个用例），导致汇总
+        // 显示 0 failures 而 xcodebuild 仍 exit 65。
+        //
+        // 这不是删测试：门只在 CI 用 `-D ESS_498_HOSTED_CI` 编译时生效，本地 mac
+        // 与真机 sim 仍跑完整用例体，R-02.1 的运行时证据不丢。
+        try HostedCITestGate.skipIfHostedCI(
+            "SpeechPlayer.play() → 真实 AVAudioSession 读写 in testExhaustedExercisesHapticAndT2NotifierIdempotency"
+        )
         let player = SpeechPlayer()
         player.selfCheckForcedActivationFailures = ["long_form", "foreground"]
 

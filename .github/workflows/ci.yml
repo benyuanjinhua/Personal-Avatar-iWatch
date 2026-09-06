@@ -236,6 +236,7 @@ jobs:
             -scheme "WristAgent Watch App" \
             -destination "id=${{ steps.pick-sim.outputs.id }}" \
             -derivedDataPath .build/DerivedData-WatchTest \
+            -resultBundlePath .build/watch-test.xcresult \
             OTHER_SWIFT_FLAGS='$(inherited) -D ESS_498_HOSTED_CI' \
             | tee xcodebuild-watch-test.log
           xcode_exit=${PIPESTATUS[0]}
@@ -265,6 +266,18 @@ jobs:
         with:
           name: xcodebuild-watch-test-log
           path: xcodebuild-watch-test.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # ESS-1170: run #570 里测试宿主中途死亡，但只上传了 .log —— 里面没有崩溃栈，
+      # 事后只能停在「强相关」而无法定位帧。xcresult 才带 crash report / attachment，
+      # 补传它是把同类事故从「猜」变成「可判定」的前提。
+      - name: Upload xcodebuild watch xcresult
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-watch-test-xcresult
+          path: .build/watch-test.xcresult
           if-no-files-found: ignore
           retention-days: 14
 
