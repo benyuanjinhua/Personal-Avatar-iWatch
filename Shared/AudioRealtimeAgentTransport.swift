@@ -124,7 +124,7 @@ final class AudioRealtimeAgentTransport {
             requestId: requestId, sessionId: sessionId, generation: generation
         )
         let session = URLSession(
-            configuration: .ephemeral,
+            configuration: makeSessionConfiguration(config: config),
             delegate: closeObserver,
             delegateQueue: nil
         )
@@ -136,11 +136,11 @@ final class AudioRealtimeAgentTransport {
         )
     }
 
-    /// Build the long-lived upgrade request. `URLRequest.timeoutInterval`
-    /// remains active after a WebSocket upgrade in Foundation on real iOS;
-    /// using the 10 s handshake budget here produced the repeatable shape
-    /// seen in ESS-1176: upgrade at 03:14:14.178, peer-side 1006 at
-    /// 03:14:34.105 while task heartbeats were still arriving.
+    /// Build the long-lived upgrade request. ESS-1176 observed a POSIX 53
+    /// abnormal close rather than `NSURLErrorTimedOut`, so the original
+    /// 10-second request value is not claimed as the exclusive root cause.
+    /// It is still invalid configuration: a connection carrying a 180-second
+    /// task must not have a shorter request-level lifetime.
     ///
     /// The session's ready/response timers bound protocol progress. This
     /// request-level cap only prevents an indefinitely retained socket and
@@ -159,6 +159,22 @@ final class AudioRealtimeAgentTransport {
             forHTTPHeaderField: "Authorization"
         )
         return request
+    }
+
+    /// `URLSessionConfiguration` has its own request/resource limits. Set both
+    /// explicitly to the same derived lifetime so the real session assembly
+    /// cannot override the request-level protection with Foundation defaults.
+    static func makeSessionConfiguration(
+        config: AudioRealtimeAgentConfig
+    ) -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        let lifetime = max(
+            config.connectionTimeout,
+            AudioRealtimeAgentConfig.minimumWebSocketLifetime
+        )
+        configuration.timeoutIntervalForRequest = lifetime
+        configuration.timeoutIntervalForResource = lifetime
+        return configuration
     }
 
     // MARK: - Send

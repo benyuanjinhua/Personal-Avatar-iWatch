@@ -66,6 +66,94 @@ test('agent transport forwards real upstream audio with request-scoped logs', as
   turn.close()
 })
 
+test('ESS-1176 reconnect rebinds one upstream turn and replays only detached frames', async () => {
+  let upstreamConnections = 0
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') {
+      upstreamConnections += 1
+      ws.send(JSON.stringify({ type: 'voice.ready' }))
+    }
+    if (message.type === 'audio.commit') {
+      setTimeout(() => ws.send(JSON.stringify({
+        type: 'audio.delta', audio: Buffer.from('missed').toString('base64'),
+        sampleRate: 24_000,
+      })), 20)
+      setTimeout(() => ws.send(JSON.stringify({ type: 'audio.done' })), 180)
+    }
+  })
+  const before = []; const after = []; const logs = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, doneSettleMs: 0,
+    log: (evt, extra) => logs.push({ evt, ...extra }),
+  })
+  const scope = {
+    requestId: 'r-resume', sessionId: 's-resume', deviceId: 'd-resume',
+    generation: 1, responseId: 'r-resume:gen1',
+  }
+  const first = transport.openTurn({ ...scope, onEvent: event => before.push(event) })
+  first.appendAudio({ bytes: Buffer.from('audio') })
+  first.commit()
+  first.detach()
+  // Let the upstream finish completely while no downstream is attached. The
+  // retained bounded journal must still make the terminal answer recoverable.
+  await new Promise(resolve => setTimeout(resolve, 220))
+
+  const resumed = transport.openTurn({ ...scope, onEvent: event => after.push(event) })
+  assert.equal(resumed.resumed, true)
+  await waitFor(() => after.some(event => event.type === 'agent.audio.done'))
+
+  assert.equal(upstreamConnections, 1, 'resume must not create/supersede the Qwen turn')
+  assert.deepEqual(before, [])
+  assert.deepEqual(after.map(event => event.type), [
+    'agent.audio.delta', 'agent.audio.done',
+  ])
+  assert.ok(logs.some(item => item.evt === 'upstream_turn_detached'))
+  assert.ok(logs.some(item => item.evt === 'upstream_turn_resumed'
+    && item.replayed_frames === 2 && item.journal_overflow === false))
+  resumed.close()
+})
+
+test('ESS-1176 12s disconnect still delivers 16s first output and 43s terminal exactly once', async () => {
+  let upstreamConnections = 0
+  const url = await upstream((ws, message) => {
+    if (message.type === 'connect') {
+      upstreamConnections += 1
+      ws.send(JSON.stringify({ type: 'voice.ready' }))
+    }
+    if (message.type === 'audio.commit') {
+      setTimeout(() => ws.send(JSON.stringify({
+        type: 'audio.delta', audio: Buffer.from('first').toString('base64'),
+        sampleRate: 24_000,
+      })), 16_000)
+      setTimeout(() => ws.send(JSON.stringify({ type: 'audio.done' })), 43_000)
+    }
+  })
+  const before = []; const after = []
+  const transport = new QwenAgentTransport({
+    gatewayUrl: url, doneSettleMs: 0, responseTimeoutMs: 0,
+  })
+  const scope = {
+    requestId: 'r-long-resume', sessionId: 's-long-resume',
+    deviceId: 'd-long-resume', generation: 1,
+    responseId: 'r-long-resume:gen1',
+  }
+  const first = transport.openTurn({ ...scope, onEvent: event => before.push(event) })
+  first.appendAudio({ bytes: Buffer.from('audio') })
+  first.commit()
+  await new Promise(resolve => setTimeout(resolve, 12_000))
+  first.detach()
+  await new Promise(resolve => setTimeout(resolve, 8_000))
+  const resumed = transport.openTurn({ ...scope, onEvent: event => after.push(event) })
+  assert.equal(resumed.resumed, true)
+  await waitFor(() => after.some(event => event.type === 'agent.audio.done'), 25_000)
+
+  assert.equal(upstreamConnections, 1)
+  assert.equal(before.filter(event => event.type === 'agent.audio.delta').length, 0)
+  assert.equal(after.filter(event => event.type === 'agent.audio.delta').length, 1)
+  assert.equal(after.filter(event => event.type === 'agent.audio.done').length, 1)
+  resumed.close()
+})
+
 // ESS-745: request_id is client-supplied (token-issuer only checks it is a
 // string), and one transport instance serves every connection of the process.
 // Two different devices/sessions may therefore present the SAME request_id.

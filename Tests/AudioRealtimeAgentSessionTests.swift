@@ -251,8 +251,11 @@ final class AudioRealtimeAgentSessionTests: XCTestCase {
             request.timeoutInterval,
             AudioRealtimeAgentConfig.minimumWebSocketLifetime
         )
-        XCTAssertGreaterThan(request.timeoutInterval, 180.0)
-        XCTAssertGreaterThan(request.timeoutInterval, 43.272)
+        XCTAssertGreaterThan(
+            request.timeoutInterval,
+            TimeInterval(RealtimeSocketLifetimePolicy.absoluteHoldCapMs) / 1_000
+        )
+        XCTAssertGreaterThan(request.timeoutInterval, config.heartbeatInterval)
     }
 
     func testExplicitLongerWebSocketLifetimeIsPreserved() {
@@ -262,6 +265,26 @@ final class AudioRealtimeAgentSessionTests: XCTestCase {
             url: URL(string: "wss://agent.example.com/api/realtime")!
         )
         XCTAssertEqual(request.timeoutInterval, 600.0)
+    }
+
+    func testActualSessionConfigurationUsesDerivedSocketLifetime() {
+        let config = makeConfig(connectionTimeout: 5.0)
+        let configuration = AudioRealtimeAgentTransport.makeSessionConfiguration(
+            config: config
+        )
+
+        XCTAssertEqual(
+            configuration.timeoutIntervalForRequest,
+            AudioRealtimeAgentConfig.minimumWebSocketLifetime
+        )
+        XCTAssertEqual(
+            configuration.timeoutIntervalForResource,
+            AudioRealtimeAgentConfig.minimumWebSocketLifetime
+        )
+        XCTAssertGreaterThan(
+            configuration.timeoutIntervalForRequest,
+            TimeInterval(RealtimeSocketLifetimePolicy.absoluteHoldCapMs) / 1_000
+        )
     }
 
     // MARK: - Connection state descriptions

@@ -12,26 +12,22 @@ import Foundation
 ///   request) lives in `SecureTokenStore` per the existing Bridge auth model.
 ///   This module does NOT store ephemeral tokens to Keychain.
 ///
-/// ### Reconnect posture (F4/F5 clarification)
+/// ### Reconnect posture
 ///
-/// - `maxReconnectAttempts` defaults to **0**: the Gateway issues single-use
-///   tokens. A disconnected WSS cannot be reconnected within the same turn
-///   without a fresh token from `POST /v1/realtime/session-token`. Token
-///   refresh is a downstream ESS-401 integration concern. When the socket
-///   drops, the session emits `.failed` and the caller falls back to the
-///   existing Bridge path.
-/// - No retransmission queue is maintained: reconnection is disallowed, so
-///   sequence continuity across sockets is moot.
+/// - This low-level session still reports a failed socket immediately and does
+///   not reuse its single-use token.
+/// - ESS-1176 recovery lives one layer up in `PhoneRealtimeAgentTransport`:
+///   while its work ledger is outstanding it mints a fresh scope-bound token,
+///   reconnects the same request/session/generation, and lets the Gateway
+///   replay the bounded detached-turn journal.
 struct AudioRealtimeAgentConfig: Sendable, Equatable {
     let gatewayURL: URL
     /// Ephemeral single-use bearer token (≤ 90 s TTL). Memory only.
     let authToken: String
     /// Device identity for scope binding (sent as `device_id` URL query param).
     let deviceId: String
-    /// Desired handshake budget. Do not copy this value onto the
-    /// `URLRequest.timeoutInterval` used by a `URLSessionWebSocketTask`:
-    /// Foundation keeps applying that request timeout after the upgrade on
-    /// real devices, which used to tear down healthy long turns at ~20 s.
+    /// Desired handshake budget. It is intentionally not reused as the
+    /// lifetime of a long-lived `URLSessionWebSocketTask`.
     let connectionTimeout: TimeInterval
     /// ESS-842: how long the client keeps waiting after `audio.commit` before
     /// it gives up on its own. It must stay **longer** than the Gateway's
@@ -46,8 +42,8 @@ struct AudioRealtimeAgentConfig: Sendable, Equatable {
     let responseWaitTimeout: TimeInterval
     /// Default heartbeat interval matches Gateway's default (15 s).
     let heartbeatInterval: TimeInterval
-    /// 0 = no reconnect. Single-use tokens make reconnect structurally
-    /// impossible without a fresh token (F4).
+    /// Low-level same-token retry count. Kept at zero because replacement
+    /// sessions must mint a fresh token in `PhoneRealtimeAgentTransport`.
     let maxReconnectAttempts: Int
 
     /// ESS-842 client-side mirror of the Gateway's shipped
@@ -61,10 +57,16 @@ struct AudioRealtimeAgentConfig: Sendable, Equatable {
     /// `AudioRealtimeGateway/test/ess842-response-deadline.test.mjs`).
     static let gatewayErrorDeliveryMargin: TimeInterval = 1.5
 
-    /// The socket must outlive the longest client-side turn hold (180 s).
-    /// A WebSocket is a long-lived request; its URLRequest timeout is a
-    /// lifetime cap, not a handshake-only timer on real iOS networking.
-    static let minimumWebSocketLifetime: TimeInterval = 240.0
+    /// Headroom after the authoritative turn/socket hold cap. Keeping this
+    /// separate makes the ordering reviewable without duplicating 180 s.
+    static let webSocketLifetimeMargin: TimeInterval = 60.0
+
+    /// The socket must outlive the authoritative client-side turn hold. Derive
+    /// it from the policy instead of copying its current 180 s value so a
+    /// future policy increase cannot silently re-introduce a mid-turn cutoff.
+    static let minimumWebSocketLifetime: TimeInterval =
+        TimeInterval(RealtimeSocketLifetimePolicy.absoluteHoldCapMs) / 1_000
+        + webSocketLifetimeMargin
 
     init(
         gatewayURL: URL,

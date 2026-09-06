@@ -91,6 +91,58 @@ describe('RealtimeSession — happy path', () => {
     assert.ok(logs.some(l => l.evt === 'session_ready'))
   })
 
+  it('ESS-1176 detaches, rather than kills, the upstream turn on abnormal 1006', () => {
+    let detached = 0; let closed = 0
+    const agentTransport = {
+      openTurn: () => ({
+        detach: () => { detached += 1 },
+        close: () => { closed += 1 },
+        appendAudio: () => {}, commit: () => {}, cancel: () => {},
+        playbackStarted: () => {}, playbackEnded: () => {},
+      }),
+    }
+    const { session, scope } = harness({ agentTransport })
+    start(session, scope)
+    session.onSocketClose(1006, '')
+    assert.equal(detached, 1)
+    assert.equal(closed, 0)
+  })
+
+  it('ESS-1176 keeps explicit close teardown semantics', () => {
+    let detached = 0; let closed = 0
+    const agentTransport = {
+      openTurn: () => ({
+        detach: () => { detached += 1 },
+        close: () => { closed += 1 },
+        appendAudio: () => {}, commit: () => {}, cancel: () => {},
+        playbackStarted: () => {}, playbackEnded: () => {},
+      }),
+    }
+    const { session, scope } = harness({ agentTransport })
+    start(session, scope)
+    session.onSocketClose(1000, 'normal')
+    assert.equal(detached, 0)
+    assert.equal(closed, 1)
+  })
+
+  it('ESS-1176 resumed downstream does not require a second audio.commit', () => {
+    const clock = controlledClock()
+    const agentTransport = {
+      openTurn: () => ({
+        resumed: true,
+        detach: () => {}, close: () => {}, appendAudio: () => {},
+        commit: () => {}, cancel: () => {}, playbackStarted: () => {},
+        playbackEnded: () => {},
+      }),
+    }
+    const { session, scope } = harness({
+      agentTransport, commitDeadlineMs: 100,
+      setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+    })
+    start(session, scope)
+    assert.equal(clock.pendingCount(), 0)
+  })
+
   it('rejects unknown fields on client frames (strict schema)', () => {
     const { session, sent, scope } = harness()
     start(session, scope)

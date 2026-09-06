@@ -291,7 +291,19 @@ export class RealtimeSession {
     if (this._idleTimer) this.clearTimer(this._idleTimer)
     this._clearBarrierTimer()
     this._clearCommitDeadline()
-    if (this.agentTurn) { try { this.agentTurn.close() } catch { /* ignore */ } }
+    if (this.agentTurn) {
+      try {
+        // ESS-1176: 1006 means the downstream disappeared without a close
+        // handshake. Keep an outstanding Qwen/Codex turn alive and journal its
+        // frames for a fresh-token reconnect of the exact same scope. Normal,
+        // explicit closes retain the old teardown semantics.
+        if (code === 1006 && typeof this.agentTurn.detach === 'function') {
+          this.agentTurn.detach()
+        } else {
+          this.agentTurn.close()
+        }
+      } catch { /* ignore */ }
+    }
     this.log('session_ended', {
       request_id: this.scope.request_id, session_id: this.scope.session_id,
       generation: this.scope.generation,
@@ -355,7 +367,7 @@ export class RealtimeSession {
       request_id: this.scope.request_id, session_id: this.scope.session_id,
       generation: this.scope.generation, response_id: this.responseId,
     })
-    this._armCommitDeadline()
+    if (this.agentTurn?.resumed !== true) this._armCommitDeadline()
   }
 
   /// ESS-959: arm the「建连后迟迟不 commit」看门狗。session_ready 后起算，

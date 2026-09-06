@@ -284,6 +284,14 @@ export class QwenAgentTransport {
   // replacement was registered; an unconditional delete by key would evict the
   // live turn and leave an orphan upstream socket nobody can cancel.
   #release(turn) {
+    // A detached downstream may reconnect after the upstream has already
+    // produced its terminal frames. Retain the bounded journal until that
+    // reconnect consumes it; otherwise the fastest successful task can still
+    // lose its answer in the recovery gap.
+    if (turn.detached) {
+      turn.releasePending = true
+      return
+    }
     if (this.turns.get(turn.key) === turn) this.turns.delete(turn.key)
   }
 
@@ -349,6 +357,39 @@ export class QwenAgentTransport {
   openTurn({ requestId, sessionId, deviceId = null, generation, responseId, onEvent }) {
     const key = scopeKey({ deviceId, sessionId, generation, requestId })
     const conversation = conversationKey({ deviceId, sessionId })
+    // ESS-1176: a fresh, scope-bound token may reconnect the exact same turn
+    // after the downstream WSS vanished. The upstream Qwen/Codex task remains
+    // authoritative; rebind its event sink and replay only frames produced
+    // while detached instead of opening/superseding a second upstream turn.
+    const resumable = this.turns.get(key)
+    if (resumable?.detached) {
+      clearTimeout(resumable.detachTimer)
+      resumable.detachTimer = null
+      resumable.onEvent = onEvent
+      resumable.detached = false
+      const missed = resumable.resumeJournal.splice(0)
+      const overflow = resumable.resumeJournalOverflow
+      resumable.resumeJournalBytes = 0
+      resumable.resumeJournalOverflow = false
+      this.log('upstream_turn_resumed', {
+        request_id: requestId, session_id: sessionId, device_id: deviceId,
+        generation, replayed_frames: missed.length, journal_overflow: overflow,
+      })
+      queueMicrotask(() => {
+        if (overflow) {
+          onEvent({
+            type: 'agent.error', response_id: responseId,
+            code: 'ERR_RESUME_JOURNAL_OVERFLOW',
+            detail: 'downlink resume journal exceeded bounded capacity',
+            retriable: true,
+          })
+          return
+        }
+        for (const event of missed) onEvent(event)
+        if (resumable.releasePending) this.#release(resumable)
+      })
+      return { ...resumable.handle, resumed: true }
+    }
     // ESS-537: a Watch conversation session may issue a new request before
     // the provider has finished draining the prior response.  The upstream
     // voice service is ownership-oriented, so leaving both sockets alive can
@@ -499,6 +540,21 @@ export class QwenAgentTransport {
       streamedTasks: new Set(), awaitingTaskDelivery: new Set(),
       deliveredTasks: new Set(), taskAnswerTimer: null,
       taskDeliveryOutcome: null,
+      onEvent, detached: false, resumeJournal: [], resumeJournalBytes: 0,
+      resumeJournalOverflow: false, releasePending: false, handle: null,
+      detachTimer: null,
+    }
+    const emit = event => {
+      if (!turn.detached) return turn.onEvent?.(event)
+      const bytes = Buffer.byteLength(JSON.stringify(event))
+      if (turn.resumeJournalOverflow
+        || turn.resumeJournalBytes + bytes > this.maxDownlinkBytes
+        || turn.resumeJournal.length >= this.maxDownlinkFrames) {
+        turn.resumeJournalOverflow = true
+        return
+      }
+      turn.resumeJournal.push(event)
+      turn.resumeJournalBytes += bytes
     }
     turn.toolGateActive = () => !turn.terminal && !turn.turnEnded
       && (turn.pendingToolCall || turn.outstandingTasks.size > 0
@@ -547,7 +603,7 @@ export class QwenAgentTransport {
       clearTimeout(turn.toolAudioTimer)
       clearTimeout(turn.taskAnswerTimer)
       this.log('upstream_error', { ...scopeLog, code })
-      onEvent({ type: 'agent.error', response_id: responseId, code, detail, retriable: true })
+      emit({ type: 'agent.error', response_id: responseId, code, detail, retriable: true })
       try { turn.ws?.close() } catch { /* best effort */ }
       this.#release(turn)
     }
@@ -747,7 +803,7 @@ export class QwenAgentTransport {
         ...scopeLog, segment_index: closed.segmentIndex,
         final_sequence: closed.finalSequence, cause,
       })
-      onEvent({
+      emit({
         type: 'agent.audio.segment_done', response_id: responseId,
         segment_index: closed.segmentIndex, final_sequence: closed.finalSequence,
       })
@@ -989,7 +1045,7 @@ export class QwenAgentTransport {
         delivered_tasks: turn.deliveredTasks.size,
       })
       turn.segmentGapWindowMs = 0
-      onEvent({
+      emit({
         // ESS-1145: `reason` 是加性字段。取消 / 失败不能与正常收口共用一个
         // 不带信息的终帧——那正是 ESS-1140 里「失败被报成通过」的形状。
         type: 'agent.audio.done', response_id: responseId, final_sequence: finalSequence,
@@ -1174,7 +1230,7 @@ export class QwenAgentTransport {
         upstream_sequence: frame.upstreamSequence,
       })
       this.log('upstream_audio_delta', { ...scopeLog, sequence })
-      onEvent({
+      emit({
         type: 'agent.audio.delta', response_id: responseId, sequence,
         sample_rate: frame.sampleRate, codec: 'pcm_s16le', audio: frame.audio,
       })
@@ -1713,7 +1769,7 @@ export class QwenAgentTransport {
             return
           }
           noteResponseProgress()
-          onEvent({ type: 'agent.transcript.final', response_id: responseId,
+          emit({ type: 'agent.transcript.final', response_id: responseId,
             role: event.role, content: typeof event.content === 'string' ? event.content : '' })
           return
         }
@@ -1778,7 +1834,7 @@ export class QwenAgentTransport {
           if (category === 'progress') {
             const progress = projectStreamProgress(event)
             if (!progress) return
-            onEvent({
+            emit({
               type: 'agent.task', response_id: responseId,
               task: { id: streamTaskId, status: streamStatus }, progress,
             })
@@ -1786,7 +1842,7 @@ export class QwenAgentTransport {
           }
           const delta = typeof event.delta === 'string' ? event.delta : ''
           if (!delta) return
-          onEvent({
+          emit({
             type: 'agent.task', response_id: responseId,
             task: { id: streamTaskId, status: streamStatus },
             answer: { delta },
@@ -1898,7 +1954,7 @@ export class QwenAgentTransport {
             progress_text: progress?.text ?? null,
             progress_category: progress?.category ?? null,
           })
-          onEvent({
+          emit({
             type: 'agent.task', response_id: responseId, task: { id, status },
             ...(progress ? { progress } : {}),
           })
@@ -1964,7 +2020,7 @@ export class QwenAgentTransport {
               // first `task.*` frame the upstream emits `voice.state=idle` while
               // the tool is still being dispatched — a client that only sees
               // audio-side facts reads that gap as「turn over」and relistens.
-              onEvent({
+              emit({
                 type: 'agent.tool_call_state', response_id: responseId,
                 status: 'tool_call_pending',
               })
@@ -1982,7 +2038,7 @@ export class QwenAgentTransport {
             // no task id ever appeared」. A client that saw `tool_call_pending`
             // has nothing else that can release its latch, so this frame is a
             // server obligation, not an optimisation.
-            onEvent({
+            emit({
               type: 'agent.tool_call_state', response_id: responseId,
               status: 'tool_call_resolved',
             })
@@ -2061,7 +2117,23 @@ export class QwenAgentTransport {
     }
     connect(false)
 
-    return {
+    const handle = {
+      resumed: false,
+      detach: () => {
+        if (turn.terminal) return
+        turn.detached = true
+        turn.onEvent = null
+        this.log('upstream_turn_detached', scopeLog)
+        clearTimeout(turn.detachTimer)
+        turn.detachTimer = setTimeout(() => {
+          if (!turn.detached) return
+          turn.detached = false
+          this.log('upstream_turn_resume_expired', scopeLog)
+          try { turn.ws?.terminate() } catch { /* best effort */ }
+          this.#release(turn)
+        }, 30_000)
+        turn.detachTimer.unref?.()
+      },
       appendAudio: ({ bytes, parentRequestId = null, contextSummary = null }) => sendOrQueue({
         type: 'audio.append', audio: bytes.toString('base64'),
         ...(parentRequestId ? { parent_request_id: parentRequestId } : {}),
@@ -2136,5 +2208,7 @@ export class QwenAgentTransport {
         turn.ws.send(JSON.stringify({ type: 'playback.ended', responseId: String(responseId ?? '') }))
       },
     }
+    turn.handle = handle
+    return handle
   }
 }
