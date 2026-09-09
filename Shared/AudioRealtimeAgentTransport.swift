@@ -118,18 +118,13 @@ final class AudioRealtimeAgentTransport {
         components.queryItems = queryItems
         guard let resolvedURL = components.url else { return nil }
 
-        var request = URLRequest(url: resolvedURL)
-        request.timeoutInterval = config.connectionTimeout
-        request.setValue(
-            "Bearer \(config.authToken)",
-            forHTTPHeaderField: "Authorization"
-        )
+        let request = makeWebSocketRequest(config: config, url: resolvedURL)
 
         let closeObserver = CloseObserver(
             requestId: requestId, sessionId: sessionId, generation: generation
         )
         let session = URLSession(
-            configuration: .ephemeral,
+            configuration: makeSessionConfiguration(config: config),
             delegate: closeObserver,
             delegateQueue: nil
         )
@@ -139,6 +134,47 @@ final class AudioRealtimeAgentTransport {
             sessionId: sessionId, requestId: requestId, generation: generation,
             closeObserver: closeObserver
         )
+    }
+
+    /// Build the long-lived upgrade request. ESS-1176 observed a POSIX 53
+    /// abnormal close rather than `NSURLErrorTimedOut`, so the original
+    /// 10-second request value is not claimed as the exclusive root cause.
+    /// It is still invalid configuration: a connection carrying a 180-second
+    /// task must not have a shorter request-level lifetime.
+    ///
+    /// The session's ready/response timers bound protocol progress. This
+    /// request-level cap only prevents an indefinitely retained socket and
+    /// must therefore exceed the 180 s turn/playback-drain ceiling.
+    static func makeWebSocketRequest(
+        config: AudioRealtimeAgentConfig,
+        url: URL
+    ) -> URLRequest {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = max(
+            config.connectionTimeout,
+            AudioRealtimeAgentConfig.minimumWebSocketLifetime
+        )
+        request.setValue(
+            "Bearer \(config.authToken)",
+            forHTTPHeaderField: "Authorization"
+        )
+        return request
+    }
+
+    /// `URLSessionConfiguration` has its own request/resource limits. Set both
+    /// explicitly to the same derived lifetime so the real session assembly
+    /// cannot override the request-level protection with Foundation defaults.
+    static func makeSessionConfiguration(
+        config: AudioRealtimeAgentConfig
+    ) -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        let lifetime = max(
+            config.connectionTimeout,
+            AudioRealtimeAgentConfig.minimumWebSocketLifetime
+        )
+        configuration.timeoutIntervalForRequest = lifetime
+        configuration.timeoutIntervalForResource = lifetime
+        return configuration
     }
 
     // MARK: - Send

@@ -33,6 +33,7 @@
 		1EF1000CCC5EE26560C0A31E /* WatchStreamPlayerStartFailureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C236AB589FD3E3793C2E2958 /* WatchStreamPlayerStartFailureTests.swift */; };
 		1EF906148F17573C9B7D948E /* BuildFingerprint.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32C8DAF30CCFE15F09A5351A /* BuildFingerprint.swift */; };
 		20A0B47A1FB2A2099BE53146 /* VoiceStatusEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0EAD7935F2F128D8408C210F /* VoiceStatusEnvelope.swift */; };
+		240C6EAB5D9B1A2E42761070 /* Ess1176AgentRecoveryGateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2F9C02AE9E0A170A3BB47AD /* Ess1176AgentRecoveryGateTests.swift */; };
 		24ABA6464E98C3CA60DE366E /* WristAgent Watch App.app in Embed Watch Content */ = {isa = PBXBuildFile; fileRef = 2E88D71F4696224E69D652E8 /* WristAgent Watch App.app */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		24E16A3259C7CBB111B7CD6B /* Ess1159UplinkFallbackHoldTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0861B9493E19A2E901578B1A /* Ess1159UplinkFallbackHoldTests.swift */; };
 		2531E7416965A3AFE0797407 /* VoiceRequestEnvelope.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16A065FFB735532D201B2183 /* VoiceRequestEnvelope.swift */; };
@@ -439,6 +440,7 @@
 		D0E2B5FAE82F1D44C2C36616 /* VoiceSessionKeeper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceSessionKeeper.swift; sourceTree = "<group>"; };
 		D22D20695006303F619B7C73 /* SpeechVaultCleaner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechVaultCleaner.swift; sourceTree = "<group>"; };
 		D270E5D7D1369F80F38C115A /* WatchRealtimeMediaAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchRealtimeMediaAdapter.swift; sourceTree = "<group>"; };
+		D2F9C02AE9E0A170A3BB47AD /* Ess1176AgentRecoveryGateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Ess1176AgentRecoveryGateTests.swift; sourceTree = "<group>"; };
 		D4F4270CF6A0906299F8D2B2 /* SessionAutoRelistenTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionAutoRelistenTests.swift; sourceTree = "<group>"; };
 		D57D9FD3BB121F4AAB879ACF /* RealtimeUplinkStream.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RealtimeUplinkStream.swift; sourceTree = "<group>"; };
 		D70795CA9CC1B496467FE2B8 /* VoiceInteractionCue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceInteractionCue.swift; sourceTree = "<group>"; };
@@ -604,6 +606,7 @@
 			children = (
 				A7602B536E298BDD668E55AC /* Ess1139SessionHoldTests.swift */,
 				0861B9493E19A2E901578B1A /* Ess1159UplinkFallbackHoldTests.swift */,
+				D2F9C02AE9E0A170A3BB47AD /* Ess1176AgentRecoveryGateTests.swift */,
 			);
 			path = iOSTests;
 			sourceTree = "<group>";
@@ -889,6 +892,7 @@
 			files = (
 				79E2F035EFFC27AA8C11FC1E /* Ess1139SessionHoldTests.swift in Sources */,
 				24E16A3259C7CBB111B7CD6B /* Ess1159UplinkFallbackHoldTests.swift in Sources */,
+				240C6EAB5D9B1A2E42761070 /* Ess1176AgentRecoveryGateTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

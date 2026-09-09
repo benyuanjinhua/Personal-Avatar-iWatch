@@ -1,6 +1,80 @@
 import Foundation
 import os
 
+/// ESS-1176 client-side recovery gate. This is the single owner of the
+/// close/epoch/generation/budget invariants used by the live transport, and is
+/// intentionally value-typed so the iOS test target can exhaustively drive it
+/// without opening a real WebSocket or minting credentials.
+struct AgentTransportRecoveryGate {
+    struct Ticket: Equatable {
+        let epoch: Int
+        let generation: Int
+        let attempt: Int
+    }
+
+    enum Start: Equatable {
+        case scheduled(Ticket)
+        case terminal
+        case ignored
+    }
+
+    let maxAttempts: Int
+    let budgetMs: Int64
+    private(set) var isClosed = false
+    private(set) var epoch = 0
+    private(set) var attempts = 0
+    private(set) var startedAtMs: Int64?
+    private(set) var terminalEmitted = false
+
+    init(maxAttempts: Int = 3, budgetMs: Int64 = 30_000) {
+        self.maxAttempts = maxAttempts
+        self.budgetMs = budgetMs
+    }
+
+    mutating func start(nowMs: Int64, generation: Int, hasOutstandingWork: Bool) -> Start {
+        guard !isClosed else { return .ignored }
+        guard hasOutstandingWork else { return emitTerminalOnce() ? .terminal : .ignored }
+        let started = startedAtMs ?? nowMs
+        startedAtMs = started
+        guard attempts < maxAttempts, nowMs - started <= budgetMs else {
+            return emitTerminalOnce() ? .terminal : .ignored
+        }
+        attempts += 1
+        epoch += 1
+        return .scheduled(Ticket(epoch: epoch, generation: generation, attempt: attempts))
+    }
+
+    mutating func beginReplacement(generation: Int) -> Ticket? {
+        guard !isClosed else { return nil }
+        epoch += 1
+        return Ticket(epoch: epoch, generation: generation, attempt: attempts)
+    }
+
+    func accepts(_ ticket: Ticket, generation: Int) -> Bool {
+        !isClosed && ticket.epoch == epoch && ticket.generation == generation
+    }
+
+    @discardableResult
+    mutating func connected(_ ticket: Ticket, generation: Int) -> Bool {
+        guard accepts(ticket, generation: generation) else { return false }
+        attempts = 0
+        startedAtMs = nil
+        return true
+    }
+
+    mutating func close() {
+        isClosed = true
+        epoch += 1
+    }
+
+    @discardableResult
+    mutating func emitTerminalOnce() -> Bool {
+        guard !terminalEmitted else { return false }
+        terminalEmitted = true
+        return true
+    }
+}
+
 /// ESS-391 production transport adapter: wraps `AudioRealtimeAgentSession` so
 /// it conforms to `PhoneRealtimeSession.Transport`, translating Watch-side
 /// `RealtimeUplinkEnvelope`/`RealtimeDownlinkEnvelope` ↔ Agent
@@ -46,7 +120,17 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
     /// advancement via `bargein.request`.
     private var gate: BargeInGenerationCoordinator
     private var cancelTimeout: Task<Void, Never>?
-    private var didEmitTransportFailure = false
+
+    // ESS-1176: a transport failure is not a task failure. Tokens are single-use,
+    // so recovery must mint a replacement session, but only while the ledger says
+    // an upstream task is still capable of producing a result. The attempt and
+    // elapsed-time caps make this fail closed instead of reconnecting forever.
+    static let maxRecoveryAttempts = 3
+    static let recoveryBudgetMs: Int64 = 30_000
+    private var recoveryTask: Task<Void, Never>?
+    private var recoveryGate = AgentTransportRecoveryGate(
+        maxAttempts: maxRecoveryAttempts, budgetMs: recoveryBudgetMs
+    )
 
     /// ESS-1139：这条 socket 上**还有没有上游工作在跑**。
     ///
@@ -188,7 +272,11 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
     }
 
     func close(reason: String) {
+        recoveryGate.close()
         cancelTimeout?.cancel()
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        upstreamWorkLedger.noteUpstreamSettled(atMs: nowMs())
         // ESS-1139 验收 6：**每一次**客户端主动关闭都必须在 bridge.log 里带上
         // 原因与当时的上游账本。事故复盘卡在「客户端关闭了 WSS」而说不出为什么，
         // 就是因为这里以前只写 `os.Logger`——真机导出的 bridge.log 里根本没有
@@ -199,6 +287,90 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
             detail: "reason=\(reason) gen=\(gate.generation) \(upstreamWorkLedger.logDetail)"
         )
         agentSession.disconnect(reason: reason)
+    }
+
+    private func recoverTransport(after reason: String) {
+        let now = nowMs()
+        let hasOutstandingWork = upstreamWorkLedger.hasOutstandingWork
+        let start = recoveryGate.start(
+            nowMs: now, generation: gate.generation,
+            hasOutstandingWork: hasOutstandingWork
+        )
+        guard case .scheduled(let ticket) = start else {
+            if start == .terminal {
+                let terminalReason = hasOutstandingWork ? "reconnect_exhausted_\(reason)" : reason
+                failTransport(terminalReason, terminalAlreadyClaimed: true)
+            }
+            return
+        }
+        guard !recoveryGate.isClosed else {
+            failTransport("reconnect_exhausted_\(reason)")
+            return
+        }
+        let attempt = ticket.attempt
+        let expectedGeneration = ticket.generation
+        PhoneAgentClientLog.info(
+            module: Self.logModule, event: "transport_reconnect_scheduled",
+            requestId: requestId, sessionId: sessionId,
+            detail: "reason=\(reason) attempt=\(attempt)/\(Self.maxRecoveryAttempts) gen=\(gate.generation)"
+        )
+        recoveryTask?.cancel()
+        recoveryTask = Task { [weak self] in
+            guard let self else { return }
+            // Short exponential backoff; the wall-clock budget above is authoritative.
+            let delayMs = 250 * (1 << (attempt - 1))
+            do {
+                try await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled,
+                  self.recoveryGate.accepts(ticket, generation: self.gate.generation) else { return }
+            do {
+                let fresh = try await self.replacementSession(expectedGeneration)
+                guard !Task.isCancelled,
+                      self.recoveryGate.accepts(ticket, generation: self.gate.generation),
+                      self.upstreamWorkLedger.hasOutstandingWork else {
+                    fresh.disconnect(reason: "reconnect_no_longer_needed")
+                    return
+                }
+                self.agentSession.disconnect(reason: "transport_replaced")
+                self.agentSession = fresh
+                self.wireAgentSession()
+                guard fresh.connect(requestId: self.requestId, generation: expectedGeneration) else {
+                    self.recoverTransport(after: "wss_upgrade_failed")
+                    return
+                }
+                PhoneAgentClientLog.info(
+                    module: Self.logModule, event: "transport_reconnect_started",
+                    requestId: self.requestId, sessionId: self.sessionId,
+                    detail: "attempt=\(attempt) gen=\(expectedGeneration)"
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled,
+                      self.recoveryGate.accepts(ticket, generation: self.gate.generation) else { return }
+                self.recoverTransport(after: "token_mint_failed")
+            }
+        }
+    }
+
+    private func failTransport(_ reason: String, terminalAlreadyClaimed: Bool = false) {
+        recoveryTask?.cancel()
+        upstreamWorkLedger.noteUpstreamSettled(atMs: nowMs())
+        guard terminalAlreadyClaimed || recoveryGate.emitTerminalOnce() else { return }
+        PhoneAgentClientLog.error(
+            module: Self.logModule, event: "transport_failure_enqueued",
+            requestId: requestId, sessionId: sessionId,
+            detail: "reason=\(reason) attempts=\(recoveryGate.attempts) gen=\(gate.generation)",
+            code: "ERR_REALTIME_TRANSPORT_FAILED"
+        )
+        onDownlink?(.transportFailed(
+            requestId: requestId, sessionId: sessionId,
+            generation: gate.generation, reason: reason
+        ))
+        onStateChange?(.failed(reason: reason))
     }
 
     // MARK: - Generation owner
@@ -222,10 +394,17 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
     private func settleCancel(_ old: Int) {
         guard case .mintAndConnect(let next) = gate.cancelSettled(generation: old) else { return }
         cancelTimeout?.cancel()
-        Task { [weak self] in
+        recoveryTask?.cancel()
+        guard let ticket = recoveryGate.beginReplacement(generation: next) else { return }
+        recoveryTask = Task { [weak self] in
             guard let self else { return }
             do {
                 let fresh = try await replacementSession(next)
+                guard !Task.isCancelled,
+                      recoveryGate.accepts(ticket, generation: gate.generation) else {
+                    fresh.disconnect(reason: "generation_replacement_superseded")
+                    return
+                }
                 agentSession.disconnect(reason: "generation_replaced")
                 agentSession = fresh
                 wireAgentSession()
@@ -233,7 +412,11 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
                     failReplacement("wss_upgrade_failed")
                     return
                 }
+            } catch is CancellationError {
+                return
             } catch {
+                guard !Task.isCancelled,
+                      recoveryGate.accepts(ticket, generation: gate.generation) else { return }
                 failReplacement("token_mint_failed")
             }
         }
@@ -402,6 +585,22 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
                     "agent connected sid=\(sid.prefix(8), privacy: .public) rid=\(rid.prefix(8), privacy: .public) gen=\(gen)"
                 )
                 self.onStateChange?(.active(requestId: rid, sessionId: sid))
+                if self.recoveryGate.attempts > 0 {
+                    PhoneAgentClientLog.info(
+                        module: Self.logModule, event: "transport_reconnected",
+                        requestId: rid, sessionId: sid,
+                        detail: "attempt=\(self.recoveryGate.attempts) gen=\(gen)"
+                    )
+                    _ = self.recoveryGate.connected(
+                        AgentTransportRecoveryGate.Ticket(
+                            epoch: self.recoveryGate.epoch,
+                            generation: gen,
+                            attempt: self.recoveryGate.attempts
+                        ),
+                        generation: gen
+                    )
+                    self.recoveryTask = nil
+                }
                 if case .open(let opened) = self.gate.ready(generation: gen) {
                     self.onDownlink?(.generationOpen(requestId: rid, sessionId: sid, generation: opened))
                     Self.logger.info("agent generation.open rid=\(rid.prefix(8), privacy: .public) sid=\(sid.prefix(8), privacy: .public) gen=\(opened)")
@@ -410,26 +609,11 @@ final class PhoneRealtimeAgentTransport: PhoneRealtimeSession.Transport {
                 Self.logger.error(
                     "agent failed sid=\(sid.prefix(8), privacy: .public) reason=\(reason, privacy: .public)"
                 )
-                // ESS-1139：socket 真的没了 ⇒ 账本清零。保住一条已死的 socket
-                // 不叫防御，叫拦住下一轮。
-                self.upstreamWorkLedger.noteUpstreamSettled(atMs: self.nowMs())
-                if !self.didEmitTransportFailure {
-                    self.didEmitTransportFailure = true
-                    PhoneAgentClientLog.error(
-                        module: Self.logModule,
-                        event: "transport_failure_enqueued",
-                        requestId: self.requestId, sessionId: self.sessionId,
-                        detail: "reason=\(reason) gen=\(self.gate.generation)",
-                        code: "ERR_REALTIME_TRANSPORT_FAILED"
-                    )
-                    self.onDownlink?(.transportFailed(
-                        requestId: self.requestId,
-                        sessionId: self.sessionId,
-                        generation: self.gate.generation,
-                        reason: reason
-                    ))
-                }
-                self.onStateChange?(.failed(reason: reason))
+                // ESS-1176: keep the ledger across an abnormal transport loss.
+                // The task lives in Gateway/Codex, not in this URLSession socket.
+                // A fresh token/session resumes observation; only exhaustion emits
+                // the single permanent terminal failure.
+                self.recoverTransport(after: reason)
             case .connecting:
                 self.onStateChange?(.connecting(requestId: self.requestId, sessionId: self.sessionId))
             default:

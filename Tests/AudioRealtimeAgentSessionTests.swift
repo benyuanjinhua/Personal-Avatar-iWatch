@@ -236,6 +236,57 @@ final class AudioRealtimeAgentSessionTests: XCTestCase {
         XCTAssertNotNil(transport)
     }
 
+    /// ESS-1176: `connectionTimeout` is a handshake budget, but Foundation
+    /// treats `URLRequest.timeoutInterval` on a WebSocket as a live request
+    /// timeout after upgrade. Reusing the 10 s default caused an abnormal
+    /// close at ~20 s session age, before a 43 s Codex task could answer.
+    func testWebSocketRequestLifetimeDoesNotReuseHandshakeTimeout() {
+        let config = makeConfig(connectionTimeout: 5.0)
+        let request = AudioRealtimeAgentTransport.makeWebSocketRequest(
+            config: config,
+            url: URL(string: "wss://agent.example.com/api/realtime")!
+        )
+
+        XCTAssertEqual(
+            request.timeoutInterval,
+            AudioRealtimeAgentConfig.minimumWebSocketLifetime
+        )
+        XCTAssertGreaterThan(
+            request.timeoutInterval,
+            TimeInterval(RealtimeSocketLifetimePolicy.absoluteHoldCapMs) / 1_000
+        )
+        XCTAssertGreaterThan(request.timeoutInterval, config.heartbeatInterval)
+    }
+
+    func testExplicitLongerWebSocketLifetimeIsPreserved() {
+        let config = makeConfig(connectionTimeout: 600.0)
+        let request = AudioRealtimeAgentTransport.makeWebSocketRequest(
+            config: config,
+            url: URL(string: "wss://agent.example.com/api/realtime")!
+        )
+        XCTAssertEqual(request.timeoutInterval, 600.0)
+    }
+
+    func testActualSessionConfigurationUsesDerivedSocketLifetime() {
+        let config = makeConfig(connectionTimeout: 5.0)
+        let configuration = AudioRealtimeAgentTransport.makeSessionConfiguration(
+            config: config
+        )
+
+        XCTAssertEqual(
+            configuration.timeoutIntervalForRequest,
+            AudioRealtimeAgentConfig.minimumWebSocketLifetime
+        )
+        XCTAssertEqual(
+            configuration.timeoutIntervalForResource,
+            AudioRealtimeAgentConfig.minimumWebSocketLifetime
+        )
+        XCTAssertGreaterThan(
+            configuration.timeoutIntervalForRequest,
+            TimeInterval(RealtimeSocketLifetimePolicy.absoluteHoldCapMs) / 1_000
+        )
+    }
+
     // MARK: - Connection state descriptions
 
     func testConnectionStateDescriptions() {
