@@ -6,6 +6,7 @@
   "tls_key": "./certs/gateway.key",
   "state_dir": "./state",
   "allowed_peer_ips": ["100.64.0.0/10"],
+  "h5_enabled": true,
   "dev_allow_plain_ws": false,
   "protocol_version": 1,
 
