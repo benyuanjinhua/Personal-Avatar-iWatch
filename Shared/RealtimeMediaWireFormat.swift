@@ -18,6 +18,119 @@ enum RealtimeDownlinkDeliveryPolicy {
     }
 }
 
+/// ESS-869: the realtime channel-ready control message is one-shot and must
+/// never be silently dropped. This policy decides which WCSession delivery
+/// path to use for the current session state, so the iPhone never hits the
+/// `guard isReachable else { return }` that used to lose the ready entirely.
+///
+/// - `.interactive`: `sendMessage` — low latency, best effort.
+/// - `.durable`: `transferUserInfo` — system-managed reliable queue that
+///   delivers as soon as the Watch is reachable, without depending on the
+///   phone app observing a reachability change.
+/// - `.none`: the session is not activated (or the Watch app is missing),
+///   so nothing can be handed to the system yet. The caller keeps the
+///   turn-scoped pending value and replays on activation.
+///
+/// There is deliberately **no** `.drop` case: a ready always resolves to an
+/// in-memory pending replay or a system-managed delivery path.
+enum RealtimeChannelReadyDeliveryPolicy {
+    enum Action: Equatable {
+        case interactive
+        case durable
+        case none
+    }
+
+    static func action(
+        isActivated: Bool,
+        isReachable: Bool,
+        isWatchAppInstalled: Bool
+    ) -> Action {
+        guard isActivated, isWatchAppInstalled else { return .none }
+        return isReachable ? .interactive : .durable
+    }
+}
+
+/// ESS-869 (architecture-review fix): value-type state machine for the durable
+/// (`transferUserInfo`) delivery of a turn-scoped channel ready. It exists so
+/// the retry / terminal transitions are unit-testable in `swift test` —
+/// `PhoneConnectivity` (iOS-only) feeds it and performs the actual WCSession
+/// calls.
+///
+/// The contract it enforces:
+/// - one durable entry in flight at a time (no duplicate `transferUserInfo`);
+/// - a final system failure clears the in-flight marker and triggers a bounded
+///   retry, instead of leaving the dedup marker set forever (the L2 gap the
+///   review flagged: `durableReadyEnqueued == ready` permanently blocked
+///   re-enqueue after a failed receipt);
+/// - after `maxAttempts` failures it enters a terminal `gaveUp` state so
+///   repeated reachability callbacks cannot retry forever.
+struct RealtimeChannelReadyDurableTracker: Equatable {
+    enum Enqueue: Equatable {
+        case enqueue(attempt: Int)
+        case skip
+    }
+
+    /// What to do after a failure receipt is recorded.
+    enum FailureOutcome: Equatable {
+        case retry
+        case giveUp
+    }
+
+    let maxAttempts: Int
+    private(set) var inFlight: RealtimeChannelReady?
+    private(set) var attempts: Int
+    private(set) var gaveUp = false
+
+    init(maxAttempts: Int = 3) {
+        self.maxAttempts = maxAttempts
+        self.inFlight = nil
+        self.attempts = 0
+    }
+
+    /// A newer turn supersedes the previous one: drop any in-flight bookkeeping
+    /// and start counting from zero.
+    mutating func reset() {
+        inFlight = nil
+        attempts = 0
+        gaveUp = false
+    }
+
+    /// Ask whether `ready` should be enqueued now. Returns `.enqueue(attempt:)`
+    /// with the 1-based attempt number, or `.skip` when it is already in flight,
+    /// or the turn has already given up.
+    mutating func requestEnqueue(_ ready: RealtimeChannelReady) -> Enqueue {
+        if let inFlight, inFlight != ready {
+            // A different turn superseded the in-flight entry; treat as a reset.
+            attempts = 0
+            gaveUp = false
+        }
+        guard !gaveUp else { return .skip }
+        guard inFlight != ready else { return .skip }
+        self.inFlight = ready
+        attempts += 1
+        return .enqueue(attempt: attempts)
+    }
+
+    /// Record the system receipt (`session(_:didFinish:error:)`) for `ready`.
+    /// Returns `nil` for a delivered receipt (or a stale receipt for another
+    /// turn), otherwise the bounded-retry decision. On `.giveUp` the tracker
+    /// stays terminal until `reset()` / a new turn supersedes it.
+    mutating func recordReceipt(_ ready: RealtimeChannelReady, delivered: Bool) -> FailureOutcome? {
+        guard inFlight == ready else { return nil }
+        inFlight = nil
+        if delivered {
+            attempts = 0
+            gaveUp = false
+            return nil
+        }
+        if attempts < maxAttempts {
+            return .retry
+        }
+        gaveUp = true
+        return .giveUp
+    }
+}
+
 /// ESS-321 wire envelope for the Watch → iPhone hop.
 ///
 /// The Watch fast channel is `WCSession.sendMessageData`, which carries an
