@@ -58,6 +58,8 @@ final class BackgroundAudioBreatherTests: XCTestCase {
         private(set) var activations = 0
         private(set) var deactivations = 0
 
+        var currentRouteDescription: String { "Speaker(BuiltInSpeaker)" }
+
         func setCategory(
             _ category: AVAudioSession.Category,
             mode: AVAudioSession.Mode,
